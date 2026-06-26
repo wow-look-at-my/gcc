@@ -380,6 +380,116 @@ maybe_shorter_path (const char * file)
     }
 }
 
+/* Per-directory filename index.  States for cpp_dir::name_index_state.  */
+#define DIR_INDEX_UNBUILT	0	/* Not yet attempted.  */
+#define DIR_INDEX_OK		1	/* name_index is a usable hash set.  */
+#define DIR_INDEX_UNAVAILABLE	2	/* opendir/readdir failed; do not use.  */
+
+/* Lazily build DIR->name_index: an in-memory hash set of the top-level
+   entry names of the directory DIR->name, populated once via
+   opendir/readdir.  On success DIR->name_index_state becomes
+   DIR_INDEX_OK; if the directory cannot be read it becomes
+   DIR_INDEX_UNAVAILABLE and callers must fall back to a real open().
+
+   The set stores xstrdup'd copies of each d_name and is keyed using
+   filename_hash/filename_eq, which match the host filesystem's
+   case-sensitivity exactly the same way a real open() would (a plain
+   byte compare on Unix, case-insensitive on DOS-like systems).  This
+   guarantees the membership test agrees with open() on whether
+   DIR/name could exist.
+
+   Assumes the directory's contents do not change for the duration of
+   the translation unit -- the same assumption libcpp's existing
+   found-file (file_hash) and missing-file (nonexistent_file_hash)
+   caches already rely on.  */
+
+static void
+build_dir_name_index (cpp_dir *dir)
+{
+  DIR *d = opendir (dir->name[0] ? dir->name : ".");
+  if (d == NULL)
+    {
+      /* Unreadable directory (permissions, ENOENT, ENOTDIR, ...).
+	 Degrade gracefully: behave exactly as before by always
+	 issuing the real open().  */
+      dir->name_index_state = DIR_INDEX_UNAVAILABLE;
+      return;
+    }
+
+  htab_t index = htab_create_alloc (64, filename_hash, filename_eq,
+				    free, xcalloc, free);
+
+  struct dirent *e;
+  int read_errno;
+  for (;;)
+    {
+      /* readdir returns NULL both at end-of-directory and on error; the
+	 two are distinguished by errno, which it leaves untouched on a
+	 clean end.  Reset it before each call and re-read immediately so
+	 nothing in the loop body can clobber it.  */
+      errno = 0;
+      e = readdir (d);
+      read_errno = errno;
+      if (e == NULL)
+	break;
+
+      /* "." and ".." can never satisfy a single-component #include
+	 lookup, so there is no need to store them.  */
+      if (e->d_name[0] == '.'
+	  && (e->d_name[1] == '\0'
+	      || (e->d_name[1] == '.' && e->d_name[2] == '\0')))
+	continue;
+
+      void **slot = htab_find_slot_with_hash (index, e->d_name,
+					      filename_hash (e->d_name),
+					      INSERT);
+      if (*slot == NULL)
+	*slot = xstrdup (e->d_name);
+    }
+
+  if (read_errno != 0)
+    {
+      /* readdir failed partway through; we cannot trust the index to be
+	 complete, so discard it and fall back to real opens.  */
+      htab_delete (index);
+      closedir (d);
+      dir->name_index_state = DIR_INDEX_UNAVAILABLE;
+      return;
+    }
+
+  closedir (d);
+  dir->name_index = index;
+  dir->name_index_state = DIR_INDEX_OK;
+}
+
+/* Return true iff the single-component filename NAME is provably NOT a
+   direct entry of directory DIR, using DIR's lazily-built filename
+   index.  Returns false (meaning "do not skip the open") whenever the
+   index is unavailable or NAME might be present -- i.e. this only ever
+   reports a guaranteed miss, never a guaranteed hit, so a real open()
+   still runs in every case where the answer is not a certain absence.
+
+   The caller must ensure NAME contains no directory separator: readdir
+   only lists top-level entries, so a multi-component name such as
+   "QtCore/qobject.h" is never a direct child and the index does not
+   apply to it (the caller falls back to open() for those).  */
+
+static bool
+name_absent_from_dir (cpp_dir *dir, const char *name)
+{
+  if (dir->name_index_state == DIR_INDEX_UNBUILT)
+    build_dir_name_index (dir);
+
+  if (dir->name_index_state != DIR_INDEX_OK)
+    return false;	/* Index unavailable: never skip the open.  */
+
+  htab_t index = (htab_t) dir->name_index;
+  if (htab_find_with_hash (index, name, filename_hash (name)) != NULL)
+    return false;	/* Present (or possibly present): must open.  */
+
+  return true;		/* Provably absent: safe to skip the open.  */
+}
+
 /* Try to open the path FILE->name appended to FILE->dir.  This is
    where remap and PCH intercept the file lookup process.  Return true
    if the file was found, whether or not the open was successful.
@@ -391,6 +501,12 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
 		  location_t loc)
 {
   char *path;
+  /* True only when PATH is exactly DIR/FILE->name as built by
+     append_file_to_dir, i.e. neither -fremap-file-name nor a DOS
+     name_map (dir->construct) rewrote it.  The per-directory name
+     index is keyed on plain top-level entry names, so it is only
+     valid for paths built by that plain route.  */
+  bool plain_path = false;
 
   if (CPP_OPTION (pfile, remap) && (path = remap_filename (pfile, file)))
     ;
@@ -398,7 +514,10 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
     if (file->dir->construct)
       path = file->dir->construct (file->name, file->dir);
     else
-      path = append_file_to_dir (file->name, file->dir);
+      {
+	path = append_file_to_dir (file->name, file->dir);
+	plain_path = true;
+      }
 
   if (path)
     {
@@ -436,10 +555,28 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
       if (!file->embed && pch_open_file (pfile, file, invalid_pch))
 	return true;
 
-      if (open_file (file))
+      /* Before issuing the real open() for DIR/name, consult the
+	 directory's filename index.  When the path is the plain
+	 DIR/name form, name is a single component (readdir only lists
+	 top-level entries, so multi-component names like
+	 "QtCore/qobject.h" must fall through to open()), and the index
+	 proves name is absent from the directory, the open() is
+	 guaranteed to fail with ENOENT.  Skip it and record the miss
+	 exactly as the ENOENT path below would, so behaviour -- the set
+	 of headers found, diagnostics, and the nonexistent_file_hash
+	 bookkeeping -- is byte-for-byte identical to actually calling
+	 open().  Only the redundant failing open() syscall disappears.  */
+      bool skip_open = (plain_path
+			&& strchr (file->name, '/') == NULL
+#ifdef HAVE_DOS_BASED_FILE_SYSTEM
+			&& strchr (file->name, '\\') == NULL
+#endif
+			&& name_absent_from_dir (file->dir, file->name));
+
+      if (!skip_open && open_file (file))
 	return true;
 
-      if (file->err_no != ENOENT)
+      if (!skip_open && file->err_no != ENOENT)
 	{
 	  open_file_failed (pfile, file, 0, loc);
 	  return true;
@@ -455,6 +592,8 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
 				     copy, hv, INSERT);
       *pp = copy;
 
+      if (skip_open)
+	file->err_no = ENOENT;
       file->path = file->name;
     }
   else
@@ -2128,6 +2267,22 @@ _cpp_init_files (cpp_reader *pfile)
 			      xmalloc, free);
 }
 
+/* Release the lazily-built filename indices for every directory in the
+   chain headed by DIR.  Safe to call on a NULL or partially-built
+   chain.  */
+
+static void
+free_dir_name_indices (cpp_dir *dir)
+{
+  for (; dir; dir = dir->next)
+    if (dir->name_index)
+      {
+	htab_delete ((htab_t) dir->name_index);
+	dir->name_index = NULL;
+	dir->name_index_state = DIR_INDEX_UNBUILT;
+      }
+}
+
 /* Finalize everything in this source file.  */
 void
 _cpp_cleanup_files (cpp_reader *pfile)
@@ -2138,6 +2293,10 @@ _cpp_cleanup_files (cpp_reader *pfile)
   obstack_free (&pfile->nonexistent_file_ob, 0);
   free_file_hash_entries (pfile);
   destroy_all_cpp_files (pfile);
+  /* The quote chain is the superset of the bracket chain, so freeing it
+     once covers both.  The embed chain is separate.  */
+  free_dir_name_indices (pfile->quote_include);
+  free_dir_name_indices (pfile->embed_include);
 }
 
 /* Make the parser forget about files it has seen.  This can be useful
@@ -2410,6 +2569,8 @@ cpp_set_include_chains (cpp_reader *pfile, cpp_dir *quote, cpp_dir *bracket,
   for (; quote; quote = quote->next)
     {
       quote->name_map = NULL;
+      quote->name_index = NULL;
+      quote->name_index_state = DIR_INDEX_UNBUILT;
       quote->len = strlen (quote->name);
       if (quote == bracket)
 	pfile->bracket_include = bracket;
@@ -2417,6 +2578,8 @@ cpp_set_include_chains (cpp_reader *pfile, cpp_dir *quote, cpp_dir *bracket,
   for (; embed; embed = embed->next)
     {
       embed->name_map = NULL;
+      embed->name_index = NULL;
+      embed->name_index_state = DIR_INDEX_UNBUILT;
       embed->len = strlen (embed->name);
     }
 }
