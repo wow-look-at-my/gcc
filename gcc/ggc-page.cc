@@ -739,6 +739,18 @@ alloc_anon (char *pref ATTRIBUTE_UNUSED, size_t size, bool check)
   /* Remember that we allocated this memory.  */
   G.bytes_mapped += size;
 
+  /* Back the GC heap with transparent huge pages where the kernel supports it.
+     The common small-object path allocates GGC_QUIRE_SIZE pages at once
+     (2 MB on a 4 KB-page host) and these maps are 2 MB-aligned, making them
+     ideal THP candidates; the GC heap is where every 'tree' node lives, so
+     promoting it to huge pages cuts first-touch minor page faults and relieves
+     dTLB pressure on allocation-heavy (e.g. heavily templated C++) compiles.
+     This is advisory: the kernel ignores it for sub-2 MB or misaligned maps,
+     and the whole thing is a no-op on platforms without MADV_HUGEPAGE.  */
+#ifdef MADV_HUGEPAGE
+  madvise (page, size, MADV_HUGEPAGE);
+#endif
+
   /* Pretend we don't have access to the allocated pages.  We'll enable
      access to smaller pieces of the area in ggc_internal_alloc.  Discard the
      handle to avoid handle leak.  */
