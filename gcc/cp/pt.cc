@@ -16767,6 +16767,19 @@ tsubst_function_type (tree t,
 	return error_mark_node;
     }
 
+  /* As an optimization, avoid rebuilding the function/method type if
+     substitution obviously left it unchanged: the return type and the whole
+     argument-type list came back pointer-identical, and there are no
+     dependent attributes to re-evaluate.  In that case
+     rebuild_function_or_method_type would reconstruct the very same canonical
+     type, so just hand back T.  This mirrors the existing fast-outs for
+     POINTER_TYPE/REFERENCE_TYPE and ARRAY_TYPE in tsubst.  */
+  if (return_type == TREE_TYPE (t)
+      && arg_types == TYPE_ARG_TYPES (t)
+      && (TYPE_ATTRIBUTES (t) == NULL_TREE
+	  || !ATTR_IS_DEPENDENT (TYPE_ATTRIBUTES (t))))
+    return t;
+
   /* Construct a new type node and return it.  */
   return rebuild_function_or_method_type (t, args, return_type, arg_types,
 					  /*raises=*/NULL_TREE, complain);
