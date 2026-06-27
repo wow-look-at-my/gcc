@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev
+
+      - name: Configure GCC (out of tree)
+        run: |
+          mkdir -p "$RUNNER_TEMP/gccbuild"
+          cd "$RUNNER_TEMP/gccbuild"
+          "$GITHUB_WORKSPACE/configure" --disable-bootstrap --enable-languages=c,c++ --disable-multilib
+
+      - name: Build GCC
+        run: |
+          cd "$RUNNER_TEMP/gccbuild"
+          make -j"$(nproc)"
+
+      - name: Verify in-compiler cache
+        uses: wow-look-at-my/actions@typescript#latest
+        with:
+          script: |
+            const XGCC = process.env.RUNNER_TEMP + '/gccbuild/gcc/xgcc';
+            const XGXX = process.env.RUNNER_TEMP + '/gccbuild/gcc/xg++';
+            const B = '-B' + process.env.RUNNER_TEMP + '/gccbuild/gcc';
+
+            const work = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-verify-'));
+            const debugEnv = { ...process.env, GCC_COMPILE_CACHE_DEBUG: '1' };
+
+            // Parse the 12-char key that follows "miss " / "hit " on a
+            // "compile-cache: <action> <key12> <output>" debug line.
+            function parseKey(stderr, action) {
+              const re = new RegExp('compile-cache: ' + action + ' ([0-9a-f]+)');
+              const m = stderr.match(re);
+              return m ? m[1] : null;
+            }
+
+            async function compile(driver, src, obj, cacheDir, extra) {
+              const args = ['-O2', '-c', src, '-o', obj,
+                            '-fcompile-cache=' + cacheDir, B].concat(extra || []);
+              const res = await exec.getExecOutput(driver, args,
+                { env: debugEnv, ignoreReturnCode: true });
+              if (res.exitCode !== 0) {
+                core.setFailed('compile failed (' + driver + '): exit ' +
+                  res.exitCode + '\n' + res.stderr);
+                throw new Error('compile failed');
+              }
+              return res.stderr;
+            }
+
+            // ---- C test sources --------------------------------------------
+            const incH = path.join(work, 'inc.h');
+            const aC = path.join(work, 'a.c');
+            fs.writeFileSync(incH, '#define VAL 42\nint helper(void);\n');
+            fs.writeFileSync(aC,
+              '#include "inc.h"\n' +
+              'static int s(void){return VAL;}\n' +
+              'int helper(void){return s();}\n' +
+              'int main(void){return helper();}\n');
+
+            // ---- 1. miss + store -------------------------------------------
+            const cache1 = path.join(work, 'cache1');
+            const o1 = path.join(work, 'a1.o');
+            let err = await compile(XGCC, aC, o1, cache1);
+            if (!/compile-cache: miss /.test(err))
+              core.setFailed('expected a miss on first compile\n' + err);
+            if (!/compile-cache: store /.test(err))
+              core.setFailed('expected a store on first compile\n' + err);
+            const key42 = parseKey(err, 'miss');
+            core.info('first compile key (VAL=42): ' + key42);
+
+            // ---- 2. hit + byte-identical reproduction ----------------------
+            const o2 = path.join(work, 'a2.o');
+            err = await compile(XGCC, aC, o2, cache1);
+            if (!/compile-cache: hit /.test(err))
+              core.setFailed('expected a hit on second compile\n' + err);
+            const b1 = fs.readFileSync(o1);
+            const b2 = fs.readFileSync(o2);
+            if (!b1.equals(b2))
+              core.setFailed('cache hit produced a non-identical object');
+            else
+              core.info('hit reproduced a byte-identical object');
+
+            // ---- 3. determinism: fresh empty cache, identical output -------
+            const cache2 = path.join(work, 'cache2');
+            const o3 = path.join(work, 'a3.o');
+            err = await compile(XGCC, aC, o3, cache2);
+            const b3 = fs.readFileSync(o3);
+            if (!b1.equals(b3))
+              core.setFailed('non-deterministic object across fresh caches');
+            else
+              core.info('deterministic across a fresh empty cache');
+
+            // ---- 4. invalidation: change inc.h, expect a different key -----
+            fs.writeFileSync(incH, '#define VAL 43\nint helper(void);\n');
+            const o4 = path.join(work, 'a4.o');
+            err = await compile(XGCC, aC, o4, cache1);
+            if (!/compile-cache: miss /.test(err))
+              core.setFailed('expected a miss after changing inc.h\n' + err);
+            const key43 = parseKey(err, 'miss');
+            core.info('post-change key (VAL=43): ' + key43);
+            if (!key42 || !key43 || key42 === key43)
+              core.setFailed('key did not change after inc.h was edited (' +
+                key42 + ' vs ' + key43 + ')');
+            else
+              core.info('key changed on input change: ' + key42 + ' -> ' + key43);
+
+            // ---- 5. functional: link and run, expect exit 42 ---------------
+            // Restore VAL=42 and rebuild the object so the program returns 42.
+            fs.writeFileSync(incH, '#define VAL 42\nint helper(void);\n');
+            const oFunc = path.join(work, 'afunc.o');
+            await compile(XGCC, aC, oFunc, cache1);
+            const exe = path.join(work, 'a.out');
+            const link = await exec.getExecOutput(XGCC, [oFunc, '-o', exe, B],
+              { env: process.env, ignoreReturnCode: true });
+            if (link.exitCode !== 0)
+              core.setFailed('link failed: exit ' + link.exitCode + '\n' + link.stderr);
+            const run = await exec.getExecOutput(exe, [], { ignoreReturnCode: true });
+            if (run.exitCode !== 42)
+              core.setFailed('program exit code was ' + run.exitCode + ', expected 42');
+            else
+              core.info('linked program returned 42 as expected');
+
+            // ---- 6. C++ miss -> hit -> byte-identical (cc1plus) ------------
+            const cppCache = path.join(work, 'cppcache');
+            const cpp = path.join(work, 't.cc');
+            fs.writeFileSync(cpp,
+              'struct W { int v; W():v(7){} int get() const { return v; } };\n' +
+              'int main(){ W w; return w.get(); }\n');
+            const co1 = path.join(work, 't1.o');
+            const co2 = path.join(work, 't2.o');
+            let cerr = await compile(XGXX, cpp, co1, cppCache);
+            if (!/compile-cache: miss /.test(cerr))
+              core.setFailed('C++: expected a miss on first compile\n' + cerr);
+            if (!/compile-cache: store /.test(cerr))
+              core.setFailed('C++: expected a store on first compile\n' + cerr);
+            cerr = await compile(XGXX, cpp, co2, cppCache);
+            if (!/compile-cache: hit /.test(cerr))
+              core.setFailed('C++: expected a hit on second compile\n' + cerr);
+            const cb1 = fs.readFileSync(co1);
+            const cb2 = fs.readFileSync(co2);
+            if (!cb1.equals(cb2))
+              core.setFailed('C++: cache hit produced a non-identical object');
+            else
+              core.info('C++: hit reproduced a byte-identical object');
+
+            core.info('in-compiler cache verification passed');
