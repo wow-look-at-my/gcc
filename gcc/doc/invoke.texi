@@ -20789,6 +20789,35 @@ optional argument is omitted (or if @var{file} is @code{.}), the name
 of the dump file is determined by appending @code{.gkd} to the
 dump base name, see @option{-dumpbase}.
 
+@opindex fcompile-cache
+@item -fcompile-cache=@var{dir}
+Cache the assembly output of each C and C++ translation unit in @var{dir}
+and reuse it on a later compilation of identical input, skipping the
+compiler back end entirely on a cache hit.  The cache is content-addressed:
+the lookup key is a hash over the compiler's own version, the source
+language and dialect, the complete preprocessed source closure (every
+included file's path and exact bytes), and the code-generation- and
+ABI-relevant command-line options.  A change to any of these produces a new
+key, so a stale result is never served.
+
+This is an in-compiler cache: no separate cache daemon or compiler wrapper
+is required, and it has no effect unless explicitly enabled.  Caching is
+automatically bypassed for compilations that do not produce a single
+reusable assembly file for one translation unit, including @option{-E},
+@option{-fsyntax-only}, link-time optimization, profiling or coverage
+instrumentation, precompiled-header creation or use, plugins, and output to
+standard output or @file{/dev/null}.  To keep generated symbol names
+reproducible across runs (a prerequisite for any hit), GCC pins a
+deterministic per-translation-unit @option{-frandom-seed} when you have not
+supplied one yourself.
+
+If @option{-fcompile-cache=} is not given, the cache directory is taken from
+the @env{GCC_COMPILE_CACHE_DIR} environment variable instead; the option
+takes precedence when both are present.  Setting the environment variable
+@env{GCC_COMPILE_CACHE_DEBUG} to a non-empty value prints one diagnostic
+line to standard error per translation unit reporting whether the cache was
+a hit, a miss, or stored.
+
 @opindex fcompare-debug
 @opindex fno-compare-debug
 @item -fcompare-debug@r{[}=@var{opts}@r{]}

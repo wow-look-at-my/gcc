@@ -1415,6 +1415,7 @@ OBJS = \
 	combine.o \
 	combine-stack-adj.o \
 	compare-elim.o \
+	compile-cache.o \
 	context.o \
 	convert.o \
 	coroutine-passes.o \
