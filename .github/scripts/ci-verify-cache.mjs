@@ -159,6 +159,118 @@ function findLibstdcxxDir(root) {
   return hits.length ? path.dirname(hits[0]) : null;
 }
 
+// --- structured binary cache-object format -------------------------------
+// One little-endian binary file per entry at DIR/<2hex>/<rest>.bin.
+const CC_MAGIC = 'GCCCACHE';
+const CC_FORMAT_VERSION = 1;
+const CC_HEADER_SIZE = 128;
+// Fixed-header field byte offsets (must match gcc/compile-cache.cc).
+const H = {
+  MAGIC: 0, FORMAT_VER: 8, FLAGS: 10, INPUT_COUNT: 12, CREATED: 16,
+  ASM_OFF: 24, ASM_LEN: 32, DIAG_OFF: 40, DIAG_LEN: 48, INPUTS_OFF: 56,
+  WARNINGS: 64, ERRORS: 68, KEY: 72, CHECKSUM: 92,
+  SOURCE_OFF: 108, CWD_OFF: 112, TARGET_OFF: 116, LANGUAGE_OFF: 120,
+  OPTIONS_OFF: 124,
+};
+const CC_INPUT_REC_SIZE = 32;
+const IN = { HASH: 0, SIZE: 20, PATH: 28 };
+
+// Recursively list every regular file under DIR.
+function listFiles(dir) {
+  const out = [];
+  const stack = [dir];
+  while (stack.length) {
+    const d = stack.pop();
+    let ents;
+    try {
+      ents = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of ents) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) stack.push(full);
+      else if (e.isFile()) out.push(full);
+    }
+  }
+  return out;
+}
+
+// Read a length-prefixed + NUL string referenced by a u32 file offset that
+// points at the u32 length prefix. Returns the string content (no NUL).
+function readRefString(buf, off, label) {
+  if (off + 4 > buf.length) {
+    fail('binary: ' + label + ' offset ' + off + ' out of range');
+  }
+  const slen = buf.readUInt32LE(off);
+  const start = off + 4;
+  const end = start + slen;
+  if (end + 1 > buf.length) {
+    fail('binary: ' + label + ' string [' + start + ',' + end + ') out of range');
+  }
+  if (buf[end] !== 0) {
+    fail('binary: ' + label + ' string is not NUL-terminated at ' + end);
+  }
+  return buf.toString('utf8', start, end);
+}
+
+// Parse + validate ONE .bin cache object. Returns a small summary object.
+// Verbose-prints the header hexdump, the decoded source path, and one decoded
+// input path.
+function parseAndValidateObject(binPath) {
+  const buf = fs.readFileSync(binPath);
+  if (buf.length < CC_HEADER_SIZE) {
+    fail('binary: ' + binPath + ' is shorter than the 128-byte header');
+  }
+  const magic = buf.toString('latin1', H.MAGIC, H.MAGIC + 8);
+  if (magic !== CC_MAGIC) {
+    fail('binary: bad magic ' + JSON.stringify(magic) + ' (want "GCCCACHE")');
+  }
+  const ver = buf.readUInt16LE(H.FORMAT_VER);
+  if (ver !== CC_FORMAT_VERSION) {
+    fail('binary: format_version ' + ver + ' != ' + CC_FORMAT_VERSION);
+  }
+  const inputCount = buf.readUInt32LE(H.INPUT_COUNT);
+  const asmOff = Number(buf.readBigUInt64LE(H.ASM_OFF));
+  const asmLen = Number(buf.readBigUInt64LE(H.ASM_LEN));
+  const diagOff = Number(buf.readBigUInt64LE(H.DIAG_OFF));
+  const diagLen = Number(buf.readBigUInt64LE(H.DIAG_LEN));
+  const inputsOff = Number(buf.readBigUInt64LE(H.INPUTS_OFF));
+
+  // Section spans must fit inside the file.
+  if (asmOff + asmLen > buf.length) {
+    fail('binary: asm span [' + asmOff + ',' + (asmOff + asmLen) +
+      ') exceeds file size ' + buf.length);
+  }
+  if (diagOff + diagLen > buf.length) {
+    fail('binary: diag span [' + diagOff + ',' + (diagOff + diagLen) +
+      ') exceeds file size ' + buf.length);
+  }
+  if (inputsOff + inputCount * CC_INPUT_REC_SIZE > buf.length) {
+    fail('binary: inputs table exceeds file size');
+  }
+
+  // Follow source_off -> length-prefixed + NUL string.
+  const sourceOff = buf.readUInt32LE(H.SOURCE_OFF);
+  const source = readRefString(buf, sourceOff, 'source_off');
+
+  // Walk the inputs table and decode one path via its path_off.
+  let firstInputPath = null;
+  for (let i = 0; i < inputCount; i++) {
+    const rec = inputsOff + i * CC_INPUT_REC_SIZE;
+    const pathOff = buf.readUInt32LE(rec + IN.PATH);
+    const p = readRefString(buf, pathOff, 'input[' + i + '].path_off');
+    if (i === 0) firstInputPath = p;
+  }
+
+  return {
+    buf, magic, ver, inputCount, asmOff, asmLen, diagOff, diagLen, inputsOff,
+    sourceOff, source, firstInputPath,
+    warnings: buf.readUInt32LE(H.WARNINGS),
+    errors: buf.readUInt32LE(H.ERRORS),
+  };
+}
+
 // ---------------------------------------------------------------------------
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-verify-'));
 
@@ -319,6 +431,96 @@ const o3 = path.join(work, 'a3.o');
     fail('check 6: C++ linked program exit code was ' + code + ', expected 7');
   }
   process.stdout.write('check 6 OK: C++ miss->hit, byte-identical, program returned 7\n');
+}
+
+// ---- 7. binary object format: parse/validate + no sidecars ----------------
+{
+  // cacheA holds the VAL=43 entry (last written in check 4) plus the VAL=42
+  // entry; every regular file under it must be a .bin (no sidecars).
+  const files = listFiles(cacheA);
+  if (files.length === 0) {
+    fail('check 7: no cache objects found under ' + cacheA);
+  }
+  const nonBin = files.filter((f) => !f.endsWith('.bin'));
+  if (nonBin.length) {
+    fail('check 7: found non-.bin file(s) (sidecars not allowed):\n  ' +
+      nonBin.join('\n  '));
+  }
+
+  // Parse + validate one object in full.
+  const obj = parseAndValidateObject(files[0]);
+  if (obj.inputCount < 1) {
+    fail('check 7: expected at least one input record, got ' + obj.inputCount);
+  }
+  if (!obj.firstInputPath) {
+    fail('check 7: could not decode any input path');
+  }
+  process.stdout.write(
+    'check 7 OK: ' + files.length + ' object(s), all .bin; ' +
+    'magic=GCCCACHE version=' + obj.ver + ' inputs=' + obj.inputCount + '\n' +
+    '           source=' + obj.source + '\n' +
+    '           input[0]=' + obj.firstInputPath + '\n' +
+    '           asm=[' + obj.asmOff + ',' + (obj.asmOff + obj.asmLen) +
+    ') diag=[' + obj.diagOff + ',' + (obj.diagOff + obj.diagLen) + ')\n');
+}
+
+// ---- 8. warning parity: -Wmaybe-uninitialized on MISS and HIT -------------
+{
+  const wCache = path.join(work, 'wcache');
+  const wSrc = path.join(work, 'w.c');
+  // A conditional definition followed by an UNCONDITIONAL use; at -O2 -Wall
+  // this reliably triggers the middle-end/back-end warning
+  // -Wmaybe-uninitialized, so it exercises the back-end diagnostic
+  // capture-on-MISS / replay-on-HIT path. (The terser
+  // "int f(int c){int x; if(c) x=1; return x;}" does not fire on this
+  // compiler -- the optimizer proves the garbage value never matters -- so it
+  // would make this parity check vacuous; the unconditional use below forces
+  // the warning to actually appear.)
+  fs.writeFileSync(
+    wSrc,
+    'int g(int);\n' +
+    'int f(int c){\n' +
+    '  int x;\n' +
+    '  if (c > 5)\n' +
+    '    x = g(c);\n' +
+    '  return x + c;\n' +
+    '}\n'
+  );
+  const wObj1 = path.join(work, 'w1.o');
+  const wObj2 = path.join(work, 'w2.o');
+
+  // -Wall is needed to enable -Wmaybe-uninitialized; pass it as an extra arg.
+  function compileW(obj) {
+    const args = [
+      '-O2', '-Wall', '-c', wSrc, '-o', obj,
+      '-fcompile-cache=' + wCache, B,
+    ];
+    const res = spawnSync(XGCC, args, { env: debugEnv, encoding: 'utf8' });
+    if (res.error) fail('check 8: failed to spawn xgcc: ' + res.error.message);
+    return { status: res.status, stderr: res.stderr || '', keys: parseKeys(res.stderr || '') };
+  }
+
+  const miss = compileW(wObj1);
+  if (!keyFor(miss.keys, 'miss')) {
+    fail('check 8: expected a "miss" on first -Wall compile\n' + miss.stderr);
+  }
+  if (!/-Wmaybe-uninitialized/.test(miss.stderr)) {
+    fail('check 8: expected -Wmaybe-uninitialized on MISS\n' + miss.stderr);
+  }
+
+  const hit = compileW(wObj2);
+  if (!keyFor(hit.keys, 'hit')) {
+    fail('check 8: expected a "hit" on second -Wall compile\n' + hit.stderr);
+  }
+  if (!/-Wmaybe-uninitialized/.test(hit.stderr)) {
+    fail('check 8: expected -Wmaybe-uninitialized replayed on HIT\n' + hit.stderr);
+  }
+  if (miss.status !== hit.status) {
+    fail('check 8: exit codes differ MISS=' + miss.status + ' HIT=' + hit.status);
+  }
+  process.stdout.write(
+    'check 8 OK: -Wmaybe-uninitialized on MISS and HIT; exit codes match (' +
+    miss.status + ')\n');
 }
 
 // ---- cleanup + success ---------------------------------------------------

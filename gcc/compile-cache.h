@@ -1,4 +1,4 @@
-/* In-compiler compilation cache (cache the assembly .s).
+/* In-compiler compilation cache (structured binary cache objects).
 
    Public interface.  Built as a back-end object (gcc/compile-cache.o in
    OBJS) so toplev.cc's references resolve in every *1 compiler; the cache
@@ -30,11 +30,26 @@
    ---------------------------------------------------------------------------
 
    This is an in-process, content-addressed cache of the *assembly* output
-   of a single C/C++ translation unit.  It lives entirely inside the
-   compiler; there is NO driver protocol change.  The driver forwards
-   "-fcompile-cache=DIR" through its existing "%{f*}" wildcard, and
-   cc1/cc1plus do all the work (the dir can equally come from the
-   GCC_COMPILE_CACHE_DIR environment variable).
+   of a single C/C++ translation unit, plus the back-end diagnostics emitted
+   while producing it.  It lives entirely inside the compiler; there is NO
+   driver protocol change.  The driver forwards "-fcompile-cache=DIR" through
+   its existing "%{f*}" wildcard, and cc1/cc1plus do all the work (the dir
+   can equally come from the GCC_COMPILE_CACHE_DIR environment variable).
+
+   On a miss the produced assembly and the captured back-end diagnostics are
+   written as ONE little-endian binary object per entry, at
+   "DIR/<2hex>/<rest>.bin" (no sidecar files).  The object has a fixed 128-byte
+   header (magic "GCCCACHE", format_version, section offsets/lengths, the raw
+   SHA-1 key, the executable checksum, warning/error counts, and offsets to a
+   set of metadata strings), an inputs table (one record per included file:
+   raw SHA-1 + size + path offset), a string area (offset-referenced,
+   length-prefixed + NUL strings), the assembly bytes, and the diagnostic
+   bytes.  On a hit the object is read once; if the magic/format_version do not
+   match it is ignored (treated as a miss -- self-healing).  The stored
+   assembly is written verbatim to the .o-bound asm output (so "as" sees
+   byte-identical input), and the stored diagnostics are replayed to stderr
+   with the warning/error counts folded into the global counters for -Werror
+   and exit-status parity.
 
    The cache key is a SHA-1 over everything that can change the generated
    assembly for this TU:
@@ -50,22 +65,28 @@
      1. compile_cache_init_determinism (pch_active)
           Called once, BEFORE parsing.  Records whether a PCH pipeline is
           active (a C/C++-specific fact the back-end object cannot see for
-          itself) and, if the user did not pass -frandom-seed, pins a
-          deterministic, TU-unique seed so codegen name generation is
-          reproducible across runs -- otherwise two runs of the same TU
-          would emit byte-different .s and never hit the cache.
+          itself) and, if the user did not pass -frandom-seed, pins a single
+          fixed -frandom-seed so codegen name generation is reproducible
+          across runs -- otherwise two runs of the same TU would emit
+          byte-different assembly and never hit the cache.
 
      2. compile_cache_try_serve (pfile)
           Called AFTER the parse loop has populated the include closure,
-          with parse_in.  Computes the key; on a hit, replaces the open
-          asm_out_file with the cached bytes and returns true (caller skips
-          the back-end via compile_cache_hit_p ()).  On a miss it stashes
-          the key for a later compile_cache_store ().
+          with parse_in.  Computes the key (and gathers the object metadata
+          from the same include-closure walk).  On a hit, writes the cached
+          assembly into the open asm_out_file, replays the cached back-end
+          diagnostics to stderr, folds the stored warning/error counts into
+          the global counters, and returns true (caller skips the back-end
+          via compile_cache_hit_p ()).  On a miss it stashes the key + metadata
+          and installs a capturing+teeing sink on global_dc so the back-end
+          diagnostics are both printed (as usual) and recorded for storage.
 
      3. compile_cache_store ()
           Called from toplev.cc on a miss, AFTER finalize () has closed
           asm_out_file, so the freshly produced .s on disk is complete.
-          Atomically publishes it into the cache under the stashed key.
+          Removes the capturing sink, serializes {metadata, assembly,
+          captured diagnostics} into one binary object, and atomically
+          publishes it into the cache under the stashed key.
    --------------------------------------------------------------------------- */
 
 struct cpp_reader;
@@ -76,24 +97,28 @@ struct cpp_reader;
 extern bool compile_cache_enabled_p (void);
 
 /* Record PCH state (PCH_ACTIVE true when creating or consuming a PCH) and,
-   if the user did not set -frandom-seed, pin it to a value derived from
-   {main input path, codegen-relevant flags, executable_checksum} so codegen
-   is reproducible and the cache can ever hit.  No-op when caching is
+   if the user did not set -frandom-seed, pin it to a single fixed value so
+   codegen is reproducible and the cache can ever hit.  No-op when caching is
    disabled or the user already passed -frandom-seed.  Call BEFORE parsing,
    from the C/C++ front end.  */
 extern void compile_cache_init_determinism (bool pch_active);
 
 /* Compute the cache key from the now-complete include closure (walked via
-   PFILE) + options.  On a hit, write the cached assembly into the open
-   asm_out_file and return true (caller should skip the back-end).  On a miss
-   (or when disabled) return false; the key is stashed for compile_cache_store
-   ().  */
+   PFILE) + options, gathering the object metadata along the way.  On a hit,
+   write the cached assembly into the open asm_out_file, replay the cached
+   back-end diagnostics, fold the stored counts into the global counters, and
+   return true (caller should skip the back-end).  On a miss (or when disabled)
+   return false; the key + metadata are stashed and a capturing sink is
+   installed on global_dc so the back-end diagnostics are recorded for
+   compile_cache_store ().  */
 extern bool compile_cache_try_serve (cpp_reader *pfile);
 
-/* Store the freshly produced assembly (asm_file_name's contents) into the
-   cache under the key from the preceding compile_cache_try_serve ().  Call
-   on a miss, AFTER asm_out_file has been closed by finalize ().  No-op when
-   disabled, on error, or if no key was computed.  */
+/* Serialize {metadata, freshly produced assembly (asm_file_name's contents),
+   captured back-end diagnostics} into one binary object and atomically publish
+   it under the key from the preceding compile_cache_try_serve ().  Call on a
+   miss, AFTER asm_out_file has been closed by finalize ().  Also removes the
+   capturing sink installed on a miss.  No-op when disabled, on error, or if no
+   key was computed.  */
 extern void compile_cache_store (void);
 
 /* True once compile_cache_try_serve () has reported a hit, i.e. the back-end
