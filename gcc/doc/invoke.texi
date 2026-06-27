@@ -20795,10 +20795,35 @@ Cache the assembly output of each C and C++ translation unit in @var{dir}
 and reuse it on a later compilation of identical input, skipping the
 compiler back end entirely on a cache hit.  The cache is content-addressed:
 the lookup key is a hash over the compiler's own version, the source
-language and dialect, the complete preprocessed source closure (every
-included file's path and exact bytes), and the code-generation- and
+language and dialect, the exact bytes of the complete preprocessed source
+closure (every included file's contents), and the code-generation- and
 ABI-relevant command-line options.  A change to any of these produces a new
 key, so a stale result is never served.
+
+The key deliberately does @emph{not} include file @emph{paths} when the
+generated assembly does not depend on them.  The include-search-path options
+(@option{-I}, @option{-iquote}, @option{-isystem}, @option{-idirafter},
+@option{-iprefix}, @option{-iwithprefix}, @option{-iwithprefixbefore},
+@option{-isysroot}) influence only @emph{which} files are pulled into the
+source closure, whose contents are already hashed, so their directory values
+are excluded.  Likewise the main input filename, the compilation directory,
+and each included file's path are excluded unless debug information is being
+generated.  This makes a cache populated in one build directory hit when the
+identical source is recompiled in a different build directory, or on a
+different machine, so a shared cache is effective across checkouts and CI
+runners.  When debug information is requested (any @option{-g}), source paths
+@emph{are} part of the key, because they are baked into the emitted DWARF
+(@code{DW_AT_name}, @code{DW_AT_comp_dir}, the line-number file table); use
+the @option{-f*-prefix-map} options (which @emph{are} part of the key) to
+normalize those paths and restore cross-directory hits for debug builds.
+
+As an optimistic optimization, the @code{__FILE__} and @code{__BASE_FILE__}
+predefined macros are treated like @code{__TIME__}: a translation unit that
+expands them but is compiled @emph{without} debug information may receive a
+cache hit whose assembly embeds the path string from the compilation that
+first populated the entry.  If exact @code{__FILE__} bytes matter in a
+non-debug build, compile with @option{-g}, apply a @option{-f*-prefix-map},
+or change @env{GCC_COMPILE_CACHE_SALT}.
 
 This is an in-compiler cache: no separate cache daemon or compiler wrapper
 is required, and it has no effect unless explicitly enabled.  Caching is

@@ -427,8 +427,14 @@ enum cc_tag
 /* Bump when the key construction or cached payload format changes, to
    invalidate stale entries written by an older compiler.  Bumped to 2 with
    the structured binary object format + diagnostic capture (was 1 for the
-   raw-.s entries).  */
-#define CC_KEY_SCHEMA_VERSION 2u
+   raw-.s entries).  Bumped to 3 when the key was made content-addressed:
+   search-path option *values* (-I/-isystem/...) and the main input path /
+   cwd / per-include-file paths were dropped from the key (the resolved file
+   *contents* already cover them), so the key no longer folds in build-dir
+   path strings and hits across different build directories and machines.
+   Path components are now hashed only when output truly depends on them
+   (under -g, where paths are baked into DWARF).  */
+#define CC_KEY_SCHEMA_VERSION 3u
 
 /* Feed a 1-byte tag, an 8-byte little-endian length, then the bytes, into
    CTX.  The tag+length framing makes the key unambiguous.  */
@@ -523,6 +529,36 @@ cc_option_affects_output_p (const cl_decoded_option *decoded)
   if (f & (CL_OPTIMIZATION | CL_TARGET))
     return true;
 
+  /* The include-search-path options name DIRECTORIES, not produced bytes.
+     Their VALUES are deliberately excluded from the key: what they affect is
+     *which* files end up in the include closure, and the closure walk already
+     hashes the resolved files' exact CONTENTS (see cc_hash_one_file).  So the
+     path strings are redundant -- two builds that resolve the same headers
+     from differently named -I/-isystem trees produce identical assembly and
+     must share a key.  Folding the path strings in defeats cross-build-dir /
+     cross-machine hits (an -isystem dir contributing zero files was observed
+     to flip the key).  We return false here rather than letting the generic
+     CL_COMMON/lang catch-all at the bottom include them.
+
+     Note this drops only the search-path *values*.  -D/-U/-A/-include/
+     -imacros below DO affect the produced bytes (they change the
+     preprocessed source) and stay in the key; nostdinc/undef/ansi change the
+     set of predefined macros / search behaviour and stay too.  */
+  switch (idx)
+    {
+    case OPT_I:
+    case OPT_iquote:
+    case OPT_isystem:
+    case OPT_idirafter:
+    case OPT_iprefix:
+    case OPT_iwithprefix:
+    case OPT_iwithprefixbefore:
+    case OPT_isysroot:
+      return false;
+    default:
+      break;
+    }
+
   /* Force-include specific indices that change produced bytes but are not in
      CL_OPTIMIZATION.  Intentionally broad.  */
   switch (idx)
@@ -533,14 +569,6 @@ cc_option_affects_output_p (const cl_decoded_option *decoded)
     case OPT_A:
     case OPT_include:
     case OPT_imacros:
-    case OPT_I:
-    case OPT_iquote:
-    case OPT_isystem:
-    case OPT_idirafter:
-    case OPT_iprefix:
-    case OPT_iwithprefix:
-    case OPT_iwithprefixbefore:
-    case OPT_isysroot:
     case OPT_nostdinc:
     case OPT_undef:
     case OPT_ansi:
@@ -642,6 +670,33 @@ compile_cache_enabled_p (void)
 /* Key computation                                                          */
 /* ------------------------------------------------------------------------ */
 
+/* True when the emitted assembly actually depends on source PATH strings, so
+   they must participate in the key.  The only thing that bakes a source path
+   into the produced bytes is debug info: under -g the main input filename,
+   the compilation directory, and each included file's path are emitted into
+   DWARF (DW_AT_name / DW_AT_comp_dir / the .debug_line file table).  Without
+   any -g the assembly is path-independent (the same content compiled from any
+   directory, via any -I spelling, is byte-identical), so leaving the paths
+   OUT of the key is what lets it hit across build directories and machines.
+
+   -f*-prefix-map already canonicalizes the paths that land in debug info and
+   is itself in the key (cc_option_affects_output_p), so a -g build that
+   remaps to a stable prefix still hits; a -g build with raw absolute paths
+   correctly keys on them and so will NOT cross-pollinate between trees.
+
+   Caveat (deliberate, documented in invoke.texi): a non-debug TU that expands
+   __FILE__ / __BASE_FILE__ bakes a path into the assembly even though
+   debug_info_level is NONE.  libcpp does not cheaply expose whether those
+   built-ins were expanded this TU (built-in macros, unlike user macros, never
+   set NODE_USED), so we accept the same optimistic sloppiness as __TIME__:
+   such a TU may get a hit carrying the first compiler's path string.  Use -g,
+   a prefix-map, or the salt if exact __FILE__ bytes matter without debug.  */
+static bool
+cc_paths_affect_output_p (void)
+{
+  return debug_info_level > DINFO_LEVEL_NONE;
+}
+
 /* Closure-walk state shared with the cpp_foreach_included_file callback.  */
 struct cc_closure_state
 {
@@ -656,7 +711,13 @@ cc_hash_one_file (const char *path, const unsigned char *buffer,
 		  size_t size, void *user)
 {
   struct cc_closure_state *st = (struct cc_closure_state *) user;
-  cc_hash_str (st->ctx, CC_TAG_FILE_PATH, path);
+  /* The file's CONTENTS are always part of the key; its PATH only when the
+     produced bytes depend on it (under -g -- see cc_paths_affect_output_p).
+     Dropping the path off the non-debug key is what makes an identical header
+     reached via a differently named include tree hash the same.  The inputs
+     table below still records the real path for diagnostics either way.  */
+  if (cc_paths_affect_output_p ())
+    cc_hash_str (st->ctx, CC_TAG_FILE_PATH, path);
   cc_hash_component (st->ctx, CC_TAG_FILE_BODY, buffer, size);
 
   /* Per-file SHA-1 for the inputs table (independent of the TU key digest).  */
@@ -737,9 +798,17 @@ cc_compute_key (cpp_reader *pfile)
   cc_hash_str (&ctx, CC_TAG_LANG, lang_hooks.name);
   cc_hash_str (&ctx, CC_TAG_STD, "");
 
-  /* Main input path + cwd (they also feed debug info / __FILE__).  */
-  cc_hash_str (&ctx, CC_TAG_MAIN_INPUT, main_input_filename);
-  cc_hash_str (&ctx, CC_TAG_CWD, cc_meta.cwd);
+  /* Main input path + cwd.  These bake into the produced bytes only as debug
+     info (DW_AT_name / DW_AT_comp_dir), so they are hashed only under -g; see
+     cc_paths_affect_output_p.  Leaving them out of the non-debug key is what
+     lets the same source compiled from two different directories (different
+     cwd, different -o) share one cache entry.  They are still recorded in the
+     object metadata (cc_meta.source / cc_meta.cwd) for diagnostics.  */
+  if (cc_paths_affect_output_p ())
+    {
+      cc_hash_str (&ctx, CC_TAG_MAIN_INPUT, main_input_filename);
+      cc_hash_str (&ctx, CC_TAG_CWD, cc_meta.cwd);
+    }
 
   /* (4) Canonicalized codegen/ABI-relevant command-line options, in order.
      The same token set is recorded in the metadata "options" string (minus

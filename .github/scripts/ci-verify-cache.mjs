@@ -523,6 +523,141 @@ const o3 = path.join(work, 'a3.o');
     miss.status + ')\n');
 }
 
+// ---- 9. cross-dir HIT without -g (content-addressed key) ------------------
+// The headline property of the content-addressed key: the SAME source content,
+// compiled from two DIFFERENT working directories, with a DIFFERENT -I<dir>
+// spelling and a DIFFERENT -o, and WITHOUT -g, must hit on the second compile
+// (the key folds in file CONTENTS, not paths). Before this fix the key folded
+// in the main input path, the cwd, the per-include paths, and the -I/-isystem
+// values, so this scenario always missed -- a shared cache got zero hits on
+// real builds. Compile into the SAME cache dir from both trees and require
+// miss+store then hit, with identical keys.
+{
+  const xdCache = path.join(work, 'xdcache');
+  const dirA = path.join(work, 'xdA', 'inc');
+  const dirB = path.join(work, 'xdB', 'inc');
+  fs.mkdirSync(dirA, { recursive: true });
+  fs.mkdirSync(dirB, { recursive: true });
+
+  const SRC =
+    '#include "h.h"\n' +
+    'int helper(void);\n' +
+    'static int s(void){return VAL;}\n' +
+    'int helper(void){return s();}\n' +
+    'int main(void){return helper();}\n';
+  const HDR = '#define VAL 42\nint helper(void);\n';
+
+  // Identical content under two differently named trees + differently named
+  // source files. The header is reached via "-Iinc" in each tree, so the
+  // resolved include path differs between the two compiles.
+  const aSrc = path.join(work, 'xdA', 'a.c');
+  const bSrc = path.join(work, 'xdB', 'b.c');
+  fs.writeFileSync(aSrc, SRC);
+  fs.writeFileSync(path.join(dirA, 'h.h'), HDR);
+  fs.writeFileSync(bSrc, SRC);
+  fs.writeFileSync(path.join(dirB, 'h.h'), HDR);
+
+  const objA = path.join(work, 'xdA.o');
+  const objB = path.join(work, 'xdB.o');
+
+  // Compile #1 from xdA/ : cwd=xdA, -Iinc, -o xdA.o, NO -g.
+  const r1 = spawnSync(
+    XGCC,
+    ['-O2', '-c', 'a.c', '-Iinc', '-o', objA,
+      '-fcompile-cache=' + xdCache, B],
+    { cwd: path.join(work, 'xdA'), env: debugEnv, encoding: 'utf8' });
+  if (r1.error) fail('check 9: failed to spawn xgcc (dirA): ' + r1.error.message);
+  if (r1.status !== 0) fail('check 9: dirA compile failed: ' + (r1.stderr || ''));
+  const k1 = parseKeys(r1.stderr || '');
+  const miss1 = keyFor(k1, 'miss');
+  if (!miss1) fail('check 9: expected a "miss" on first cross-dir compile\n' + r1.stderr);
+  if (!keyFor(k1, 'store')) fail('check 9: expected a "store" on first cross-dir compile\n' + r1.stderr);
+
+  // Compile #2 from xdB/ : cwd=xdB, -Iinc, -o xdB.o, NO -g -- different cwd,
+  // different source filename, different resolved -I path, different output.
+  const r2 = spawnSync(
+    XGCC,
+    ['-O2', '-c', 'b.c', '-Iinc', '-o', objB,
+      '-fcompile-cache=' + xdCache, B],
+    { cwd: path.join(work, 'xdB'), env: debugEnv, encoding: 'utf8' });
+  if (r2.error) fail('check 9: failed to spawn xgcc (dirB): ' + r2.error.message);
+  if (r2.status !== 0) fail('check 9: dirB compile failed: ' + (r2.stderr || ''));
+  const k2 = parseKeys(r2.stderr || '');
+  const hit2 = keyFor(k2, 'hit');
+  if (!hit2) {
+    fail('check 9: expected a "hit" on the SAME content from a different ' +
+      'build dir (the content-addressed key must ignore paths without -g)\n' +
+      r2.stderr);
+  }
+  if (hit2 !== miss1) {
+    fail('check 9: cross-dir hit key ' + hit2 + ' != original key ' + miss1 +
+      ' (key still depends on a path component without -g)');
+  }
+  if (Buffer.compare(readObj(objA), readObj(objB)) !== 0) {
+    fail('check 9: cross-dir cache hit produced a non-identical object');
+  }
+  process.stdout.write(
+    'check 9 OK: cross-dir HIT without -g, key=' + miss1 +
+    ' (same content, different cwd/-I/-o -> same key)\n');
+}
+
+// ---- 10. cross-dir MISS with -g, plus same-dir -g HIT control -------------
+// The complement of check 9: under -g the source path IS baked into the DWARF
+// (DW_AT_name / DW_AT_comp_dir / the line table), so it MUST be part of the
+// key. The same content compiled from two different dirs with -g must produce
+// two DIFFERENT keys (a second miss), and recompiling the FIRST tree again
+// with -g must hit (same path -> same key). This proves the path is in the
+// key exactly when output depends on it.
+{
+  const gCache = path.join(work, 'gxdcache');
+  // Reuse the trees created in check 9.
+  const aDir = path.join(work, 'xdA');
+  const bDir = path.join(work, 'xdB');
+  const objAg = path.join(work, 'xdAg.o');
+  const objBg = path.join(work, 'xdBg.o');
+  const objAg2 = path.join(work, 'xdAg2.o');
+
+  function compileG(cwd, src, obj) {
+    const res = spawnSync(
+      XGCC,
+      ['-O2', '-g', '-c', src, '-Iinc', '-o', obj,
+        '-fcompile-cache=' + gCache, B],
+      { cwd, env: debugEnv, encoding: 'utf8' });
+    if (res.error) fail('check 10: failed to spawn xgcc: ' + res.error.message);
+    if (res.status !== 0) fail('check 10: -g compile failed: ' + (res.stderr || ''));
+    return parseKeys(res.stderr || '');
+  }
+
+  const kA = compileG(aDir, 'a.c', objAg);
+  const missA = keyFor(kA, 'miss');
+  if (!missA) fail('check 10: expected a "miss" on first -g compile (dirA)');
+
+  const kB = compileG(bDir, 'b.c', objBg);
+  const missB = keyFor(kB, 'miss');
+  if (!missB) {
+    fail('check 10: expected a "miss" compiling the same content from a ' +
+      'different dir WITH -g (the path must be in the key under -g)');
+  }
+  if (missB === missA) {
+    fail('check 10: -g keys from different build dirs are equal (' + missA +
+      '); the source path is NOT in the key under -g but must be');
+  }
+
+  // Control: recompiling the FIRST tree with -g must hit (identical path).
+  const kA2 = compileG(aDir, 'a.c', objAg2);
+  const hitA2 = keyFor(kA2, 'hit');
+  if (!hitA2) {
+    fail('check 10: expected a "hit" recompiling the SAME -g tree (dirA)\n' +
+      'a -g build must still hit when nothing changed');
+  }
+  if (hitA2 !== missA) {
+    fail('check 10: -g re-hit key ' + hitA2 + ' != original -g key ' + missA);
+  }
+  process.stdout.write(
+    'check 10 OK: cross-dir MISS with -g (' + missA + ' != ' + missB +
+    '); same-dir -g re-compile HIT (' + hitA2 + ')\n');
+}
+
 // ---- cleanup + success ---------------------------------------------------
 try {
   fs.rmSync(work, { recursive: true, force: true });
