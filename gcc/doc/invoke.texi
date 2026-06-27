@@ -20818,6 +20818,38 @@ takes precedence when both are present.  Setting the environment variable
 line to standard error per translation unit reporting whether the cache was
 a hit, a miss, or stored.
 
+Setting the environment variable @env{GCC_COMPILE_CACHE_SALT} to a non-empty
+value mixes that string into every cache key.  Because the key changes, all
+previously cached entries become unreachable and the next compilation of each
+translation unit is a miss that re-populates the cache under the new keys.
+This is a non-destructive @emph{logical reset}: it does not delete anything on
+disk, so reverting to the previous salt (or unsetting it) makes the original
+entries reachable again.  It is convenient for cache-busting in tests, or for
+forcing a clean run in a shared environment without removing files.
+
+@cindex compile cache, resetting
+@anchor{compile-cache-reset}
+There are three ways to reset the compile cache:
+
+@table @asis
+@item Logical reset (non-destructive)
+Set @env{GCC_COMPILE_CACHE_SALT} to a new value (for example a timestamp or
+build id).  All keys change, so old entries are simply no longer looked up;
+nothing is deleted, and switching the salt back restores access to the prior
+entries.
+
+@item Physical reset (destructive)
+Delete the cache directory, e.g.@: @samp{rm -rf @var{dir}}, where @var{dir} is
+the directory given to @option{-fcompile-cache=} or in
+@env{GCC_COMPILE_CACHE_DIR}.  This permanently removes all cached objects.
+
+@item Continuous-integration reset
+In the GCC CI workflow, a @code{workflow_dispatch} run with the boolean input
+@code{reset_cache} set to @code{true} clears the persisted cache (both the
+on-disk directory and the @code{actions/cache} entry) before building, forcing
+a cold run.
+@end table
+
 @opindex fcompare-debug
 @opindex fno-compare-debug
 @item -fcompare-debug@r{[}=@var{opts}@r{]}

@@ -2,13 +2,25 @@ name: CI
 
 on:
   push:
+  workflow_dispatch:
+    inputs:
+      reset_cache:
+        description: 'Clear the persisted compile cache before building (forces a cold run)'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  # Persisted compile-cache directory, shared across runs via actions/cache.
+  GCC_CC_DIR: ${{ github.workspace }}/.gcc-compile-cache
 
 jobs:
   build-test:
@@ -26,6 +38,46 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev
 
+      # When dispatched with reset_cache=true, delete the persisted cache entry
+      # (so the restore below finds nothing) and remove any local copy, giving
+      # a forced cold run. gh needs GH_TOKEN; actions:write permits cache
+      # deletion. Best-effort: a missing entry is not an error.
+      - name: Reset compile cache (workflow_dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_cache }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "reset_cache requested: clearing persisted compile cache"
+          rm -rf "$GCC_CC_DIR" || true
+          PREFIX="gcc-cc-${{ runner.os }}-${{ github.ref_name }}-"
+          gh cache list --ref "${{ github.ref }}" --limit 100 --json id,key \
+            --jq ".[] | select(.key | startswith(\"$PREFIX\")) | .id" \
+            | while read -r id; do
+                echo "deleting cache entry id=$id"
+                gh cache delete "$id" || true
+              done
+
+      - name: Restore compile cache
+        # Skip the restore entirely on a forced reset so we start truly cold.
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.reset_cache) }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GCC_CC_DIR }}
+          key: gcc-cc-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            gcc-cc-${{ runner.os }}-${{ github.ref_name }}-
+            gcc-cc-${{ runner.os }}-
+
+      # On a forced reset we skipped actions/cache (which also schedules the
+      # post-run save), so register the cache here to persist this cold run's
+      # freshly populated dir for next time.
+      - name: Save compile cache (after forced reset)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_cache }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GCC_CC_DIR }}
+          key: gcc-cc-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+
       - name: Configure GCC (out of tree)
         run: |
           mkdir -p "$RUNNER_TEMP/gccbuild"
@@ -39,3 +91,20 @@ jobs:
 
       - name: Verify in-compiler cache
         run: node "$GITHUB_WORKSPACE/.github/scripts/ci-verify-cache.mjs" "$RUNNER_TEMP/gccbuild"
+
+      # 3-way benchmark (no-cache / cold / warm) on a small fixed workload.
+      # Writes a Markdown table to the run UI ($GITHUB_STEP_SUMMARY) and the log.
+      - name: Benchmark in-compiler cache
+        run: node "$GITHUB_WORKSPACE/.github/scripts/ci-bench-cache.mjs" "$RUNNER_TEMP/gccbuild"
+
+      # Exercise the persisted cache so the post-run actions/cache save captures
+      # populated entries that a later run on this ref can reuse.
+      - name: Warm persisted compile cache
+        run: |
+          mkdir -p "$GCC_CC_DIR"
+          BUILD="$RUNNER_TEMP/gccbuild"
+          XGCC="$BUILD/gcc/xgcc -B$BUILD/gcc"
+          printf 'int main(void){return 0;}\n' > "$RUNNER_TEMP/warm.c"
+          GCC_COMPILE_CACHE_DEBUG=1 $XGCC -O2 -fcompile-cache="$GCC_CC_DIR" \
+            -c "$RUNNER_TEMP/warm.c" -o "$RUNNER_TEMP/warm.o"
+          echo "persisted cache now holds $(find "$GCC_CC_DIR" -name '*.bin' | wc -l) object(s)"

@@ -420,7 +420,8 @@ enum cc_tag
   CC_TAG_OPT = 6,	/* one canonicalized command-line option token */
   CC_TAG_MAIN_INPUT = 7,/* main_input_filename */
   CC_TAG_CWD = 8,	/* current working directory */
-  CC_TAG_VERSION = 9	/* key-schema version */
+  CC_TAG_VERSION = 9,	/* key-schema version */
+  CC_TAG_SALT = 10	/* GCC_COMPILE_CACHE_SALT (logical cache reset) */
 };
 
 /* Bump when the key construction or cached payload format changes, to
@@ -714,6 +715,17 @@ cc_compute_key (cpp_reader *pfile)
     for (int i = 0; i < 4; i++)
       v[i] = (unsigned char) (ver >> (8 * i));
     cc_hash_component (&ctx, CC_TAG_VERSION, v, sizeof (v));
+  }
+
+  /* (0b) Optional user salt (GCC_COMPILE_CACHE_SALT).  When set and non-empty
+     it is mixed into the key, so changing it remaps every TU to a fresh key and
+     makes the previously cached entries unreachable -- a non-destructive logical
+     cache reset / cache-bust.  When unset or empty it is not hashed at all, so
+     existing keys are unaffected for users who never set it.  */
+  {
+    const char *salt = getenv ("GCC_COMPILE_CACHE_SALT");
+    if (salt && salt[0])
+      cc_hash_str (&ctx, CC_TAG_SALT, salt);
   }
 
   /* (1) The compiler binary's own fingerprint.  */
