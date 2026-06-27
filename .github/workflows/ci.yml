@@ -23,7 +23,7 @@ env:
   GCC_CC_DIR: ${{ github.workspace }}/.gcc-compile-cache
 
 jobs:
-  build-test:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +37,63 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev
+
+      - name: Configure GCC (out of tree)
+        run: |
+          mkdir -p "$RUNNER_TEMP/gccbuild"
+          cd "$RUNNER_TEMP/gccbuild"
+          "$GITHUB_WORKSPACE/configure" --disable-bootstrap --enable-languages=c,c++ --disable-multilib
+
+      - name: Build GCC
+        run: |
+          cd "$RUNNER_TEMP/gccbuild"
+          make -j"$(nproc)"
+
+      - name: Verify in-compiler cache
+        run: node "$GITHUB_WORKSPACE/.github/scripts/ci-verify-cache.mjs" "$RUNNER_TEMP/gccbuild"
+
+      # Package the whole build dir (cc1/cc1plus/xgcc/xg++ plus the build-tree
+      # libstdc++ needed for linking and STL compiles) so the benchmark job can
+      # restore the exact compiler without rebuilding. Large but compresses well.
+      - name: Package built compiler
+        run: |
+          tar -C "$RUNNER_TEMP" -czf gccbuild.tar.gz gccbuild
+          ls -lh gccbuild.tar.gz
+
+      - name: Upload built compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: gccbuild
+          path: gccbuild.tar.gz
+          retention-days: 1
+
+  benchmark:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Download built compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: gccbuild
+
+      - name: Restore built compiler
+        run: |
+          tar -C "$RUNNER_TEMP" -xzf gccbuild.tar.gz
+          test -x "$RUNNER_TEMP/gccbuild/gcc/xg++"
+
+      # Runtime libs in case the restored compiler needs them at link/compile
+      # time, plus ccache (used as a comparison baseline in the benchmark).
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache libgmp-dev libmpfr-dev libmpc-dev libisl-dev
 
       # When dispatched with reset_cache=true, delete the persisted cache entry
       # (so the restore below finds nothing) and remove any local copy, giving
@@ -78,22 +135,9 @@ jobs:
           path: ${{ env.GCC_CC_DIR }}
           key: gcc-cc-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
 
-      - name: Configure GCC (out of tree)
-        run: |
-          mkdir -p "$RUNNER_TEMP/gccbuild"
-          cd "$RUNNER_TEMP/gccbuild"
-          "$GITHUB_WORKSPACE/configure" --disable-bootstrap --enable-languages=c,c++ --disable-multilib
-
-      - name: Build GCC
-        run: |
-          cd "$RUNNER_TEMP/gccbuild"
-          make -j"$(nproc)"
-
-      - name: Verify in-compiler cache
-        run: node "$GITHUB_WORKSPACE/.github/scripts/ci-verify-cache.mjs" "$RUNNER_TEMP/gccbuild"
-
-      # 3-way benchmark (no-cache / cold / warm) on a small fixed workload.
-      # Writes a Markdown table to the run UI ($GITHUB_STEP_SUMMARY) and the log.
+      # 5-way benchmark (no-cache / ours-cold / ours-warm / ccache-cold /
+      # ccache-warm) on a small fixed workload. Writes a Markdown table to the
+      # run UI ($GITHUB_STEP_SUMMARY) and the log.
       - name: Benchmark in-compiler cache
         run: node "$GITHUB_WORKSPACE/.github/scripts/ci-bench-cache.mjs" "$RUNNER_TEMP/gccbuild"
 

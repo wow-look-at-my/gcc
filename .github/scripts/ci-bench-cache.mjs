@@ -4,16 +4,22 @@
 // Usage:  node ci-bench-cache.mjs <gcc-build-dir>
 //         GCC_BUILD_DIR=<dir> node ci-bench-cache.mjs
 //
-// Drives the freshly built xg++ over a small fixed C++ workload three ways and
-// reports wall-clock medians plus the two headline ratios (warm-vs-base
-// speedup and cold-vs-base overhead):
+// Drives the freshly built xg++ over a small fixed C++ workload several ways and
+// reports wall-clock medians plus the headline ratios (warm-vs-base speedup and
+// cold-vs-base overhead) for our in-compiler cache and, when available, for
+// ccache wrapping the SAME xg++ as a comparison baseline:
 //
-//   T_base  - compile the batch with NO -fcompile-cache
-//   T_cold  - fresh empty cache, compile the batch (all miss + store)
-//   T_warm  - compile the batch again against the now-full cache (all hits)
+//   T_base       - compile the batch with NO -fcompile-cache
+//   T_cold       - our cache, fresh empty dir, compile the batch (all miss + store)
+//   T_warm       - our cache, compile again against the now-full dir (all hits)
+//   T_ccache_cold - ccache wrapping xg++ (no -fcompile-cache), fresh empty
+//                   CCACHE_DIR after `ccache -C -z` (all miss)
+//   T_ccache_warm - ccache wrapping xg++, compile again against the populated
+//                   CCACHE_DIR (all hits)
 //
-// Results are written to the log and, when set, appended to the file named by
-// $GITHUB_STEP_SUMMARY (Markdown) so they show up in the run UI. The workload
+// The ccache rows are skipped gracefully (not a failure) when `ccache` is not on
+// PATH. Results are written to the log and, when set, appended to the file named
+// by $GITHUB_STEP_SUMMARY (Markdown) so they show up in the run UI. The workload
 // is deliberately small (a handful of heavy-STL TUs) so CI stays reasonable.
 //
 // Node ESM, standard-library only (no external deps). Exits 0 on success, or
@@ -49,6 +55,23 @@ function fail(msg) {
   process.stderr.write('CACHE BENCH FAILED: ' + msg + '\n');
   process.exit(1);
 }
+
+// Locate the ccache binary on PATH (used for a comparison baseline). Returns
+// the absolute path, or null if ccache isn't installed -- in which case the
+// ccache rows are skipped gracefully rather than failing the benchmark.
+function findCcache() {
+  const probe = spawnSync('ccache', ['--version'], { encoding: 'utf8' });
+  if (probe.error || probe.status !== 0) return null;
+  const which = spawnSync('command', ['-v', 'ccache'], {
+    shell: true,
+    encoding: 'utf8',
+  });
+  const p = (which.stdout || '').trim();
+  return p || 'ccache';
+}
+
+const CCACHE = findCcache();
+const haveCcache = CCACHE !== null;
 
 // An uninstalled in-tree xg++ does not know where its own freshly built
 // libstdc++ headers are, so a TU that #includes <vector> fails with
@@ -295,6 +318,70 @@ function compileBatch(cacheDir) {
   return Number(end - start) / 1e9;
 }
 
+// Compile ONE TU at -O2 via `ccache xg++ ...` (no -fcompile-cache; ccache is
+// the cache here). CCACHE_DIR points ccache at an isolated dir so it doesn't
+// touch the user's real cache. Returns nothing; fails on a compile error.
+function compileOneCcache(src, cacheDir) {
+  const b = path.basename(src, '.cc');
+  const args = [XGPP, '-O2', '-c', src, '-o', path.join(objDir, b + '.o')];
+  if (useStl) args.push(...stdcxxIncludes);
+  args.push(B);
+  const res = spawnSync(CCACHE, args, {
+    env: { ...process.env, CCACHE_DIR: cacheDir },
+    encoding: 'utf8',
+  });
+  if (res.error) fail('failed to spawn ccache: ' + res.error.message);
+  if (res.status !== 0) {
+    fail(
+      'ccache compile failed: exit ' + res.status + '\n--- args ---\n' +
+      CCACHE + ' ' + args.join(' ') + '\n--- stderr ---\n' + (res.stderr || '')
+    );
+  }
+}
+
+// Compile the whole batch once via ccache. Returns elapsed seconds.
+function compileBatchCcache(cacheDir) {
+  const start = process.hrtime.bigint();
+  for (const f of files) compileOneCcache(f, cacheDir);
+  const end = process.hrtime.bigint();
+  return Number(end - start) / 1e9;
+}
+
+// Read ccache's hit/miss counters for a given CCACHE_DIR. Uses the stable
+// machine-readable `ccache --print-stats` (key<TAB>value lines). Returns
+// { hit, miss } summing direct+preprocessed hits; missing keys count as 0.
+function ccacheStats(cacheDir) {
+  const res = spawnSync(CCACHE, ['--print-stats'], {
+    env: { ...process.env, CCACHE_DIR: cacheDir },
+    encoding: 'utf8',
+  });
+  const out = res.stdout || '';
+  const get = (key) => {
+    const m = out.match(new RegExp('^' + key + '\\t(\\d+)', 'm'));
+    return m ? Number(m[1]) : 0;
+  };
+  const hit = get('direct_cache_hit') + get('preprocessed_cache_hit');
+  const miss = get('cache_miss');
+  return { hit, miss };
+}
+
+// Reset a CCACHE_DIR to empty and zero its stats (`-C` clears, `-z` zeroes).
+function ccacheReset(cacheDir) {
+  spawnSync(CCACHE, ['-C', '-z'], {
+    env: { ...process.env, CCACHE_DIR: cacheDir },
+    encoding: 'utf8',
+  });
+}
+
+// Zero a CCACHE_DIR's stats only (`-z`) without clearing cached objects, so the
+// next pass against an already-populated dir registers as hits.
+function ccacheZeroStats(cacheDir) {
+  spawnSync(CCACHE, ['-z'], {
+    env: { ...process.env, CCACHE_DIR: cacheDir },
+    encoding: 'utf8',
+  });
+}
+
 function median(xs) {
   const s = [...xs].sort((a, b) => a - b);
   const mid = Math.floor(s.length / 2);
@@ -342,6 +429,41 @@ const warmTimes = [];
 for (let r = 0; r < REPS; r++) warmTimes.push(compileBatch(warmCache));
 const tWarm = median(warmTimes);
 
+// ccache comparison rows (only if ccache is on PATH). Wrap the SAME xg++ with
+// ccache (no -fcompile-cache) and measure cold (fresh dir, cleared+zeroed each
+// rep -> all miss) and warm (populated dir -> all hits), same workload/flags.
+let tCcacheCold = null, tCcacheWarm = null;
+let ccacheColdHit = 0, ccacheColdMiss = 0;
+let ccacheWarmHit = 0, ccacheWarmMiss = 0;
+if (haveCcache) {
+  const ccacheCacheDir = path.join(work, 'ccache');
+  fs.mkdirSync(ccacheCacheDir);
+
+  // T_ccache_cold: clear+zero before each timed rep so every TU is a miss.
+  const ccacheColdTimes = [];
+  for (let r = 0; r < REPS; r++) {
+    ccacheReset(ccacheCacheDir);
+    ccacheColdTimes.push(compileBatchCcache(ccacheCacheDir));
+  }
+  tCcacheCold = median(ccacheColdTimes);
+
+  // T_ccache_warm: the dir is already populated from the last cold rep -> all
+  // hits. Time without clearing.
+  const ccacheWarmTimes = [];
+  for (let r = 0; r < REPS; r++) ccacheWarmTimes.push(compileBatchCcache(ccacheCacheDir));
+  tCcacheWarm = median(ccacheWarmTimes);
+
+  // Hit/miss accounting on isolated fresh dirs (one cold pass, one warm pass).
+  const ccacheAcct = path.join(work, 'ccache-acct');
+  fs.mkdirSync(ccacheAcct);
+  ccacheReset(ccacheAcct); // clear + zero -> truly cold
+  compileBatchCcache(ccacheAcct); // cold: all miss (populates the dir)
+  ({ hit: ccacheColdHit, miss: ccacheColdMiss } = ccacheStats(ccacheAcct));
+  ccacheZeroStats(ccacheAcct); // zero stats only; populated dir stays warm
+  compileBatchCcache(ccacheAcct); // warm: all hits
+  ({ hit: ccacheWarmHit, miss: ccacheWarmMiss } = ccacheStats(ccacheAcct));
+}
+
 // Hit/miss accounting via the debug lines, on a separate fresh cache.
 const acctCache = path.join(work, 'acct');
 fs.mkdirSync(acctCache);
@@ -362,6 +484,8 @@ for (const f of files) {
 
 const speedup = tBase / tWarm;
 const overheadPct = ((tCold - tBase) / tBase) * 100;
+const ccacheSpeedup = haveCcache ? tBase / tCcacheWarm : null;
+const ccacheOverheadPct = haveCcache ? ((tCcacheCold - tBase) / tBase) * 100 : null;
 const f2 = (x) => x.toFixed(2);
 
 // Sanity: the cache must actually behave. A broken cache (0 hits warm, or
@@ -371,25 +495,54 @@ if (warmHit !== TU_COUNT) {
   fail(`warm pass had ${warmHit} hit(s), expected ${TU_COUNT}`);
 }
 
+const tableRows = [
+  '| Measurement | Wall-clock (s) |',
+  '| --- | --- |',
+  `| T_base (no cache) | ${f2(tBase)} |`,
+  `| T_cold (ours, empty cache: all miss+store) | ${f2(tCold)} |`,
+  `| T_warm (ours, full cache: all hits) | ${f2(tWarm)} |`,
+];
+if (haveCcache) {
+  tableRows.push(
+    `| T_ccache_cold (ccache, empty cache: all miss) | ${f2(tCcacheCold)} |`,
+    `| T_ccache_warm (ccache, full cache: all hits) | ${f2(tCcacheWarm)} |`
+  );
+}
+
 const lines = [
   '### Compile-cache benchmark',
   '',
   `Workload: **${TU_COUNT}** ${workloadDesc}, \`-O2\`, serial, median of ${REPS} reps.`,
   '',
-  '| Measurement | Wall-clock (s) |',
-  '| --- | --- |',
-  `| T_base (no cache) | ${f2(tBase)} |`,
-  `| T_cold (empty cache: all miss+store) | ${f2(tCold)} |`,
-  `| T_warm (full cache: all hits) | ${f2(tWarm)} |`,
+  ...tableRows,
   '',
-  `**Warm-vs-base speedup:** ${f2(speedup)}x  (\`T_base / T_warm\`)`,
+  `**Ours warm-vs-base speedup:** ${f2(speedup)}x  (\`T_base / T_warm\`)`,
   '',
-  `**Cold-vs-base overhead:** ${overheadPct.toFixed(1)}%  (\`(T_cold - T_base) / T_base\`)`,
-  '',
-  `Hit/miss accounting — cold: ${coldMiss} miss, ${coldStore} store, ${coldHit} hit; ` +
-  `warm: ${warmMiss} miss, ${warmStore} store, ${warmHit} hit.`,
+  `**Ours cold-vs-base overhead:** ${overheadPct.toFixed(1)}%  (\`(T_cold - T_base) / T_base\`)`,
   '',
 ];
+if (haveCcache) {
+  lines.push(
+    `**ccache warm-vs-base speedup:** ${f2(ccacheSpeedup)}x  (\`T_base / T_ccache_warm\`)`,
+    '',
+    `**ccache cold-vs-base overhead:** ${ccacheOverheadPct.toFixed(1)}%  (\`(T_ccache_cold - T_base) / T_base\`)`,
+    ''
+  );
+} else {
+  lines.push('_ccache not found on PATH — ccache rows skipped._', '');
+}
+lines.push(
+  `Hit/miss accounting — ours cold: ${coldMiss} miss, ${coldStore} store, ${coldHit} hit; ` +
+  `ours warm: ${warmMiss} miss, ${warmStore} store, ${warmHit} hit.`,
+  ''
+);
+if (haveCcache) {
+  lines.push(
+    `ccache accounting — cold: ${ccacheColdMiss} miss, ${ccacheColdHit} hit; ` +
+    `warm: ${ccacheWarmMiss} miss, ${ccacheWarmHit} hit.`,
+    ''
+  );
+}
 const summary = lines.join('\n') + '\n';
 
 // Always log it.
