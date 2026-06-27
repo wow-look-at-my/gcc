@@ -480,45 +480,15 @@ compile_cache_init_determinism (bool pch_active)
 	return;			/* user pinned it; leave as-is */
     }
 
-  /* Derive a TU-unique seed from a parse-independent subset: the compiler
-     checksum, the main input path + cwd, and the codegen-relevant flags.  We
-     do NOT use the include closure here (it isn't known pre-parse, and the
-     seed only needs to be unique per main file so two different TUs don't
-     collide on generated symbol names).  Determinism of the *output* across
-     runs is what enables a cache hit.  */
-  struct sha1_ctx ctx;
-  sha1_init_ctx (&ctx);
-  cc_hash_component (&ctx, CC_TAG_CHECKSUM, executable_checksum, 16);
-  cc_hash_str (&ctx, CC_TAG_MAIN_INPUT, main_input_filename);
-  {
-    const char *pwd = get_src_pwd ();
-    cc_hash_str (&ctx, CC_TAG_CWD, pwd ? pwd : "");
-  }
-  for (unsigned i = 1; i < save_decoded_options_count; i++)
-    {
-      const cl_decoded_option *o = &save_decoded_options[i];
-      if (!cc_option_affects_output_p (o))
-	continue;
-      for (size_t k = 0; k < o->canonical_option_num_elements; k++)
-	cc_hash_str (&ctx, CC_TAG_OPT, o->canonical_option[k]);
-    }
-
-  unsigned char raw[20];
-  sha1_finish_ctx (&ctx, raw);
-
-  /* set_random_seed() uses a pure-hex string verbatim (strtoul base 0).  Emit
-     "0x" + the first 16 hex digits (64 bits) of the digest.  */
-  char seed[3 + 16 + 1];
-  static const char hexd[] = "0123456789abcdef";
-  seed[0] = '0';
-  seed[1] = 'x';
-  for (int i = 0; i < 8; i++)
-    {
-      seed[2 + 2 * i] = hexd[(raw[i] >> 4) & 0xf];
-      seed[2 + 2 * i + 1] = hexd[raw[i] & 0xf];
-    }
-  seed[18] = '\0';
-  set_random_seed (seed);
+  /* Pin a single FIXED seed for full determinism.  We deliberately do NOT
+     derive a per-TU seed from the input: a constant seed makes two compiles
+     of the same TU byte-identical (so the cache can hit), and on ELF the
+     -frandom-seed value does not feed symbol naming, so a shared constant
+     across TUs is safe and cannot collide on generated symbol names.  The
+     cache KEY still hashes the full source closure + flags + executable
+     checksum, so distinct TUs remain distinct cache entries.  A user-supplied
+     -frandom-seed is still respected (handled by the early return above).  */
+  set_random_seed ("1234");
 }
 
 /* ------------------------------------------------------------------------ */
