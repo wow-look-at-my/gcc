@@ -195,6 +195,24 @@ cc_option_affects_output_p (const cl_decoded_option *decoded)
   if (idx >= cl_options_count)
     return false;
 
+  /* Options that name the OUTPUT location or DUMP paths, or configure the
+     cache itself, must be excluded even though they are flagged CL_COMMON:
+     they carry run-varying paths (the driver hands cc1 a fresh temporary
+     "-o /tmp/ccXXXX.s" each invocation) that do NOT change the assembly
+     *content*.  Including them would make the key differ on every run and the
+     cache could never hit.  */
+  switch (idx)
+    {
+    case OPT_o:			/* -o <file> (Var asm_file_name) */
+    case OPT_dumpbase:		/* -dumpbase <name> */
+    case OPT_dumpbase_ext:	/* -dumpbase-ext <ext> */
+    case OPT_dumpdir:		/* -dumpdir <dir> */
+    case OPT_fcompile_cache_:	/* -fcompile-cache=<dir> (this feature) */
+      return false;
+    default:
+      break;
+    }
+
   const struct cl_option *opt = &cl_options[idx];
   unsigned int f = opt->flags;
 
