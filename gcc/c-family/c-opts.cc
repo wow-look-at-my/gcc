@@ -45,6 +45,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "file-prefix-map.h"    /* add_*_prefix_map()  */
 #include "context.h"
 #include "diagnostics/text-sink.h"
+#include "compile-cache.h"
 
 #ifndef DOLLARS_IN_IDENTIFIERS
 # define DOLLARS_IN_IDENTIFIERS true
@@ -1426,6 +1427,13 @@ void
 c_common_parse_file (void)
 {
   auto dumps = g->get_dumps ();
+
+  /* Pin -frandom-seed (if the user did not) so codegen name generation is
+     reproducible and the assembly cache can ever hit.  Must be before any
+     parsing/codegen begins.  No-op when caching is disabled.  PCH state is a
+     C/C++-specific fact the back-end cache object cannot see, so pass it in.  */
+  compile_cache_init_determinism (pch_file != NULL || flag_pch_preprocess);
+
   for (unsigned int i = 0;;)
     {
       c_finish_options ();
@@ -1453,6 +1461,13 @@ c_common_parse_file (void)
     }
 
   c_parse_final_cleanups ();
+
+  /* The include closure is now complete.  Try to serve cached assembly; on a
+     hit this writes the .s into asm_out_file and sets a TU-global so the
+     back-end is skipped back in compile_file().  parse_in carries the include
+     closure for the key.  */
+  (void) compile_cache_try_serve (parse_in);
+
   dumps->dump_finish (TDI_original);
 }
 

@@ -51,6 +51,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "insn-attr.h"
 #include "output.h"
 #include "toplev.h"
+#include "compile-cache.h"
 #include "expr.h"
 #include "intl.h"
 #include "tree-diagnostic.h"
@@ -465,7 +466,10 @@ compile_file (void)
   /* Compilation is now finished except for writing
      what's left of the symbol table output.  */
 
-  if (flag_syntax_only || flag_wpa)
+  /* On a compilation-cache hit, the .s has already been written into
+     asm_out_file by compile_cache_try_serve() during parsing; skip the
+     back-end entirely.  */
+  if (flag_syntax_only || flag_wpa || compile_cache_hit_p ())
     return;
 
   /* Reset maximum_field_alignment, it can be adjusted by #pragma pack
@@ -2235,6 +2239,11 @@ do_compile ()
       timevar_start (TV_PHASE_FINALIZE);
 
       finalize ();
+
+      /* If this was a cache miss, the back-end has now produced and
+	 finalize() has closed the .s file; publish it to the cache.  No-op
+	 on a hit, on error, or when caching is disabled.  */
+      compile_cache_store ();
 
       timevar_stop (TV_PHASE_FINALIZE);
     }

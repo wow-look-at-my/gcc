@@ -2752,6 +2752,72 @@ _cpp_save_file_entries (cpp_reader *pfile, FILE *fp)
   return ret;
 }
 
+/* Invoke CB once for every file that was actually stacked for preprocessing
+   in this TU, passing the file's resolved path and its exact on-disk
+   contents.  Mirrors the walk/filter of _cpp_save_file_entries (skip files
+   that were never stacked, couldn't be read, or errored), and like it falls
+   back to re-opening and reading the file when libcpp no longer holds the
+   in-memory buffer.  Stops early if CB returns false.  Returns false if a
+   file needed re-reading but could not be read, true otherwise.  */
+
+bool
+cpp_foreach_included_file (cpp_reader *pfile, cpp_included_file_cb cb,
+			   void *user)
+{
+  for (_cpp_file *f = pfile->all_files; f; f = f->next_file)
+    {
+      if (f->dont_read || f->err_no)
+	continue;
+      if (f->stack_count == 0)
+	continue;
+
+      const char *path = f->path ? f->path : f->name;
+
+      if (f->buffer_valid)
+	{
+	  if (!cb (path, f->buffer, f->st.st_size, user))
+	    return true;
+	}
+      else
+	{
+	  /* The buffer was freed after preprocessing; re-read from disk,
+	     preserving f->fd exactly as _cpp_save_file_entries does.  */
+	  int oldfd = f->fd;
+	  if (!open_file (f))
+	    {
+	      open_file_failed (pfile, f, 0, 0);
+	      return false;
+	    }
+
+	  size_t size = f->st.st_size;
+	  uchar *buf = XNEWVEC (uchar, size ? size : 1);
+	  FILE *ff = fdopen (f->fd, "rb");
+	  bool read_ok = false;
+	  if (ff)
+	    {
+	      size_t got = size ? fread (buf, 1, size, ff) : 0;
+	      read_ok = (got == size) && !ferror (ff);
+	      fclose (ff);
+	    }
+	  else
+	    close (f->fd);
+	  f->fd = oldfd;
+
+	  if (!read_ok)
+	    {
+	      free (buf);
+	      return false;
+	    }
+
+	  bool keep_going = cb (path, buf, size, user);
+	  free (buf);
+	  if (!keep_going)
+	    return true;
+	}
+    }
+  return true;
+}
+
 /* Read the pchf_data structure from F.  */
 
 bool

@@ -1318,6 +1318,10 @@ fcompare-elim
 Common Var(flag_compare_elim_after_reload) Optimization
 Perform comparison elimination after register allocation has finished.
 
+fcompile-cache=
+Common Joined RejectNegative Var(compile_cache_dir)
+Cache assembly output in DIR, keyed by source and options, and reuse it on identical inputs.  Overridden by the GCC_COMPILE_CACHE_DIR environment variable when this is unset.
+
 fconserve-stack
 Common Var(flag_conserve_stack) Optimization
 Do not perform optimizations increasing noticeably stack usage.
