@@ -7,7 +7,12 @@
 set -e
 
 BUILD="${1:-/home/user/gcc-build-gas}"
-GAS_SRC="/home/user/gcc-14/gas"          # symlink -> binutils-2.42/gas
+# GAS_SRC is the gas source dir (a symlink -> binutils-2.42/gas in the combined
+# tree).  Defaults to the local checkout; override via $GAS_SRC for CI, where the
+# GCC checkout (and its gas symlink) live under $GITHUB_WORKSPACE.
+GAS_SRC="${GAS_SRC:-/home/user/gcc-14/gas}"
+# GAS_EMBED_DIR is contrib/gas-embed (holds gas_embed_test.c).  Override for CI.
+GAS_EMBED_DIR="${GAS_EMBED_DIR:-/home/user/gcc-14/contrib/gas-embed}"
 GASB="$BUILD/gas"
 
 # The exact compile flags the gas Makefile uses for gas/*.o (run from $GASB).
@@ -72,7 +77,7 @@ if nm "$BUILD/libgas.a" | grep -q ' T main$'; then
 fi
 
 echo ">>> building harness gas_embed_test"
-gcc "/home/user/gcc-14/contrib/gas-embed/gas_embed_test.c" \
+gcc "$GAS_EMBED_DIR/gas_embed_test.c" \
   "$BUILD/libgas.a" \
   "$BUILD/bfd/.libs/libbfd.a" \
   "$BUILD/opcodes/libopcodes.a" \

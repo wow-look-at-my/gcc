@@ -38,16 +38,107 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev
 
-      - name: Configure GCC (out of tree)
+      # This branch's cc1plus links the embedded GNU assembler (libgas.a) for
+      # -fintegrated-as, so the build needs a "combined tree": binutils 2.42's
+      # gas/bfd/opcodes/libsframe/libctf built alongside GCC. The driver-level
+      # .o cache itself works without the integrated assembler, but cc1plus does
+      # not link unless libgas.a (built from this combined tree by
+      # contrib/gas-embed/build-libgas.sh) is present. The recipe below mirrors
+      # contrib/gas-embed/README.md exactly. binutils setup is plain shell (no
+      # third-party actions): download the upstream tarball, symlink the modules
+      # and binutils-only headers into the GCC checkout, apply the gas patch.
+      - name: Fetch binutils 2.42
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          curl -fL -o binutils.tar.xz https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.xz
+          tar xf binutils.tar.xz
+          test -d binutils-2.42/gas
+
+      # Combined-tree symlinks into the GCC checkout (README "Combined-tree setup
+      # recipe", Stage 1). (1) Top-level binutils-only module dirs GCC lacks.
+      # (2) The skew fix: every binutils-only header symlinked into GCC's shared
+      # include/ (bfd/opcodes/gas include ~30 headers GCC-14's include/ does not
+      # ship). We link each entry from binutils' include/ that GCC's pristine
+      # include/ does not already provide, skipping the gcc-owned doc files; the
+      # overlapping headers (libiberty.h, ansidecl.h, ...) are byte-identical
+      # between GCC-14 and binutils 2.42, so GCC's stay authoritative. Do NOT
+      # symlink config/ include/ libiberty/ zlib/ -- the tree shares GCC's.
+      - name: Set up combined tree (symlinks)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          BU="$GITHUB_WORKSPACE/binutils-2.42"
+          for d in bfd opcodes gas libsframe libctf; do
+            ln -sfn "$BU/$d" "$GITHUB_WORKSPACE/$d"
+          done
+          for entry in "$BU"/include/*; do
+            name="$(basename "$entry")"
+            case "$name" in
+              ChangeLog*|MAINTAINERS|COPYING*) continue ;;
+            esac
+            if [ ! -e "$GITHUB_WORKSPACE/include/$name" ]; then
+              ln -sfn "$entry" "$GITHUB_WORKSPACE/include/$name"
+            fi
+          done
+          echo "binutils-only headers linked into include/:"
+          find include/ -maxdepth 1 -lname "$BU/*" -printf '%f ' ; echo
+
+      # Apply the integrated-assembler gas patch to the pristine binutils 2.42
+      # gas/ tree. The patch paths are a/<file> relative to gas/, so apply from
+      # there with -p1 (README "Applying the binutils gas source changes").
+      - name: Apply gas integrated-as patch
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          patch -p1 -d binutils-2.42/gas < contrib/gas-embed/gas-integrated-as.patch
+          test -f binutils-2.42/gas/embed.c
+
+      # Configure out-of-tree. Keeps the original CI flags and adds the
+      # combined-tree requirements from the proven recipe (README Stage 1):
+      # --with-system-zlib (so the tree needs no zlib/ module), --disable-nls,
+      # --disable-werror, and MAKEINFO=true (no makeinfo on the runner). The
+      # config triplet is deliberately left to GCC's default canonicalization
+      # (x86_64-pc-linux-gnu) -- the same as the prior working CI -- so the
+      # target-library subdir paths the verify/benchmark scripts expect are
+      # unchanged.
+      - name: Configure GCC (combined tree, out of tree)
         run: |
           mkdir -p "$RUNNER_TEMP/gccbuild"
           cd "$RUNNER_TEMP/gccbuild"
-          "$GITHUB_WORKSPACE/configure" --disable-bootstrap --enable-languages=c,c++ --disable-multilib
+          "$GITHUB_WORKSPACE/configure" \
+            --disable-bootstrap --enable-languages=c,c++ --disable-multilib \
+            --with-system-zlib --disable-nls --disable-werror \
+            MAKEINFO=true
 
+      # Build the binutils host libraries first, then assemble libgas.a from the
+      # combined tree, then build GCC. build-libgas.sh writes ../libgas.a (top of
+      # the build tree) which cc1plus/cc1/lto1 link via GAS_LIBS (cp/Make-lang.in).
+      # The script's source paths default to the local checkout; point them at
+      # this checkout via $GAS_SRC / $GAS_EMBED_DIR.
+      - name: Build binutils host libs (bfd, opcodes, gas)
+        run: |
+          cd "$RUNNER_TEMP/gccbuild"
+          make -j"$(nproc)" all-libiberty MAKEINFO=true
+          make -j"$(nproc)" all-bfd all-opcodes all-gas MAKEINFO=true
+
+      - name: Build libgas.a
+        run: |
+          export GAS_SRC="$GITHUB_WORKSPACE/gas"
+          export GAS_EMBED_DIR="$GITHUB_WORKSPACE/contrib/gas-embed"
+          bash "$GITHUB_WORKSPACE/contrib/gas-embed/build-libgas.sh" "$RUNNER_TEMP/gccbuild"
+          test -f "$RUNNER_TEMP/gccbuild/libgas.a"
+
+      # Now build GCC itself: all-gcc links cc1plus/cc1/lto1 against ../libgas.a
+      # (present from the previous step). Then build the target libraries the
+      # cache verify and benchmark need -- all-target-libstdc++-v3 pulls in its
+      # prerequisites (all-gcc, all-target-libgcc, and the build-tree libstdc++
+      # headers + libstdc++.so the C++ checks link against). Building these two
+      # targets explicitly (rather than a bare `make all`) keeps the build to
+      # what the proven recipe and the CI scripts require and skips the unrelated
+      # ld/binutils host modules the combined tree would otherwise also build.
       - name: Build GCC
         run: |
           cd "$RUNNER_TEMP/gccbuild"
-          make -j"$(nproc)"
+          make -j"$(nproc)" all-gcc MAKEINFO=true
+          make -j"$(nproc)" all-target-libstdc++-v3 MAKEINFO=true
 
       - name: Verify in-compiler cache
         run: node "$GITHUB_WORKSPACE/.github/scripts/ci-verify-cache.mjs" "$RUNNER_TEMP/gccbuild"
