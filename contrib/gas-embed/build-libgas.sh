@@ -76,13 +76,25 @@ if nm "$BUILD/libgas.a" | grep -q ' T main$'; then
   echo "!!! ERROR: libgas.a still defines main" >&2; exit 1
 fi
 
+# binutils' configure auto-detects libzstd: if it was present when bfd/gas were
+# built, libbfd.a/libgas.a reference ZSTD_* and the link needs -lzstd; if it was
+# absent (e.g. no libzstd-dev), they do not and -lzstd would fail to resolve.
+# Detect from the actual archives so the same script works in both environments.
+ZSTD_LIB=
+if nm "$BUILD/bfd/.libs/libbfd.a" "$BUILD/libgas.a" 2>/dev/null \
+     | grep -qE '^ *U +ZSTD_'; then
+  ZSTD_LIB=-lzstd
+  echo ">>> zstd detected in binutils libs; linking with -lzstd"
+fi
+
 echo ">>> building harness gas_embed_test"
+# shellcheck disable=SC2086
 gcc "$GAS_EMBED_DIR/gas_embed_test.c" \
   "$BUILD/libgas.a" \
   "$BUILD/bfd/.libs/libbfd.a" \
   "$BUILD/opcodes/libopcodes.a" \
   "$BUILD/libsframe/.libs/libsframe.a" \
   "$BUILD/libiberty/libiberty.a" \
-  -lz \
+  -lz $ZSTD_LIB \
   -o "$BUILD/gas_embed_test"
 echo ">>> done: $BUILD/gas_embed_test"

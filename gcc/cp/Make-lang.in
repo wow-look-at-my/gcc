@@ -155,7 +155,7 @@ GAS_LIBS = -Wl,--start-group \
 	   $(GAS_BUILD)/opcodes/libopcodes.a \
 	   $(GAS_BUILD)/libsframe/.libs/libsframe.a \
 	   ../libiberty/libiberty.a \
-	   -Wl,--end-group $(ZLIB)
+	   -Wl,--end-group $(ZLIB) $(ZSTD_LIB)
 GAS_DEPS = $(GAS_BUILD)/libgas.a
 
 cc1plus$(exeext): $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(LIBDEPS) $(GAS_DEPS) $(c++.prev)

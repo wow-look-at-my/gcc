@@ -161,7 +161,13 @@ Link a consumer (the Stage 2 harness, and Stage 3's cc1plus) with:
   $BUILD/libiberty/libiberty.a \
   -lz
 ```
-(`-lzstd` is NOT needed for this config -- zstd was not detected/used.)
+Add `-lzstd` as well **iff** binutils was configured with zstd support
+(libzstd-dev present at binutils `configure` time defines `HAVE_ZSTD`, so
+`libbfd.a`/`libgas.a` reference `ZSTD_*`). `build-libgas.sh` detects this from
+the built archives (`nm ... | grep 'U ZSTD_'`) and adds `-lzstd` only when
+needed; GCC's own `$(ZSTD_LIB)` configure variable does the same for the
+`GAS_LIBS` link in `gcc/cp/Make-lang.in`. Without zstd (no libzstd-dev), the
+archives have no `ZSTD_*` references and `-lzstd` is neither needed nor linked.
 
 ## Proof
 
