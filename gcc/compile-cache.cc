@@ -38,7 +38,15 @@
 #include "diagnostic-core.h"	/* seen_error, fatal_error */
 #include "../libcpp/include/cpplib.h"  /* cpp_foreach_included_file */
 #include "sha1.h"
+#include "compile-cache-format.h"	/* shared on-disk format + LE helpers */
+#include "compile-cache-serve.h"	/* shared driver-usable serve unit */
 #include "compile-cache.h"
+
+/* The option predicates that build the manifest key are defined ONCE in the
+   shared serve unit (compile-cache-serve.cc) so the driver and cc1plus compute
+   an identical key.  Declared here (extern) for the store path's use.  */
+extern bool cc_option_affects_output_p (const cl_decoded_option *decoded);
+extern bool cc_option_is_search_path_p (const cl_decoded_option *decoded);
 
 #include <sys/stat.h>
 /* For the opportunistic reflink rung of cc_place_object().  Guarded so the
@@ -68,164 +76,18 @@ extern const unsigned char executable_checksum[16]
   __attribute__ ((weak)) = { 0 };
 
 /* ------------------------------------------------------------------------ */
-/* Binary object format                                                     */
+/* Binary object + manifest format                                          */
 /* ------------------------------------------------------------------------ */
 
-/* Each cache entry is ONE little-endian binary file at
-   "DIR/<2hex>/<rest>.bin" (no sidecars), laid out as:
-
-       header (128 bytes)  ->  inputs table  ->  string area
-                           ->  assembly      ->  diagnostics
-
-   Strings are stored length-prefixed: a u32 byte count (NOT counting the
-   trailing NUL) + the content bytes + one '\0'.  A string is *referenced* by
-   a u32 file offset that points at its u32 length prefix, so C reads the
-   length at off and the chars at off+4 (which is a NUL-terminated char*).  */
-
-#define CC_MAGIC      "GCCCACHE"	/* 8 bytes, no NUL stored */
-#define CC_MAGIC_LEN  8
-/* Bumped to 2 when the cached payload (the "assembly" section) became the
-   in-process-assembled OBJECT (.o) under -fintegrated-as instead of text
-   assembly, and a "had front-end diagnostics" flag was added so the pre-parse
-   manifest fast-path can tell which objects are safe to serve without a parse
-   (see CC_FLAG_HAD_FE_DIAG).  Old v1 (.s) entries self-heal: a version
-   mismatch is treated as a miss and overwritten on the next store.  */
-#define CC_FORMAT_VERSION  2u
-#define CC_HEADER_SIZE     128u
-
-/* Manifest object (ccache-style "direct mode" index): a separate cache object,
-   keyed by a manifest key MK (main-source hash + output-affecting options +
-   search paths + checksum/lang/salt/schema), that lists -- per previously seen
-   include set -- the object key OK and the headers (resolved path + size +
-   mtime + SHA-1) that closure depended on.  Consulted BEFORE parsing: if every
-   listed header still matches on disk, OK resolves a cached object and the
-   whole parse/codegen/assemble is skipped.  Stored under the same sharded path
-   layout + atomic publish, distinguished by its own magic.  */
-#define CC_MANIFEST_MAGIC      "CCMANIFS"	/* 8 bytes, no NUL stored */
-#define CC_MANIFEST_VERSION    1u
-#define CC_MANIFEST_HEADER_SIZE  32u
-
-/* Header flag bits (CC_OFF_FLAGS).  */
-#define CC_FLAG_HAD_FE_DIAG  0x1u	/* TU emitted front-end diagnostics:
-					   the manifest fast-path must NOT serve
-					   this object (it would skip the parse
-					   that re-emits them); fall through to a
-					   full compile instead.  */
-
-/* Fixed-header field byte offsets.  */
-enum cc_hdr_off
-{
-  CC_OFF_MAGIC        = 0,	/* char[8]  "GCCCACHE"            */
-  CC_OFF_FORMAT_VER   = 8,	/* u16      format_version = 1     */
-  CC_OFF_FLAGS        = 10,	/* u16      flags = 0              */
-  CC_OFF_INPUT_COUNT  = 12,	/* u32      number of inputs       */
-  CC_OFF_CREATED      = 16,	/* u64      time(NULL), Unix s UTC */
-  CC_OFF_ASM_OFF      = 24,	/* u64      assembly section off    */
-  CC_OFF_ASM_LEN      = 32,	/* u64      assembly section len    */
-  CC_OFF_DIAG_OFF     = 40,	/* u64      diagnostics section off */
-  CC_OFF_DIAG_LEN     = 48,	/* u64      diagnostics section len */
-  CC_OFF_INPUTS_OFF   = 56,	/* u64      inputs table off        */
-  CC_OFF_WARNINGS     = 64,	/* u32      back-end warning count  */
-  CC_OFF_ERRORS       = 68,	/* u32      back-end error count    */
-  CC_OFF_KEY          = 72,	/* u8[20]   raw SHA-1 key           */
-  CC_OFF_CHECKSUM     = 92,	/* u8[16]   executable_checksum     */
-  CC_OFF_SOURCE_OFF   = 108,	/* u32 -> source string             */
-  CC_OFF_CWD_OFF      = 112,	/* u32 -> cwd string                */
-  CC_OFF_TARGET_OFF   = 116,	/* u32 -> target string             */
-  CC_OFF_LANGUAGE_OFF = 120,	/* u32 -> language string           */
-  CC_OFF_OPTIONS_OFF  = 124	/* u32 -> options string            */
-};
-
-/* Each inputs-table record is 32 bytes: raw SHA-1 (20) + size (u64) +
-   path_off (u32).  */
-#define CC_INPUT_REC_SIZE  32u
-enum cc_input_off
-{
-  CC_IN_OFF_HASH = 0,		/* u8[20]  raw SHA-1 of the file */
-  CC_IN_OFF_SIZE = 20,		/* u64     file size in bytes    */
-  CC_IN_OFF_PATH = 28		/* u32 -> path string            */
-};
-
-/* ------------------------------------------------------------------------ */
-/* Manifest object format                                                   */
-/* ------------------------------------------------------------------------ */
-
-/* A manifest is laid out as:
-       header (32 bytes)  ->  entries  ->  string area
-   Each entry is variable-length:
-       u8[20] object_key OK
-       u32    warnings        (DK_WARNING count for OK's object)
-       u32    werrors         (DK_WERROR count for OK's object)
-       u32    header_count
-       header_count * { u32 path_off, u64 size, u64 mtime, u8[20] hash }
-   The string area uses the same length-prefixed + NUL form as the object
-   string area, referenced by absolute file offsets.  */
-enum cc_manifest_hdr_off
-{
-  CC_MAN_OFF_MAGIC       = 0,	/* char[8]  "CCMANIFS"          */
-  CC_MAN_OFF_VERSION     = 8,	/* u16      manifest version     */
-  CC_MAN_OFF_FLAGS       = 10,	/* u16      reserved = 0         */
-  CC_MAN_OFF_ENTRY_COUNT = 12,	/* u32      number of entries    */
-  CC_MAN_OFF_ENTRIES_OFF = 16,	/* u64      entries section off   */
-  CC_MAN_OFF_RESERVED    = 24	/* u64      reserved             */
-};
-
-/* Per-header record inside a manifest entry: 40 bytes.  */
-#define CC_MAN_HDR_REC_SIZE  40u
-enum cc_man_hdr_rec_off
-{
-  CC_MHR_OFF_PATH = 0,		/* u32 -> resolved abs path string */
-  CC_MHR_OFF_SIZE = 4,		/* u64  file size                  */
-  CC_MHR_OFF_MTIME = 12,	/* u64  st_mtime (seconds)         */
-  CC_MHR_OFF_HASH = 20		/* u8[20] raw SHA-1                */
-};
-
-/* Little-endian store helpers (do NOT rely on host endianness / packing).  */
-static void
-cc_put_u16 (unsigned char *p, uint16_t v)
-{
-  p[0] = (unsigned char) (v & 0xff);
-  p[1] = (unsigned char) ((v >> 8) & 0xff);
-}
-
-static void
-cc_put_u32 (unsigned char *p, uint32_t v)
-{
-  for (int i = 0; i < 4; i++)
-    p[i] = (unsigned char) ((v >> (8 * i)) & 0xff);
-}
-
-static void
-cc_put_u64 (unsigned char *p, uint64_t v)
-{
-  for (int i = 0; i < 8; i++)
-    p[i] = (unsigned char) ((v >> (8 * i)) & 0xff);
-}
-
-/* Little-endian load helpers (used by the serve path).  */
-static uint16_t
-cc_get_u16 (const unsigned char *p)
-{
-  return (uint16_t) (p[0] | ((uint16_t) p[1] << 8));
-}
-
-static uint32_t
-cc_get_u32 (const unsigned char *p)
-{
-  uint32_t v = 0;
-  for (int i = 0; i < 4; i++)
-    v |= (uint32_t) p[i] << (8 * i);
-  return v;
-}
-
-static uint64_t
-cc_get_u64 (const unsigned char *p)
-{
-  uint64_t v = 0;
-  for (int i = 0; i < 8; i++)
-    v |= (uint64_t) p[i] << (8 * i);
-  return v;
-}
+/* The on-disk byte layout (object header/sections, inputs table, manifest
+   header/entries, the compiler-id sidecar) and the little-endian load/store
+   helpers + cc_hex live in compile-cache-format.h, shared with the driver-side
+   serve unit so both describe identical bytes.  Each cache OBJECT is one
+   little-endian "DIR/<2hex>/<rest>.bin" (header -> inputs table -> string area
+   -> empty asm -> diagnostics) with its payload .o in a sidecar
+   "DIR/<2hex>/<rest>.o".  A MANIFEST (ccache-style direct-mode index) is a
+   separate object keyed by the manifest key MK that lists, per include set, the
+   object key OK and the headers it depended on.  */
 
 /* Forward declarations (defined later, used earlier).  */
 static unsigned char *cc_read_file (const char *path, size_t *len);
@@ -513,41 +375,15 @@ cc_debug_line (const char *action, const char *key)
 /* Small helpers                                                            */
 /* ------------------------------------------------------------------------ */
 
-/* Component tags (one byte each), participating in the key.  */
-enum cc_tag
-{
-  CC_TAG_CHECKSUM = 1,	/* executable_checksum[16] */
-  CC_TAG_LANG = 2,	/* lang_hooks.name */
-  CC_TAG_STD = 3,	/* reserved (dialect is folded into lang + options) */
-  CC_TAG_FILE_PATH = 4,	/* one included file's path */
-  CC_TAG_FILE_BODY = 5,	/* that file's bytes */
-  CC_TAG_OPT = 6,	/* one canonicalized command-line option token */
-  CC_TAG_MAIN_INPUT = 7,/* main_input_filename */
-  CC_TAG_CWD = 8,	/* current working directory */
-  CC_TAG_VERSION = 9,	/* key-schema version */
-  CC_TAG_SALT = 10,	/* GCC_COMPILE_CACHE_SALT (logical cache reset) */
-  CC_TAG_SRC_BODY = 11,	/* main source file bytes (manifest key only) */
-  CC_TAG_SEARCH_PATH = 12 /* an include-search-path value (manifest key only) */
-};
-
-/* Bump when the key construction or cached payload format changes, to
-   invalidate stale entries written by an older compiler.  Bumped to 2 with
-   the structured binary object format + diagnostic capture (was 1 for the
-   raw-.s entries).  Bumped to 3 when the key was made content-addressed:
-   search-path option *values* (-I/-isystem/...) and the main input path /
-   cwd / per-include-file paths were dropped from the key (the resolved file
-   *contents* already cover them), so the key no longer folds in build-dir
-   path strings and hits across different build directories and machines.
-   Path components are now hashed only when output truly depends on them
-   (under -g, where paths are baked into DWARF).  Bumped to 4 with Stage 5:
-   the cached payload is now the in-process .o (not .s) and a parallel
-   manifest key (MK) was introduced; the object key OK is unchanged in
-   construction, but the schema bump cleanly invalidates cross-version mixing
-   so a v3 (.s) object is never mistaken for a v4 (.o) one.  */
-#define CC_KEY_SCHEMA_VERSION 4u
+/* The component tags (enum cc_tag), the key-schema version
+   (CC_KEY_SCHEMA_VERSION), the LE load/store helpers, and cc_hex live in
+   compile-cache-format.h (shared with the serve unit).  The two sha1-feeding
+   wrappers below stay here -- they take a sha1_ctx and are used only by the
+   libcpp-dependent key walk.  */
 
 /* Feed a 1-byte tag, an 8-byte little-endian length, then the bytes, into
-   CTX.  The tag+length framing makes the key unambiguous.  */
+   CTX.  The tag+length framing makes the key unambiguous.  Must match the
+   framing in compile-cache-serve.cc (ccs_hash_component).  */
 static void
 cc_hash_component (struct sha1_ctx *ctx, unsigned char tag,
 		   const void *data, size_t len)
@@ -568,19 +404,6 @@ cc_hash_str (struct sha1_ctx *ctx, unsigned char tag, const char *s)
   cc_hash_component (ctx, tag, s ? s : "", s ? strlen (s) : 0);
 }
 
-/* Render 20 raw SHA-1 bytes into OUT[41] as lowercase hex + NUL.  */
-static void
-cc_hex (const unsigned char raw[20], char out[41])
-{
-  static const char hexd[] = "0123456789abcdef";
-  for (int i = 0; i < 20; i++)
-    {
-      out[2 * i] = hexd[(raw[i] >> 4) & 0xf];
-      out[2 * i + 1] = hexd[raw[i] & 0xf];
-    }
-  out[40] = '\0';
-}
-
 /* ------------------------------------------------------------------------ */
 /* Option filtering                                                         */
 /* ------------------------------------------------------------------------ */
@@ -590,7 +413,12 @@ cc_hex (const unsigned char raw[20], char out[41])
 
    Policy: conservative-but-broad.  We would rather over-include an option
    (an unnecessary miss) than under-include one (a WRONG hit serving stale
-   assembly).  When in doubt, INCLUDE.  */
+   assembly).  When in doubt, INCLUDE.
+
+   THE DEFINITION LIVES IN compile-cache-serve.cc (declared extern at the top
+   of this file) so the driver and cc1plus compute an identical manifest key.
+   This block is the documentation of the policy; the code is shared.  */
+#if 0
 static bool
 cc_option_affects_output_p (const cl_decoded_option *decoded)
 {
@@ -704,6 +532,7 @@ cc_option_affects_output_p (const cl_decoded_option *decoded)
 
   return false;
 }
+#endif /* 0 -- cc_option_affects_output_p now lives in compile-cache-serve.cc */
 
 /* ------------------------------------------------------------------------ */
 /* Gating                                                                   */
@@ -974,37 +803,14 @@ cc_compute_key (cpp_reader *pfile)
 /* Manifest key (MK) computation                                            */
 /* ------------------------------------------------------------------------ */
 
-/* True if DECODED names an include search path whose VALUE (the directory
-   string) must fold into the MANIFEST key.  The object key OK deliberately
-   drops these (it is content-addressed and portable, §1 of the scope), but the
-   manifest key is a local acceleration index and is allowed to be stricter:
-   folding the search-path values in closes the header-shadowing hole (a same-
-   named header newly appearing on an earlier -I would resolve differently, yet
-   the old absolute path the manifest stored still matches).  Any change to the
-   search configuration thus yields a different MK -> manifest miss -> a real
-   compile that rediscovers the closure.  */
-static bool
-cc_option_is_search_path_p (const cl_decoded_option *decoded)
-{
-  size_t idx = decoded->opt_index;
-  if (idx >= cl_options_count)
-    return false;
-  switch (idx)
-    {
-    case OPT_I:
-    case OPT_iquote:
-    case OPT_isystem:
-    case OPT_idirafter:
-    case OPT_iprefix:
-    case OPT_iwithprefix:
-    case OPT_iwithprefixbefore:
-    case OPT_isysroot:
-    case OPT_nostdinc:
-      return true;
-    default:
-      return false;
-    }
-}
+/* cc_option_is_search_path_p () -- the anti-shadowing search-path predicate --
+   is defined in compile-cache-serve.cc (declared extern at the top of this
+   file) so the store path here and the driver lookup use the identical set.
+   The OBJECT key OK deliberately drops these (it is content-addressed and
+   portable); the MANIFEST key folds them in (a same-named header newly
+   appearing on an earlier -I would resolve differently, yet the old absolute
+   path the manifest stored still matches -- so any search-config change must
+   yield a different MK -> manifest miss -> a real compile).  */
 
 /* Compute the manifest key MK into cc_manifest_key_hex / cc_manifest_key_valid.
    MK = schema ver + salt + checksum + lang + output-affecting options +
@@ -1699,6 +1505,62 @@ cc_write_atomic_readonly (const char *path, const unsigned char *bytes,
   return ok;
 }
 
+/* Write the cache's "compiler-id" sidecar (DIR/compiler-id) so the DRIVER can
+   form the manifest key without linking this compiler's checksum object or
+   knowing lang_hooks.name: it records executable_checksum + lang_hooks.name,
+   the two key components the driver cannot derive on its own.  Idempotent and
+   cheap; written on every miss-store (a recompiled compiler -> new checksum ->
+   the driver's MK changes in lockstep, so a stale id can never cause a wrong
+   hit -- it would simply differ from the object's stored checksum-keyed MK).
+   Atomic publish.  No-op on failure.  */
+static void
+cc_write_compiler_id (void)
+{
+  if (!cc_dir || !cc_dir[0])
+    return;
+  cc_ensure_dir (cc_dir);
+
+  const char *lang = lang_hooks.name ? lang_hooks.name : "";
+  uint32_t llen = (uint32_t) strlen (lang);
+
+  size_t total = 8 + 2 + 2 + 16 + 4 + (size_t) llen;
+  unsigned char *buf = (unsigned char *) xmalloc (total);
+  memcpy (buf, CC_COMPILER_ID_MAGIC, CC_MAGIC_LEN);
+  cc_put_u16 (buf + 8, (uint16_t) CC_COMPILER_ID_VERSION);
+  cc_put_u16 (buf + 10, 0);
+  memcpy (buf + 12, executable_checksum, 16);
+  cc_put_u32 (buf + 28, llen);
+  if (llen)
+    memcpy (buf + 32, lang, llen);
+
+  char *path = concat (cc_dir, "/", CC_COMPILER_ID_NAME, NULL);
+  char *tmp = concat (path, ".tmpXXXXXX", NULL);
+  int fd = mkstemp (tmp);
+  bool ok = (fd >= 0);
+  FILE *dst = ok ? fdopen (fd, "wb") : NULL;
+  if (!dst && fd >= 0)
+    {
+      close (fd);
+      ok = false;
+    }
+  if (ok)
+    {
+      ok = (fwrite (buf, 1, total, dst) == total);
+      if (fclose (dst) != 0)
+	ok = false;
+    }
+  if (ok)
+    {
+      if (rename (tmp, path) != 0)
+	unlink (tmp);
+    }
+  else if (fd >= 0)
+    unlink (tmp);
+  free (buf);
+  free (tmp);
+  free (path);
+}
+
 /* Append/refresh this TU's entry in the manifest object keyed by MK.  The
    manifest lists, per include set, the object key OK and the headers that set
    depended on (path + size + mtime + hash, from cc_meta.inputs).  Existing
@@ -2064,6 +1926,9 @@ compile_cache_store (void)
 	  /* Record/refresh the manifest entry so a future run of the SAME
 	     source can serve this object BEFORE parsing.  */
 	  cc_store_manifest (warnings, errors);
+	  /* Publish the compiler-id sidecar so the DRIVER can form the same
+	     manifest key (it needs this compiler's checksum + lang name).  */
+	  cc_write_compiler_id ();
 	}
     }
   else if (tfd >= 0)

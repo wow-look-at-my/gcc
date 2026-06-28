@@ -1318,10 +1318,16 @@ c_common_parse_file (void)
      is single-TU only (the cache gates on num_in_fnames == 1), so an early
      return here cannot strand a later input file.  */
   {
-    const char *src = (num_in_fnames == 1
-		       ? (main_input_filename ? main_input_filename
-					      : in_fnames[0])
-		       : NULL);
+    /* Hash the file actually NAMED ON THE COMMAND LINE (in_fnames[0]), NOT
+       main_input_filename.  For a preprocessed input (.i/.ii) libcpp resets
+       main_input_filename to the ORIGINAL source recorded in the leading
+       "# 1 \"...\"" line marker, so main_input_filename would be the .cc while
+       the file on disk is the .ii.  The DRIVER, which has no preprocessed
+       content to parse, can only hash the input file it was handed (the .ii).
+       Keying both sides on in_fnames[0] makes the driver's manifest key match
+       cc1plus's -- the #1 requirement for the driver-level serve to ever hit.
+       For an ordinary .cc input the two are identical, so nothing changes.  */
+    const char *src = (num_in_fnames == 1 ? in_fnames[0] : NULL);
     if (src && compile_cache_try_serve_manifest (parse_in, src))
       return;
   }
