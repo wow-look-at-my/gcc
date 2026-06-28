@@ -95,6 +95,8 @@ along with GCC; see the file COPYING3.  If not see
 
 #include "selftest.h"
 
+#include "gas-embed.h"		/* for -fintegrated-as (gas_assemble_buffer) */
+
 #ifdef HAVE_isl
 #include <isl/version.h>
 #endif
@@ -168,6 +170,15 @@ FILE *callgraph_info_file = NULL;
 static bitmap callgraph_info_external_printed;
 FILE *stack_usage_file = NULL;
 static bool no_backend = false;
+
+/* When -fintegrated-as is in effect, asm_out_file is an in-memory stream
+   (open_memstream) rather than a text file.  INTEG_ASM_BUF / INTEG_ASM_SIZE
+   are the backing buffer/length that the memstream populates on flush, and
+   INTEG_OBJ_PATH is the .o we hand to the built-in assembler.  All three are
+   only used on the -fintegrated-as path; the default path leaves them unset.  */
+static char *integ_asm_buf;
+static size_t integ_asm_size;
+static const char *integ_obj_path;
 
 /* The current working directory of a translation.  It's generally the
    directory from which compilation was initiated, but a preprocessed
@@ -688,7 +699,24 @@ print_version (FILE *file, const char *indent, bool show_global_state)
 static void
 init_asm_output (const char *name)
 {
-  if (name == NULL && asm_file_name == 0)
+  if (flag_integrated_as)
+    {
+      /* With the built-in assembler, the compiler's assembly is captured into
+	 an in-memory stream and handed to gas_assemble_buffer at the end of
+	 compilation; the -o value names the final .o, not a text .s.  The
+	 prototype requires an explicit -o (asm_file_name) because integrated
+	 mode writes an object, which makes no sense on stdout.  */
+      if (asm_file_name == 0 || !strcmp (asm_file_name, "-"))
+	fatal_error (UNKNOWN_LOCATION,
+		     "%<-fintegrated-as%> requires an output file "
+		     "(%<-o%> <object>)");
+      integ_obj_path = asm_file_name;
+      asm_out_file = open_memstream (&integ_asm_buf, &integ_asm_size);
+      if (asm_out_file == 0)
+	fatal_error (UNKNOWN_LOCATION,
+		     "cannot open in-memory assembly stream: %m");
+    }
+  else if (name == NULL && asm_file_name == 0)
     asm_out_file = stdout;
   else
     {
@@ -2006,7 +2034,35 @@ finalize ()
      whether fclose returns an error, since the pages might still be on the
      buffer chain while the file is open.  */
 
-  if (asm_out_file)
+  if (asm_out_file && flag_integrated_as)
+    {
+      /* asm_out_file is an open_memstream: closing it flushes the captured
+	 assembly into integ_asm_buf/integ_asm_size, which we then hand to the
+	 built-in assembler to write the object directly.  Do NOT take the
+	 normal text-file close path below for this stream.  */
+      if (ferror (asm_out_file) != 0)
+	fatal_error (input_location,
+		     "error writing in-memory assembly stream: %m");
+      if (fclose (asm_out_file) != 0)
+	fatal_error (input_location,
+		     "error closing in-memory assembly stream: %m");
+      asm_out_file = NULL;
+
+      /* Only assemble if compilation itself produced no errors; a broken TU
+	 would otherwise feed garbage to the assembler.  */
+      if (!seen_error ())
+	{
+	  int rc = gas_assemble_buffer (integ_asm_buf ? integ_asm_buf : "",
+					integ_asm_size, integ_obj_path);
+	  if (rc != 0)
+	    error ("integrated assembler failed");
+	}
+
+      free (integ_asm_buf);
+      integ_asm_buf = NULL;
+      integ_asm_size = 0;
+    }
+  else if (asm_out_file)
     {
       if (ferror (asm_out_file) != 0)
 	fatal_error (input_location, "error writing to %s: %m", asm_file_name);

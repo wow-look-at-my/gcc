@@ -1285,6 +1285,7 @@ static const char *cc1_options =
  %1 %{!Q:-quiet} %(cpp_debug_options) %{m*} %{aux-info*}\
  %{g*} %{O*} %{W*&pedantic*} %{w} %{std*&ansi&trigraphs}\
  %{v:-version} %{pg:-p} %{p} %{f*} %{undef}\
+ %{S|fsyntax-only:%{fintegrated-as:-fno-integrated-as}}\
  %{Qn:-fno-ident} %{Qy:} %{-help:--help}\
  %{-target-help:--target-help}\
  %{-version:--version}\
@@ -1310,13 +1311,19 @@ ASM_COMPRESS_DEBUG_SPEC
 static const char *invoke_as =
 #ifdef AS_NEEDS_DASH_FOR_PIPED_INPUT
 "%{!fwpa*:\
-   %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
-   %{!S:-o %|.s |\n as %(asm_options) %|.s %A }\
+   %{fintegrated-as:\
+     %{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}}\
+   %{!fintegrated-as:\
+     %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
+     %{!S:-o %|.s |\n as %(asm_options) %|.s %A }}\
   }";
 #else
 "%{!fwpa*:\
-   %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
-   %{!S:-o %|.s |\n as %(asm_options) %m.s %A }\
+   %{fintegrated-as:\
+     %{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}}\
+   %{!fintegrated-as:\
+     %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
+     %{!S:-o %|.s |\n as %(asm_options) %m.s %A }}\
   }";
 #endif
 

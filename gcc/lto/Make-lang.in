@@ -91,16 +91,19 @@ lto.stagefeedback:
 # Use strict warnings for this front end.
 lto-warn = $(STRICT_WARN)
 
-$(LTO_EXE): $(LTO_OBJS) $(BACKEND) $(LIBDEPS) $(lto1.prev)
+# $(GAS_LIBS)/$(GAS_DEPS) (defined in cp/Make-lang.in) resolve gas_assemble_buffer,
+# which the shared libbackend.a (toplev.o) references for -fintegrated-as; any
+# binary linking the backend must resolve it at link time.
+$(LTO_EXE): $(LTO_OBJS) $(BACKEND) $(LIBDEPS) $(GAS_DEPS) $(lto1.prev)
 	@$(call LINK_PROGRESS,$(INDEX.lto1),start)
 	+$(LLINKER) $(ALL_LINKERFLAGS) $(LDFLAGS) -o $@ \
-		$(LTO_OBJS) $(BACKEND) $(BACKENDLIBS) $(LIBS)
+		$(LTO_OBJS) $(BACKEND) $(BACKENDLIBS) $(LIBS) $(GAS_LIBS)
 	@$(call LINK_PROGRESS,$(INDEX.lto1),end)
 
-$(LTO_DUMP_EXE): $(LTO_DUMP_OBJS) $(BACKEND) $(LIBDEPS) $(lto2.prev)
+$(LTO_DUMP_EXE): $(LTO_DUMP_OBJS) $(BACKEND) $(LIBDEPS) $(GAS_DEPS) $(lto2.prev)
 	@$(call LINK_PROGRESS,$(INDEX.lto2),start)
 	+$(LLINKER) $(ALL_LINKERFLAGS) $(LDFLAGS) -o $@ \
-		$(LTO_DUMP_OBJS) $(BACKEND) $(BACKENDLIBS) $(LIBS)
+		$(LTO_DUMP_OBJS) $(BACKEND) $(BACKENDLIBS) $(LIBS) $(GAS_LIBS)
 	@$(call LINK_PROGRESS,$(INDEX.lto2),end)
 
 lto/lto-dump.o: $(LTO_OBJS)

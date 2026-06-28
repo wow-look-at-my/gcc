@@ -1,0 +1,529 @@
+--- a/as.h
++++ b/as.h
+@@ -53,6 +53,7 @@
+ 
+ #include <errno.h>
+ #include <stdarg.h>
++#include <setjmp.h>
+ 
+ #include "getopt.h"
+ /* The first getopt value for machine-independent long options.
+@@ -477,6 +478,12 @@
+ void   signal_init (void);
+ int    had_errors (void);
+ int    had_warnings (void);
++
++/* cc1plus embed mode: when gas_in_embed is non-zero, as_fatal/as_abort
++   longjmp to gas_fatal_jmp instead of xexit-ing the process.  Both are
++   defined in messages.c.  */
++extern jmp_buf gas_fatal_jmp;
++extern int gas_in_embed;
+ void   as_warn_value_out_of_range (const char *, offsetT, offsetT, offsetT,
+ 				   const char *, unsigned);
+ void   as_bad_value_out_of_range (const char *, offsetT, offsetT, offsetT,
+--- a/input-file.c
++++ b/input-file.c
+@@ -44,6 +44,26 @@
+ static FILE *f_in;
+ static const char *file_name;
+ 
++/* In-memory buffer input (cc1plus embed mode).  When gas_buf_mode is set,
++   input is read from gas_buf_in[gas_buf_pos .. gas_buf_len) instead of f_in,
++   while still passing through the normal preprocess/do_scrub_chars path.  */
++static const char *gas_buf_in;
++static size_t gas_buf_pos;
++static size_t gas_buf_len;
++static int gas_buf_mode;
++
++/* Register an in-memory assembly buffer as the input source.  Must be called
++   before input_file_open (i.e. before read_a_source_file).  */
++
++void
++input_file_set_buffer (const char *buf, size_t len)
++{
++  gas_buf_in = buf;
++  gas_buf_pos = 0;
++  gas_buf_len = len;
++  gas_buf_mode = 1;
++}
++
+ /* Struct for saving the state of this module for file includes.  */
+ struct saved_file
+   {
+@@ -64,6 +84,10 @@
+ void
+ input_file_end (void)
+ {
++  gas_buf_mode = 0;
++  gas_buf_in = NULL;
++  gas_buf_pos = 0;
++  gas_buf_len = 0;
+ }
+ 
+ /* Return BUFFER_SIZE.  */
+@@ -122,6 +146,39 @@
+ 
+   preprocess = pre;
+ 
++  if (gas_buf_mode)
++    {
++      /* In-memory buffer input.  Mirror the file path's leading-byte peek
++	 for #APP / #NO_APP so the scrubber behaves identically, but do not
++	 consume the bytes (gas_buf_pos stays at 0 so input_file_get re-reads
++	 them).  */
++      const char *p = gas_buf_in;
++      size_t avail = gas_buf_len;
++
++      file_name = _("<gas-embed>");
++
++      /* Empty input: nothing to do (mirrors the empty-file early return).  */
++      if (avail == 0)
++	return;
++
++      c = (unsigned char) p[0];
++      if (c == '#')
++	{
++	  /* Begins with comment, may not want to preprocess.  */
++	  if (avail >= 2 && p[1] == 'N')
++	    {
++	      if (avail >= 7 && startswith (p + 2, "O_APP") && ISSPACE (p[7]))
++		preprocess = 0;
++	    }
++	  else if (avail >= 2 && p[1] == 'A')
++	    {
++	      if (avail >= 4 && startswith (p + 2, "PP") && ISSPACE (p[4]))
++		preprocess = 1;
++	    }
++	}
++      return;
++    }
++
+   gas_assert (filename != 0);	/* Filename may not be NULL.  */
+   if (filename[0])
+     {
+@@ -207,6 +264,11 @@
+     fclose (f_in);
+ 
+   f_in = 0;
++
++  gas_buf_mode = 0;
++  gas_buf_in = NULL;
++  gas_buf_pos = 0;
++  gas_buf_len = 0;
+ }
+ 
+ /* This function is passed to do_scrub_chars.  */
+@@ -216,6 +278,19 @@
+ {
+   size_t size;
+ 
++  if (gas_buf_mode)
++    {
++      size_t remaining = gas_buf_len - gas_buf_pos;
++
++      if (remaining == 0)
++	return 0;
++      if (remaining > buflen)
++	remaining = buflen;
++      memcpy (buf, gas_buf_in + gas_buf_pos, remaining);
++      gas_buf_pos += remaining;
++      return remaining;
++    }
++
+   if (feof (f_in))
+     return 0;
+ 
+@@ -233,7 +308,7 @@
+   char *return_value;		/* -> Last char of what we read, + 1.  */
+   size_t size;
+ 
+-  if (f_in == (FILE *) 0)
++  if (!gas_buf_mode && f_in == (FILE *) 0)
+     return 0;
+   /* fflush (stdin); could be done here if you want to synchronise
+      stdin and stdout, for the case where our input file is stdin.
+@@ -248,10 +323,13 @@
+     return_value = where + size;
+   else
+     {
+-      if (fclose (f_in))
+-	as_warn (_("can't close %s: %s"), file_name, xstrerror (errno));
++      if (!gas_buf_mode)
++	{
++	  if (fclose (f_in))
++	    as_warn (_("can't close %s: %s"), file_name, xstrerror (errno));
+ 
+-      f_in = (FILE *) 0;
++	  f_in = (FILE *) 0;
++	}
+       return_value = 0;
+     }
+ 
+--- a/input-file.h
++++ b/input-file.h
+@@ -63,3 +63,7 @@
+ void input_file_end (void);
+ void input_file_open (const char *filename, int pre);
+ void input_file_pop (char *arg);
++
++/* Register an in-memory assembly buffer as the input source (cc1plus embed
++   mode).  Call before input_file_open / read_a_source_file.  */
++void input_file_set_buffer (const char *buf, size_t len);
+--- a/messages.c
++++ b/messages.c
+@@ -20,6 +20,14 @@
+ #include "as.h"
+ #include <limits.h>
+ #include <signal.h>
++#include <setjmp.h>
++
++/* When embedded in cc1plus (gas_in_embed != 0), as_fatal / as_abort must not
++   kill the host process.  Instead they longjmp back to a landing pad set up by
++   gas_assemble_buffer.  In standalone gas (gas_in_embed == 0) they xexit as
++   before, preserving exact standalone behaviour.  */
++jmp_buf gas_fatal_jmp;
++int gas_in_embed = 0;
+ 
+ /* If the system doesn't provide strsignal, we get it defined in
+    libiberty but no declaration is supplied.  Because, reasons. */
+@@ -332,6 +340,8 @@
+      thinking that a file was created and hence does not need rebuilding.  */
+   if (out_file_name != NULL)
+     unlink_if_ordinary (out_file_name);
++  if (gas_in_embed)
++    longjmp (gas_fatal_jmp, 1);
+   xexit (EXIT_FAILURE);
+ }
+ 
+@@ -354,6 +364,8 @@
+ 
+   fprintf (stderr, _("Please report this bug.\n"));
+ 
++  if (gas_in_embed)
++    longjmp (gas_fatal_jmp, 1);
+   xexit (EXIT_FAILURE);
+ }
+ 
+--- a/config/tc-i386.c
++++ b/config/tc-i386.c
+@@ -16591,6 +16591,35 @@
+   return 1;
+ }
+ 
++/* cc1plus embed support: select the x86-64 (64-bit ELF) target at runtime,
++   exactly as the "--64" command-line option does (see OPTION_64 above).  This
++   sets default_arch = "x86_64" so that i386_target_format () selects
++   ELF_TARGET_FORMAT64 ("elf64-x86-64") and 64-bit code generation.  Must be
++   called before output_file_create (which invokes TARGET_FORMAT).  */
++
++void i386_set_default_arch_64 (void);
++
++void
++i386_set_default_arch_64 (void)
++{
++  const char **list, **l;
++
++  list = bfd_target_list ();
++  for (l = list; *l != NULL; l++)
++    if (startswith (*l, "elf64-x86-64")
++	|| strcmp (*l, "coff-x86-64") == 0
++	|| strcmp (*l, "pe-x86-64") == 0
++	|| strcmp (*l, "pei-x86-64") == 0
++	|| strcmp (*l, "mach-o-x86-64") == 0)
++      {
++	default_arch = "x86_64";
++	break;
++      }
++  if (*l == NULL)
++    as_fatal (_("no compiled in support for x86_64"));
++  free (list);
++}
++
+ #define MESSAGE_TEMPLATE \
+ "                                                                                "
+ 
+--- /dev/null
++++ b/embed.h
+@@ -0,0 +1,44 @@
++/* embed.h - in-process GAS assembler entry point for cc1plus.
++   Copyright (C) 1987-2024 Free Software Foundation, Inc.
++
++   This file is part of GAS, the GNU Assembler.
++
++   GAS is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3, or (at your option)
++   any later version.
++
++   GAS is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with GAS; see the file COPYING.  If not, write to the Free
++   Software Foundation, 51 Franklin Street - Fifth Floor, Boston, MA
++   02110-1301, USA.  */
++
++#ifndef GAS_EMBED_H
++#define GAS_EMBED_H
++
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Assemble the GAS-syntax assembly text in [asm_buf, asm_buf + len) and write
++   an ELF object file to OUT_OBJ.  Targets x86-64 ELF.  Performs no subprocess
++   and never exits the host process: returns 0 on success, non-zero on any
++   assembler error (a fatal assembler condition is caught and turned into a
++   returned error rather than killing the caller).
++
++   One-shot per process: GAS keeps file-scope state that is not re-zeroed, so
++   call this at most once in a process (cc1plus forks a fresh process per TU).  */
++int gas_assemble_buffer (const char *asm_buf, size_t len, const char *out_obj);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* GAS_EMBED_H */
+--- /dev/null
++++ b/embed.c
+@@ -0,0 +1,235 @@
++/* embed.c - in-process GAS assembler entry point for cc1plus.
++   Copyright (C) 1987-2024 Free Software Foundation, Inc.
++
++   This file is part of GAS, the GNU Assembler.
++
++   GAS is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3, or (at your option)
++   any later version.
++
++   GAS is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with GAS; see the file COPYING.  If not, write to the Free
++   Software Foundation, 51 Franklin Street - Fifth Floor, Boston, MA
++   02110-1301, USA.  */
++
++/* gas_assemble_buffer() drives the assembler over an in-memory buffer and
++   writes an ELF object, with no subprocess and no process exit.  Its body is
++   gas/as.c:main() minus argv parsing and minus the xexit()s; the two static
++   helpers main() calls (gas_init, perform_an_assembly_pass) are static in
++   as.c, so their bodies are replicated here verbatim from as.c.  Keep this in
++   sync with as.c if that init/pass/finalize sequence changes.  */
++
++/* NOTE: do NOT #define COMMON here.  as.c owns the single definition of the
++   COMMON globals (it #defines COMMON to empty); this file references them as
++   extern (as.h sets COMMON to "extern").  Linking embed.o together with the
++   other gas objects (minus as.o) therefore resolves them against as.c's...
++   no, against the COMMON tentative definitions in as.o -- which is exactly
++   why as.o is dropped from libgas.a and the COMMONs are provided here.  See
++   the matching tentative definitions block below.  */
++
++#include "as.h"
++#include "subsegs.h"
++#include "output-file.h"
++#include "sb.h"
++#include "macro.h"
++#include "dwarf2dbg.h"
++#include "dw2gencfi.h"
++#include "codeview.h"
++#include "bfdver.h"
++#include "write.h"
++#include "ginsn.h"
++#include "input-file.h"
++#include "embed.h"
++
++#ifdef HAVE_ITBL_CPU
++#include "itbl-ops.h"
++#else
++#define itbl_init()
++#endif
++
++/* Runtime x86-64 (64-bit ELF) target selection, defined in config/tc-i386.c.
++   Equivalent to the assembler's "--64" command-line option; must run before
++   output_file_create (which invokes TARGET_FORMAT).  */
++extern void i386_set_default_arch_64 (void);
++
++int
++gas_assemble_buffer (const char *asm_buf, size_t len, const char *out_obj)
++{
++  /* Modified between setjmp and a possible longjmp, so it must be volatile.
++     0 = fault would occur before/while building the object (clean it up);
++     1 = we have reached explicit teardown (do not re-close on a fault).  */
++  volatile int phase = 0;
++#ifndef OBJ_MACH_O
++  flagword applicable;
++#endif
++
++  /* --- gas_early_init() (as.c:1276), MINUS signal_init (cc1plus owns the
++     signal handlers), MINUS expandargv (no argv) and the locale setup (it
++     affects only diagnostic text, not the emitted object).  --- */
++  hex_init ();
++  if (bfd_init () != BFD_INIT_MAGIC)
++    return -1;				/* was as_fatal ("libbfd ABI mismatch") */
++
++  obstack_begin (&notes, chunksize);
++  xmalloc_set_program_name ("gas-embed");
++  bfd_set_error_program_name ("gas-embed");
++
++  init_include_dir ();
++
++  /* --- target: x86-64 ELF, the runtime "--64" effect (tc-i386.c).  Must
++     precede output_file_create.  --- */
++  i386_set_default_arch_64 ();
++
++  out_file_name = out_obj;		/* as.h:357 */
++
++  /* From here on a fatal assembler condition must come back to us rather than
++     kill the host process.  Arm the landing pad BEFORE any work that can call
++     as_fatal/as_abort (output_file_create, md_begin, the parse, write...).  */
++  gas_in_embed = 1;
++  if (setjmp (gas_fatal_jmp))
++    {
++      /* as_fatal / as_abort fired and longjmp'd here.  The diagnostic has
++	 already been printed.  Disable embed mode so any further fatal (e.g.
++	 from the cleanup below) xexits rather than re-entering this landing
++	 pad.  */
++      gas_in_embed = 0;
++      if (phase == 0 && stdoutput != NULL)
++	{
++	  keep_it = 0;
++	  output_file_close ();		/* flush/free; unlinks the bad object */
++	}
++      return -1;
++    }
++
++  /* --- gas_init() (as.c:1324), EXCEPT the xatexit(output_file_close): we
++     call teardown explicitly below instead of via the atexit chain.  --- */
++  symbol_begin ();
++  frag_init ();
++  subsegs_begin ();
++  read_begin ();
++  input_scrub_begin ();
++  expr_begin ();
++  eh_begin ();
++
++  macro_init ();
++
++  dwarf2_init ();
++
++  local_symbol_make (".gasversion.", absolute_section,
++		     &predefined_address_frag, BFD_VERSION / 10000UL);
++
++  output_file_create (out_file_name);
++  gas_assert (stdoutput != 0);
++
++  dot_symbol_init ();
++
++#ifdef tc_init_after_args
++  tc_init_after_args ();
++#endif
++
++  itbl_init ();
++
++  /* --- input: feed the in-memory buffer through the normal file path
++     (preprocess + do_scrub_chars), so #APP/#NO_APP behave identically to the
++     standalone assembler.  --- */
++  input_file_set_buffer (asm_buf, len);
++
++  /* --- perform_an_assembly_pass() (as.c:1202), single buffer "file".  --- */
++  need_pass_2 = 0;
++
++#ifndef OBJ_MACH_O
++  /* Create the standard sections, and those the assembler uses internally.  */
++  text_section = subseg_new (TEXT_SECTION_NAME, 0);
++  data_section = subseg_new (DATA_SECTION_NAME, 0);
++  bss_section = subseg_new (BSS_SECTION_NAME, 0);
++  /* @@ FIXME -- we're setting the RELOC flag so that sections are assumed
++     to have relocs, otherwise we don't find out in time.  */
++  applicable = bfd_applicable_section_flags (stdoutput);
++  bfd_set_section_flags (text_section,
++			 applicable & (SEC_ALLOC | SEC_LOAD | SEC_RELOC
++				       | SEC_CODE | SEC_READONLY));
++  bfd_set_section_flags (data_section,
++			 applicable & (SEC_ALLOC | SEC_LOAD | SEC_RELOC
++				       | SEC_DATA));
++  bfd_set_section_flags (bss_section, applicable & SEC_ALLOC);
++  seg_info (bss_section)->bss = 1;
++#endif
++  subseg_new (BFD_ABS_SECTION_NAME, 0);
++  subseg_new (BFD_UND_SECTION_NAME, 0);
++  reg_section = subseg_new ("*GAS `reg' section*", 0);
++  expr_section = subseg_new ("*GAS `expr' section*", 0);
++
++#ifndef OBJ_MACH_O
++  subseg_set (text_section, 0);
++#endif
++
++  /* This may add symbol table entries, which requires having an open BFD,
++     and sections already created.  */
++  md_begin ();
++
++#ifdef obj_begin
++  obj_begin ();
++#endif
++
++  read_a_source_file ("<gas-embed>");
++
++  /* --- finalize (as.c:1441-1468).  --- */
++  cond_finish_check (-1);
++
++#ifdef md_finish
++  md_finish ();
++#endif
++
++#if defined OBJ_ELF || defined OBJ_MAYBE_ELF
++  if ((flag_execstack || flag_noexecstack)
++      && OUTPUT_FLAVOR == bfd_target_elf_flavour)
++    {
++      segT gnustack;
++
++      gnustack = subseg_new (".note.GNU-stack", 0);
++      bfd_set_section_flags (gnustack,
++			     SEC_READONLY | (flag_execstack ? SEC_CODE : 0));
++
++    }
++#endif
++
++  codeview_finish ();
++
++  /* If we've been collecting dwarf2 .debug_line info, either for assembly
++     debugging or on behalf of the compiler, emit it now.  */
++  dwarf2_finish ();
++
++  /* If we constructed dwarf2 .eh_frame info, either via .cfi directives from
++     the user or by the backend, emit it now.  */
++  cfi_finish ();
++
++  keep_it = 0;
++  if (seen_at_least_1_file ())
++    {
++      write_object_file ();		/* write.c:2126 -- THE OUTPUT */
++
++      if (had_errors () == 0)
++	keep_it = 1;
++      else if (flag_always_generate_output)
++	keep_it = 1;
++    }
++
++  /* --- teardown.  output_file_close() does bfd_close(stdoutput) (which
++     flushes the .o), nulls now_seg/stdoutput, unlinks the file if !keep_it,
++     and runs md_end/obj_end/macro_end/expr_end/read_end/symbol_end/
++     subsegs_end.  It cannot be skipped.  --- */
++  phase = 1;
++
++  input_scrub_end ();
++
++  output_file_close ();
++
++  gas_in_embed = 0;
++  return had_errors () ? -1 : 0;
++}

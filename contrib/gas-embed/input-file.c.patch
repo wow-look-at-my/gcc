@@ -1,0 +1,138 @@
+--- a/input-file.c	2024-01-29 00:00:00.000000000 +0000
++++ b/input-file.c	2026-06-28 06:07:03.192413250 +0000
+@@ -44,6 +44,26 @@
+ static FILE *f_in;
+ static const char *file_name;
+ 
++/* In-memory buffer input (cc1plus embed mode).  When gas_buf_mode is set,
++   input is read from gas_buf_in[gas_buf_pos .. gas_buf_len) instead of f_in,
++   while still passing through the normal preprocess/do_scrub_chars path.  */
++static const char *gas_buf_in;
++static size_t gas_buf_pos;
++static size_t gas_buf_len;
++static int gas_buf_mode;
++
++/* Register an in-memory assembly buffer as the input source.  Must be called
++   before input_file_open (i.e. before read_a_source_file).  */
++
++void
++input_file_set_buffer (const char *buf, size_t len)
++{
++  gas_buf_in = buf;
++  gas_buf_pos = 0;
++  gas_buf_len = len;
++  gas_buf_mode = 1;
++}
++
+ /* Struct for saving the state of this module for file includes.  */
+ struct saved_file
+   {
+@@ -64,6 +84,10 @@
+ void
+ input_file_end (void)
+ {
++  gas_buf_mode = 0;
++  gas_buf_in = NULL;
++  gas_buf_pos = 0;
++  gas_buf_len = 0;
+ }
+ 
+ /* Return BUFFER_SIZE.  */
+@@ -122,6 +146,39 @@
+ 
+   preprocess = pre;
+ 
++  if (gas_buf_mode)
++    {
++      /* In-memory buffer input.  Mirror the file path's leading-byte peek
++	 for #APP / #NO_APP so the scrubber behaves identically, but do not
++	 consume the bytes (gas_buf_pos stays at 0 so input_file_get re-reads
++	 them).  */
++      const char *p = gas_buf_in;
++      size_t avail = gas_buf_len;
++
++      file_name = _("<gas-embed>");
++
++      /* Empty input: nothing to do (mirrors the empty-file early return).  */
++      if (avail == 0)
++	return;
++
++      c = (unsigned char) p[0];
++      if (c == '#')
++	{
++	  /* Begins with comment, may not want to preprocess.  */
++	  if (avail >= 2 && p[1] == 'N')
++	    {
++	      if (avail >= 7 && startswith (p + 2, "O_APP") && ISSPACE (p[7]))
++		preprocess = 0;
++	    }
++	  else if (avail >= 2 && p[1] == 'A')
++	    {
++	      if (avail >= 4 && startswith (p + 2, "PP") && ISSPACE (p[4]))
++		preprocess = 1;
++	    }
++	}
++      return;
++    }
++
+   gas_assert (filename != 0);	/* Filename may not be NULL.  */
+   if (filename[0])
+     {
+@@ -207,6 +264,11 @@
+     fclose (f_in);
+ 
+   f_in = 0;
++
++  gas_buf_mode = 0;
++  gas_buf_in = NULL;
++  gas_buf_pos = 0;
++  gas_buf_len = 0;
+ }
+ 
+ /* This function is passed to do_scrub_chars.  */
+@@ -216,6 +278,19 @@
+ {
+   size_t size;
+ 
++  if (gas_buf_mode)
++    {
++      size_t remaining = gas_buf_len - gas_buf_pos;
++
++      if (remaining == 0)
++	return 0;
++      if (remaining > buflen)
++	remaining = buflen;
++      memcpy (buf, gas_buf_in + gas_buf_pos, remaining);
++      gas_buf_pos += remaining;
++      return remaining;
++    }
++
+   if (feof (f_in))
+     return 0;
+ 
+@@ -233,7 +308,7 @@
+   char *return_value;		/* -> Last char of what we read, + 1.  */
+   size_t size;
+ 
+-  if (f_in == (FILE *) 0)
++  if (!gas_buf_mode && f_in == (FILE *) 0)
+     return 0;
+   /* fflush (stdin); could be done here if you want to synchronise
+      stdin and stdout, for the case where our input file is stdin.
+@@ -248,10 +323,13 @@
+     return_value = where + size;
+   else
+     {
+-      if (fclose (f_in))
+-	as_warn (_("can't close %s: %s"), file_name, xstrerror (errno));
++      if (!gas_buf_mode)
++	{
++	  if (fclose (f_in))
++	    as_warn (_("can't close %s: %s"), file_name, xstrerror (errno));
+ 
+-      f_in = (FILE *) 0;
++	  f_in = (FILE *) 0;
++	}
+       return_value = 0;
+     }
+ 
