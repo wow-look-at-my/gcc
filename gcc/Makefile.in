@@ -1415,6 +1415,7 @@ OBJS = \
 	combine.o \
 	combine-stack-adj.o \
 	compare-elim.o \
+	compile-cache.o \
 	context.o \
 	convert.o \
 	coroutine-passes.o \
@@ -2495,6 +2496,7 @@ s-bversion: BASE-VER
 	$(STAMP) s-bversion
 
 CFLAGS-toplev.o += -DTARGET_NAME=\"$(target_noncanonical)\"
+CFLAGS-compile-cache.o += -DTARGET_NAME=\"$(target_noncanonical)\"
 CFLAGS-tree-diagnostic-client-data-hooks.o += -DTARGET_NAME=\"$(target_noncanonical)\"
 CFLAGS-optinfo-emit-json.o += -DTARGET_NAME=\"$(target_noncanonical)\" $(ZLIBINC)
 CFLAGS-analyzer/engine.o += $(ZLIBINC)

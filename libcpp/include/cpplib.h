@@ -1465,6 +1465,22 @@ extern bool cpp_compare_macros (const cpp_macro *macro1,
 /* In files.cc */
 extern bool cpp_included (cpp_reader *, const char *);
 extern bool cpp_included_before (cpp_reader *, const char *, location_t);
+
+/* Callback invoked once per file that was actually stacked (read) for the
+   current translation unit, with the file's resolved PATH and its exact
+   on-disk contents (BUFFER of SIZE bytes).  Return false to stop the walk.
+   See cpp_foreach_included_file.  */
+typedef bool (*cpp_included_file_cb) (const char *path,
+				      const unsigned char *buffer,
+				      size_t size, void *user);
+
+/* Walk every file that was stacked for preprocessing in this TU, invoking
+   CB with each file's path and contents (re-reading from disk if libcpp no
+   longer holds the buffer).  Stops early if CB returns false; returns false
+   if a file needed re-reading but could not be read, true otherwise.  */
+extern bool cpp_foreach_included_file (cpp_reader *,
+				       cpp_included_file_cb, void *);
+
 extern void cpp_make_system_header (cpp_reader *, int, int);
 extern bool cpp_push_include (cpp_reader *, const char *);
 extern bool cpp_push_default_include (cpp_reader *, const char *);
