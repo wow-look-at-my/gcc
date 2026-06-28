@@ -172,6 +172,10 @@ FILE *asm_out_file;
    -S, written to the .s output and not assembled).  */
 static char *asm_mem_buf;
 static size_t asm_mem_size;
+/* True when asm_out_file is an open_memstream() handle (set in
+   init_asm_output).  Checked at finalize independently of asm_mem_buf, which
+   open_memstream only populates once the stream is flushed/closed.  */
+static bool asm_using_memstream;
 
 FILE *aux_info_file;
 FILE *callgraph_info_file = NULL;
@@ -724,7 +728,10 @@ init_asm_output (const char *name)
 	   handed to the integrated assembler to produce the object file, or
 	   (when emitting assembly only, -S) written verbatim to asm_file_name.
 	   This is the seam that lets a compile-to-object run in one process.  */
-	asm_out_file = open_memstream (&asm_mem_buf, &asm_mem_size);
+	{
+	  asm_out_file = open_memstream (&asm_mem_buf, &asm_mem_size);
+	  asm_using_memstream = true;
+	}
       else
 	/* Use UNKOWN_LOCATION to prevent gcc from printing the first
 	   line in the current file. */
@@ -2026,7 +2033,7 @@ finalize ()
 
   if (asm_out_file)
     {
-      bool used_memstream = (asm_out_file != stdout && asm_mem_buf != NULL);
+      bool used_memstream = asm_using_memstream;
       if (ferror (asm_out_file) != 0)
 	fatal_error (input_location, "error writing to %s: %m", asm_file_name);
       /* Closing the memstream flushes the assembly text into asm_mem_buf and
@@ -2069,6 +2076,7 @@ finalize ()
 	  free (asm_mem_buf);
 	  asm_mem_buf = NULL;
 	  asm_mem_size = 0;
+	  asm_using_memstream = false;
 	}
     }
 
