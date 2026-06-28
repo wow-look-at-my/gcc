@@ -1308,6 +1308,24 @@ c_common_parse_file (void)
      C/C++-specific fact the back-end cache object cannot see, so pass it in.  */
   compile_cache_init_determinism (pch_file != NULL || flag_pch_preprocess);
 
+  /* Stage 5 pre-parse fast-path: before parsing anything, try to serve this
+     TU's object from the manifest cache (hash the main source + flags + search
+     paths -> recorded include set -> re-stat the headers -> cached .o).  On a
+     hit the cached .o is placed at the output and the hit flag is set, so we
+     return immediately WITHOUT parsing or running the back-end: compile_file()
+     sees compile_cache_hit_p() and skips the back-end, finalize() skips the
+     (now-NULL) asm stream, and compile_cache_store() no-ops on the hit.  This
+     is single-TU only (the cache gates on num_in_fnames == 1), so an early
+     return here cannot strand a later input file.  */
+  {
+    const char *src = (num_in_fnames == 1
+		       ? (main_input_filename ? main_input_filename
+					      : in_fnames[0])
+		       : NULL);
+    if (src && compile_cache_try_serve_manifest (parse_in, src))
+      return;
+  }
+
   for (unsigned int i = 0;;)
     {
       c_finish_options ();

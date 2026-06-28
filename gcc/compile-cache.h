@@ -113,6 +113,21 @@ extern void compile_cache_init_determinism (bool pch_active);
    compile_cache_store ().  */
 extern bool compile_cache_try_serve (cpp_reader *pfile);
 
+/* Pre-parse manifest fast-path (Stage 5).  Call BEFORE the parse loop with the
+   main source path.  Hashes the source + output-affecting options + include
+   search paths into a manifest key, looks up the recorded include set(s) for
+   that key, and re-resolves each header by its stored absolute path WITHOUT
+   preprocessing or parsing (size+mtime stat shortcut, else content re-hash).
+   If a recorded set fully matches and its object exists (and carries no
+   front-end diagnostics), places the cached .o at the output, replays
+   diagnostics, sets the hit flag, and returns true -- the caller MUST then
+   skip the parse and the back-end entirely.  Returns false on any miss /
+   mismatch / bypass (a TU using __has_include is always bypassed); the caller
+   proceeds with a normal compile, which records/updates the manifest on the
+   miss path.  No-op (returns false) when caching is disabled.  */
+extern bool compile_cache_try_serve_manifest (cpp_reader *pfile,
+					      const char *src_path);
+
 /* Serialize {metadata, freshly produced assembly (asm_file_name's contents),
    captured back-end diagnostics} into one binary object and atomically publish
    it under the key from the preceding compile_cache_try_serve ().  Call on a

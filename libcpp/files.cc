@@ -2130,6 +2130,14 @@ cpp_foreach_included_file (cpp_reader *pfile, cpp_included_file_cb cb,
   return true;
 }
 
+/* True if __has_include / __has_include_next was evaluated during this TU.  */
+
+bool
+cpp_used_has_include (cpp_reader *pfile)
+{
+  return pfile && pfile->used_has_include;
+}
+
 /* Read the pchf_data structure from F.  */
 
 bool

@@ -41,6 +41,18 @@
 #include "compile-cache.h"
 
 #include <sys/stat.h>
+/* For the opportunistic reflink rung of cc_place_object().  Guarded so the
+   feature compiles in only where the kernel headers expose FICLONE (Linux);
+   elsewhere cc_place_object falls back to hardlink/copy.  The reflink block in
+   cc_place_object is itself further guarded by "#ifdef FICLONE".  */
+#if defined (__linux__)
+# include <sys/ioctl.h>
+# if defined (__has_include)
+#  if __has_include (<linux/fs.h>)
+#   include <linux/fs.h>
+#  endif
+# endif
+#endif
 
 /* The compiler binary's own 16-byte fingerprint.  Each front-end compiler is
    linked with its own generated <binary>-checksum.o (cc1-checksum.o,
@@ -72,8 +84,33 @@ extern const unsigned char executable_checksum[16]
 
 #define CC_MAGIC      "GCCCACHE"	/* 8 bytes, no NUL stored */
 #define CC_MAGIC_LEN  8
-#define CC_FORMAT_VERSION  1u
+/* Bumped to 2 when the cached payload (the "assembly" section) became the
+   in-process-assembled OBJECT (.o) under -fintegrated-as instead of text
+   assembly, and a "had front-end diagnostics" flag was added so the pre-parse
+   manifest fast-path can tell which objects are safe to serve without a parse
+   (see CC_FLAG_HAD_FE_DIAG).  Old v1 (.s) entries self-heal: a version
+   mismatch is treated as a miss and overwritten on the next store.  */
+#define CC_FORMAT_VERSION  2u
 #define CC_HEADER_SIZE     128u
+
+/* Manifest object (ccache-style "direct mode" index): a separate cache object,
+   keyed by a manifest key MK (main-source hash + output-affecting options +
+   search paths + checksum/lang/salt/schema), that lists -- per previously seen
+   include set -- the object key OK and the headers (resolved path + size +
+   mtime + SHA-1) that closure depended on.  Consulted BEFORE parsing: if every
+   listed header still matches on disk, OK resolves a cached object and the
+   whole parse/codegen/assemble is skipped.  Stored under the same sharded path
+   layout + atomic publish, distinguished by its own magic.  */
+#define CC_MANIFEST_MAGIC      "CCMANIFS"	/* 8 bytes, no NUL stored */
+#define CC_MANIFEST_VERSION    1u
+#define CC_MANIFEST_HEADER_SIZE  32u
+
+/* Header flag bits (CC_OFF_FLAGS).  */
+#define CC_FLAG_HAD_FE_DIAG  0x1u	/* TU emitted front-end diagnostics:
+					   the manifest fast-path must NOT serve
+					   this object (it would skip the parse
+					   that re-emits them); fall through to a
+					   full compile instead.  */
 
 /* Fixed-header field byte offsets.  */
 enum cc_hdr_off
@@ -107,6 +144,40 @@ enum cc_input_off
   CC_IN_OFF_HASH = 0,		/* u8[20]  raw SHA-1 of the file */
   CC_IN_OFF_SIZE = 20,		/* u64     file size in bytes    */
   CC_IN_OFF_PATH = 28		/* u32 -> path string            */
+};
+
+/* ------------------------------------------------------------------------ */
+/* Manifest object format                                                   */
+/* ------------------------------------------------------------------------ */
+
+/* A manifest is laid out as:
+       header (32 bytes)  ->  entries  ->  string area
+   Each entry is variable-length:
+       u8[20] object_key OK
+       u32    warnings        (DK_WARNING count for OK's object)
+       u32    werrors         (DK_WERROR count for OK's object)
+       u32    header_count
+       header_count * { u32 path_off, u64 size, u64 mtime, u8[20] hash }
+   The string area uses the same length-prefixed + NUL form as the object
+   string area, referenced by absolute file offsets.  */
+enum cc_manifest_hdr_off
+{
+  CC_MAN_OFF_MAGIC       = 0,	/* char[8]  "CCMANIFS"          */
+  CC_MAN_OFF_VERSION     = 8,	/* u16      manifest version     */
+  CC_MAN_OFF_FLAGS       = 10,	/* u16      reserved = 0         */
+  CC_MAN_OFF_ENTRY_COUNT = 12,	/* u32      number of entries    */
+  CC_MAN_OFF_ENTRIES_OFF = 16,	/* u64      entries section off   */
+  CC_MAN_OFF_RESERVED    = 24	/* u64      reserved             */
+};
+
+/* Per-header record inside a manifest entry: 40 bytes.  */
+#define CC_MAN_HDR_REC_SIZE  40u
+enum cc_man_hdr_rec_off
+{
+  CC_MHR_OFF_PATH = 0,		/* u32 -> resolved abs path string */
+  CC_MHR_OFF_SIZE = 4,		/* u64  file size                  */
+  CC_MHR_OFF_MTIME = 12,	/* u64  st_mtime (seconds)         */
+  CC_MHR_OFF_HASH = 20		/* u8[20] raw SHA-1                */
 };
 
 /* Little-endian store helpers (do NOT rely on host endianness / packing).  */
@@ -156,6 +227,10 @@ cc_get_u64 (const unsigned char *p)
   return v;
 }
 
+/* Forward declarations (defined later, used earlier).  */
+static unsigned char *cc_read_file (const char *path, size_t *len);
+static bool cc_place_object (const char *cached_o, const char *dst);
+
 /* ------------------------------------------------------------------------ */
 /* Configuration / state                                                    */
 /* ------------------------------------------------------------------------ */
@@ -187,6 +262,26 @@ static bool cc_key_valid = false;
 /* Set once compile_cache_try_serve() reports a hit.  */
 static bool cc_hit = false;
 
+/* The 40-char lowercase-hex manifest key (MK) for this TU, computed by the
+   pre-parse fast-path and reused by the miss-path manifest store.  */
+static char cc_manifest_key_hex[41];
+static bool cc_manifest_key_valid = false;
+
+/* Number of {DK_WARNING, DK_WERROR} diagnostics already counted when the
+   back-end capture started (i.e. emitted by the front end / parse).  Used to
+   set CC_FLAG_HAD_FE_DIAG so the manifest fast-path never serves an object
+   whose front-end diagnostics it would silently drop.  */
+static int cc_fe_warnings = 0;
+static int cc_fe_werrors = 0;
+
+/* True if this TU evaluated __has_include / __has_include_next (captured from
+   the cpp_reader at post-parse time).  When set, compile_cache_store () writes
+   NO manifest entry, so the pre-parse fast-path never has a manifest to serve
+   for this TU (its include closure is not a sound predictor -- a probed-but-
+   not-included header can flip absent<->present without changing the closure).
+   The post-parse object cache still applies.  */
+static bool cc_tu_used_has_include = false;
+
 /* ------------------------------------------------------------------------ */
 /* Object metadata, gathered during key computation                         */
 /* ------------------------------------------------------------------------ */
@@ -196,6 +291,7 @@ struct cc_input
 {
   char *path;			/* xstrdup'd path */
   uint64_t size;		/* byte count */
+  uint64_t mtime;		/* st_mtime (seconds) for the stat shortcut */
   unsigned char hash[20];	/* raw SHA-1 of the bytes */
 };
 
@@ -230,7 +326,7 @@ cc_meta_clear (void)
 }
 
 static void
-cc_meta_add_input (const char *path, uint64_t size,
+cc_meta_add_input (const char *path, uint64_t size, uint64_t mtime,
 		   const unsigned char hash[20])
 {
   if (cc_meta.input_count == cc_meta.input_cap)
@@ -243,6 +339,7 @@ cc_meta_add_input (const char *path, uint64_t size,
   cc_input *in = &cc_meta.inputs[cc_meta.input_count++];
   in->path = xstrdup (path);
   in->size = size;
+  in->mtime = mtime;
   memcpy (in->hash, hash, 20);
 }
 
@@ -290,6 +387,13 @@ cc_begin_backend_capture (void)
   buf->stream = cc_diag_capture;
   cc_diag_base_warnings = global_dc->diagnostic_count (DK_WARNING);
   cc_diag_base_werrors = global_dc->diagnostic_count (DK_WERROR);
+  /* Whatever warnings/werrors are already counted were emitted by the front
+     end / parse (this hook runs after the parse loop).  Remember them so the
+     store can flag the object as having front-end diagnostics -- the manifest
+     fast-path must never serve such an object (it skips the parse that would
+     re-emit them).  */
+  cc_fe_warnings = cc_diag_base_warnings;
+  cc_fe_werrors = cc_diag_base_werrors;
   cc_capturing = true;
 }
 
@@ -421,7 +525,9 @@ enum cc_tag
   CC_TAG_MAIN_INPUT = 7,/* main_input_filename */
   CC_TAG_CWD = 8,	/* current working directory */
   CC_TAG_VERSION = 9,	/* key-schema version */
-  CC_TAG_SALT = 10	/* GCC_COMPILE_CACHE_SALT (logical cache reset) */
+  CC_TAG_SALT = 10,	/* GCC_COMPILE_CACHE_SALT (logical cache reset) */
+  CC_TAG_SRC_BODY = 11,	/* main source file bytes (manifest key only) */
+  CC_TAG_SEARCH_PATH = 12 /* an include-search-path value (manifest key only) */
 };
 
 /* Bump when the key construction or cached payload format changes, to
@@ -433,8 +539,12 @@ enum cc_tag
    *contents* already cover them), so the key no longer folds in build-dir
    path strings and hits across different build directories and machines.
    Path components are now hashed only when output truly depends on them
-   (under -g, where paths are baked into DWARF).  */
-#define CC_KEY_SCHEMA_VERSION 3u
+   (under -g, where paths are baked into DWARF).  Bumped to 4 with Stage 5:
+   the cached payload is now the in-process .o (not .s) and a parallel
+   manifest key (MK) was introduced; the object key OK is unchanged in
+   construction, but the schema bump cleanly invalidates cross-version mixing
+   so a v3 (.s) object is never mistaken for a v4 (.o) one.  */
+#define CC_KEY_SCHEMA_VERSION 4u
 
 /* Feed a 1-byte tag, an 8-byte little-endian length, then the bytes, into
    CTX.  The tag+length framing makes the key unambiguous.  */
@@ -662,6 +772,16 @@ compile_cache_enabled_p (void)
       || !strcmp (asm_file_name, HOST_BIT_BUCKET))
     return false;
 
+  /* 10. Stage 5 caches and serves the in-process-assembled OBJECT (.o), which
+     only exists under -fintegrated-as (cc1plus produced the .o itself via
+     gas_assemble_buffer).  Without integrated-as there is no in-process .o to
+     cache, and the whole pre-parse serve premise ("the compiler already made
+     the object") does not hold -- so the cache disables itself rather than
+     fall back to the older .s behaviour.  asm_file_name == integ_obj_path in
+     that mode (the real .o), which is what we place on a hit.  */
+  if (!flag_integrated_as)
+    return false;
+
   cc_enabled = 1;
   return true;
 }
@@ -727,7 +847,17 @@ cc_hash_one_file (const char *path, const unsigned char *buffer,
   if (size)
     sha1_process_bytes (buffer, size, &fctx);
   sha1_finish_ctx (&fctx, fh);
-  cc_meta_add_input (path, (uint64_t) size, fh);
+
+  /* Capture st_mtime for the manifest stat-shortcut (size+mtime match accepts
+     a header on a hit without re-reading it).  Best-effort: a failed stat
+     records mtime 0, which simply forces a content re-hash on the next hit.  */
+  uint64_t mtime = 0;
+  {
+    struct stat stt;
+    if (stat (path, &stt) == 0)
+      mtime = (uint64_t) stt.st_mtime;
+  }
+  cc_meta_add_input (path, (uint64_t) size, mtime, fh);
   return true;			/* keep walking */
 }
 
@@ -841,6 +971,125 @@ cc_compute_key (cpp_reader *pfile)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Manifest key (MK) computation                                            */
+/* ------------------------------------------------------------------------ */
+
+/* True if DECODED names an include search path whose VALUE (the directory
+   string) must fold into the MANIFEST key.  The object key OK deliberately
+   drops these (it is content-addressed and portable, §1 of the scope), but the
+   manifest key is a local acceleration index and is allowed to be stricter:
+   folding the search-path values in closes the header-shadowing hole (a same-
+   named header newly appearing on an earlier -I would resolve differently, yet
+   the old absolute path the manifest stored still matches).  Any change to the
+   search configuration thus yields a different MK -> manifest miss -> a real
+   compile that rediscovers the closure.  */
+static bool
+cc_option_is_search_path_p (const cl_decoded_option *decoded)
+{
+  size_t idx = decoded->opt_index;
+  if (idx >= cl_options_count)
+    return false;
+  switch (idx)
+    {
+    case OPT_I:
+    case OPT_iquote:
+    case OPT_isystem:
+    case OPT_idirafter:
+    case OPT_iprefix:
+    case OPT_iwithprefix:
+    case OPT_iwithprefixbefore:
+    case OPT_isysroot:
+    case OPT_nostdinc:
+      return true;
+    default:
+      return false;
+    }
+}
+
+/* Compute the manifest key MK into cc_manifest_key_hex / cc_manifest_key_valid.
+   MK = schema ver + salt + checksum + lang + output-affecting options +
+   search-path values + the MAIN SOURCE FILE's bytes (read once from disk; no
+   preprocess, no parse), and -- under -g only -- the main source path + cwd.
+   MK deliberately excludes header contents: headers are what the manifest
+   *discovers*.  Returns false (and leaves cc_manifest_key_valid false) if the
+   source cannot be read.  */
+static bool
+cc_compute_manifest_key (const char *src_path)
+{
+  cc_manifest_key_valid = false;
+
+  if (!src_path || !src_path[0])
+    return false;
+
+  /* Read the main source bytes once.  */
+  size_t src_len = 0;
+  unsigned char *src = cc_read_file (src_path, &src_len);
+  if (!src)
+    return false;
+
+  struct sha1_ctx ctx;
+  sha1_init_ctx (&ctx);
+
+  /* (0) Schema version (shared with OK so a format bump invalidates both).  */
+  {
+    unsigned char v[4];
+    unsigned ver = CC_KEY_SCHEMA_VERSION;
+    for (int i = 0; i < 4; i++)
+      v[i] = (unsigned char) (ver >> (8 * i));
+    cc_hash_component (&ctx, CC_TAG_VERSION, v, sizeof (v));
+  }
+  /* A distinct domain tag so an MK can never collide with an OK that happened
+     to hash the same components (manifest objects live under MK, objects under
+     OK, in the same sharded namespace).  */
+  cc_hash_str (&ctx, CC_TAG_LANG, "compile-cache-manifest-key");
+
+  /* (0b) Salt.  */
+  {
+    const char *salt = getenv ("GCC_COMPILE_CACHE_SALT");
+    if (salt && salt[0])
+      cc_hash_str (&ctx, CC_TAG_SALT, salt);
+  }
+
+  /* (1) Compiler fingerprint + (2) language/dialect.  */
+  cc_hash_component (&ctx, CC_TAG_CHECKSUM, executable_checksum, 16);
+  cc_hash_str (&ctx, CC_TAG_LANG, lang_hooks.name);
+
+  /* Under -g the source path + cwd bake into DWARF, so fold them in.  */
+  if (cc_paths_affect_output_p ())
+    {
+      cc_hash_str (&ctx, CC_TAG_MAIN_INPUT, src_path);
+      const char *pwd = get_src_pwd ();
+      cc_hash_str (&ctx, CC_TAG_CWD, pwd ? pwd : "");
+    }
+
+  /* (4) Output-affecting options + (anti-shadow) search-path VALUES.  Walked
+     in command-line order so option ordering is part of the key.  */
+  for (unsigned i = 1; i < save_decoded_options_count; i++)
+    {
+      const cl_decoded_option *o = &save_decoded_options[i];
+      bool affects = cc_option_affects_output_p (o);
+      bool search = cc_option_is_search_path_p (o);
+      if (!affects && !search)
+	continue;
+      for (size_t k = 0; k < o->canonical_option_num_elements; k++)
+	cc_hash_str (&ctx, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT,
+		     o->canonical_option[k]);
+    }
+
+  /* (S) The main source file's exact bytes.  This is the heart of MK: it is
+     what makes the manifest re-usable across runs of the SAME source without
+     a parse.  */
+  cc_hash_component (&ctx, CC_TAG_SRC_BODY, src, src_len);
+  free (src);
+
+  unsigned char raw[20];
+  sha1_finish_ctx (&ctx, raw);
+  cc_hex (raw, cc_manifest_key_hex);
+  cc_manifest_key_valid = true;
+  return true;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Path construction                                                        */
 /* ------------------------------------------------------------------------ */
 
@@ -943,100 +1192,198 @@ cc_read_file (const char *path, size_t *len)
   return buf;
 }
 
-bool
-compile_cache_try_serve (cpp_reader *pfile)
+/* The cached object's bytes are stored in a sidecar file next to the .bin
+   metadata object so that placement can hardlink it (O(1)) instead of copying.
+   For "DIR/ab/rest.bin" the sidecar is "DIR/ab/rest.o".  Caller frees.  */
+static char *
+cc_object_sidecar_path (const char *entry_bin_path)
 {
-  if (!compile_cache_enabled_p ())
+  size_t n = strlen (entry_bin_path);
+  /* Replace a trailing ".bin" with ".o"; otherwise just append ".o".  */
+  if (n >= 4 && strcmp (entry_bin_path + n - 4, ".bin") == 0)
+    {
+      char *p = (char *) xmalloc (n - 4 + 2 + 1);
+      memcpy (p, entry_bin_path, n - 4);
+      memcpy (p + (n - 4), ".o", 3);	/* ".o\0" */
+      return p;
+    }
+  return concat (entry_bin_path, ".o", NULL);
+}
+
+/* Place the cached object file CACHED_O at DST.  Ladder (each rung falls
+   through to the next on failure):
+     1. reflink (FICLONE)  -- CoW, O(1); unavailable on ext4 (this env), the
+        win on btrfs/XFS/ZFS.
+     2. hardlink (link())  -- O(1), no byte copy, same-fs.  Cache objects are
+        stored read-only (0444) so an accidental in-place edit of the output
+        (objcopy/strip --in-place) fails loudly rather than mutating the cache.
+     3. copy               -- always-correct fallback (read once, write once).
+   GCC_COMPILE_CACHE_LINK = copy|hardlink|reflink|auto (default auto) selects
+   the highest rung to start at.  DST is unlinked first so link()/open() see a
+   clean target (the driver hands us a fresh -o path, but be defensive).
+   Returns true on success.  */
+static bool
+cc_place_object (const char *cached_o, const char *dst)
+{
+  enum { LINK_AUTO, LINK_COPY, LINK_HARDLINK, LINK_REFLINK } mode = LINK_AUTO;
+  const char *e = getenv ("GCC_COMPILE_CACHE_LINK");
+  if (e && e[0])
+    {
+      if (!strcmp (e, "copy"))
+	mode = LINK_COPY;
+      else if (!strcmp (e, "hardlink"))
+	mode = LINK_HARDLINK;
+      else if (!strcmp (e, "reflink"))
+	mode = LINK_REFLINK;
+    }
+
+  /* Clear any existing target so link()/rename see a clean slot.  */
+  unlink (dst);
+
+#ifdef FICLONE
+  if (mode == LINK_AUTO || mode == LINK_REFLINK)
+    {
+      int sfd = open (cached_o, O_RDONLY);
+      if (sfd >= 0)
+	{
+	  int dfd = open (dst, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	  if (dfd >= 0)
+	    {
+	      int rc = ioctl (dfd, FICLONE, sfd);
+	      close (dfd);
+	      if (rc == 0)
+		{
+		  close (sfd);
+		  return true;
+		}
+	      unlink (dst);		/* reflink failed; try next rung */
+	    }
+	  close (sfd);
+	}
+      if (mode == LINK_REFLINK)
+	return false;
+    }
+#else
+  if (mode == LINK_REFLINK)
+    mode = LINK_HARDLINK;		/* no reflink support; degrade */
+#endif
+
+  if (mode == LINK_AUTO || mode == LINK_HARDLINK)
+    {
+      if (link (cached_o, dst) == 0)
+	return true;
+      if (mode == LINK_HARDLINK)
+	return false;
+      /* AUTO: fall through to copy (e.g. cross-device link -> EXDEV).  */
+    }
+
+  /* Copy fallback: read the cached object once, write it to DST.  */
+  size_t len = 0;
+  unsigned char *bytes = cc_read_file (cached_o, &len);
+  if (!bytes)
     return false;
-  if (!pfile)
-    return false;
+  FILE *out = fopen (dst, "wb");
+  if (!out)
+    {
+      free (bytes);
+      return false;
+    }
+  bool ok = (len == 0) || (fwrite (bytes, 1, len, out) == len);
+  if (fclose (out) != 0)
+    ok = false;
+  free (bytes);
+  if (!ok)
+    unlink (dst);
+  return ok;
+}
 
-  if (!cc_compute_key (pfile))
-    return false;		/* key untrustworthy -> behave as a miss */
+/* Core serve routine shared by the post-parse object-key path
+   (compile_cache_try_serve) and the pre-parse manifest path
+   (compile_cache_try_serve_manifest).  Given the object's hex key OK_HEX:
 
-  char *path = cc_entry_path (cc_key_hex, /*make_dirs=*/false);
+     - read and validate "DIR/ab/rest.bin" (header magic/version + bounds);
+     - if REQUIRE_NO_FE_DIAG and the object carries front-end diagnostics
+       (CC_FLAG_HAD_FE_DIAG), refuse to serve (return false) -- the pre-parse
+       path skips the parse that would re-emit them, so it must fall through;
+     - place the sidecar object "DIR/ab/rest.o" at asm_file_name via the
+       reflink->hardlink->copy ladder (cc_place_object);
+     - close the in-memory asm stream (asm_out_file) WITHOUT assembling -- on a
+       hit the memstream is empty and finalize() must not run gas on it (it is
+       gated off by compile_cache_hit_p ());
+     - replay the cached diagnostics and fold the stored warning/werror counts;
+     - set cc_hit.
 
+   Returns true on a served hit, false on miss/refusal (caller decides whether
+   to install the back-end capture and fall through).  DEBUG_ACTION labels the
+   debug line ("hit" / "manifest-hit").  */
+static bool
+cc_serve_from_bin (const char *ok_hex, bool require_no_fe_diag,
+		   const char *debug_action)
+{
+  char *bin_path = cc_entry_path (ok_hex, /*make_dirs=*/false);
   size_t flen = 0;
-  unsigned char *file = cc_read_file (path, &flen);
-  free (path);
+  unsigned char *file = cc_read_file (bin_path, &flen);
 
-  /* MISS: no object, too small, wrong magic, or wrong format version are all
-     treated as a miss (the wrong-magic/version case is self-healing: we will
-     overwrite the stale object on store).  Install the back-end diagnostic
-     capture so the store can record them.  */
   if (!file
       || flen < CC_HEADER_SIZE
       || memcmp (file + CC_OFF_MAGIC, CC_MAGIC, CC_MAGIC_LEN) != 0
       || cc_get_u16 (file + CC_OFF_FORMAT_VER) != CC_FORMAT_VERSION)
     {
       free (file);
-      cc_debug_line ("miss", cc_key_hex);
-      cc_begin_backend_capture ();
+      free (bin_path);
       return false;
     }
 
-  /* Parse the section table and bounds-check every span against the file.  */
-  uint64_t asm_off = cc_get_u64 (file + CC_OFF_ASM_OFF);
-  uint64_t asm_len = cc_get_u64 (file + CC_OFF_ASM_LEN);
   uint64_t diag_off = cc_get_u64 (file + CC_OFF_DIAG_OFF);
   uint64_t diag_len = cc_get_u64 (file + CC_OFF_DIAG_LEN);
   uint32_t warnings = cc_get_u32 (file + CC_OFF_WARNINGS);
   uint32_t errors = cc_get_u32 (file + CC_OFF_ERRORS);
+  uint16_t flags = cc_get_u16 (file + CC_OFF_FLAGS);
 
-  if (asm_off > flen || asm_len > flen - asm_off
-      || diag_off > flen || diag_len > flen - diag_off)
+  if (diag_off > flen || diag_len > flen - diag_off)
     {
-      /* Structurally corrupt: ignore and recompute (self-healing).  */
-      free (file);
-      cc_debug_line ("miss", cc_key_hex);
-      cc_begin_backend_capture ();
+      free (file);			/* structurally corrupt -> miss */
+      free (bin_path);
       return false;
     }
 
-  /* Hit: replace asm_out_file's contents with the cached assembly.
-     init_asm_output() has already written the target preamble into
-     asm_out_file; the cached assembly is the *complete* final assembly (it has
-     its own preamble), so we substitute the stored bytes wholesale.  Close and
-     reopen with "wb" (which truncates) -- GCC's config does not probe
-     ftruncate.  finalize() will close this fresh handle as usual.
-     asm_file_name is a real, seekable path here (gated above).  Once we have
-     committed to truncating the back-end's output, a reopen failure is fatal:
-     there is no correct output to fall back to.  */
-  fclose (asm_out_file);
-  asm_out_file = fopen (asm_file_name, "wb");
-  if (!asm_out_file)
+  /* The pre-parse fast-path must not serve an object whose front-end
+     diagnostics it would silently drop (it skipped the parse).  */
+  if (require_no_fe_diag && (flags & CC_FLAG_HAD_FE_DIAG))
     {
       free (file);
-      fatal_error (input_location,
-		   "compilation cache: cannot reopen %qs", asm_file_name);
-    }
-
-  bool ok = true;
-  if (asm_len)
-    ok = (fwrite (file + asm_off, 1, (size_t) asm_len, asm_out_file)
-	  == (size_t) asm_len);
-
-  if (!ok)
-    {
-      /* Partial write of the assembly: we have already truncated the file, so
-	 there is no correct fallback -- but treat it as a miss so the caller
-	 runs the back-end and regenerates correct output.  */
-      free (file);
-      cc_debug_line ("miss", cc_key_hex);
-      cc_begin_backend_capture ();
+      free (bin_path);
       return false;
     }
-  fflush (asm_out_file);
 
-  /* Replay the cached back-end diagnostics to stderr and fold the stored
-     counts into the global counters so the "N warnings"/"M errors" summary
-     and the -Werror exit status match a fresh compile.  Front-end/parse
-     diagnostics re-emit naturally on the re-parse, so we only replay (and
-     only counted) the back-end phase here.  The warnings field restores
-     DK_WARNING (plain warnings); the errors field carries DK_WERROR (warnings
-     promoted by -Werror) and restores to werrorcount, which is what drives
-     the non-zero exit under -Werror.  (A real back-end DK_ERROR is never
-     cached: compile_cache_store() bails when seen_error() is true.)  */
+  /* Place the sidecar .o at the output.  The cache only runs under
+     -fintegrated-as (gating check #10), so asm_file_name is the real .o path
+     and asm_out_file is the (still-open, empty-on-a-hit) memstream.  */
+  char *sidecar = cc_object_sidecar_path (bin_path);
+  bool placed = cc_place_object (sidecar, asm_file_name);
+  free (sidecar);
+  free (bin_path);
+  if (!placed)
+    {
+      /* Sidecar missing/unreadable: treat as a miss and recompute.  */
+      free (file);
+      return false;
+    }
+
+  /* Close the in-memory asm stream without assembling it.  finalize() gates
+     gas_assemble_buffer on !compile_cache_hit_p (), so on a hit it just frees
+     the (empty) buffer.  We close it here so finalize()'s integrated branch
+     sees asm_out_file == NULL and skips both the close and the assemble.  */
+  if (asm_out_file && asm_out_file != stdout)
+    fclose (asm_out_file);
+  asm_out_file = NULL;
+
+  /* Replay the cached diagnostics and fold the stored counts so the
+     "N warnings"/"M errors" summary and the -Werror exit status match a fresh
+     compile.  For the post-parse path these are the back-end diagnostics only
+     (front-end ones re-emit on the re-parse); for the manifest path the object
+     is guaranteed to have NO front-end diagnostics (refused above), so the
+     back-end set is the complete set.  */
   if (diag_len)
     {
       fflush (stdout);
@@ -1051,8 +1398,208 @@ compile_cache_try_serve (cpp_reader *pfile)
 
   free (file);
   cc_hit = true;
-  cc_debug_line ("hit", cc_key_hex);
+  cc_debug_line (debug_action, ok_hex);
   return true;
+}
+
+bool
+compile_cache_try_serve (cpp_reader *pfile)
+{
+  if (!compile_cache_enabled_p ())
+    return false;
+  if (!pfile)
+    return false;
+
+  /* A pre-parse manifest hit already served and set cc_hit; nothing to do.  */
+  if (cc_hit)
+    return true;
+
+  /* Record whether the parse used __has_include so the store can decide
+     whether a manifest entry is sound for this TU (it isn't, if it did).  */
+  cc_tu_used_has_include = cpp_used_has_include (pfile);
+
+  if (!cc_compute_key (pfile))
+    return false;		/* key untrustworthy -> behave as a miss */
+
+  /* Try to serve by the object key OK.  Front-end diagnostics are allowed here
+     (they re-emit on the re-parse that already happened), so pass
+     require_no_fe_diag = false.  */
+  if (cc_serve_from_bin (cc_key_hex, /*require_no_fe_diag=*/false, "hit"))
+    return true;
+
+  /* MISS: install the back-end diagnostic capture so the store can record
+     them, and fall through to the back-end.  */
+  cc_debug_line ("miss", cc_key_hex);
+  cc_begin_backend_capture ();
+  return false;
+}
+
+/* Pre-parse manifest fast-path.  Called BEFORE the parse loop with the main
+   source path.  Computes the manifest key MK, reads the manifest object under
+   MK, and for each recorded include set re-resolves every header by its stored
+   absolute path -- accepting on a size+mtime stat match, else a content
+   re-hash -- WITHOUT preprocessing or parsing.  On the first set that fully
+   matches AND whose object (under that set's OK) exists and is servable, places
+   the cached .o, replays diagnostics, sets cc_hit, and returns true so the
+   front end can skip the parse and back-end entirely.  Otherwise returns false
+   and the caller proceeds to a normal compile (which records/updates the
+   manifest + object on the miss path).  */
+bool
+compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
+{
+  if (!compile_cache_enabled_p ())
+    return false;
+
+  /* Note on __has_include: a TU that probes __has_include / __has_include_next
+     cannot be soundly served from the manifest (such a probe never enters the
+     include closure, so the manifest cannot notice it flipping absent<->present
+     between runs).  The bit that records this (cpp_reader::used_has_include) is
+     only set DURING the parse, so it is not yet known here at pre-parse time.
+     The protection therefore lives on the STORE side: compile_cache_store ()
+     refuses to write a manifest for a TU that used __has_include, so no
+     manifest ever exists for such a TU and this lookup simply misses -> a full
+     compile re-resolves everything.  Safe by construction.  (void pfile.)  */
+  (void) pfile;
+
+  /* Optional airtight mode: GCC_COMPILE_CACHE_VERIFY=hash forces a full
+     content re-hash of every header on a hit instead of the size+mtime stat
+     shortcut.  Even this still skips parse/codegen/assemble.  */
+  bool verify_hash = false;
+  {
+    const char *v = getenv ("GCC_COMPILE_CACHE_VERIFY");
+    if (v && !strcmp (v, "hash"))
+      verify_hash = true;
+  }
+
+  if (!cc_compute_manifest_key (src_path))
+    return false;
+
+  char *man_path = cc_entry_path (cc_manifest_key_hex, /*make_dirs=*/false);
+  size_t mlen = 0;
+  unsigned char *man = cc_read_file (man_path, &mlen);
+  free (man_path);
+
+  if (!man
+      || mlen < CC_MANIFEST_HEADER_SIZE
+      || memcmp (man + CC_MAN_OFF_MAGIC, CC_MANIFEST_MAGIC, CC_MAGIC_LEN) != 0
+      || cc_get_u16 (man + CC_MAN_OFF_VERSION) != CC_MANIFEST_VERSION)
+    {
+      free (man);
+      cc_debug_line ("manifest-miss", cc_manifest_key_hex);
+      return false;
+    }
+
+  uint32_t entry_count = cc_get_u32 (man + CC_MAN_OFF_ENTRY_COUNT);
+  uint64_t entries_off = cc_get_u64 (man + CC_MAN_OFF_ENTRIES_OFF);
+  if (entries_off > mlen)
+    {
+      free (man);
+      cc_debug_line ("manifest-miss", cc_manifest_key_hex);
+      return false;
+    }
+
+  /* Walk each entry (candidate header set).  */
+  uint64_t cur = entries_off;
+  for (uint32_t ei = 0; ei < entry_count; ei++)
+    {
+      /* Entry fixed part: OK[20] warnings(4) werrors(4) header_count(4).  */
+      if (cur + 20 + 4 + 4 + 4 > mlen)
+	break;			/* truncated manifest -> stop */
+      const unsigned char *ent = man + cur;
+      unsigned char ok_raw[20];
+      memcpy (ok_raw, ent + 0, 20);
+      uint32_t hdr_count = cc_get_u32 (ent + 28);
+      uint64_t recs_off = cur + 32;
+      uint64_t recs_len = (uint64_t) hdr_count * CC_MAN_HDR_REC_SIZE;
+      if (recs_off + recs_len > mlen)
+	break;			/* truncated -> stop */
+
+      /* Verify every header in this set resolves and matches.  */
+      bool all_match = true;
+      for (uint32_t hi = 0; hi < hdr_count && all_match; hi++)
+	{
+	  const unsigned char *rec = man + recs_off
+				     + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+	  uint32_t path_off = cc_get_u32 (rec + CC_MHR_OFF_PATH);
+	  uint64_t want_size = cc_get_u64 (rec + CC_MHR_OFF_SIZE);
+	  uint64_t want_mtime = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
+	  const unsigned char *want_hash = rec + CC_MHR_OFF_HASH;
+
+	  /* The path string lives in the string area (length-prefixed + NUL).
+	     Bounds-check before dereferencing.  */
+	  if (path_off + 4 > mlen)
+	    {
+	      all_match = false;
+	      break;
+	    }
+	  uint32_t plen = cc_get_u32 (man + path_off);
+	  if ((uint64_t) path_off + 4 + plen + 1 > mlen)
+	    {
+	      all_match = false;
+	      break;
+	    }
+	  const char *hpath = (const char *) (man + path_off + 4);
+
+	  struct stat stt;
+	  if (stat (hpath, &stt) != 0)
+	    {
+	      all_match = false;	/* header moved/deleted -> stale set */
+	      break;
+	    }
+
+	  /* Stat shortcut: size + mtime match accepts without reading, unless
+	     the airtight verify-hash mode is on.  */
+	  if (!verify_hash
+	      && (uint64_t) stt.st_size == want_size
+	      && (uint64_t) stt.st_mtime == want_mtime)
+	    continue;
+
+	  /* Otherwise read + content-hash and compare.  */
+	  size_t got_len = 0;
+	  unsigned char *body = cc_read_file (hpath, &got_len);
+	  if (!body || (uint64_t) got_len != want_size)
+	    {
+	      free (body);
+	      all_match = false;
+	      break;
+	    }
+	  unsigned char got_hash[20];
+	  struct sha1_ctx fctx;
+	  sha1_init_ctx (&fctx);
+	  if (got_len)
+	    sha1_process_bytes (body, got_len, &fctx);
+	  sha1_finish_ctx (&fctx, got_hash);
+	  free (body);
+	  if (memcmp (got_hash, want_hash, 20) != 0)
+	    {
+	      all_match = false;
+	      break;
+	    }
+	}
+
+      if (all_match)
+	{
+	  /* Every header matched.  Resolve the object under this set's OK and
+	     serve it -- but only if it carries no front-end diagnostics (we are
+	     about to skip the parse).  */
+	  char ok_hex[41];
+	  cc_hex (ok_raw, ok_hex);
+	  if (cc_serve_from_bin (ok_hex, /*require_no_fe_diag=*/true,
+				 "manifest-hit"))
+	    {
+	      free (man);
+	      return true;
+	    }
+	  /* Object missing or refused (front-end diag): try the next set, then
+	     fall through to a real compile.  */
+	}
+
+      cur = recs_off + recs_len;
+    }
+
+  free (man);
+  cc_debug_line ("manifest-miss", cc_manifest_key_hex);
+  return false;
 }
 
 bool
@@ -1113,6 +1660,245 @@ cc_blob_add_string (cc_blob *b, const char *s)
   return off;
 }
 
+/* Write BYTES (LEN bytes) to PATH atomically (temp + rename), then make PATH
+   read-only (0444).  PATH lives in an already-created shard dir.  The 0444
+   mode guards a hardlink-placed output against accidental in-place mutation
+   (objcopy/strip --in-place would fail loudly rather than corrupt the cache).
+   Returns true on success.  */
+static bool
+cc_write_atomic_readonly (const char *path, const unsigned char *bytes,
+			  size_t len)
+{
+  char *tmp = concat (path, ".tmpXXXXXX", NULL);
+  int fd = mkstemp (tmp);
+  bool ok = (fd >= 0);
+  FILE *dst = ok ? fdopen (fd, "wb") : NULL;
+  if (!dst && fd >= 0)
+    {
+      close (fd);
+      ok = false;
+    }
+  if (ok)
+    {
+      ok = (len == 0) || (fwrite (bytes, 1, len, dst) == len);
+      if (fclose (dst) != 0)
+	ok = false;
+    }
+  if (ok)
+    {
+      chmod (tmp, 0444);
+      if (rename (tmp, path) != 0)
+	{
+	  unlink (tmp);
+	  ok = false;
+	}
+    }
+  else if (fd >= 0)
+    unlink (tmp);
+  free (tmp);
+  return ok;
+}
+
+/* Append/refresh this TU's entry in the manifest object keyed by MK.  The
+   manifest lists, per include set, the object key OK and the headers that set
+   depended on (path + size + mtime + hash, from cc_meta.inputs).  Existing
+   entries with a DIFFERENT OK are preserved (the same source+flags can reach
+   different header sets via conditional includes / -I ordering); an entry with
+   the SAME OK is replaced (refreshes mtimes after a touch).  WARNINGS/WERRORS
+   are the object's stored counts (carried so a future manifest reader could
+   short-circuit; the authoritative copy is in the object header).  Atomic
+   publish.  No-op unless the manifest key is valid.  */
+static void
+cc_store_manifest (uint32_t warnings, uint32_t werrors)
+{
+  if (!cc_manifest_key_valid)
+    return;
+
+  /* A TU that probed __has_include / __has_include_next has an include closure
+     that is not a sound predictor for a pre-parse serve (a probed-but-not-
+     included header can appear without changing the closure).  Do NOT record a
+     manifest for it, so the fast-path never serves it; the object cache still
+     hits post-parse.  */
+  if (cc_tu_used_has_include)
+    {
+      cc_debug_line ("manifest-skip-has-include", cc_manifest_key_hex);
+      return;
+    }
+
+  char *man_path = cc_entry_path (cc_manifest_key_hex, /*make_dirs=*/true);
+
+  /* Read any existing manifest so we can preserve its other entries.  */
+  size_t old_len = 0;
+  unsigned char *old = cc_read_file (man_path, &old_len);
+  bool old_valid = (old
+		    && old_len >= CC_MANIFEST_HEADER_SIZE
+		    && memcmp (old + CC_MAN_OFF_MAGIC, CC_MANIFEST_MAGIC,
+			       CC_MAGIC_LEN) == 0
+		    && cc_get_u16 (old + CC_MAN_OFF_VERSION)
+			 == CC_MANIFEST_VERSION);
+
+  /* Build the new manifest: a fresh string area + entries blob.  We re-emit
+     preserved entries (rewriting their header paths into the new string area)
+     plus this TU's entry.  */
+  cc_blob strings = { NULL, 0, 0 };
+  cc_blob entries = { NULL, 0, 0 };
+  uint32_t entry_count = 0;
+
+  /* Helper lambda-style emit of one entry given OK + per-header arrays.  Done
+     inline (C++ here has no convenient closure over the blobs without a struct)
+     so we keep two code paths: preserved entries and the new entry.  */
+
+  /* (a) Preserve existing entries whose OK differs from ours.  */
+  if (old_valid)
+    {
+      uint32_t ocount = cc_get_u32 (old + CC_MAN_OFF_ENTRY_COUNT);
+      uint64_t ooff = cc_get_u64 (old + CC_MAN_OFF_ENTRIES_OFF);
+      uint64_t ocur = ooff;
+      for (uint32_t ei = 0; ei < ocount && ocur + 32 <= old_len; ei++)
+	{
+	  const unsigned char *ent = old + ocur;
+	  unsigned char ok_raw[20];
+	  memcpy (ok_raw, ent, 20);
+	  uint32_t ow = cc_get_u32 (ent + 20);
+	  uint32_t owe = cc_get_u32 (ent + 24);
+	  uint32_t hc = cc_get_u32 (ent + 28);
+	  uint64_t recs = ocur + 32;
+	  uint64_t recs_len = (uint64_t) hc * CC_MAN_HDR_REC_SIZE;
+	  if (recs + recs_len > old_len)
+	    break;
+	  /* Skip our own OK -- the fresh entry below supersedes it.  */
+	  if (memcmp (ok_raw, cc_key_raw, 20) == 0)
+	    {
+	      ocur = recs + recs_len;
+	      continue;
+	    }
+	  /* Re-emit this entry into the new blobs.  */
+	  unsigned char head[32];
+	  memcpy (head, ok_raw, 20);
+	  cc_put_u32 (head + 20, ow);
+	  cc_put_u32 (head + 24, owe);
+	  cc_put_u32 (head + 28, hc);
+	  cc_blob_append (&entries, head, 32);
+	  for (uint32_t hi = 0; hi < hc; hi++)
+	    {
+	      const unsigned char *rec = old + recs
+					 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+	      uint32_t opath = cc_get_u32 (rec + CC_MHR_OFF_PATH);
+	      const char *hpath = "";
+	      if ((uint64_t) opath + 4 <= old_len)
+		{
+		  uint32_t plen = cc_get_u32 (old + opath);
+		  if ((uint64_t) opath + 4 + plen + 1 <= old_len)
+		    hpath = (const char *) (old + opath + 4);
+		}
+	      uint32_t npath = cc_blob_add_string (&strings, hpath);
+	      unsigned char nrec[CC_MAN_HDR_REC_SIZE];
+	      cc_put_u32 (nrec + CC_MHR_OFF_PATH, npath);	/* rebased later */
+	      memcpy (nrec + CC_MHR_OFF_SIZE, rec + CC_MHR_OFF_SIZE, 8);
+	      memcpy (nrec + CC_MHR_OFF_MTIME, rec + CC_MHR_OFF_MTIME, 8);
+	      memcpy (nrec + CC_MHR_OFF_HASH, rec + CC_MHR_OFF_HASH, 20);
+	      cc_blob_append (&entries, nrec, CC_MAN_HDR_REC_SIZE);
+	    }
+	  entry_count++;
+	  ocur = recs + recs_len;
+	}
+    }
+  free (old);
+
+  /* (b) This TU's entry: OK + counts + the recorded include set.  */
+  {
+    unsigned char head[32];
+    memcpy (head, cc_key_raw, 20);
+    cc_put_u32 (head + 20, warnings);
+    cc_put_u32 (head + 24, werrors);
+    cc_put_u32 (head + 28, cc_meta.input_count);
+    cc_blob_append (&entries, head, 32);
+    for (unsigned i = 0; i < cc_meta.input_count; i++)
+      {
+	uint32_t npath = cc_blob_add_string (&strings, cc_meta.inputs[i].path);
+	unsigned char nrec[CC_MAN_HDR_REC_SIZE];
+	cc_put_u32 (nrec + CC_MHR_OFF_PATH, npath);		/* rebased later */
+	cc_put_u64 (nrec + CC_MHR_OFF_SIZE, cc_meta.inputs[i].size);
+	cc_put_u64 (nrec + CC_MHR_OFF_MTIME, cc_meta.inputs[i].mtime);
+	memcpy (nrec + CC_MHR_OFF_HASH, cc_meta.inputs[i].hash, 20);
+	cc_blob_append (&entries, nrec, CC_MAN_HDR_REC_SIZE);
+      }
+    entry_count++;
+  }
+
+  /* Layout: header -> entries -> string area.  Rebase every header record's
+     path offset (currently relative to the string area) to an absolute file
+     offset.  Walk the entries blob in lockstep with how we built it.  */
+  uint64_t entries_off = CC_MANIFEST_HEADER_SIZE;
+  uint64_t string_area_off = entries_off + entries.len;
+  {
+    uint64_t cur = 0;
+    for (uint32_t ei = 0; ei < entry_count; ei++)
+      {
+	uint32_t hc = cc_get_u32 (entries.data + cur + 28);
+	uint64_t recs = cur + 32;
+	for (uint32_t hi = 0; hi < hc; hi++)
+	  {
+	    unsigned char *rec = entries.data + recs
+				 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+	    uint32_t rel = cc_get_u32 (rec + CC_MHR_OFF_PATH);
+	    cc_put_u32 (rec + CC_MHR_OFF_PATH,
+			rel + (uint32_t) string_area_off);
+	  }
+	cur = recs + (uint64_t) hc * CC_MAN_HDR_REC_SIZE;
+      }
+  }
+
+  unsigned char mhdr[CC_MANIFEST_HEADER_SIZE];
+  memset (mhdr, 0, sizeof (mhdr));
+  memcpy (mhdr + CC_MAN_OFF_MAGIC, CC_MANIFEST_MAGIC, CC_MAGIC_LEN);
+  cc_put_u16 (mhdr + CC_MAN_OFF_VERSION, (uint16_t) CC_MANIFEST_VERSION);
+  cc_put_u16 (mhdr + CC_MAN_OFF_FLAGS, 0);
+  cc_put_u32 (mhdr + CC_MAN_OFF_ENTRY_COUNT, entry_count);
+  cc_put_u64 (mhdr + CC_MAN_OFF_ENTRIES_OFF, entries_off);
+
+  /* Assemble the whole manifest into one buffer and publish atomically.  The
+     manifest is NOT made read-only (it is rewritten as new sets appear).  */
+  size_t total = (size_t) string_area_off + strings.len;
+  unsigned char *buf = (unsigned char *) xmalloc (total ? total : 1);
+  memcpy (buf, mhdr, sizeof (mhdr));
+  if (entries.len)
+    memcpy (buf + entries_off, entries.data, entries.len);
+  if (strings.len)
+    memcpy (buf + string_area_off, strings.data, strings.len);
+
+  char *tmp = concat (man_path, ".tmpXXXXXX", NULL);
+  int fd = mkstemp (tmp);
+  bool ok = (fd >= 0);
+  FILE *dst = ok ? fdopen (fd, "wb") : NULL;
+  if (!dst && fd >= 0)
+    {
+      close (fd);
+      ok = false;
+    }
+  if (ok)
+    {
+      ok = (total == 0) || (fwrite (buf, 1, total, dst) == total);
+      if (fclose (dst) != 0)
+	ok = false;
+    }
+  if (ok)
+    {
+      if (rename (tmp, man_path) != 0)
+	unlink (tmp);
+      else
+	cc_debug_line ("manifest-store", cc_manifest_key_hex);
+    }
+  else if (fd >= 0)
+    unlink (tmp);
+
+  free (buf);
+  free (tmp);
+  free (entries.data);
+  free (strings.data);
+  free (man_path);
+}
+
 void
 compile_cache_store (void)
 {
@@ -1137,16 +1923,26 @@ compile_cache_store (void)
       return;
     }
 
-  /* The freshly produced assembly lives at asm_file_name and has been closed
-     by finalize() before we are called.  Slurp it.  */
-  size_t asm_len = 0;
-  unsigned char *asm_bytes = cc_read_file (asm_file_name, &asm_len);
-  if (!asm_bytes)
+  /* The freshly produced OBJECT (.o) lives at asm_file_name: under
+     -fintegrated-as (required, gating check #10) finalize() ran
+     gas_assemble_buffer (integ_obj_path == asm_file_name) before we are
+     called, so asm_file_name holds the finished .o.  Slurp it; it becomes the
+     cache payload, stored as a sidecar (DIR/ab/rest.o) so a hit can hardlink
+     it instead of copying.  */
+  size_t obj_len = 0;
+  unsigned char *obj_bytes = cc_read_file (asm_file_name, &obj_len);
+  if (!obj_bytes)
     {
       free (diag_bytes);
       cc_meta_clear ();
       return;
     }
+
+  /* Did the front end / parse emit any diagnostics?  If so, flag the object so
+     the pre-parse manifest fast-path never serves it (it would skip the parse
+     that re-emits those).  cc_fe_* were snapshotted when the back-end capture
+     started, i.e. after the parse.  */
+  bool had_fe_diag = (cc_fe_warnings > 0 || cc_fe_werrors > 0);
 
   /* Build the string area: the 5 header strings, then every input path.  The
      per-input path offsets are captured for the inputs table.  */
@@ -1163,13 +1959,15 @@ compile_cache_store (void)
   for (unsigned i = 0; i < cc_meta.input_count; i++)
     path_offs[i] = cc_blob_add_string (&strings, cc_meta.inputs[i].path);
 
-  /* Section layout: header -> inputs table -> string area -> asm -> diag.
-     The string offsets above are relative to the string area; rebase them to
-     absolute file offsets now that the area's position is known.  */
+  /* Section layout: header -> inputs table -> string area -> (empty asm) ->
+     diag.  The .o is NOT embedded -- it goes to the sidecar -- so the ASM
+     section is empty (len 0).  The string offsets above are relative to the
+     string area; rebase them to absolute file offsets now.  */
   uint64_t inputs_off = CC_HEADER_SIZE;
   uint64_t inputs_size = (uint64_t) cc_meta.input_count * CC_INPUT_REC_SIZE;
   uint64_t string_area_off = inputs_off + inputs_size;
   uint64_t asm_off = string_area_off + strings.len;
+  uint64_t asm_len = 0;			/* payload is the sidecar, not here */
   uint64_t diag_off = asm_off + asm_len;
 
   source_off += (uint32_t) string_area_off;
@@ -1185,11 +1983,12 @@ compile_cache_store (void)
   memset (hdr, 0, sizeof (hdr));
   memcpy (hdr + CC_OFF_MAGIC, CC_MAGIC, CC_MAGIC_LEN);
   cc_put_u16 (hdr + CC_OFF_FORMAT_VER, (uint16_t) CC_FORMAT_VERSION);
-  cc_put_u16 (hdr + CC_OFF_FLAGS, 0);
+  cc_put_u16 (hdr + CC_OFF_FLAGS,
+	      (uint16_t) (had_fe_diag ? CC_FLAG_HAD_FE_DIAG : 0));
   cc_put_u32 (hdr + CC_OFF_INPUT_COUNT, cc_meta.input_count);
   cc_put_u64 (hdr + CC_OFF_CREATED, (uint64_t) time (NULL));
   cc_put_u64 (hdr + CC_OFF_ASM_OFF, asm_off);
-  cc_put_u64 (hdr + CC_OFF_ASM_LEN, (uint64_t) asm_len);
+  cc_put_u64 (hdr + CC_OFF_ASM_LEN, asm_len);
   cc_put_u64 (hdr + CC_OFF_DIAG_OFF, diag_off);
   cc_put_u64 (hdr + CC_OFF_DIAG_LEN, (uint64_t) diag_len);
   cc_put_u64 (hdr + CC_OFF_INPUTS_OFF, inputs_off);
@@ -1217,7 +2016,7 @@ compile_cache_store (void)
 	}
     }
 
-  /* Write everything to a temp file in the shard dir, then atomic-rename.  */
+  /* Write the .bin metadata object to a temp file, then atomic-rename.  */
   char *final_path = cc_entry_path (cc_key_hex, /*make_dirs=*/true);
   char *tmp_path = concat (final_path, ".tmpXXXXXX", NULL);
   int tfd = mkstemp (tmp_path);
@@ -1237,22 +2036,35 @@ compile_cache_store (void)
 	      == (size_t) inputs_size);
       if (ok && strings.len)
 	ok = (fwrite (strings.data, 1, strings.len, dst) == strings.len);
-      if (ok && asm_len)
-	ok = (fwrite (asm_bytes, 1, asm_len, dst) == asm_len);
       if (ok && diag_len)
 	ok = (fwrite (diag_bytes, 1, diag_len, dst) == diag_len);
       if (fclose (dst) != 0)
 	ok = false;
     }
 
+  /* Write the sidecar .o (read-only) and publish both atomically.  The object
+     is only usable if BOTH the .bin and the .o land; write the sidecar first,
+     then the .bin, so a reader that sees the .bin can rely on the .o.  */
   if (ok)
     {
-      /* Atomic publish.  If another process won the race the rename simply
-	 replaces an identical-keyed entry; harmless.  */
+      char *sidecar = cc_object_sidecar_path (final_path);
+      ok = cc_write_atomic_readonly (sidecar, obj_bytes, obj_len);
+      free (sidecar);
+    }
+
+  if (ok)
+    {
+      /* Atomic publish of the .bin.  If another process won the race the
+	 rename simply replaces an identical-keyed entry; harmless.  */
       if (rename (tmp_path, final_path) != 0)
 	unlink (tmp_path);
       else
-	cc_debug_line ("store", cc_key_hex);
+	{
+	  cc_debug_line ("store", cc_key_hex);
+	  /* Record/refresh the manifest entry so a future run of the SAME
+	     source can serve this object BEFORE parsing.  */
+	  cc_store_manifest (warnings, errors);
+	}
     }
   else if (tfd >= 0)
     unlink (tmp_path);
@@ -1260,7 +2072,7 @@ compile_cache_store (void)
   free (intab);
   free (path_offs);
   free (strings.data);
-  free (asm_bytes);
+  free (obj_bytes);
   free (diag_bytes);
   free (tmp_path);
   free (final_path);

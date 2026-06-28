@@ -2038,12 +2038,18 @@ finalize ()
      whether fclose returns an error, since the pages might still be on the
      buffer chain while the file is open.  */
 
-  if (asm_out_file && flag_integrated_as)
+  if (asm_out_file && flag_integrated_as && !compile_cache_hit_p ())
     {
       /* asm_out_file is an open_memstream: closing it flushes the captured
 	 assembly into integ_asm_buf/integ_asm_size, which we then hand to the
 	 built-in assembler to write the object directly.  Do NOT take the
-	 normal text-file close path below for this stream.  */
+	 normal text-file close path below for this stream.
+
+	 On a compilation-cache HIT this branch is skipped entirely: the serve
+	 path already placed the cached .o at integ_obj_path and closed the
+	 (empty) memstream, setting asm_out_file = NULL -- so there is nothing
+	 to assemble.  The explicit compile_cache_hit_p () guard makes that
+	 intent clear and is defensive should the memstream ever survive.  */
       if (ferror (asm_out_file) != 0)
 	fatal_error (input_location,
 		     "error writing in-memory assembly stream: %m");

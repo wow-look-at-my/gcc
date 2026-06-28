@@ -1481,6 +1481,12 @@ typedef bool (*cpp_included_file_cb) (const char *path,
 extern bool cpp_foreach_included_file (cpp_reader *,
 				       cpp_included_file_cb, void *);
 
+/* True if __has_include / __has_include_next was evaluated during this TU.
+   The in-compiler cache uses this to bypass its pre-parse manifest fast-path
+   for such TUs (a header probed by __has_include but never #include'd is not
+   in the include closure, so the manifest cannot notice it appearing).  */
+extern bool cpp_used_has_include (cpp_reader *);
+
 extern void cpp_make_system_header (cpp_reader *, int, int);
 extern bool cpp_push_include (cpp_reader *, const char *);
 extern bool cpp_push_default_include (cpp_reader *, const char *);
