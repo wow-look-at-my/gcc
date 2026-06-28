@@ -1289,7 +1289,9 @@ static const char *cc1_options =
  %{-target-help:--target-help}\
  %{-version:--version}\
  %{-help=*:--help=%*}\
- %{!fsyntax-only:%{S:%W{o*}%{!o*:-o %w%b.s}}}\
+ %{!fsyntax-only:\
+   %{S:-fasm-output-only %W{o*}%{!o*:-o %w%b.s}}\
+   %{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}}\
  %{fsyntax-only:-o %j} %{-param*}\
  %{coverage:-fprofile-arcs -ftest-coverage}\
  %{fprofile-arcs|fcondition-coverage|fprofile-generate*|coverage:\
@@ -1307,18 +1309,19 @@ static const char *asm_options =
 ASM_COMPRESS_DEBUG_SPEC
 "%a %Y %{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}";
 
+/* Integrated assembler: cc1plus assembles in-process via libgas, so there is
+   no separate `as` stage.  The object's -o name is handed to cc1plus by
+   cc1_options (the %{!S:...%O} arm), and cc1plus writes the object directly.
+   This spec therefore emits no ` | as` pipeline at all -- the compile-to-object
+   is a single process.  The compare-debug dump-opt hook is kept because it
+   rewrites cc1's own -o dump naming and must still run.  This fold is
+   unconditional and permanent: there is no -fno- form and no fork-`as`
+   fallback for a compile.  (Hand-written .s inputs still use `as`; that is a
+   separate spec, see the assembler_spec/@assembler path, and is left alone.)  */
 static const char *invoke_as =
-#ifdef AS_NEEDS_DASH_FOR_PIPED_INPUT
 "%{!fwpa*:\
    %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
-   %{!S:-o %|.s |\n as %(asm_options) %|.s %A }\
   }";
-#else
-"%{!fwpa*:\
-   %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
-   %{!S:-o %|.s |\n as %(asm_options) %m.s %A }\
-  }";
-#endif
 
 /* Some compilers have limits on line lengths, and the multilib_select
    and/or multilib_matches strings can be very long, so we build them at

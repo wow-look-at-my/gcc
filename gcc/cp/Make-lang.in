@@ -140,10 +140,21 @@ cc1plus-checksum.cc : build/genchecksum$(build_exeext) checksum-options \
 	  $(srcdir)/../move-if-change cc1plus-checksum.cc.tmp cc1plus-checksum.cc; \
 	fi
 
-cc1plus$(exeext): $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(LIBDEPS) $(c++.prev)
+# Integrated assembler (single-process compile-to-object fold): the carved gas
+# library plus its bfd/opcodes/sframe co-link dependencies.  The collision set
+# (text_section/data_section/bss_section) is objcopy-prefixed to gas_* in
+# libgas-prefixed.a so it does not clash with GCC's varasm definitions.  Listed
+# BEFORE $(LIBS)/$(BACKENDLIBS) so gas's zlib/libiberty references resolve
+# against the copies GCC already links.  Absolute paths for this prototype.
+LIBGAS = /home/user/libgas/libgas-prefixed.a \
+	/home/user/binutils-src/opcodes/.libs/libopcodes.a \
+	/home/user/binutils-src/bfd/.libs/libbfd.a \
+	/home/user/binutils-src/libsframe/.libs/libsframe.a
+
+cc1plus$(exeext): $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(LIBGAS) $(CODYLIB) $(LIBDEPS) $(c++.prev)
 	@$(call LINK_PROGRESS,$(INDEX.c++),start)
 	+$(LLINKER) $(ALL_LINKERFLAGS) $(LDFLAGS) -o $@ \
-	      $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(NETLIBS) \
+	      $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(LIBGAS) $(CODYLIB) $(NETLIBS) \
 		$(LIBS) $(BACKENDLIBS)
 	@$(call LINK_PROGRESS,$(INDEX.c++),end)
 

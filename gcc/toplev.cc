@@ -49,6 +49,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "insn-attr.h"
 #include "output.h"
 #include "toplev.h"
+#include "integrated-as.h"
 #include "expr.h"
 #include "intl.h"
 #include "tree-diagnostic.h"
@@ -163,6 +164,15 @@ const char *user_label_prefix;
    and debugging dumps.  */
 
 FILE *asm_out_file;
+
+/* When assembling in-process (the integrated-assembler fold), asm_out_file is
+   an open_memstream() handle and these capture the buffer it writes into.
+   After fclose(asm_out_file) they hold the complete assembly text, which is
+   then handed to gas_assemble_buffer() to produce the object file (or, for
+   -S, written to the .s output and not assembled).  */
+static char *asm_mem_buf;
+static size_t asm_mem_size;
+
 FILE *aux_info_file;
 FILE *callgraph_info_file = NULL;
 static bitmap callgraph_info_external_printed;
@@ -704,9 +714,17 @@ init_asm_output (const char *name)
 	}
       if (!strcmp (asm_file_name, "-"))
 	asm_out_file = stdout;
-      else if (!canonical_filename_eq (asm_file_name, name)
-	       || !strcmp (asm_file_name, HOST_BIT_BUCKET))
+      else if (!strcmp (asm_file_name, HOST_BIT_BUCKET))
+	/* -fsyntax-only and friends: keep writing to the bit bucket; no
+	   object is produced and the integrated assembler is not invoked.  */
 	asm_out_file = fopen (asm_file_name, "w");
+      else if (!canonical_filename_eq (asm_file_name, name))
+	/* Real output.  Build the assembly into an in-memory buffer instead of
+	   writing it straight to a file.  At finalize() the buffer is either
+	   handed to the integrated assembler to produce the object file, or
+	   (when emitting assembly only, -S) written verbatim to asm_file_name.
+	   This is the seam that lets a compile-to-object run in one process.  */
+	asm_out_file = open_memstream (&asm_mem_buf, &asm_mem_size);
       else
 	/* Use UNKOWN_LOCATION to prevent gcc from printing the first
 	   line in the current file. */
@@ -2008,11 +2026,50 @@ finalize ()
 
   if (asm_out_file)
     {
+      bool used_memstream = (asm_out_file != stdout && asm_mem_buf != NULL);
       if (ferror (asm_out_file) != 0)
 	fatal_error (input_location, "error writing to %s: %m", asm_file_name);
+      /* Closing the memstream flushes the assembly text into asm_mem_buf and
+	 sets asm_mem_size to its length.  */
       if (fclose (asm_out_file) != 0)
 	fatal_error (input_location, "error closing %s: %m", asm_file_name);
       asm_out_file = NULL;
+
+      if (used_memstream)
+	{
+	  if (flag_asm_output_only)
+	    {
+	      /* The user asked for -S: emit the assembly text verbatim to the
+		 .s output file and do not assemble it.  Preserves `gcc -S`.  */
+	      FILE *sf = fopen (asm_file_name, "w");
+	      if (sf == NULL)
+		fatal_error (input_location,
+			     "cannot open %qs for writing: %m", asm_file_name);
+	      if (asm_mem_size != 0
+		  && fwrite (asm_mem_buf, 1, asm_mem_size, sf) != asm_mem_size)
+		fatal_error (input_location,
+			     "error writing to %s: %m", asm_file_name);
+	      if (fclose (sf) != 0)
+		fatal_error (input_location,
+			     "error closing %s: %m", asm_file_name);
+	    }
+	  else if (!seen_error ())
+	    {
+	      /* Compile-to-object: assemble the buffered text in-process,
+		 writing the object straight to asm_file_name (the .o path the
+		 driver handed us).  No forked `as`, no temporary .s file.  */
+	      int rc = gas_assemble_buffer (asm_mem_buf, asm_mem_size,
+					    asm_file_name, NULL);
+	      if (rc != 0)
+		fatal_error (input_location,
+			     "integrated assembler failed on %qs (code %d)",
+			     asm_file_name, rc);
+	    }
+
+	  free (asm_mem_buf);
+	  asm_mem_buf = NULL;
+	  asm_mem_size = 0;
+	}
     }
 
   if (stack_usage_file)
