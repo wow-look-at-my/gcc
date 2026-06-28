@@ -140,11 +140,29 @@ cc1plus-checksum.cc : build/genchecksum$(build_exeext) checksum-options \
 	  $(srcdir)/../move-if-change cc1plus-checksum.cc.tmp cc1plus-checksum.cc; \
 	fi
 
-cc1plus$(exeext): $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(LIBDEPS) $(c++.prev)
+# -fintegrated-as: the built-in assembler (gas/embed.c) is shipped in libgas.a
+# alongside libbfd/libopcodes/libsframe, all built in the combined tree.  They
+# are linked ONLY into cc1plus (not added to OBJS/BACKEND).  The four archives
+# plus libiberty have mutual dependencies, so they are wrapped in a linker
+# --start-group to make resolution order-independent.  Paths are relative to
+# the gcc build subdir (CWD of this rule): ../gas, ../bfd/.libs, etc. are the
+# sibling combined-tree build dirs; libgas.a is built by
+# contrib/gas-embed/build-libgas.sh into the top of the build tree (../libgas.a).
+GAS_BUILD = ..
+GAS_LIBS = -Wl,--start-group \
+	   $(GAS_BUILD)/libgas.a \
+	   $(GAS_BUILD)/bfd/.libs/libbfd.a \
+	   $(GAS_BUILD)/opcodes/libopcodes.a \
+	   $(GAS_BUILD)/libsframe/.libs/libsframe.a \
+	   ../libiberty/libiberty.a \
+	   -Wl,--end-group $(ZLIB)
+GAS_DEPS = $(GAS_BUILD)/libgas.a
+
+cc1plus$(exeext): $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(LIBDEPS) $(GAS_DEPS) $(c++.prev)
 	@$(call LINK_PROGRESS,$(INDEX.c++),start)
 	+$(LLINKER) $(ALL_LINKERFLAGS) $(LDFLAGS) -o $@ \
 	      $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(NETLIBS) \
-		$(LIBS) $(BACKENDLIBS)
+		$(LIBS) $(BACKENDLIBS) $(GAS_LIBS)
 	@$(call LINK_PROGRESS,$(INDEX.c++),end)
 
 ifeq ($(ENABLE_MAINTAINER_RULES), true)

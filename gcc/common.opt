@@ -2042,6 +2042,10 @@ finstrument-functions-exclude-file-list=
 Common RejectNegative Joined
 -finstrument-functions-exclude-file-list=filename,...	Do not instrument functions listed in files.
 
+fintegrated-as
+Common Var(flag_integrated_as) Init(0)
+Assemble in-process with the built-in assembler instead of invoking as.
+
 fipa-cp
 Common Var(flag_ipa_cp) Optimization
 Perform interprocedural constant propagation.
