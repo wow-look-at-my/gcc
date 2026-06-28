@@ -49,6 +49,10 @@
 #  endif
 # endif
 #endif
+#if defined (HAVE_MMAP_FILE) || defined (HAVE_SYS_MMAN_H) || defined (__linux__)
+# include <sys/mman.h>
+# define CCS_HAVE_MMAP 1
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* Small helpers (self-contained: no compiler globals)                      */
@@ -306,8 +310,15 @@ ccs_compute_manifest_key (const cc_serve_ctx *ctx, const char *src_path,
 		      o->canonical_option[k]);
     }
 
-  /* (S) The main source file's exact bytes.  */
-  ccs_hash_component (&ctx_sha, CC_TAG_SRC_BODY, src, src_len);
+  /* (S) The main source file's exact bytes.  Fingerprinted with the fast
+     128-bit hash (cc_fast128) and the fingerprint folded into MK's SHA-1, so
+     the multi-megabyte body is hashed once at several GB/s instead of through
+     SHA-1.  MUST match cc1plus's cc_compute_manifest_key.  */
+  {
+    unsigned char fp[16];
+    cc_fast128 (src, src_len, fp);
+    ccs_hash_component (&ctx_sha, CC_TAG_SRC_BODY, fp, sizeof (fp));
+  }
 
   unsigned char raw[20];
   sha1_finish_ctx (&ctx_sha, raw);
@@ -511,19 +522,53 @@ compile_cache_serve_object (const cc_serve_ctx *ctx, const char *src_path,
       || !out_path || !out_path[0])
     return false;
 
-  /* Read the main source bytes once (no preprocess, no parse).  */
+  /* Map (or read) the main source bytes once for hashing -- no preprocess, no
+     parse.  mmap avoids a multi-megabyte malloc+copy of a preprocessed .ii and
+     is the bulk of a warm hit's cost; cc_fast128 then fingerprints it at
+     several GB/s (see ccs_compute_manifest_key).  */
   size_t src_len = 0;
-  unsigned char *src = ccs_read_file (src_path, &src_len);
+  unsigned char *src = NULL;
+  bool src_mapped = false;
+#ifdef CCS_HAVE_MMAP
+  {
+    int sfd = open (src_path, O_RDONLY);
+    if (sfd >= 0)
+      {
+	struct stat st;
+	if (fstat (sfd, &st) == 0 && S_ISREG (st.st_mode) && st.st_size > 0)
+	  {
+	    void *m = mmap (NULL, (size_t) st.st_size, PROT_READ, MAP_PRIVATE,
+			    sfd, 0);
+	    if (m != MAP_FAILED)
+	      {
+		src = (unsigned char *) m;
+		src_len = (size_t) st.st_size;
+		src_mapped = true;
+	      }
+	  }
+	close (sfd);
+      }
+  }
+#endif
   if (!src)
-    return false;
+    {
+      /* Fallback (mmap unavailable, or an empty source -- ccs_read_file yields
+	 a 1-byte buffer with len 0 for an empty file, NULL only on error).  */
+      src = ccs_read_file (src_path, &src_len);
+      if (!src)
+	return false;
+    }
 
   char mk_hex[41];
-  if (!ccs_compute_manifest_key (ctx, src_path, src, src_len, mk_hex))
-    {
-      free (src);
-      return false;
-    }
-  free (src);
+  bool mk_ok = ccs_compute_manifest_key (ctx, src_path, src, src_len, mk_hex);
+#ifdef CCS_HAVE_MMAP
+  if (src_mapped)
+    munmap (src, src_len);
+  else
+#endif
+    free (src);
+  if (!mk_ok)
+    return false;
 
   char *man_path = ccs_entry_path (ctx->cache_dir, mk_hex);
   size_t mlen = 0;

@@ -189,4 +189,112 @@ cc_hex (const unsigned char raw[20], char out[41])
   out[40] = '\0';
 }
 
+/* ------------------------------------------------------------------------ */
+/* Fast 128-bit content fingerprint (for the MANIFEST key's bulk source body) */
+/* ------------------------------------------------------------------------ */
+
+/* The manifest key MK must hash the entire (possibly multi-megabyte,
+   preprocessed) source body, and it is computed BOTH by cc1plus (store +
+   pre-parse serve) and by the driver (no-spawn serve) -- so a warm hit's wall
+   time is dominated by hashing that body, and SHA-1 (~0.5 GB/s here) is the
+   bottleneck.  MK is only a LOOKUP INDEX: a collision causes a manifest miss
+   (fall through to a real compile), never a wrong answer -- the object key OK
+   is still a full SHA-1 content address and every recorded header is verified
+   on a hit.  So the body may be fingerprinted with a fast non-cryptographic
+   hash and that fingerprint folded into MK's SHA-1, keeping MK 160-bit and
+   collision-safe while hashing the bulk bytes several times faster.
+
+   cc_fast128 is a single-pass 128-bit hash (two independent xxHash-style
+   64-bit lanes, avalanche-finalized).  It MUST be byte-for-byte identical on
+   the driver and in cc1plus -- it lives here, static inline, so both compile
+   the same code.  Do not "optimize" one copy.  */
+
+static inline uint64_t
+cc_f128_rotl (uint64_t x, int r)
+{
+  return (x << r) | (x >> (64 - r));
+}
+
+static inline uint64_t
+cc_f128_read64 (const unsigned char *p)
+{
+  /* memcpy compiles to a single unaligned 64-bit load; the byte-order is
+     native, which is fine because cc_fast128 is only ever compared against
+     itself (and MK already folds in the compiler checksum, so a cache is never
+     shared across architectures).  Both the driver and cc1plus compile this
+     identical inline, so they agree on the same machine.  */
+  uint64_t v;
+  memcpy (&v, p, sizeof (v));
+  return v;
+}
+
+static inline uint64_t
+cc_f128_mix (uint64_t h, uint64_t k)
+{
+  const uint64_t P1 = 0x9E3779B185EBCA87ULL;
+  const uint64_t P2 = 0xC2B2AE3D27D4EB4FULL;
+  k *= P2;
+  k = cc_f128_rotl (k, 31);
+  k *= P1;
+  h ^= k;
+  h = cc_f128_rotl (h, 27);
+  h = h * 5 + 0x52DCE729ULL;
+  return h;
+}
+
+static inline uint64_t
+cc_f128_avalanche (uint64_t h)
+{
+  h ^= h >> 33;
+  h *= 0xFF51AFD7ED558CCDULL;
+  h ^= h >> 33;
+  h *= 0xC4CEB9FE1A85EC53ULL;
+  h ^= h >> 33;
+  return h;
+}
+
+/* Fingerprint LEN bytes at DATA into OUT[16] (little-endian: lane0 then
+   lane1).  */
+static inline void
+cc_fast128 (const void *data, size_t len, unsigned char out[16])
+{
+  const unsigned char *p = (const unsigned char *) data;
+  const unsigned char *end = p + len;
+  uint64_t h1 = 0x9E3779B185EBCA87ULL ^ (uint64_t) len;
+  uint64_t h2 = 0xC2B2AE3D27D4EB4FULL + (uint64_t) len;
+
+  while (end - p >= 16)
+    {
+      h1 = cc_f128_mix (h1, cc_f128_read64 (p));
+      h2 = cc_f128_mix (h2, cc_f128_read64 (p + 8));
+      p += 16;
+    }
+  if (end - p >= 8)
+    {
+      h1 = cc_f128_mix (h1, cc_f128_read64 (p));
+      p += 8;
+    }
+  /* Tail (< 8 bytes): pack remaining bytes into a word, fold into h2.  */
+  {
+    uint64_t t = 0;
+    int shift = 0;
+    while (p < end)
+      {
+	t |= (uint64_t) *p++ << shift;
+	shift += 8;
+      }
+    h2 = cc_f128_mix (h2, t);
+  }
+
+  h1 += h2;
+  h2 += h1;
+  h1 = cc_f128_avalanche (h1);
+  h2 = cc_f128_avalanche (h2);
+
+  for (int i = 0; i < 8; i++)
+    out[i] = (unsigned char) (h1 >> (8 * i));
+  for (int i = 0; i < 8; i++)
+    out[8 + i] = (unsigned char) (h2 >> (8 * i));
+}
+
 #endif /* GCC_COMPILE_CACHE_FORMAT_H */

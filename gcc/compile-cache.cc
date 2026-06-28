@@ -882,10 +882,17 @@ cc_compute_manifest_key (const char *src_path)
 		     o->canonical_option[k]);
     }
 
-  /* (S) The main source file's exact bytes.  This is the heart of MK: it is
-     what makes the manifest re-usable across runs of the SAME source without
-     a parse.  */
-  cc_hash_component (&ctx, CC_TAG_SRC_BODY, src, src_len);
+  /* (S) The main source file's exact bytes -- the heart of MK.  Fingerprinted
+     with the fast 128-bit cc_fast128 and folded into MK's SHA-1 (see the long
+     note in compile-cache-format.h): MK is a lookup index, so a fingerprint
+     collision only yields a manifest miss, never a wrong serve.  This MUST stay
+     byte-identical to the driver's ccs_compute_manifest_key, or the driver-
+     level no-spawn serve never hits.  */
+  {
+    unsigned char fp[16];
+    cc_fast128 (src, src_len, fp);
+    cc_hash_component (&ctx, CC_TAG_SRC_BODY, fp, sizeof (fp));
+  }
   free (src);
 
   unsigned char raw[20];

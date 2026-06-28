@@ -5885,6 +5885,12 @@ driver_try_serve_from_cache (void)
   if (argbuf.length () < 1)
     return false;
 
+  /* Respect dry-run modes: -### (verbose_only_flag) prints commands without
+     running them, and -n (do nothing) likewise.  Serving (which writes the .o)
+     would violate the user's request, so fall through to the normal print.  */
+  if (verbose_only_flag)
+    return false;
+
   /* Only intercept the C/C++ compiler proper.  */
   const char *prog = lbasename (argbuf[0]);
   if (strcmp (prog, "cc1") != 0 && strcmp (prog, "cc1plus") != 0)
