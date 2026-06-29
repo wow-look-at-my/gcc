@@ -54,6 +54,15 @@
 # define CCS_HAVE_MMAP 1
 #endif
 
+/* The v3 per-object metadata lives in an xattr on the cache .o; fall back to
+   the .bin sidecar where xattrs are unavailable.  */
+#if defined (__has_include)
+# if __has_include (<sys/xattr.h>)
+#  include <sys/xattr.h>
+#  define CCS_HAVE_XATTR 1
+# endif
+#endif
+
 /* ------------------------------------------------------------------------ */
 /* Small helpers (self-contained: no compiler globals)                      */
 /* ------------------------------------------------------------------------ */
@@ -433,16 +442,66 @@ ccs_place_object (const char *cached_o, const char *dst)
 }
 
 /* ------------------------------------------------------------------------ */
+/* v3 metadata read (xattr on the cache .o, .bin sidecar fallback)          */
+/* ------------------------------------------------------------------------ */
+
+/* Read the CC_XATTR_META xattr from OBJ_PATH into a freshly xmalloc'd buffer;
+   set *LEN.  Returns NULL if absent/unreadable or xattrs are unavailable.
+   Byte-twin of compile-cache.cc's cc_get_meta_xattr ().  */
+static unsigned char *
+ccs_get_meta_xattr (const char *obj_path, size_t *len)
+{
+  *len = 0;
+#ifdef CCS_HAVE_XATTR
+  ssize_t n = getxattr (obj_path, CC_XATTR_META, NULL, 0);
+  if (n < 0)
+    return NULL;
+  unsigned char *buf = (unsigned char *) xmalloc ((size_t) n + 1);
+  ssize_t got = getxattr (obj_path, CC_XATTR_META, buf, (size_t) n);
+  if (got < 0)
+    {
+      free (buf);
+      return NULL;
+    }
+  buf[got] = '\0';
+  *len = (size_t) got;
+  return buf;
+#else
+  (void) obj_path;
+  return NULL;
+#endif
+}
+
+/* Decode a CC_META record + diag blob.  Byte-twin of cc_parse_meta ().  */
+static bool
+ccs_parse_meta (const unsigned char *meta, size_t mlen, uint16_t *flags,
+		const unsigned char **diag, size_t *diag_len)
+{
+  if (mlen < CC_META_REC_SIZE
+      || memcmp (meta + CC_META_OFF_MAGIC, CC_META_MAGIC, CC_MAGIC_LEN) != 0
+      || cc_get_u16 (meta + CC_META_OFF_VERSION) != CC_FORMAT_VERSION)
+    return false;
+  uint32_t dlen = cc_get_u32 (meta + CC_META_OFF_DIAG_LEN);
+  if ((uint64_t) dlen > mlen - CC_META_REC_SIZE)
+    return false;
+  *flags = cc_get_u16 (meta + CC_META_OFF_FLAGS);
+  *diag = dlen ? meta + CC_META_REC_SIZE : NULL;
+  *diag_len = dlen;
+  return true;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Object serve                                                             */
 /* ------------------------------------------------------------------------ */
 
-/* Read + validate the object .bin under OK_HEX, refuse it if it carries
-   front-end diagnostics (the serve path skips the parse that would re-emit
-   them), place its sidecar .o at OUT_PATH, and replay any recorded back-end
-   diagnostics to stderr.  Returns true on a served hit.  This is the
-   driver-safe twin of compile-cache.cc's cc_serve_from_bin (), minus the
+/* Read + validate the v3 metadata for the object keyed by OK_HEX (the
+   CC_XATTR_META xattr on the cache .o, or the minimal .bin sidecar fallback),
+   refuse it if it carries front-end diagnostics (the serve path skips the parse
+   that would re-emit them), place the cache .o at OUT_PATH, and replay any
+   recorded back-end diagnostics to stderr.  Returns true on a served hit.  This
+   is the driver-safe twin of compile-cache.cc's cc_serve_from_bin (), minus the
    global_dc count folding (the serve unit has no diagnostic context; counts
-   live in the object header and are irrelevant to a process that emits no new
+   live in the metadata and are irrelevant to a process that emits no new
    diagnostics and exits 0 -- a TU with -Werror promotions had front-end diags
    and is refused above, and a back-end-only warning count does not change exit
    status on a hit with no errors).  */
@@ -451,26 +510,20 @@ ccs_serve_from_bin (const cc_serve_ctx *ctx, const char *ok_hex,
 		    const char *out_path, const char *debug_action)
 {
   char *bin_path = ccs_entry_path (ctx->cache_dir, ok_hex);
-  size_t flen = 0;
-  unsigned char *file = ccs_read_file (bin_path, &flen);
+  char *obj_path = ccs_object_sidecar_path (bin_path);
 
-  if (!file
-      || flen < CC_HEADER_SIZE
-      || memcmp (file + CC_OFF_MAGIC, CC_MAGIC, CC_MAGIC_LEN) != 0
-      || cc_get_u16 (file + CC_OFF_FORMAT_VER) != CC_FORMAT_VERSION)
+  size_t mlen = 0;
+  unsigned char *meta = ccs_get_meta_xattr (obj_path, &mlen);
+  if (!meta)
+    meta = ccs_read_file (bin_path, &mlen);
+
+  uint16_t flags = 0;
+  const unsigned char *diag = NULL;
+  size_t diag_len = 0;
+  if (!meta || !ccs_parse_meta (meta, mlen, &flags, &diag, &diag_len))
     {
-      free (file);
-      free (bin_path);
-      return false;
-    }
-
-  uint64_t diag_off = cc_get_u64 (file + CC_OFF_DIAG_OFF);
-  uint64_t diag_len = cc_get_u64 (file + CC_OFF_DIAG_LEN);
-  uint16_t flags = cc_get_u16 (file + CC_OFF_FLAGS);
-
-  if (diag_off > flen || diag_len > flen - diag_off)
-    {
-      free (file);
+      free (meta);
+      free (obj_path);
       free (bin_path);
       return false;
     }
@@ -479,18 +532,18 @@ ccs_serve_from_bin (const cc_serve_ctx *ctx, const char *ok_hex,
      would silently drop.  */
   if (flags & CC_FLAG_HAD_FE_DIAG)
     {
-      free (file);
+      free (meta);
+      free (obj_path);
       free (bin_path);
       return false;
     }
 
-  char *sidecar = ccs_object_sidecar_path (bin_path);
-  bool placed = ccs_place_object (sidecar, out_path);
-  free (sidecar);
+  bool placed = ccs_place_object (obj_path, out_path);
+  free (obj_path);
   free (bin_path);
   if (!placed)
     {
-      free (file);
+      free (meta);
       return false;
     }
 
@@ -499,11 +552,11 @@ ccs_serve_from_bin (const cc_serve_ctx *ctx, const char *ok_hex,
   if (diag_len)
     {
       fflush (stdout);
-      fwrite (file + diag_off, 1, (size_t) diag_len, stderr);
+      fwrite (diag, 1, diag_len, stderr);
       fflush (stderr);
     }
 
-  free (file);
+  free (meta);
   ccs_debug_line (ctx, debug_action, ok_hex, out_path);
   return true;
 }

@@ -35,8 +35,44 @@
 
 #define CC_MAGIC      "GCCCACHE"		/* 8 bytes, no NUL stored */
 #define CC_MAGIC_LEN  8
-#define CC_FORMAT_VERSION  2u
+/* Version 3: the per-object ".bin" metadata sidecar is gone.  The cache object
+   is now the produced ".o" itself, hardlinked (reflink->hardlink->copy) into
+   the content-addressed path "DIR/<2hex>/<rest>.o".  The few fields a hit needs
+   (format version, flags, back-end warning/error counts, and the recorded
+   diagnostics blob) live in an extended attribute "user.gcc_cc.meta" on that
+   .o; the small "user.gcc_cc.v" xattr carries the format version on its own for
+   a cheap probe.  The old .bin's inputs table and header strings were
+   write-only at serve time (the object key is a full-closure SHA-1 content
+   address and the manifest keeps its own include set), so they were dropped.
+   A minimal .bin sidecar is still written ONLY as a per-entry fallback when the
+   filesystem rejects user xattrs (ENOTSUP / E2BIG); see CC_META_* below.  */
+#define CC_FORMAT_VERSION  3u
 #define CC_HEADER_SIZE     128u
+
+/* Extended-attribute names for the v3 metadata carried on the cache .o.  The
+   "user." namespace is the only one a normal (non-root, non-trusted) process
+   may set on a regular file.  */
+#define CC_XATTR_VERSION  "user.gcc_cc.v"	/* u16 LE format version */
+#define CC_XATTR_META     "user.gcc_cc.meta"	/* CC_META_* record + diag blob */
+
+/* Compact metadata record stored in the CC_XATTR_META xattr (and, on the
+   xattr-unsupported fallback path, as the body of a ".bin" sidecar).  It holds
+   exactly the fields a served hit consumes; the diagnostics blob (if any) is
+   appended immediately after the fixed record.  Kept tiny so it fits in a
+   single inode xattr (ext4 packs all of an inode's xattrs into ~one 4 KB
+   block).  */
+#define CC_META_MAGIC      "GCCCMETA"		/* 8 bytes, no NUL stored */
+#define CC_META_REC_SIZE   24u
+enum cc_meta_off
+{
+  CC_META_OFF_MAGIC    = 0,	/* char[8]  "GCCCMETA"              */
+  CC_META_OFF_VERSION  = 8,	/* u16      format_version           */
+  CC_META_OFF_FLAGS    = 10,	/* u16      flags (CC_FLAG_*)        */
+  CC_META_OFF_WARNINGS = 12,	/* u32      back-end warning count   */
+  CC_META_OFF_ERRORS   = 16,	/* u32      back-end error count     */
+  CC_META_OFF_DIAG_LEN = 20	/* u32      diagnostics blob length  */
+  /* diagnostics blob (DIAG_LEN bytes) follows at CC_META_REC_SIZE.  */
+};
 
 /* Manifest object (ccache-style "direct mode" index).  */
 #define CC_MANIFEST_MAGIC      "CCMANIFS"	/* 8 bytes, no NUL stored */

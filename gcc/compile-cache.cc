@@ -62,6 +62,16 @@ extern bool cc_option_is_search_path_p (const cl_decoded_option *decoded);
 # endif
 #endif
 
+/* Extended attributes carry the v3 per-object metadata on the cache .o.  When
+   the platform lacks <sys/xattr.h> the store falls back to the minimal .bin
+   sidecar and the serve reads it; CC_HAVE_XATTR gates the fast path.  */
+#if defined (__has_include)
+# if __has_include (<sys/xattr.h>)
+#  include <sys/xattr.h>
+#  define CC_HAVE_XATTR 1
+# endif
+#endif
+
 /* The compiler binary's own 16-byte fingerprint.  Each front-end compiler is
    linked with its own generated <binary>-checksum.o (cc1-checksum.o,
    cc1plus-checksum.o, ...) defining a strong "executable_checksum".  But this
@@ -1110,15 +1120,130 @@ cc_place_object (const char *cached_o, const char *dst)
   return ok;
 }
 
+/* ------------------------------------------------------------------------ */
+/* v3 metadata: xattr on the cache .o, with a minimal .bin fallback         */
+/* ------------------------------------------------------------------------ */
+
+/* Build the compact CC_META record (CC_META_REC_SIZE bytes) followed by the
+   DIAG_LEN-byte diagnostics blob into a freshly xmalloc'd buffer; set *OUT_LEN.
+   Caller frees.  This identical byte sequence is stored either in the
+   CC_XATTR_META xattr or, on the fallback path, as the body of the .bin
+   sidecar.  */
+static unsigned char *
+cc_build_meta (uint16_t flags, uint32_t warnings, uint32_t errors,
+	       const unsigned char *diag_bytes, size_t diag_len,
+	       size_t *out_len)
+{
+  size_t total = CC_META_REC_SIZE + diag_len;
+  unsigned char *buf = (unsigned char *) xmalloc (total ? total : 1);
+  memcpy (buf + CC_META_OFF_MAGIC, CC_META_MAGIC, CC_MAGIC_LEN);
+  cc_put_u16 (buf + CC_META_OFF_VERSION, (uint16_t) CC_FORMAT_VERSION);
+  cc_put_u16 (buf + CC_META_OFF_FLAGS, flags);
+  cc_put_u32 (buf + CC_META_OFF_WARNINGS, warnings);
+  cc_put_u32 (buf + CC_META_OFF_ERRORS, errors);
+  cc_put_u32 (buf + CC_META_OFF_DIAG_LEN, (uint32_t) diag_len);
+  if (diag_len)
+    memcpy (buf + CC_META_REC_SIZE, diag_bytes, diag_len);
+  *out_len = total;
+  return buf;
+}
+
+/* Decode a CC_META record + diag blob (META, MLEN bytes) into the fields a hit
+   needs.  Returns true if the record is structurally valid and is our version;
+   on success *DIAG points into META (no copy) and *DIAG_LEN is its length.  */
+static bool
+cc_parse_meta (const unsigned char *meta, size_t mlen, uint16_t *flags,
+	       uint32_t *warnings, uint32_t *errors,
+	       const unsigned char **diag, size_t *diag_len)
+{
+  if (mlen < CC_META_REC_SIZE
+      || memcmp (meta + CC_META_OFF_MAGIC, CC_META_MAGIC, CC_MAGIC_LEN) != 0
+      || cc_get_u16 (meta + CC_META_OFF_VERSION) != CC_FORMAT_VERSION)
+    return false;
+  uint32_t dlen = cc_get_u32 (meta + CC_META_OFF_DIAG_LEN);
+  if ((uint64_t) dlen > mlen - CC_META_REC_SIZE)
+    return false;			/* truncated diag blob -> reject */
+  *flags = cc_get_u16 (meta + CC_META_OFF_FLAGS);
+  *warnings = cc_get_u32 (meta + CC_META_OFF_WARNINGS);
+  *errors = cc_get_u32 (meta + CC_META_OFF_ERRORS);
+  *diag = dlen ? meta + CC_META_REC_SIZE : NULL;
+  *diag_len = dlen;
+  return true;
+}
+
+/* Attach the meta record (BUF, LEN bytes) to the cache object at OBJ_PATH as
+   the CC_XATTR_META xattr (plus a tiny CC_XATTR_VERSION probe).  Returns true
+   on success.  Sets *UNSUPPORTED true when the failure is "this filesystem
+   does not support user xattrs / the record does not fit" (ENOTSUP / E2BIG /
+   ENOSPC / EDQUOT), so the caller can fall back to a .bin sidecar for THIS
+   entry only.  Any other error is a hard failure (returns false, *UNSUPPORTED
+   false).  When built without <sys/xattr.h>, reports unsupported.  */
+static bool
+cc_set_meta_xattr (const char *obj_path, const unsigned char *buf, size_t len,
+		   bool *unsupported)
+{
+  *unsupported = false;
+#ifdef CC_HAVE_XATTR
+  unsigned char vbuf[2];
+  cc_put_u16 (vbuf, (uint16_t) CC_FORMAT_VERSION);
+  if (setxattr (obj_path, CC_XATTR_META, buf, len, 0) != 0
+      || setxattr (obj_path, CC_XATTR_VERSION, vbuf, sizeof (vbuf), 0) != 0)
+    {
+      if (errno == ENOTSUP || errno == EOPNOTSUPP || errno == E2BIG
+	  || errno == ENOSPC || errno == EDQUOT || errno == ERANGE)
+	*unsupported = true;
+      /* Clear a partial set so a later reader never sees a stale half-record.  */
+      removexattr (obj_path, CC_XATTR_META);
+      removexattr (obj_path, CC_XATTR_VERSION);
+      return false;
+    }
+  return true;
+#else
+  (void) obj_path; (void) buf; (void) len;
+  *unsupported = true;
+  return false;
+#endif
+}
+
+/* Read the CC_XATTR_META xattr from OBJ_PATH into a freshly xmalloc'd buffer;
+   set *LEN and return it (caller frees).  Returns NULL if the attribute is
+   absent/unreadable or xattrs are unavailable -- the caller then tries the
+   .bin fallback.  */
+static unsigned char *
+cc_get_meta_xattr (const char *obj_path, size_t *len)
+{
+  *len = 0;
+#ifdef CC_HAVE_XATTR
+  ssize_t n = getxattr (obj_path, CC_XATTR_META, NULL, 0);
+  if (n < 0)
+    return NULL;
+  unsigned char *buf = (unsigned char *) xmalloc ((size_t) n + 1);
+  ssize_t got = getxattr (obj_path, CC_XATTR_META, buf, (size_t) n);
+  if (got < 0)
+    {
+      free (buf);
+      return NULL;
+    }
+  buf[got] = '\0';
+  *len = (size_t) got;
+  return buf;
+#else
+  (void) obj_path;
+  return NULL;
+#endif
+}
+
 /* Core serve routine shared by the post-parse object-key path
    (compile_cache_try_serve) and the pre-parse manifest path
    (compile_cache_try_serve_manifest).  Given the object's hex key OK_HEX:
 
-     - read and validate "DIR/ab/rest.bin" (header magic/version + bounds);
+     - read and validate the v3 metadata for the object keyed by OK_HEX: the
+       CC_XATTR_META xattr on the cache object "DIR/ab/rest.o", or the minimal
+       ".bin" sidecar written on the xattr-unsupported fallback path;
      - if REQUIRE_NO_FE_DIAG and the object carries front-end diagnostics
        (CC_FLAG_HAD_FE_DIAG), refuse to serve (return false) -- the pre-parse
        path skips the parse that would re-emit them, so it must fall through;
-     - place the sidecar object "DIR/ab/rest.o" at asm_file_name via the
+     - place the cache object "DIR/ab/rest.o" at asm_file_name via the
        reflink->hardlink->copy ladder (cc_place_object);
      - close the in-memory asm stream (asm_out_file) WITHOUT assembling -- on a
        hit the memstream is empty and finalize() must not run gas on it (it is
@@ -1134,28 +1259,26 @@ cc_serve_from_bin (const char *ok_hex, bool require_no_fe_diag,
 		   const char *debug_action)
 {
   char *bin_path = cc_entry_path (ok_hex, /*make_dirs=*/false);
-  size_t flen = 0;
-  unsigned char *file = cc_read_file (bin_path, &flen);
+  char *obj_path = cc_object_sidecar_path (bin_path);
 
-  if (!file
-      || flen < CC_HEADER_SIZE
-      || memcmp (file + CC_OFF_MAGIC, CC_MAGIC, CC_MAGIC_LEN) != 0
-      || cc_get_u16 (file + CC_OFF_FORMAT_VER) != CC_FORMAT_VERSION)
+  /* The metadata lives in an xattr on the cache .o; fall back to the .bin
+     sidecar written when the filesystem rejected the xattr.  Either way it is
+     the same CC_META record + diag blob.  */
+  size_t mlen = 0;
+  unsigned char *meta = cc_get_meta_xattr (obj_path, &mlen);
+  if (!meta)
+    meta = cc_read_file (bin_path, &mlen);
+
+  uint16_t flags = 0;
+  uint32_t warnings = 0, errors = 0;
+  const unsigned char *diag = NULL;
+  size_t diag_len = 0;
+  if (!meta
+      || !cc_parse_meta (meta, mlen, &flags, &warnings, &errors,
+			 &diag, &diag_len))
     {
-      free (file);
-      free (bin_path);
-      return false;
-    }
-
-  uint64_t diag_off = cc_get_u64 (file + CC_OFF_DIAG_OFF);
-  uint64_t diag_len = cc_get_u64 (file + CC_OFF_DIAG_LEN);
-  uint32_t warnings = cc_get_u32 (file + CC_OFF_WARNINGS);
-  uint32_t errors = cc_get_u32 (file + CC_OFF_ERRORS);
-  uint16_t flags = cc_get_u16 (file + CC_OFF_FLAGS);
-
-  if (diag_off > flen || diag_len > flen - diag_off)
-    {
-      free (file);			/* structurally corrupt -> miss */
+      free (meta);
+      free (obj_path);
       free (bin_path);
       return false;
     }
@@ -1164,22 +1287,22 @@ cc_serve_from_bin (const char *ok_hex, bool require_no_fe_diag,
      diagnostics it would silently drop (it skipped the parse).  */
   if (require_no_fe_diag && (flags & CC_FLAG_HAD_FE_DIAG))
     {
-      free (file);
+      free (meta);
+      free (obj_path);
       free (bin_path);
       return false;
     }
 
-  /* Place the sidecar .o at the output.  The cache only runs under
+  /* Place the cache .o at the output.  The cache only runs under
      -fintegrated-as (gating check #10), so asm_file_name is the real .o path
      and asm_out_file is the (still-open, empty-on-a-hit) memstream.  */
-  char *sidecar = cc_object_sidecar_path (bin_path);
-  bool placed = cc_place_object (sidecar, asm_file_name);
-  free (sidecar);
+  bool placed = cc_place_object (obj_path, asm_file_name);
+  free (obj_path);
   free (bin_path);
   if (!placed)
     {
-      /* Sidecar missing/unreadable: treat as a miss and recompute.  */
-      free (file);
+      /* Object missing/unreadable: treat as a miss and recompute.  */
+      free (meta);
       return false;
     }
 
@@ -1200,7 +1323,7 @@ cc_serve_from_bin (const char *ok_hex, bool require_no_fe_diag,
   if (diag_len)
     {
       fflush (stdout);
-      fwrite (file + diag_off, 1, (size_t) diag_len, stderr);
+      fwrite (diag, 1, diag_len, stderr);
       fflush (stderr);
     }
   if (global_dc)
@@ -1209,7 +1332,7 @@ cc_serve_from_bin (const char *ok_hex, bool require_no_fe_diag,
       global_dc->diagnostic_count (DK_WERROR) += (int) errors;
     }
 
-  free (file);
+  free (meta);
   cc_hit = true;
   cc_debug_line (debug_action, ok_hex);
   return true;
@@ -1795,158 +1918,73 @@ compile_cache_store (void)
   /* The freshly produced OBJECT (.o) lives at asm_file_name: under
      -fintegrated-as (required, gating check #10) finalize() ran
      gas_assemble_buffer (integ_obj_path == asm_file_name) before we are
-     called, so asm_file_name holds the finished .o.  Slurp it; it becomes the
-     cache payload, stored as a sidecar (DIR/ab/rest.o) so a hit can hardlink
-     it instead of copying.  */
-  size_t obj_len = 0;
-  unsigned char *obj_bytes = cc_read_file (asm_file_name, &obj_len);
-  if (!obj_bytes)
-    {
-      free (diag_bytes);
-      cc_meta_clear ();
-      return;
-    }
+     called, so asm_file_name holds the finished .o.  In v3 we do NOT slurp it:
+     the cache object IS that .o, hardlinked (reflink->hardlink->copy) into the
+     content-addressed cache path so the store costs O(1) instead of a
+     read-into-memory + rewrite that scaled with object size.  */
 
   /* Did the front end / parse emit any diagnostics?  If so, flag the object so
      the pre-parse manifest fast-path never serves it (it would skip the parse
      that re-emits those).  cc_fe_* were snapshotted when the back-end capture
      started, i.e. after the parse.  */
   bool had_fe_diag = (cc_fe_warnings > 0 || cc_fe_werrors > 0);
+  uint16_t flags = (uint16_t) (had_fe_diag ? CC_FLAG_HAD_FE_DIAG : 0);
 
-  /* Build the string area: the 5 header strings, then every input path.  The
-     per-input path offsets are captured for the inputs table.  */
-  cc_blob strings = { NULL, 0, 0 };
-  uint32_t source_off = cc_blob_add_string (&strings, cc_meta.source);
-  uint32_t cwd_off = cc_blob_add_string (&strings, cc_meta.cwd);
-  uint32_t target_off = cc_blob_add_string (&strings, cc_meta.target);
-  uint32_t language_off = cc_blob_add_string (&strings, cc_meta.language);
-  uint32_t options_off = cc_blob_add_string (&strings, cc_meta.options);
+  /* Build the compact metadata record (the only fields a hit consumes) plus
+     the diagnostics blob.  No inputs table, no header strings: those were
+     write-only at serve time (the object key is a full-closure SHA-1 content
+     address; the manifest carries its own include set), so v3 drops them.  */
+  size_t meta_len = 0;
+  unsigned char *meta = cc_build_meta (flags, warnings, errors,
+				       diag_bytes, diag_len, &meta_len);
 
-  uint32_t *path_offs = NULL;
-  if (cc_meta.input_count)
-    path_offs = XNEWVEC (uint32_t, cc_meta.input_count);
-  for (unsigned i = 0; i < cc_meta.input_count; i++)
-    path_offs[i] = cc_blob_add_string (&strings, cc_meta.inputs[i].path);
+  /* Place the produced .o into the content-addressed cache slot
+     (DIR/<2hex>/<rest>.o) via reflink->hardlink->copy.  cc_entry_path makes the
+     shard dirs; the .o path is derived from it.  */
+  char *bin_path = cc_entry_path (cc_key_hex, /*make_dirs=*/true);
+  char *obj_path = cc_object_sidecar_path (bin_path);
+  bool ok = cc_place_object (asm_file_name, obj_path);
 
-  /* Section layout: header -> inputs table -> string area -> (empty asm) ->
-     diag.  The .o is NOT embedded -- it goes to the sidecar -- so the ASM
-     section is empty (len 0).  The string offsets above are relative to the
-     string area; rebase them to absolute file offsets now.  */
-  uint64_t inputs_off = CC_HEADER_SIZE;
-  uint64_t inputs_size = (uint64_t) cc_meta.input_count * CC_INPUT_REC_SIZE;
-  uint64_t string_area_off = inputs_off + inputs_size;
-  uint64_t asm_off = string_area_off + strings.len;
-  uint64_t asm_len = 0;			/* payload is the sidecar, not here */
-  uint64_t diag_off = asm_off + asm_len;
-
-  source_off += (uint32_t) string_area_off;
-  cwd_off += (uint32_t) string_area_off;
-  target_off += (uint32_t) string_area_off;
-  language_off += (uint32_t) string_area_off;
-  options_off += (uint32_t) string_area_off;
-  for (unsigned i = 0; i < cc_meta.input_count; i++)
-    path_offs[i] += (uint32_t) string_area_off;
-
-  /* Compose the fixed header.  */
-  unsigned char hdr[CC_HEADER_SIZE];
-  memset (hdr, 0, sizeof (hdr));
-  memcpy (hdr + CC_OFF_MAGIC, CC_MAGIC, CC_MAGIC_LEN);
-  cc_put_u16 (hdr + CC_OFF_FORMAT_VER, (uint16_t) CC_FORMAT_VERSION);
-  cc_put_u16 (hdr + CC_OFF_FLAGS,
-	      (uint16_t) (had_fe_diag ? CC_FLAG_HAD_FE_DIAG : 0));
-  cc_put_u32 (hdr + CC_OFF_INPUT_COUNT, cc_meta.input_count);
-  cc_put_u64 (hdr + CC_OFF_CREATED, (uint64_t) time (NULL));
-  cc_put_u64 (hdr + CC_OFF_ASM_OFF, asm_off);
-  cc_put_u64 (hdr + CC_OFF_ASM_LEN, asm_len);
-  cc_put_u64 (hdr + CC_OFF_DIAG_OFF, diag_off);
-  cc_put_u64 (hdr + CC_OFF_DIAG_LEN, (uint64_t) diag_len);
-  cc_put_u64 (hdr + CC_OFF_INPUTS_OFF, inputs_off);
-  cc_put_u32 (hdr + CC_OFF_WARNINGS, warnings);
-  cc_put_u32 (hdr + CC_OFF_ERRORS, errors);
-  memcpy (hdr + CC_OFF_KEY, cc_key_raw, 20);
-  memcpy (hdr + CC_OFF_CHECKSUM, executable_checksum, 16);
-  cc_put_u32 (hdr + CC_OFF_SOURCE_OFF, source_off);
-  cc_put_u32 (hdr + CC_OFF_CWD_OFF, cwd_off);
-  cc_put_u32 (hdr + CC_OFF_TARGET_OFF, target_off);
-  cc_put_u32 (hdr + CC_OFF_LANGUAGE_OFF, language_off);
-  cc_put_u32 (hdr + CC_OFF_OPTIONS_OFF, options_off);
-
-  /* Compose the inputs table (32 bytes each).  */
-  unsigned char *intab = NULL;
-  if (inputs_size)
+  /* Attach the metadata as an xattr on the cache .o.  If the filesystem rejects
+     user xattrs (ENOTSUP) or the record will not fit (E2BIG/ENOSPC/...), fall
+     back to a minimal .bin sidecar carrying the same bytes -- for THIS entry
+     only -- so functionality is preserved everywhere.  Logged once.  */
+  if (ok)
     {
-      intab = (unsigned char *) xmalloc ((size_t) inputs_size);
-      for (unsigned i = 0; i < cc_meta.input_count; i++)
+      bool unsupported = false;
+      if (!cc_set_meta_xattr (obj_path, meta, meta_len, &unsupported))
 	{
-	  unsigned char *rec = intab + (size_t) i * CC_INPUT_REC_SIZE;
-	  memcpy (rec + CC_IN_OFF_HASH, cc_meta.inputs[i].hash, 20);
-	  cc_put_u64 (rec + CC_IN_OFF_SIZE, cc_meta.inputs[i].size);
-	  cc_put_u32 (rec + CC_IN_OFF_PATH, path_offs[i]);
+	  if (unsupported)
+	    {
+	      static bool warned = false;
+	      if (!warned)
+		{
+		  warned = true;
+		  cc_debug_line ("xattr-fallback", cc_key_hex);
+		}
+	      ok = cc_write_atomic_readonly (bin_path, meta, meta_len);
+	    }
+	  else
+	    ok = false;		/* hard xattr error -> abandon this entry */
 	}
     }
 
-  /* Write the .bin metadata object to a temp file, then atomic-rename.  */
-  char *final_path = cc_entry_path (cc_key_hex, /*make_dirs=*/true);
-  char *tmp_path = concat (final_path, ".tmpXXXXXX", NULL);
-  int tfd = mkstemp (tmp_path);
-  bool ok = (tfd >= 0);
-  FILE *dst = ok ? fdopen (tfd, "wb") : NULL;
-  if (!dst && tfd >= 0)
-    {
-      close (tfd);
-      ok = false;
-    }
-
   if (ok)
     {
-      ok = (fwrite (hdr, 1, sizeof (hdr), dst) == sizeof (hdr));
-      if (ok && inputs_size)
-	ok = (fwrite (intab, 1, (size_t) inputs_size, dst)
-	      == (size_t) inputs_size);
-      if (ok && strings.len)
-	ok = (fwrite (strings.data, 1, strings.len, dst) == strings.len);
-      if (ok && diag_len)
-	ok = (fwrite (diag_bytes, 1, diag_len, dst) == diag_len);
-      if (fclose (dst) != 0)
-	ok = false;
+      cc_debug_line ("store", cc_key_hex);
+      /* Record/refresh the manifest entry so a future run of the SAME source
+	 can serve this object BEFORE parsing.  */
+      cc_store_manifest (warnings, errors);
+      /* Publish the compiler-id sidecar so the DRIVER can form the same
+	 manifest key (it needs this compiler's checksum + lang name).  */
+      cc_write_compiler_id ();
     }
+  else
+    unlink (obj_path);		/* clean up a placed-but-unannotated object */
 
-  /* Write the sidecar .o (read-only) and publish both atomically.  The object
-     is only usable if BOTH the .bin and the .o land; write the sidecar first,
-     then the .bin, so a reader that sees the .bin can rely on the .o.  */
-  if (ok)
-    {
-      char *sidecar = cc_object_sidecar_path (final_path);
-      ok = cc_write_atomic_readonly (sidecar, obj_bytes, obj_len);
-      free (sidecar);
-    }
-
-  if (ok)
-    {
-      /* Atomic publish of the .bin.  If another process won the race the
-	 rename simply replaces an identical-keyed entry; harmless.  */
-      if (rename (tmp_path, final_path) != 0)
-	unlink (tmp_path);
-      else
-	{
-	  cc_debug_line ("store", cc_key_hex);
-	  /* Record/refresh the manifest entry so a future run of the SAME
-	     source can serve this object BEFORE parsing.  */
-	  cc_store_manifest (warnings, errors);
-	  /* Publish the compiler-id sidecar so the DRIVER can form the same
-	     manifest key (it needs this compiler's checksum + lang name).  */
-	  cc_write_compiler_id ();
-	}
-    }
-  else if (tfd >= 0)
-    unlink (tmp_path);
-
-  free (intab);
-  free (path_offs);
-  free (strings.data);
-  free (obj_bytes);
+  free (meta);
   free (diag_bytes);
-  free (tmp_path);
-  free (final_path);
+  free (obj_path);
+  free (bin_path);
   cc_meta_clear ();
 }
