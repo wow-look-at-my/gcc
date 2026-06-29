@@ -1,0 +1,2 @@
+
+Auth-debug probe: trivial change to test push/auth path (2026-06-29).
