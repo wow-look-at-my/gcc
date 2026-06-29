@@ -1291,7 +1291,8 @@ FORTRAN_TARGET_OBJS=@fortran_target_objs@
 RUST_TARGET_OBJS=@rust_target_objs@
 
 # Object files for gcc many-languages driver.
-GCC_OBJS = gcc.o gcc-main.o ggc-none.o gcc-urlifier.o options-urls.o
+GCC_OBJS = gcc.o gcc-main.o ggc-none.o gcc-urlifier.o options-urls.o \
+	compile-cache-serve.o
 
 c-family-warn = $(STRICT_WARN)
 
@@ -1415,6 +1416,8 @@ OBJS = \
 	combine.o \
 	combine-stack-adj.o \
 	compare-elim.o \
+	compile-cache.o \
+	compile-cache-serve.o \
 	context.o \
 	convert.o \
 	coroutine-passes.o \
@@ -1868,20 +1871,6 @@ ALL_HOST_OBJS = $(ALL_HOST_FRONTEND_OBJS) $(ALL_HOST_BACKEND_OBJS)
 
 BACKEND = libbackend.a main.o libcommon-target.a libcommon.a \
 	$(CPPLIB) $(LIBDECNUMBER)
-
-# Integrated assembler (single-process compile-to-object fold).  toplev.cc, in
-# libbackend.a, calls gas_assemble_buffer(), so EVERY compiler that links
-# $(BACKEND) -- cc1, cc1plus, lto1, lto-dump -- must also link the carved gas
-# library and its bfd/opcodes/sframe co-link deps.  The collision set
-# (text_section/data_section/bss_section) is objcopy-prefixed to gas_* in
-# libgas-prefixed.a so it does not clash with GCC's varasm definitions.  Always
-# placed BEFORE $(LIBS)/$(BACKENDLIBS) on the link line so gas's zlib/libiberty
-# references resolve against the copies GCC already links.  Absolute paths for
-# this prototype.  This fold is unconditional and permanent.
-LIBGAS = /home/user/libgas/libgas-prefixed.a \
-	/home/user/binutils-src/opcodes/.libs/libopcodes.a \
-	/home/user/binutils-src/bfd/.libs/libbfd.a \
-	/home/user/binutils-src/libsframe/.libs/libsframe.a
 
 # This is defined to "yes" if Tree checking is enabled, which roughly means
 # front-end checking.
@@ -2509,6 +2498,7 @@ s-bversion: BASE-VER
 	$(STAMP) s-bversion
 
 CFLAGS-toplev.o += -DTARGET_NAME=\"$(target_noncanonical)\"
+CFLAGS-compile-cache.o += -DTARGET_NAME=\"$(target_noncanonical)\"
 CFLAGS-tree-diagnostic-client-data-hooks.o += -DTARGET_NAME=\"$(target_noncanonical)\"
 CFLAGS-optinfo-emit-json.o += -DTARGET_NAME=\"$(target_noncanonical)\" $(ZLIBINC)
 CFLAGS-analyzer/engine.o += $(ZLIBINC)

@@ -459,6 +459,16 @@ struct cpp_reader
      one.  */
   bool about_to_expand_macro_p;
 
+  /* True once __has_include / __has_include_next has been evaluated in this
+     translation unit.  The in-compiler cache's pre-parse manifest fast-path
+     uses this: a header probed by __has_include but never #include'd does not
+     enter the include closure (cpp_foreach_included_file skips files with
+     stack_count == 0), so the manifest cannot detect an absent->present flip
+     of such a probe.  A TU that used __has_include therefore bypasses the
+     manifest fast-path and falls back to a full (post-parse) compile, which
+     re-resolves everything.  Read via cpp_used_has_include().  */
+  bool used_has_include;
+
   /* Search paths for include files.  */
   struct cpp_dir *quote_include;	/* "" */
   struct cpp_dir *bracket_include;	/* <> */

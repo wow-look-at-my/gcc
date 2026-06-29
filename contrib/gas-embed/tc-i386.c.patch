@@ -1,0 +1,38 @@
+--- a/config/tc-i386.c	2024-01-29 00:00:00.000000000 +0000
++++ b/config/tc-i386.c	2026-06-28 06:10:45.008408177 +0000
+@@ -16591,6 +16591,35 @@
+   return 1;
+ }
+ 
++/* cc1plus embed support: select the x86-64 (64-bit ELF) target at runtime,
++   exactly as the "--64" command-line option does (see OPTION_64 above).  This
++   sets default_arch = "x86_64" so that i386_target_format () selects
++   ELF_TARGET_FORMAT64 ("elf64-x86-64") and 64-bit code generation.  Must be
++   called before output_file_create (which invokes TARGET_FORMAT).  */
++
++void i386_set_default_arch_64 (void);
++
++void
++i386_set_default_arch_64 (void)
++{
++  const char **list, **l;
++
++  list = bfd_target_list ();
++  for (l = list; *l != NULL; l++)
++    if (startswith (*l, "elf64-x86-64")
++	|| strcmp (*l, "coff-x86-64") == 0
++	|| strcmp (*l, "pe-x86-64") == 0
++	|| strcmp (*l, "pei-x86-64") == 0
++	|| strcmp (*l, "mach-o-x86-64") == 0)
++      {
++	default_arch = "x86_64";
++	break;
++      }
++  if (*l == NULL)
++    as_fatal (_("no compiled in support for x86_64"));
++  free (list);
++}
++
+ #define MESSAGE_TEMPLATE \
+ "                                                                                "
+ 
