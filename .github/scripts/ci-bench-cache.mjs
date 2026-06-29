@@ -9,9 +9,11 @@
 // cold-vs-base overhead) for our in-compiler cache and, when available, for
 // ccache wrapping the SAME xg++ as a comparison baseline:
 //
-//   T_base       - compile the batch with NO -fcompile-cache
-//   T_cold       - our cache, fresh empty dir, compile the batch (all miss + store)
-//   T_warm       - our cache, compile again against the now-full dir (all hits)
+//   T_base       - compile the batch with NO -fcompile-cache (default flags)
+//   T_cold       - our cache (-fcompile-cache -fintegrated-as), fresh empty dir,
+//                  compile the batch (all miss + store)
+//   T_warm       - our cache, compile again against the now-full dir (all hits;
+//                  each served pre-parse, logged as "manifest-hit")
 //   T_ccache_cold - ccache wrapping xg++ (no -fcompile-cache), fresh empty
 //                   CCACHE_DIR after `ccache -C -z` (all miss)
 //   T_ccache_warm - ccache wrapping xg++, compile again against the populated
@@ -287,15 +289,29 @@ for (let i = 0; i < TU_COUNT; i++) {
 
 const debugEnv = { ...process.env, GCC_COMPILE_CACHE_DEBUG: '1' };
 
-// Compile ONE TU at -O2. cacheDir==null -> no -fcompile-cache. captureDebug
-// turns on the debug env so the returned stderr carries the cache action
-// lines. Returns { stderr }.
+// Compile ONE TU at -O2. cacheDir==null -> no -fcompile-cache (the no-cache
+// baseline). captureDebug turns on the debug env so the returned stderr
+// carries the cache action lines. Returns { stderr }.
+//
+// When a cacheDir is given we ALSO pass -fintegrated-as: Stage 5 caches and
+// serves the in-process (integrated-as) assembled object, and gates the cache
+// off entirely without it (compile_cache_enabled_p() -> false, so NO
+// miss/store/hit lines are emitted and nothing is ever stored). It is NOT the
+// default on this target, so every cache-exercising compile must request it
+// explicitly or the cache stays disabled -- which is exactly why the warm pass
+// would otherwise see zero hits. The null-cache baseline (T_base) is left at
+// the compiler's default flags on purpose, so it measures a real plain build.
 function compileOne(src, cacheDir, captureDebug) {
   const b = path.basename(src, '.cc');
   const args = ['-O2', '-c', src, '-o', path.join(objDir, b + '.o')];
   if (useStl) args.push(...stdcxxIncludes);
   args.push(B);
-  if (cacheDir) args.splice(args.length - 1, 0, '-fcompile-cache=' + cacheDir);
+  if (cacheDir) {
+    args.splice(
+      args.length - 1, 0,
+      '-fcompile-cache=' + cacheDir, '-fintegrated-as'
+    );
+  }
   const res = spawnSync(XGPP, args, {
     env: captureDebug ? debugEnv : process.env,
     encoding: 'utf8',
@@ -388,10 +404,29 @@ function median(xs) {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
+// Count "compile-cache: <action> ..." debug lines for a given action
+// (miss/store/hit), with the Stage 5 normalization the verify script uses:
+//
+//   * A warm compile serves the in-process-assembled object BEFORE parse via a
+//     ccache-style direct-mode manifest, so it logs "manifest-hit" (the
+//     pre-parse object serve) instead of the post-parse "hit". Both carry the
+//     same content key and place a byte-identical object, so for accounting a
+//     "manifest-hit" IS a hit -- fold it in when counting 'hit'.
+//   * The manifest LAYER also logs "manifest-miss" / "manifest-store" (keyed on
+//     the separate manifest key) on a cold compile, ALONGSIDE the real
+//     content-level "miss" / "store". Those must NOT be counted as miss/store
+//     here -- the single anchored regex below matches the bare action token
+//     right after "compile-cache: ", so "manifest-miss"/"manifest-store" are
+//     left unmatched (only "manifest-hit" is explicitly folded into 'hit').
 function countAction(stderr, action) {
-  const re = new RegExp('compile-cache: ' + action + ' ', 'g');
-  const m = stderr.match(re);
-  return m ? m.length : 0;
+  const re = /compile-cache: (manifest-hit|miss|store|hit) (?:[0-9a-f]+|-)/g;
+  let n = 0;
+  let m;
+  while ((m = re.exec(stderr)) !== null) {
+    const folded = m[1] === 'manifest-hit' ? 'hit' : m[1];
+    if (folded === action) n++;
+  }
+  return n;
 }
 
 const workloadDesc = useStl
