@@ -392,6 +392,11 @@ builtin_has_include (cpp_reader *pfile, cpp_hashnode *op, bool has_next)
 {
   int result = 0;
 
+  /* Record that this TU evaluated __has_include so the in-compiler cache can
+     bypass its manifest fast-path (such probes don't enter the include
+     closure; see cpp_reader::used_has_include).  */
+  pfile->used_has_include = true;
+
   if (!pfile->state.in_directive)
     cpp_error (pfile, CPP_DL_ERROR,
 	       "\"%s\" used outside of preprocessing directive",
