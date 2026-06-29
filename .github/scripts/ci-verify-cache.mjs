@@ -195,25 +195,25 @@ function findLibstdcxxDir(root) {
 }
 
 // --- structured binary cache-object format -------------------------------
-// One little-endian binary file per entry at DIR/<2hex>/<rest>.bin.
-const CC_MAGIC = 'GCCCACHE';
-// Object-header format version. Bumped to 2 when the assembled-object payload
-// moved out of the .bin and into a sibling ".o" sidecar (Stage 5 .o cache):
-// the .bin now carries only metadata + diagnostics, and its asm section is
-// empty (asm_len == 0). Field offsets are unchanged from v1.
-const CC_FORMAT_VERSION = 2;
+// v3 cache layout under DIR:
+//   <2hex>/<rest>.o    the cache OBJECT itself (the produced .o, hardlinked
+//                      into its content-addressed slot). Per-object metadata
+//                      (format version, flags, back-end warning/error counts,
+//                      diagnostics blob) lives in the "user.gcc_cc.meta" xattr
+//                      on this file -- there is no per-object .bin.
+//   <2hex>/<rest>.bin  a MANIFEST (magic "CCMANIFS"), the direct-mode index;
+//                      OR, only where the filesystem rejects user xattrs, a
+//                      per-object meta-fallback (magic "GCCCMETA").
+//   compiler-id        the driver's pre-parse compiler-identity sidecar.
+const CC_MAGIC = 'GCCCACHE';          // legacy v2 object magic (must NOT appear)
+// Object format version. Bumped to 3 when the per-object .bin metadata sidecar
+// was removed: the cache object is now the produced .o, hardlinked into the
+// content-addressed slot, with its (tiny) metadata stored in the
+// "user.gcc_cc.meta" xattr. The old inputs table + header strings were
+// write-only at serve time and were dropped.
+const CC_FORMAT_VERSION = 3;
 const CC_MANIFEST_MAGIC = 'CCMANIFS';
 const CC_HEADER_SIZE = 128;
-// Fixed-header field byte offsets (must match gcc/compile-cache.cc).
-const H = {
-  MAGIC: 0, FORMAT_VER: 8, FLAGS: 10, INPUT_COUNT: 12, CREATED: 16,
-  ASM_OFF: 24, ASM_LEN: 32, DIAG_OFF: 40, DIAG_LEN: 48, INPUTS_OFF: 56,
-  WARNINGS: 64, ERRORS: 68, KEY: 72, CHECKSUM: 92,
-  SOURCE_OFF: 108, CWD_OFF: 112, TARGET_OFF: 116, LANGUAGE_OFF: 120,
-  OPTIONS_OFF: 124,
-};
-const CC_INPUT_REC_SIZE = 32;
-const IN = { HASH: 0, SIZE: 20, PATH: 28 };
 
 // Recursively list every regular file under DIR.
 function listFiles(dir) {
@@ -234,81 +234,6 @@ function listFiles(dir) {
     }
   }
   return out;
-}
-
-// Read a length-prefixed + NUL string referenced by a u32 file offset that
-// points at the u32 length prefix. Returns the string content (no NUL).
-function readRefString(buf, off, label) {
-  if (off + 4 > buf.length) {
-    fail('binary: ' + label + ' offset ' + off + ' out of range');
-  }
-  const slen = buf.readUInt32LE(off);
-  const start = off + 4;
-  const end = start + slen;
-  if (end + 1 > buf.length) {
-    fail('binary: ' + label + ' string [' + start + ',' + end + ') out of range');
-  }
-  if (buf[end] !== 0) {
-    fail('binary: ' + label + ' string is not NUL-terminated at ' + end);
-  }
-  return buf.toString('utf8', start, end);
-}
-
-// Parse + validate ONE .bin cache object. Returns a small summary object.
-// Verbose-prints the header hexdump, the decoded source path, and one decoded
-// input path.
-function parseAndValidateObject(binPath) {
-  const buf = fs.readFileSync(binPath);
-  if (buf.length < CC_HEADER_SIZE) {
-    fail('binary: ' + binPath + ' is shorter than the 128-byte header');
-  }
-  const magic = buf.toString('latin1', H.MAGIC, H.MAGIC + 8);
-  if (magic !== CC_MAGIC) {
-    fail('binary: bad magic ' + JSON.stringify(magic) + ' (want "GCCCACHE")');
-  }
-  const ver = buf.readUInt16LE(H.FORMAT_VER);
-  if (ver !== CC_FORMAT_VERSION) {
-    fail('binary: format_version ' + ver + ' != ' + CC_FORMAT_VERSION);
-  }
-  const inputCount = buf.readUInt32LE(H.INPUT_COUNT);
-  const asmOff = Number(buf.readBigUInt64LE(H.ASM_OFF));
-  const asmLen = Number(buf.readBigUInt64LE(H.ASM_LEN));
-  const diagOff = Number(buf.readBigUInt64LE(H.DIAG_OFF));
-  const diagLen = Number(buf.readBigUInt64LE(H.DIAG_LEN));
-  const inputsOff = Number(buf.readBigUInt64LE(H.INPUTS_OFF));
-
-  // Section spans must fit inside the file.
-  if (asmOff + asmLen > buf.length) {
-    fail('binary: asm span [' + asmOff + ',' + (asmOff + asmLen) +
-      ') exceeds file size ' + buf.length);
-  }
-  if (diagOff + diagLen > buf.length) {
-    fail('binary: diag span [' + diagOff + ',' + (diagOff + diagLen) +
-      ') exceeds file size ' + buf.length);
-  }
-  if (inputsOff + inputCount * CC_INPUT_REC_SIZE > buf.length) {
-    fail('binary: inputs table exceeds file size');
-  }
-
-  // Follow source_off -> length-prefixed + NUL string.
-  const sourceOff = buf.readUInt32LE(H.SOURCE_OFF);
-  const source = readRefString(buf, sourceOff, 'source_off');
-
-  // Walk the inputs table and decode one path via its path_off.
-  let firstInputPath = null;
-  for (let i = 0; i < inputCount; i++) {
-    const rec = inputsOff + i * CC_INPUT_REC_SIZE;
-    const pathOff = buf.readUInt32LE(rec + IN.PATH);
-    const p = readRefString(buf, pathOff, 'input[' + i + '].path_off');
-    if (i === 0) firstInputPath = p;
-  }
-
-  return {
-    buf, magic, ver, inputCount, asmOff, asmLen, diagOff, diagLen, inputsOff,
-    sourceOff, source, firstInputPath,
-    warnings: buf.readUInt32LE(H.WARNINGS),
-    errors: buf.readUInt32LE(H.ERRORS),
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -475,20 +400,21 @@ const o3 = path.join(work, 'a3.o');
   process.stdout.write('check 6 OK: C++ miss->hit, byte-identical, program returned 7\n');
 }
 
-// ---- 7. on-disk layout: object .bin + .o sidecar + manifest + compiler-id --
+// ---- 7. on-disk layout: content-addressed .o + xattr meta + manifest + id --
 {
-  // cacheA holds (at least) the VAL=42 and VAL=43 entries. The Stage 5 .o
-  // cache layout under a cache dir is:
-  //   <2hex>/<rest>.bin  -- an OBJECT (magic "GCCCACHE"): metadata + diags,
-  //                         asm section empty (payload externalized);
-  //   <2hex>/<rest>.o    -- that object's payload SIDECAR (placed on a hit via
-  //                         reflink/hardlink/copy);
+  // cacheA holds (at least) the VAL=42 and VAL=43 entries. The v3 .o cache
+  // layout under a cache dir is:
+  //   <2hex>/<rest>.o    -- the cache OBJECT itself: the produced .o, hardlinked
+  //                         (reflink/hardlink/copy) into the content-addressed
+  //                         slot. Its metadata (format version, flags, back-end
+  //                         warning/error counts, diag blob) lives in the
+  //                         "user.gcc_cc.meta" xattr (+ "user.gcc_cc.v" probe).
+  //                         There is NO per-object .bin anymore.
   //   <2hex>/<rest>.bin  -- a MANIFEST (magic "CCMANIFS"): the direct-mode
-  //                         index; has NO .o sidecar;
+  //                         index; has NO .o object. (A per-object .bin appears
+  //                         ONLY on the xattr-unsupported fallback path, holding
+  //                         the CC_META record; see metaOf below.)
   //   compiler-id        -- the driver's pre-parse compiler-identity sidecar.
-  // The .o sidecars and compiler-id are REQUIRED artifacts of this design, not
-  // forbidden extras, so this check validates those invariants rather than
-  // rejecting non-.bin files (which the pre-Stage-5 .s cache did).
   const files = listFiles(cacheA);
   if (files.length === 0) {
     fail('check 7: no cache files found under ' + cacheA);
@@ -499,6 +425,65 @@ const o3 = path.join(work, 'a3.o');
     const b = fs.readFileSync(f);
     return b.length >= 8 ? b.toString('latin1', 0, 8) : '';
   };
+
+  // Read an extended attribute as a Buffer (or null if absent/unsupported).
+  // Node has no xattr API, so shell out to python3's os.getxattr, which is the
+  // same syscall the compiler uses. Returns null when the attr is missing.
+  function getxattr(file, name) {
+    const py =
+      'import os,sys\n' +
+      'try:\n' +
+      '  sys.stdout.buffer.write(os.getxattr(sys.argv[1], sys.argv[2]))\n' +
+      'except OSError:\n' +
+      '  sys.exit(3)\n';
+    const r = spawnSync('python3', ['-c', py, file, name],
+      { encoding: 'buffer' });
+    if (r.status === 0) return r.stdout;
+    return null;
+  }
+
+  // Decode the CC_META record carried by an object: the xattr, or (fallback)
+  // the .bin sidecar body. Returns { ver, flags, warnings, errors, diagLen }
+  // or fails. METAREC layout: magic[8] ver(u16) flags(u16) warn(u32) err(u32)
+  // diag_len(u32), then diag_len bytes.
+  const CC_META_MAGIC = 'GCCCMETA';
+  const CC_META_REC_SIZE = 24;
+  function decodeMeta(buf, src) {
+    if (buf.length < CC_META_REC_SIZE) {
+      fail('check 7: meta record too short (' + buf.length + ' B) from ' + src);
+    }
+    const mg = buf.toString('latin1', 0, 8);
+    if (mg !== CC_META_MAGIC) {
+      fail('check 7: meta magic ' + JSON.stringify(mg) + ' (want "' +
+        CC_META_MAGIC + '") from ' + src);
+    }
+    const ver = buf.readUInt16LE(8);
+    if (ver !== CC_FORMAT_VERSION) {
+      fail('check 7: meta format_version ' + ver + ' != ' + CC_FORMAT_VERSION +
+        ' from ' + src);
+    }
+    const diagLen = buf.readUInt32LE(20);
+    if (CC_META_REC_SIZE + diagLen > buf.length) {
+      fail('check 7: meta diag blob exceeds record from ' + src);
+    }
+    return {
+      ver, flags: buf.readUInt16LE(10),
+      warnings: buf.readUInt32LE(12), errors: buf.readUInt32LE(16), diagLen,
+    };
+  }
+  // Read an object's metadata: prefer the xattr, fall back to the .bin sidecar.
+  function metaOf(objPath) {
+    const x = getxattr(objPath, 'user.gcc_cc.meta');
+    if (x) return { meta: decodeMeta(x, objPath + ' [xattr]'), via: 'xattr' };
+    const binPath = objPath.replace(/\.o$/, '.bin');
+    if (fs.existsSync(binPath)) {
+      return { meta: decodeMeta(fs.readFileSync(binPath), binPath),
+        via: 'bin-fallback' };
+    }
+    fail('check 7: object .o has neither user.gcc_cc.meta xattr nor a .bin ' +
+      'fallback: ' + objPath);
+    return null; // unreached
+  }
 
   const binFiles = files.filter((f) => f.endsWith('.bin'));
   const oFiles = files.filter((f) => f.endsWith('.o'));
@@ -517,69 +502,54 @@ const o3 = path.join(work, 'a3.o');
       idFiles.length);
   }
 
-  // Split .bin files into objects (GCCCACHE) and manifests (CCMANIFS).
-  const objBins = [];
+  // Classify .bin files: manifests (CCMANIFS) vs per-object meta fallbacks
+  // (GCCCMETA). A GCCCACHE .bin is the OLD v2 object format and must NOT appear.
   const manBins = [];
   for (const f of binFiles) {
     const mg = magicOf(f);
-    if (mg === CC_MAGIC) objBins.push(f);
-    else if (mg === CC_MANIFEST_MAGIC) manBins.push(f);
-    else fail('check 7: .bin with unknown magic ' + JSON.stringify(mg) +
-      ': ' + f);
+    if (mg === CC_MANIFEST_MAGIC) manBins.push(f);
+    else if (mg === CC_META_MAGIC) {
+      // A meta fallback .bin must sit beside its object .o.
+      if (!fs.existsSync(f.replace(/\.bin$/, '.o'))) {
+        fail('check 7: meta-fallback .bin without its object .o: ' + f);
+      }
+    } else if (mg === CC_MAGIC) {
+      fail('check 7: found a legacy v2 object .bin (GCCCACHE); v3 stores the ' +
+        'object as the content-addressed .o with xattr metadata: ' + f);
+    } else {
+      fail('check 7: .bin with unknown magic ' + JSON.stringify(mg) + ': ' + f);
+    }
   }
-  if (objBins.length < 2) {
-    fail('check 7: expected >=2 object .bin entries (VAL=42 and VAL=43), got ' +
-      objBins.length);
+  // The cache objects are the .o files (excluding any that is purely a manifest
+  // sibling -- manifests have no .o, so every .o here is a real object).
+  const objFiles = oFiles;
+  if (objFiles.length < 2) {
+    fail('check 7: expected >=2 cache object .o entries (VAL=42 and VAL=43), ' +
+      'got ' + objFiles.length);
   }
   if (manBins.length < 1) {
     fail('check 7: expected at least one manifest (.bin, CCMANIFS), got ' +
       manBins.length);
   }
 
-  // Every OBJECT .bin must have a sibling .o payload sidecar; every MANIFEST
-  // .bin must NOT (the manifest is an index, it carries no object payload).
-  const sidecarOf = (binPath) => binPath.replace(/\.bin$/, '.o');
-  for (const ob of objBins) {
-    if (!fs.existsSync(sidecarOf(ob))) {
-      fail('check 7: object .bin missing its .o payload sidecar: ' + ob);
-    }
-  }
-  for (const mb of manBins) {
-    if (fs.existsSync(sidecarOf(mb))) {
-      fail('check 7: manifest .bin must not have a .o sidecar: ' + mb);
-    }
-  }
-  // Each .o must belong to an object .bin (no orphan sidecars).
-  const objBinSet = new Set(objBins);
-  for (const o of oFiles) {
-    if (!objBinSet.has(o.replace(/\.o$/, '.bin'))) {
-      fail('check 7: orphan .o sidecar with no object .bin: ' + o);
-    }
+  // Every cache object .o must carry valid v3 metadata (xattr or .bin fallback).
+  let viaXattr = 0, viaBin = 0;
+  let sample = null;
+  for (const o of objFiles) {
+    const { meta, via } = metaOf(o);
+    if (via === 'xattr') viaXattr++; else viaBin++;
+    if (!sample) sample = { o, meta, via };
   }
 
-  // Parse + validate one full OBJECT (not a manifest).
-  const obj = parseAndValidateObject(objBins[0]);
-  if (obj.inputCount < 1) {
-    fail('check 7: expected at least one input record, got ' + obj.inputCount);
-  }
-  if (!obj.firstInputPath) {
-    fail('check 7: could not decode any input path');
-  }
-  // The asm payload now lives in the .o sidecar, so the in-.bin asm span is
-  // empty. Assert that explicitly (it characterizes the v2 .o-cache format).
-  if (obj.asmLen !== 0) {
-    fail('check 7: expected empty in-.bin asm span (payload is the .o ' +
-      'sidecar), got asm_len=' + obj.asmLen);
-  }
   process.stdout.write(
-    'check 7 OK: ' + objBins.length + ' object(s) + ' + manBins.length +
-    ' manifest(s), each object has a .o sidecar, compiler-id present;\n' +
-    '           magic=GCCCACHE version=' + obj.ver + ' inputs=' +
-    obj.inputCount + ' asm_len=' + obj.asmLen + '\n' +
-    '           source=' + obj.source + '\n' +
-    '           input[0]=' + obj.firstInputPath + '\n' +
-    '           diag=[' + obj.diagOff + ',' + (obj.diagOff + obj.diagLen) +
-    ')\n');
+    'check 7 OK: ' + objFiles.length + ' cache object(s) (.o) + ' +
+    manBins.length + ' manifest(s), compiler-id present; no legacy v2 .bin;\n' +
+    '           metadata via xattr=' + viaXattr + ' bin-fallback=' + viaBin +
+    '\n' +
+    '           sample ' + path.basename(sample.o) + ' [' + sample.via +
+    ']: version=' + sample.meta.ver + ' flags=' + sample.meta.flags +
+    ' warnings=' + sample.meta.warnings + ' errors=' + sample.meta.errors +
+    ' diag_len=' + sample.meta.diagLen + '\n');
 }
 
 // ---- 8. warning parity: -Wmaybe-uninitialized on MISS and HIT -------------
