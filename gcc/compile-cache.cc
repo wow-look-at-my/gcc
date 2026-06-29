@@ -1966,18 +1966,14 @@ compile_cache_store (void)
   char *obj_path = cc_object_sidecar_path (bin_path);
   bool ok = cc_place_object (asm_file_name, obj_path);
 
-  /* Make the cache object read-only (0444) as the docstring promises: an
-     accidental in-place rewrite of the cache (objcopy/strip --in-place) then
-     fails loudly instead of silently corrupting it.  When the object was
-     hardlinked to the output .o (same-fs store), the output .o becomes 0444
-     too -- the documented "fail loudly" tradeoff, intended on the store side.  */
-  if (ok)
-    chmod (obj_path, 0444);
-
-  /* Attach the metadata as an xattr on the cache .o.  If the filesystem rejects
-     user xattrs (ENOTSUP) or the record will not fit (E2BIG/ENOSPC/...), fall
-     back to a minimal .bin sidecar carrying the same bytes -- for THIS entry
-     only -- so functionality is preserved everywhere.  Logged once.  */
+  /* Attach the metadata as an xattr on the cache .o.  This MUST happen while the
+     object is still writable: on Linux, setting a user.* xattr requires WRITE
+     permission on the inode, so doing it after the 0444 chmod below would fail
+     with EACCES on a non-root runner (root's CAP_DAC_OVERRIDE masks this, which
+     is why it only surfaced in CI).  If the filesystem rejects user xattrs
+     (ENOTSUP) or the record will not fit (E2BIG/ENOSPC/...), fall back to a
+     minimal .bin sidecar carrying the same bytes -- for THIS entry only -- so
+     functionality is preserved everywhere.  Logged once.  */
   if (ok)
     {
       bool unsupported = false;
@@ -1997,6 +1993,16 @@ compile_cache_store (void)
 	    ok = false;		/* hard xattr error -> abandon this entry */
 	}
     }
+
+  /* Make the cache object read-only (0444) as the docstring promises: an
+     accidental in-place rewrite of the cache (objcopy/strip --in-place) then
+     fails loudly instead of silently corrupting it.  When the object was
+     hardlinked to the output .o (same-fs store), the output .o becomes 0444
+     too -- the documented "fail loudly" tradeoff, intended on the store side.
+     This is the LAST step before publishing: the metadata xattr above needed a
+     writable inode, so the chmod cannot precede it.  */
+  if (ok)
+    chmod (obj_path, 0444);
 
   if (ok)
     {
