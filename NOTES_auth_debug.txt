@@ -1,2 +1,3 @@
 
 Auth-debug probe: trivial change to test push/auth path (2026-06-29).
+Non-claude-prefixed branch push test: auth-debug-test-20260629 (2026-06-29).
