@@ -48,25 +48,60 @@ function fail(msg) {
 // Parse every "compile-cache: <action> <key12> <output>" debug line from
 // stderr into [{ action, key }, ...]. action is miss/store/hit, key is the
 // first 12 hex chars (or "-").
+//
+// Stage 5 caches the in-process-assembled .o and serves it BEFORE parse via a
+// ccache-style direct-mode manifest, so a warm compile logs "manifest-hit"
+// (the pre-parse object serve) instead of the post-parse "hit". Both carry the
+// same content key (OK) and place a byte-identical object, so for these checks
+// a "manifest-hit" IS a hit -- normalize it. The manifest-layer "manifest-miss"
+// / "manifest-store" lines (keyed on the separate manifest key MK) are NOT
+// folded into miss/store: on a cold compile they appear ALONGSIDE the real
+// content-level miss/store, and the checks below assert on the content key, so
+// they are deliberately left unmatched by this regex.
 function parseKeys(stderr) {
-  const re = /compile-cache: (miss|store|hit) ([0-9a-f]+|-)/g;
+  const re = /compile-cache: (manifest-hit|miss|store|hit) ([0-9a-f]+|-)/g;
   const out = [];
   let m;
   while ((m = re.exec(stderr)) !== null) {
-    out.push({ action: m[1], key: m[2] });
+    const action = m[1] === 'manifest-hit' ? 'hit' : m[1];
+    out.push({ action, key: m[2] });
   }
   return out;
 }
 
 const debugEnv = { ...process.env, GCC_COMPILE_CACHE_DEBUG: '1' };
 
+// Write a header file and advance its mtime so a content change is reliably
+// detected by the manifest fast-path. The pre-parse manifest serve records
+// each header's size+mtime and accepts a candidate set on a size+mtime stat
+// match WITHOUT re-hashing (a deliberate, documented ccache-style shortcut;
+// GCC_COMPILE_CACHE_VERIFY=hash forces a full re-hash instead). A real edit
+// always advances mtime, but an instantaneous same-size rewrite in a test may
+// land in the same coarse mtime tick, which would let the shortcut correctly
+// accept the OLD content and serve a stale object. Bumping mtime mirrors a
+// real edit and keeps the invalidation check exercising the DEFAULT fast path
+// deterministically (rather than only the airtight verify-hash mode).
+let mtimeNudgeSecs = 0;
+function writeHeader(p, content) {
+  fs.writeFileSync(p, content);
+  mtimeNudgeSecs += 2;
+  const t = new Date(Date.now() + mtimeNudgeSecs * 1000);
+  fs.utimesSync(p, t, t);
+}
+
 // Compile SRC -> OBJ with -O2 -c -fcompile-cache=CACHEDIR (plus optional
 // EXTRA driver args). Returns { status, stderr, keys } where keys is the
 // parsed list of cache actions. EXTRA is genuinely optional.
+//
+// -fintegrated-as is REQUIRED: Stage 5 caches and serves the in-process
+// (integrated-as) assembled object, and gates itself off entirely without it
+// (compile_cache_enabled_p() -> false, so NO miss/store/hit lines are emitted).
+// It is not the default on this target, so every cache-exercising compile must
+// pass it explicitly or the cache stays disabled and every check sees nothing.
 function compile(driver, src, obj, cacheDir, extra) {
   const args = [
     '-O2', '-c', src, '-o', obj,
-    '-fcompile-cache=' + cacheDir, B,
+    '-fcompile-cache=' + cacheDir, '-fintegrated-as', B,
   ].concat(extra || []);
   const res = spawnSync(driver, args, {
     env: debugEnv,
@@ -162,7 +197,12 @@ function findLibstdcxxDir(root) {
 // --- structured binary cache-object format -------------------------------
 // One little-endian binary file per entry at DIR/<2hex>/<rest>.bin.
 const CC_MAGIC = 'GCCCACHE';
-const CC_FORMAT_VERSION = 1;
+// Object-header format version. Bumped to 2 when the assembled-object payload
+// moved out of the .bin and into a sibling ".o" sidecar (Stage 5 .o cache):
+// the .bin now carries only metadata + diagnostics, and its asm section is
+// empty (asm_len == 0). Field offsets are unchanged from v1.
+const CC_FORMAT_VERSION = 2;
+const CC_MANIFEST_MAGIC = 'CCMANIFS';
 const CC_HEADER_SIZE = 128;
 // Fixed-header field byte offsets (must match gcc/compile-cache.cc).
 const H = {
@@ -363,7 +403,8 @@ const o3 = path.join(work, 'a3.o');
 
 // ---- 4. invalidation: change inc.h -> different key -----------------------
 {
-  fs.writeFileSync(incH, '#define VAL 43\nint helper(void);\n');
+  // writeHeader bumps mtime so the manifest stat-shortcut sees the change.
+  writeHeader(incH, '#define VAL 43\nint helper(void);\n');
   const o4 = path.join(work, 'a4.o');
   const r = compile(XGCC, aC, o4, cacheA);
   const missKey = keyFor(r.keys, 'miss');
@@ -376,8 +417,9 @@ const o3 = path.join(work, 'a3.o');
   }
   process.stdout.write('check 4 OK: key changed on input change: ' +
     KEY42 + ' -> ' + missKey + '\n');
-  // Restore VAL=42 for the functional check.
-  fs.writeFileSync(incH, '#define VAL 42\nint helper(void);\n');
+  // Restore VAL=42 for the functional check (mtime-bumped so the next compile
+  // resolves the VAL=42 content again rather than a stale VAL=43 stat match).
+  writeHeader(incH, '#define VAL 42\nint helper(void);\n');
 }
 
 // ---- 5. functional: link and run, expect exit 42 -------------------------
@@ -433,35 +475,111 @@ const o3 = path.join(work, 'a3.o');
   process.stdout.write('check 6 OK: C++ miss->hit, byte-identical, program returned 7\n');
 }
 
-// ---- 7. binary object format: parse/validate + no sidecars ----------------
+// ---- 7. on-disk layout: object .bin + .o sidecar + manifest + compiler-id --
 {
-  // cacheA holds the VAL=43 entry (last written in check 4) plus the VAL=42
-  // entry; every regular file under it must be a .bin (no sidecars).
+  // cacheA holds (at least) the VAL=42 and VAL=43 entries. The Stage 5 .o
+  // cache layout under a cache dir is:
+  //   <2hex>/<rest>.bin  -- an OBJECT (magic "GCCCACHE"): metadata + diags,
+  //                         asm section empty (payload externalized);
+  //   <2hex>/<rest>.o    -- that object's payload SIDECAR (placed on a hit via
+  //                         reflink/hardlink/copy);
+  //   <2hex>/<rest>.bin  -- a MANIFEST (magic "CCMANIFS"): the direct-mode
+  //                         index; has NO .o sidecar;
+  //   compiler-id        -- the driver's pre-parse compiler-identity sidecar.
+  // The .o sidecars and compiler-id are REQUIRED artifacts of this design, not
+  // forbidden extras, so this check validates those invariants rather than
+  // rejecting non-.bin files (which the pre-Stage-5 .s cache did).
   const files = listFiles(cacheA);
   if (files.length === 0) {
-    fail('check 7: no cache objects found under ' + cacheA);
-  }
-  const nonBin = files.filter((f) => !f.endsWith('.bin'));
-  if (nonBin.length) {
-    fail('check 7: found non-.bin file(s) (sidecars not allowed):\n  ' +
-      nonBin.join('\n  '));
+    fail('check 7: no cache files found under ' + cacheA);
   }
 
-  // Parse + validate one object in full.
-  const obj = parseAndValidateObject(files[0]);
+  // Read a file's 8-byte magic (latin1), or '' if too short.
+  const magicOf = (f) => {
+    const b = fs.readFileSync(f);
+    return b.length >= 8 ? b.toString('latin1', 0, 8) : '';
+  };
+
+  const binFiles = files.filter((f) => f.endsWith('.bin'));
+  const oFiles = files.filter((f) => f.endsWith('.o'));
+  const idFiles = files.filter((f) => path.basename(f) === 'compiler-id');
+  const unexpected = files.filter(
+    (f) => !f.endsWith('.bin') && !f.endsWith('.o') &&
+      path.basename(f) !== 'compiler-id');
+  if (unexpected.length) {
+    fail('check 7: found unexpected cache file(s) (not .bin/.o/compiler-id):\n  ' +
+      unexpected.join('\n  '));
+  }
+
+  // The driver's compiler-id sidecar must exist.
+  if (idFiles.length !== 1) {
+    fail('check 7: expected exactly one compiler-id sidecar, got ' +
+      idFiles.length);
+  }
+
+  // Split .bin files into objects (GCCCACHE) and manifests (CCMANIFS).
+  const objBins = [];
+  const manBins = [];
+  for (const f of binFiles) {
+    const mg = magicOf(f);
+    if (mg === CC_MAGIC) objBins.push(f);
+    else if (mg === CC_MANIFEST_MAGIC) manBins.push(f);
+    else fail('check 7: .bin with unknown magic ' + JSON.stringify(mg) +
+      ': ' + f);
+  }
+  if (objBins.length < 2) {
+    fail('check 7: expected >=2 object .bin entries (VAL=42 and VAL=43), got ' +
+      objBins.length);
+  }
+  if (manBins.length < 1) {
+    fail('check 7: expected at least one manifest (.bin, CCMANIFS), got ' +
+      manBins.length);
+  }
+
+  // Every OBJECT .bin must have a sibling .o payload sidecar; every MANIFEST
+  // .bin must NOT (the manifest is an index, it carries no object payload).
+  const sidecarOf = (binPath) => binPath.replace(/\.bin$/, '.o');
+  for (const ob of objBins) {
+    if (!fs.existsSync(sidecarOf(ob))) {
+      fail('check 7: object .bin missing its .o payload sidecar: ' + ob);
+    }
+  }
+  for (const mb of manBins) {
+    if (fs.existsSync(sidecarOf(mb))) {
+      fail('check 7: manifest .bin must not have a .o sidecar: ' + mb);
+    }
+  }
+  // Each .o must belong to an object .bin (no orphan sidecars).
+  const objBinSet = new Set(objBins);
+  for (const o of oFiles) {
+    if (!objBinSet.has(o.replace(/\.o$/, '.bin'))) {
+      fail('check 7: orphan .o sidecar with no object .bin: ' + o);
+    }
+  }
+
+  // Parse + validate one full OBJECT (not a manifest).
+  const obj = parseAndValidateObject(objBins[0]);
   if (obj.inputCount < 1) {
     fail('check 7: expected at least one input record, got ' + obj.inputCount);
   }
   if (!obj.firstInputPath) {
     fail('check 7: could not decode any input path');
   }
+  // The asm payload now lives in the .o sidecar, so the in-.bin asm span is
+  // empty. Assert that explicitly (it characterizes the v2 .o-cache format).
+  if (obj.asmLen !== 0) {
+    fail('check 7: expected empty in-.bin asm span (payload is the .o ' +
+      'sidecar), got asm_len=' + obj.asmLen);
+  }
   process.stdout.write(
-    'check 7 OK: ' + files.length + ' object(s), all .bin; ' +
-    'magic=GCCCACHE version=' + obj.ver + ' inputs=' + obj.inputCount + '\n' +
+    'check 7 OK: ' + objBins.length + ' object(s) + ' + manBins.length +
+    ' manifest(s), each object has a .o sidecar, compiler-id present;\n' +
+    '           magic=GCCCACHE version=' + obj.ver + ' inputs=' +
+    obj.inputCount + ' asm_len=' + obj.asmLen + '\n' +
     '           source=' + obj.source + '\n' +
     '           input[0]=' + obj.firstInputPath + '\n' +
-    '           asm=[' + obj.asmOff + ',' + (obj.asmOff + obj.asmLen) +
-    ') diag=[' + obj.diagOff + ',' + (obj.diagOff + obj.diagLen) + ')\n');
+    '           diag=[' + obj.diagOff + ',' + (obj.diagOff + obj.diagLen) +
+    ')\n');
 }
 
 // ---- 8. warning parity: -Wmaybe-uninitialized on MISS and HIT -------------
@@ -490,10 +608,11 @@ const o3 = path.join(work, 'a3.o');
   const wObj2 = path.join(work, 'w2.o');
 
   // -Wall is needed to enable -Wmaybe-uninitialized; pass it as an extra arg.
+  // -fintegrated-as is required to engage the cache (see compile() above).
   function compileW(obj) {
     const args = [
       '-O2', '-Wall', '-c', wSrc, '-o', obj,
-      '-fcompile-cache=' + wCache, B,
+      '-fcompile-cache=' + wCache, '-fintegrated-as', B,
     ];
     const res = spawnSync(XGCC, args, { env: debugEnv, encoding: 'utf8' });
     if (res.error) fail('check 8: failed to spawn xgcc: ' + res.error.message);
@@ -564,7 +683,7 @@ const o3 = path.join(work, 'a3.o');
   const r1 = spawnSync(
     XGCC,
     ['-O2', '-c', 'a.c', '-Iinc', '-o', objA,
-      '-fcompile-cache=' + xdCache, B],
+      '-fcompile-cache=' + xdCache, '-fintegrated-as', B],
     { cwd: path.join(work, 'xdA'), env: debugEnv, encoding: 'utf8' });
   if (r1.error) fail('check 9: failed to spawn xgcc (dirA): ' + r1.error.message);
   if (r1.status !== 0) fail('check 9: dirA compile failed: ' + (r1.stderr || ''));
@@ -578,7 +697,7 @@ const o3 = path.join(work, 'a3.o');
   const r2 = spawnSync(
     XGCC,
     ['-O2', '-c', 'b.c', '-Iinc', '-o', objB,
-      '-fcompile-cache=' + xdCache, B],
+      '-fcompile-cache=' + xdCache, '-fintegrated-as', B],
     { cwd: path.join(work, 'xdB'), env: debugEnv, encoding: 'utf8' });
   if (r2.error) fail('check 9: failed to spawn xgcc (dirB): ' + r2.error.message);
   if (r2.status !== 0) fail('check 9: dirB compile failed: ' + (r2.stderr || ''));
@@ -621,7 +740,7 @@ const o3 = path.join(work, 'a3.o');
     const res = spawnSync(
       XGCC,
       ['-O2', '-g', '-c', src, '-Iinc', '-o', obj,
-        '-fcompile-cache=' + gCache, B],
+        '-fcompile-cache=' + gCache, '-fintegrated-as', B],
       { cwd, env: debugEnv, encoding: 'utf8' });
     if (res.error) fail('check 10: failed to spawn xgcc: ' + res.error.message);
     if (res.status !== 0) fail('check 10: -g compile failed: ' + (res.stderr || ''));
