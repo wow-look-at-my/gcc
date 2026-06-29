@@ -367,8 +367,14 @@ ccs_object_sidecar_path (const char *entry_bin_path)
 }
 
 /* Place the cached object file CACHED_O at DST.  reflink->hardlink->copy
-   ladder, selectable via GCC_COMPILE_CACHE_LINK.  Byte-for-byte twin of
-   compile-cache.cc's cc_place_object ().  Returns true on success.  */
+   ladder, selectable via GCC_COMPILE_CACHE_LINK.  Twin of compile-cache.cc's
+   cc_place_object ().  The copy rung writes to a temp in DST's dir then
+   rename()s atomically, so a killed/ENOSPC write never leaves a truncated .o
+   at the user's -o path.  On a same-fs hardlink to the cache object (stored
+   0444 by the store side) the served DST is read-only but fully readable and
+   correct; reflink/copy leave it writable.  Either way DST is usable -- the
+   caller additionally ensures the owner read bit is set.  Returns true on
+   success.  */
 static bool
 ccs_place_object (const char *cached_o, const char *dst)
 {
@@ -422,13 +428,25 @@ ccs_place_object (const char *cached_o, const char *dst)
 	return false;
     }
 
+  /* Copy fallback: write to a temp file in the SAME directory as DST, then
+     rename() it into place atomically.  A killed process or ENOSPC mid-write
+     leaves only the temp (unlinked here) -- never a truncated object at the
+     user's -o path that would later look valid.  */
   size_t len = 0;
   unsigned char *bytes = ccs_read_file (cached_o, &len);
   if (!bytes)
     return false;
-  FILE *out = fopen (dst, "wb");
+  char *tmp = concat (dst, ".tmpXXXXXX", NULL);
+  int fd = mkstemp (tmp);
+  FILE *out = (fd >= 0) ? fdopen (fd, "wb") : NULL;
   if (!out)
     {
+      if (fd >= 0)
+	{
+	  close (fd);
+	  unlink (tmp);
+	}
+      free (tmp);
       free (bytes);
       return false;
     }
@@ -436,8 +454,11 @@ ccs_place_object (const char *cached_o, const char *dst)
   if (fclose (out) != 0)
     ok = false;
   free (bytes);
+  if (ok && rename (tmp, dst) != 0)
+    ok = false;
   if (!ok)
-    unlink (dst);
+    unlink (tmp);
+  free (tmp);
   return ok;
 }
 
@@ -546,6 +567,16 @@ ccs_serve_from_bin (const cc_serve_ctx *ctx, const char *ok_hex,
       free (meta);
       return false;
     }
+
+  /* The served output must be usable by the user.  A same-fs hardlink to the
+     0444 cache object lands DST at 0444 (read-only but readable -- acceptable
+     per the design); guarantee at least the owner read bit so the served .o is
+     never left unreadable.  reflink/copy already leave it writable.  */
+  {
+    struct stat st;
+    if (stat (out_path, &st) == 0 && !(st.st_mode & S_IRUSR))
+      chmod (out_path, (st.st_mode & 07777) | S_IRUSR);
+  }
 
   /* Replay the cached back-end diagnostics so a warm hit prints exactly what a
      fresh compile would.  */

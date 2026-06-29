@@ -1037,13 +1037,20 @@ cc_object_sidecar_path (const char *entry_bin_path)
    through to the next on failure):
      1. reflink (FICLONE)  -- CoW, O(1); unavailable on ext4 (this env), the
         win on btrfs/XFS/ZFS.
-     2. hardlink (link())  -- O(1), no byte copy, same-fs.  Cache objects are
-        stored read-only (0444) so an accidental in-place edit of the output
-        (objcopy/strip --in-place) fails loudly rather than mutating the cache.
-     3. copy               -- always-correct fallback (read once, write once).
+     2. hardlink (link())  -- O(1), no byte copy, same-fs.  The caller
+        (compile_cache_store) chmods the cache object 0444 AFTER a successful
+        placement, so an accidental in-place edit (objcopy/strip --in-place)
+        fails loudly rather than mutating the cache.  Because a same-fs hardlink
+        shares one inode, the output .o becomes 0444 too -- the documented
+        "fail loudly" tradeoff, intended on the store side.
+     3. copy               -- always-correct fallback (read once, write to a
+        temp in DST's dir, then rename() atomically -- a killed/ENOSPC write
+        never leaves a truncated object at DST).
    GCC_COMPILE_CACHE_LINK = copy|hardlink|reflink|auto (default auto) selects
    the highest rung to start at.  DST is unlinked first so link()/open() see a
    clean target (the driver hands us a fresh -o path, but be defensive).
+   This function itself leaves DST writable (mkstemp/reflink/link defaults);
+   the 0444 enforcement is the store caller's job (see compile_cache_store).
    Returns true on success.  */
 static bool
 cc_place_object (const char *cached_o, const char *dst)
@@ -1100,14 +1107,25 @@ cc_place_object (const char *cached_o, const char *dst)
       /* AUTO: fall through to copy (e.g. cross-device link -> EXDEV).  */
     }
 
-  /* Copy fallback: read the cached object once, write it to DST.  */
+  /* Copy fallback: read the cached object once, write it to a temp file in the
+     SAME directory as DST, then rename() it into place atomically.  A killed
+     process or ENOSPC mid-write leaves only the temp (unlinked here) -- never a
+     truncated object at DST that would later look valid.  */
   size_t len = 0;
   unsigned char *bytes = cc_read_file (cached_o, &len);
   if (!bytes)
     return false;
-  FILE *out = fopen (dst, "wb");
+  char *tmp = concat (dst, ".tmpXXXXXX", NULL);
+  int fd = mkstemp (tmp);
+  FILE *out = (fd >= 0) ? fdopen (fd, "wb") : NULL;
   if (!out)
     {
+      if (fd >= 0)
+	{
+	  close (fd);
+	  unlink (tmp);
+	}
+      free (tmp);
       free (bytes);
       return false;
     }
@@ -1115,8 +1133,11 @@ cc_place_object (const char *cached_o, const char *dst)
   if (fclose (out) != 0)
     ok = false;
   free (bytes);
+  if (ok && rename (tmp, dst) != 0)
+    ok = false;
   if (!ok)
-    unlink (dst);
+    unlink (tmp);
+  free (tmp);
   return ok;
 }
 
@@ -1944,6 +1965,14 @@ compile_cache_store (void)
   char *bin_path = cc_entry_path (cc_key_hex, /*make_dirs=*/true);
   char *obj_path = cc_object_sidecar_path (bin_path);
   bool ok = cc_place_object (asm_file_name, obj_path);
+
+  /* Make the cache object read-only (0444) as the docstring promises: an
+     accidental in-place rewrite of the cache (objcopy/strip --in-place) then
+     fails loudly instead of silently corrupting it.  When the object was
+     hardlinked to the output .o (same-fs store), the output .o becomes 0444
+     too -- the documented "fail loudly" tradeoff, intended on the store side.  */
+  if (ok)
+    chmod (obj_path, 0444);
 
   /* Attach the metadata as an xattr on the cache .o.  If the filesystem rejects
      user xattrs (ENOTSUP) or the record will not fit (E2BIG/ENOSPC/...), fall
