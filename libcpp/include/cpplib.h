@@ -1467,17 +1467,31 @@ extern bool cpp_included (cpp_reader *, const char *);
 extern bool cpp_included_before (cpp_reader *, const char *, location_t);
 
 /* Callback invoked once per file that was actually stacked (read) for the
-   current translation unit, with the file's resolved PATH and its exact
-   on-disk contents (BUFFER of SIZE bytes).  Return false to stop the walk.
-   See cpp_foreach_included_file.  */
+   current translation unit, with the file's resolved PATH.
+
+   When CONTENT_SHA1 is non-NULL it is the 20-byte SHA-1 of the file's raw
+   on-disk bytes, computed once when the compiler first read the file; BUFFER
+   is then NULL and SIZE is the file's on-disk byte count.  A consumer that
+   only needs a content digest (e.g. the in-compiler compile cache) uses this
+   stored digest directly and avoids re-reading the file.
+
+   When CONTENT_SHA1 is NULL the digest was not available, so BUFFER points at
+   SIZE bytes of the file's contents (re-read from disk if libcpp no longer
+   holds the buffer) for the consumer to hash itself.
+
+   Return false to stop the walk.  See cpp_foreach_included_file.  */
 typedef bool (*cpp_included_file_cb) (const char *path,
 				      const unsigned char *buffer,
-				      size_t size, void *user);
+				      size_t size,
+				      const unsigned char *content_sha1,
+				      void *user);
 
 /* Walk every file that was stacked for preprocessing in this TU, invoking
-   CB with each file's path and contents (re-reading from disk if libcpp no
-   longer holds the buffer).  Stops early if CB returns false; returns false
-   if a file needed re-reading but could not be read, true otherwise.  */
+   CB for each.  CB receives each file's path and either its stored raw-bytes
+   SHA-1 (no re-read) or, when no digest is available, its contents (re-read
+   from disk if libcpp no longer holds the buffer).  Stops early if CB returns
+   false; returns false if a file needed re-reading but could not be read,
+   true otherwise.  */
 extern bool cpp_foreach_included_file (cpp_reader *,
 				       cpp_included_file_cb, void *);
 

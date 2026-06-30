@@ -28,6 +28,7 @@ along with this program; see the file COPYING3.  If not see
 #include "obstack.h"
 #include "hashtab.h"
 #include "md5.h"
+#include "sha1.h"
 #include <dirent.h>
 
 /* Variable length record files on VMS will have a stat size that includes
@@ -106,6 +107,13 @@ struct _cpp_file
   /* If BUFFER above contains the true contents of the file.  */
   bool buffer_valid : 1;
 
+  /* If CONTENT_SHA1 below holds a valid SHA-1 of the file's RAW on-disk
+     bytes (computed once in read_file_guts, before charset conversion).
+     The in-compiler compile cache consumes this stored digest so a cache
+     MISS need not re-open and re-read the include closure just to hash it
+     (see cpp_foreach_included_file).  */
+  bool content_sha1_valid : 1;
+
   /* If this file is implicitly preincluded.  */
   bool implicit_preinclude : 1;
 
@@ -115,6 +123,12 @@ struct _cpp_file
 
   /* > 0: Known C++ Module header unit, <0: known not.  ==0, unknown  */
   int header_unit : 2;
+
+  /* SHA-1 of the file's RAW on-disk bytes (the bytes read off disk, before
+     any input-charset conversion / BOM stripping / line cleaning), computed
+     once in read_file_guts.  Valid only when content_sha1_valid is set.
+     Zero-initialised by XCNEW in make_cpp_file.  */
+  unsigned char content_sha1[20];
 };
 
 /* A singly-linked list for all searches for a given file name, with
@@ -762,6 +776,23 @@ read_file_guts (cpp_reader *pfile, _cpp_file *file, location_t loc,
   if (pfile && regular && total != size && STAT_SIZE_RELIABLE (file->st))
     cpp_error_at (pfile, CPP_DL_WARNING, loc,
 	       "%s is shorter than expected", file->path);
+
+  /* Hash the RAW on-disk bytes exactly once, here, before _cpp_convert_input
+     (which may free BUF and rewrite it in the source charset).  The in-
+     compiler compile cache consumes this stored digest instead of re-opening
+     and re-reading the whole include closure on a cache miss just to hash it
+     -- the compiler already read these exact bytes, so a miss does zero
+     redundant file I/O.  TOTAL is the meaningful byte count (BUF holds 16
+     extra padding bytes that are never hashed); a zero-byte file yields the
+     well-defined SHA-1 of the empty input, still a valid digest.  */
+  {
+    struct sha1_ctx sctx;
+    sha1_init_ctx (&sctx);
+    if (total > 0)
+      sha1_process_bytes (buf, (size_t) total, &sctx);
+    sha1_finish_ctx (&sctx, file->content_sha1);
+    file->content_sha1_valid = true;
+  }
 
   file->buffer = _cpp_convert_input (pfile,
 				     input_charset,
@@ -2065,12 +2096,23 @@ _cpp_save_file_entries (cpp_reader *pfile, FILE *fp)
 }
 
 /* Invoke CB once for every file that was actually stacked for preprocessing
-   in this TU, passing the file's resolved path and its exact on-disk
-   contents.  Mirrors the walk/filter of _cpp_save_file_entries (skip files
-   that were never stacked, couldn't be read, or errored), and like it falls
-   back to re-opening and reading the file when libcpp no longer holds the
-   in-memory buffer.  Stops early if CB returns false.  Returns false if a
-   file needed re-reading but could not be read, true otherwise.  */
+   in this TU, passing the file's resolved path together with either its
+   precomputed raw-bytes SHA-1 (the common case) or its contents.  Mirrors the
+   walk/filter of _cpp_save_file_entries (skip files that were never stacked,
+   couldn't be read, or errored).
+
+   read_file_guts records a SHA-1 of each file's raw on-disk bytes
+   (content_sha1_valid) the first time the compiler reads the file.  When that
+   digest is present we hand it to CB and DO NOT touch the file again -- so a
+   consumer that only needs a content hash (the in-compiler compile cache) does
+   zero redundant I/O on a cache miss, even though preprocessing has long since
+   freed the in-memory buffer.  Only when no digest is available do we fall
+   back to the buffer (if still valid) or to re-opening and re-reading the file
+   (exactly as _cpp_save_file_entries does); in that fallback CONTENT_SHA1 is
+   NULL and CB hashes the bytes itself.
+
+   Stops early if CB returns false.  Returns false if a file lacked a digest
+   AND needed re-reading but could not be read, true otherwise.  */
 
 bool
 cpp_foreach_included_file (cpp_reader *pfile, cpp_included_file_cb cb,
@@ -2085,15 +2127,25 @@ cpp_foreach_included_file (cpp_reader *pfile, cpp_included_file_cb cb,
 
       const char *path = f->path ? f->path : f->name;
 
-      if (f->buffer_valid)
+      if (f->content_sha1_valid)
 	{
-	  if (!cb (path, f->buffer, f->st.st_size, user))
+	  /* Fast path: hand over the stored raw-bytes digest; no file I/O,
+	     no buffer needed.  SIZE is informational (the on-disk byte count
+	     recorded by stat); the digest is the load-bearing value.  */
+	  if (!cb (path, NULL, f->st.st_size, f->content_sha1, user))
+	    return true;
+	}
+      else if (f->buffer_valid)
+	{
+	  if (!cb (path, f->buffer, f->st.st_size, NULL, user))
 	    return true;
 	}
       else
 	{
-	  /* The buffer was freed after preprocessing; re-read from disk,
-	     preserving f->fd exactly as _cpp_save_file_entries does.  */
+	  /* No digest and the buffer was freed after preprocessing; re-read
+	     from disk, preserving f->fd exactly as _cpp_save_file_entries
+	     does.  This path is only reached for files that never went through
+	     read_file_guts (which always records the digest).  */
 	  int oldfd = f->fd;
 	  if (!open_file (f))
 	    {
@@ -2121,7 +2173,7 @@ cpp_foreach_included_file (cpp_reader *pfile, cpp_included_file_cb cb,
 	      return false;
 	    }
 
-	  bool keep_going = cb (path, buf, size, user);
+	  bool keep_going = cb (path, buf, size, NULL, user);
 	  free (buf);
 	  if (!keep_going)
 	    return true;
