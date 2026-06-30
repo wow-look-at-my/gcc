@@ -1291,7 +1291,8 @@ FORTRAN_TARGET_OBJS=@fortran_target_objs@
 RUST_TARGET_OBJS=@rust_target_objs@
 
 # Object files for gcc many-languages driver.
-GCC_OBJS = gcc.o gcc-main.o ggc-none.o gcc-urlifier.o options-urls.o
+GCC_OBJS = gcc.o gcc-main.o ggc-none.o gcc-urlifier.o options-urls.o \
+	compile-cache-serve.o
 
 c-family-warn = $(STRICT_WARN)
 
@@ -1415,6 +1416,8 @@ OBJS = \
 	combine.o \
 	combine-stack-adj.o \
 	compare-elim.o \
+	compile-cache.o \
+	compile-cache-serve.o \
 	context.o \
 	convert.o \
 	coroutine-passes.o \
@@ -2509,6 +2512,7 @@ s-bversion: BASE-VER
 	$(STAMP) s-bversion
 
 CFLAGS-toplev.o += -DTARGET_NAME=\"$(target_noncanonical)\"
+CFLAGS-compile-cache.o += -DTARGET_NAME=\"$(target_noncanonical)\"
 CFLAGS-tree-diagnostic-client-data-hooks.o += -DTARGET_NAME=\"$(target_noncanonical)\"
 CFLAGS-optinfo-emit-json.o += -DTARGET_NAME=\"$(target_noncanonical)\" $(ZLIBINC)
 CFLAGS-analyzer/engine.o += $(ZLIBINC)

@@ -50,6 +50,8 @@ compilation is specified by a string called a "spec".  */
 #include "opts-jobserver.h"
 #include "common/common-target.h"
 #include "gcc-urlifier.h"
+#include "compile-cache-format.h"	/* compiler-id sidecar format */
+#include "compile-cache-serve.h"	/* driver-level warm-hit serve */
 
 #ifndef MATH_LIBRARY
 #define MATH_LIBRARY "m"
@@ -5796,6 +5798,197 @@ insert_wrapper (const char *wrapper)
   gcc_assert (i == n);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Driver-level compile cache (Stage 5.2): answer a warm hit without ever    */
+/* spawning cc1/cc1plus or as.                                               */
+/* ------------------------------------------------------------------------ */
+
+/* True if GCC_COMPILE_CACHE_DEBUG is set (lazily probed).  Mirrors the
+   compiler side so the driver's "manifest-hit"/"manifest-miss" lines look the
+   same.  */
+static bool
+driver_cc_debug_p (void)
+{
+  static int dbg = -1;
+  if (dbg == -1)
+    {
+      const char *e = env.get ("GCC_COMPILE_CACHE_DEBUG");
+      dbg = (e && e[0]) ? 1 : 0;
+    }
+  return dbg == 1;
+}
+
+/* Read the cache's "compiler-id" sidecar (DIR/compiler-id), written by
+   cc1/cc1plus on a miss-store, into *CHECKSUM (16 bytes, caller-provided) and a
+   freshly xmalloc'd *LANG.  Returns true on success.  The sidecar lets the
+   driver form the manifest key without linking the compiler's checksum object
+   or knowing lang_hooks.name.  */
+static bool
+driver_read_compiler_id (const char *cache_dir, unsigned char checksum[16],
+			 char **lang)
+{
+  *lang = NULL;
+  char *path = concat (cache_dir, "/", CC_COMPILER_ID_NAME, NULL);
+  FILE *f = fopen (path, "rb");
+  free (path);
+  if (!f)
+    return false;
+
+  /* Fixed prefix: 8 magic + u16 ver + u16 reserved + 16 checksum + u32 len.  */
+  unsigned char head[8 + 2 + 2 + 16 + 4];
+  bool ok = (fread (head, 1, sizeof (head), f) == sizeof (head));
+  if (ok
+      && memcmp (head, CC_COMPILER_ID_MAGIC, CC_MAGIC_LEN) == 0
+      && cc_get_u16 (head + 8) == CC_COMPILER_ID_VERSION)
+    {
+      memcpy (checksum, head + 12, 16);
+      uint32_t llen = cc_get_u32 (head + 28);
+      char *buf = (char *) xmalloc ((size_t) llen + 1);
+      if (llen == 0 || fread (buf, 1, llen, f) == llen)
+	{
+	  buf[llen] = '\0';
+	  *lang = buf;
+	}
+      else
+	{
+	  free (buf);
+	  ok = false;
+	}
+    }
+  else
+    ok = false;
+  fclose (f);
+  return ok && *lang;
+}
+
+/* The cc1/cc1plus command line has just been assembled into ARGBUF (its [0] is
+   the program name, e.g. "cc1plus").  If this is an integrated-as compile to an
+   object with -fcompile-cache active, try to serve the cached object directly
+   from the driver -- WITHOUT spawning cc1/cc1plus or as.
+
+   The key trick that makes the driver and cc1plus agree on the manifest key:
+   we decode ARGBUF with the SAME decode_cmdline_options_to_array () the
+   compiler runs on the SAME argv, so the cl_decoded_option array (and thus the
+   key the shared serve unit computes) is identical to the compiler's.  The
+   source file is the first OPT_SPECIAL_input_file -- exactly how the compiler
+   derives main_input_filename (opts-global.cc).
+
+   Returns true if the cache served the object (caller must NOT execute the
+   command).  Returns false to fall through to the normal spawn.  */
+static bool
+driver_try_serve_from_cache (void)
+{
+  if (argbuf.length () < 1)
+    return false;
+
+  /* Respect dry-run modes: -### (verbose_only_flag) prints commands without
+     running them, and -n (do nothing) likewise.  Serving (which writes the .o)
+     would violate the user's request, so fall through to the normal print.  */
+  if (verbose_only_flag)
+    return false;
+
+  /* Only intercept the C/C++ compiler proper.  */
+  const char *prog = lbasename (argbuf[0]);
+  if (strcmp (prog, "cc1") != 0 && strcmp (prog, "cc1plus") != 0)
+    return false;
+
+  /* Decode the assembled cc1 argv exactly as the compiler will.  A broad mask
+     (all languages + common + target + driver) recognizes every option the
+     compiler would, so opt_index / canonical_option match the compiler's
+     decode (the language-fit errors it may flag do not change those).
+     argbuf[0] is the program name -- it is argv[0] (decode skips argv[0]); do
+     NOT prepend an extra dummy, or argbuf[0] ("cc1plus") would be decoded as
+     the first input file (OPT_SPECIAL_input_file) and masquerade as the
+     source.  */
+  unsigned int argc = argbuf.length ();
+  const char **argv = XNEWVEC (const char *, argc);
+  for (unsigned i = 0; i < argbuf.length (); i++)
+    argv[i] = argbuf[i];
+
+  struct cl_decoded_option *decoded = NULL;
+  unsigned int decoded_count = 0;
+  decode_cmdline_options_to_array (argc, argv,
+				   CL_LANG_ALL | CL_COMMON | CL_TARGET
+				   | CL_DRIVER,
+				   &decoded, &decoded_count);
+  free (argv);
+
+  /* Scan for: the cache dir, integrated-as state, disqualifying modes, the
+     source file, and the output object.  The integrated assembler is always
+     on (common.opt: fintegrated-as Init(1) RejectNegative), and the driver no
+     longer puts -fintegrated-as on the cc1 command line, so default this true;
+     the OPT_fintegrated_as case below only ever re-affirms it (a negated form
+     is rejected at decode and cannot reach here).  */
+  const char *cache_dir = NULL;
+  const char *src_path = NULL;
+  const char *out_path = NULL;
+  bool integrated_as = true;
+  bool disqualify = false;
+  bool saw_g = false;
+  for (unsigned i = 1; i < decoded_count; i++)
+    {
+      const cl_decoded_option *o = &decoded[i];
+      switch (o->opt_index)
+	{
+	case OPT_fcompile_cache_:
+	  cache_dir = o->arg;
+	  break;
+	case OPT_fintegrated_as:
+	  integrated_as = (o->value != 0);	/* always 1; negation rejected */
+	  break;
+	case OPT_o:
+	  out_path = o->arg;
+	  break;
+	case OPT_SPECIAL_input_file:
+	  if (!src_path)
+	    src_path = o->arg;	/* first input == main_input_filename */
+	  break;
+	case OPT_E:
+	case OPT_S:
+	case OPT_fsyntax_only:
+	  disqualify = true;	/* not a compile-to-object */
+	  break;
+	case OPT_g:
+	case OPT_ggdb:
+	case OPT_gdwarf:
+	case OPT_gdwarf_:
+	  saw_g = true;
+	  break;
+	default:
+	  break;
+	}
+    }
+
+  bool served = false;
+  if (cache_dir && cache_dir[0] && integrated_as && !disqualify
+      && src_path && out_path)
+    {
+      unsigned char checksum[16];
+      char *lang = NULL;
+      if (driver_read_compiler_id (cache_dir, checksum, &lang))
+	{
+	  const char *verify = env.get ("GCC_COMPILE_CACHE_VERIFY");
+	  char *cwd = getpwd ();
+	  cc_serve_ctx ctx;
+	  ctx.cache_dir = cache_dir;
+	  ctx.checksum = checksum;
+	  ctx.lang_name = lang;
+	  ctx.decoded = decoded;
+	  ctx.decoded_count = decoded_count;
+	  ctx.paths_affect_output = saw_g;
+	  ctx.cwd = cwd ? cwd : "";
+	  ctx.verify_hash = (verify && !strcmp (verify, "hash"));
+	  ctx.debug = driver_cc_debug_p ();
+	  served = compile_cache_serve_object (&ctx, src_path, out_path);
+	  free (lang);
+	}
+    }
+
+  /* decoded uses the opts obstack; the array itself is heap.  */
+  free (decoded);
+  return served;
+}
+
 /* Process the spec SPEC and run the commands specified therein.
    Returns 0 if the spec is successfully processed; -1 if failed.  */
 
@@ -5815,6 +6008,14 @@ do_spec (const char *spec)
 	argbuf.pop ();
 
       set_collect_gcc_options ();
+
+      /* Driver-level compile-cache serve (Stage 5.2): if this assembled
+	 command is an integrated-as compile-to-object with -fcompile-cache and
+	 the cache holds a warm hit, place the cached .o now and SKIP the spawn
+	 entirely -- no cc1/cc1plus, no as.  On a miss we fall through and run
+	 the command normally (cc1plus then compiles + stores, as before).  */
+      if (argbuf.length () > 0 && driver_try_serve_from_cache ())
+	return 0;
 
       if (argbuf.length () > 0)
 	value = execute ();

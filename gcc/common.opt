@@ -1255,6 +1255,10 @@ fcompare-elim
 Common Var(flag_compare_elim_after_reload) Optimization
 Perform comparison elimination after register allocation has finished.
 
+fcompile-cache=
+Common Joined RejectNegative Var(compile_cache_dir)
+Cache assembly output in DIR, keyed by source and options, and reuse it on identical inputs.  Overridden by the GCC_COMPILE_CACHE_DIR environment variable when this is unset.
+
 fconserve-stack
 Common Var(flag_conserve_stack) Optimization
 Do not perform optimizations increasing noticeably stack usage.
@@ -2037,6 +2041,10 @@ Common RejectNegative Joined
 finstrument-functions-exclude-file-list=
 Common RejectNegative Joined
 -finstrument-functions-exclude-file-list=filename,...	Do not instrument functions listed in files.
+
+fintegrated-as
+Common Var(flag_integrated_as) Init(1) RejectNegative
+Assemble in-process with the built-in assembler instead of invoking as.  This is always on: cc1plus folds the GNU assembler into the compiler so a compile-to-object is a single process; there is no fork to a separate as and no way to turn it off.
 
 fipa-cp
 Common Var(flag_ipa_cp) Optimization

@@ -1,0 +1,245 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      reset_cache:
+        description: 'Clear the persisted compile cache before building (forces a cold run)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Persisted compile-cache directory, shared across runs via actions/cache.
+  GCC_CC_DIR: ${{ github.workspace }}/.gcc-compile-cache
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev
+
+      # This branch's cc1plus links the embedded GNU assembler (libgas.a) for
+      # -fintegrated-as, so the build needs a "combined tree": binutils 2.42's
+      # gas/bfd/opcodes/libsframe/libctf built alongside GCC. The driver-level
+      # .o cache itself works without the integrated assembler, but cc1plus does
+      # not link unless libgas.a (built from this combined tree by
+      # contrib/gas-embed/build-libgas.sh) is present. The recipe below mirrors
+      # contrib/gas-embed/README.md exactly. binutils setup is plain shell (no
+      # third-party actions): download the upstream tarball, symlink the modules
+      # and binutils-only headers into the GCC checkout, apply the gas patch.
+      - name: Fetch binutils 2.42
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          curl -fL -o binutils.tar.xz https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.xz
+          tar xf binutils.tar.xz
+          test -d binutils-2.42/gas
+
+      # Combined-tree symlinks into the GCC checkout (README "Combined-tree setup
+      # recipe", Stage 1). (1) Top-level binutils-only module dirs GCC lacks.
+      # (2) The skew fix: every binutils-only header symlinked into GCC's shared
+      # include/ (bfd/opcodes/gas include ~30 headers GCC-14's include/ does not
+      # ship). We link each entry from binutils' include/ that GCC's pristine
+      # include/ does not already provide, skipping the gcc-owned doc files; the
+      # overlapping headers (libiberty.h, ansidecl.h, ...) are byte-identical
+      # between GCC-14 and binutils 2.42, so GCC's stay authoritative. Do NOT
+      # symlink config/ include/ libiberty/ zlib/ -- the tree shares GCC's.
+      - name: Set up combined tree (symlinks)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          BU="$GITHUB_WORKSPACE/binutils-2.42"
+          for d in bfd opcodes gas libsframe libctf; do
+            ln -sfn "$BU/$d" "$GITHUB_WORKSPACE/$d"
+          done
+          for entry in "$BU"/include/*; do
+            name="$(basename "$entry")"
+            case "$name" in
+              ChangeLog*|MAINTAINERS|COPYING*) continue ;;
+            esac
+            if [ ! -e "$GITHUB_WORKSPACE/include/$name" ]; then
+              ln -sfn "$entry" "$GITHUB_WORKSPACE/include/$name"
+            fi
+          done
+          echo "binutils-only headers linked into include/:"
+          find include/ -maxdepth 1 -lname "$BU/*" -printf '%f ' ; echo
+
+      # Apply the integrated-assembler gas patch to the pristine binutils 2.42
+      # gas/ tree. The patch paths are a/<file> relative to gas/, so apply from
+      # there with -p1 (README "Applying the binutils gas source changes").
+      - name: Apply gas integrated-as patch
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          patch -p1 -d binutils-2.42/gas < contrib/gas-embed/gas-integrated-as.patch
+          test -f binutils-2.42/gas/embed.c
+
+      # Configure out-of-tree. Keeps the original CI flags and adds the
+      # combined-tree requirements from the proven recipe (README Stage 1):
+      # --with-system-zlib (so the tree needs no zlib/ module), --disable-nls,
+      # --disable-werror, and MAKEINFO=true (no makeinfo on the runner). The
+      # config triplet is deliberately left to GCC's default canonicalization
+      # (x86_64-pc-linux-gnu) -- the same as the prior working CI -- so the
+      # target-library subdir paths the verify/benchmark scripts expect are
+      # unchanged.
+      - name: Configure GCC (combined tree, out of tree)
+        run: |
+          mkdir -p "$RUNNER_TEMP/gccbuild"
+          cd "$RUNNER_TEMP/gccbuild"
+          "$GITHUB_WORKSPACE/configure" \
+            --disable-bootstrap --enable-languages=c,c++ --disable-multilib \
+            --with-system-zlib --disable-nls --disable-werror \
+            MAKEINFO=true
+
+      # Build the binutils host libraries first, then assemble libgas.a from the
+      # combined tree, then build GCC. build-libgas.sh writes ../libgas.a (top of
+      # the build tree) which cc1plus/cc1/lto1 link via GAS_LIBS (cp/Make-lang.in).
+      # The script's source paths default to the local checkout; point them at
+      # this checkout via $GAS_SRC / $GAS_EMBED_DIR.
+      - name: Build binutils host libs (bfd, opcodes, gas)
+        run: |
+          cd "$RUNNER_TEMP/gccbuild"
+          make -j"$(nproc)" all-libiberty MAKEINFO=true
+          make -j"$(nproc)" all-bfd all-opcodes all-gas MAKEINFO=true
+
+      - name: Build libgas.a
+        run: |
+          export GAS_SRC="$GITHUB_WORKSPACE/gas"
+          export GAS_EMBED_DIR="$GITHUB_WORKSPACE/contrib/gas-embed"
+          bash "$GITHUB_WORKSPACE/contrib/gas-embed/build-libgas.sh" "$RUNNER_TEMP/gccbuild"
+          test -f "$RUNNER_TEMP/gccbuild/libgas.a"
+
+      # Now build GCC itself: all-gcc links cc1plus/cc1/lto1 against ../libgas.a
+      # (present from the previous step). Then build the target libraries the
+      # cache verify and benchmark need -- all-target-libstdc++-v3 pulls in its
+      # prerequisites (all-gcc, all-target-libgcc, and the build-tree libstdc++
+      # headers + libstdc++.so the C++ checks link against). Building these two
+      # targets explicitly (rather than a bare `make all`) keeps the build to
+      # what the proven recipe and the CI scripts require and skips the unrelated
+      # ld/binutils host modules the combined tree would otherwise also build.
+      - name: Build GCC
+        run: |
+          cd "$RUNNER_TEMP/gccbuild"
+          make -j"$(nproc)" all-gcc MAKEINFO=true
+          make -j"$(nproc)" all-target-libstdc++-v3 MAKEINFO=true
+
+      - name: Verify in-compiler cache
+        run: node "$GITHUB_WORKSPACE/.github/scripts/ci-verify-cache.mjs" "$RUNNER_TEMP/gccbuild"
+
+      # Package the whole build dir (cc1/cc1plus/xgcc/xg++ plus the build-tree
+      # libstdc++ needed for linking and STL compiles) so the benchmark job can
+      # restore the exact compiler without rebuilding. Large but compresses well.
+      - name: Package built compiler
+        run: |
+          tar -C "$RUNNER_TEMP" -czf gccbuild.tar.gz gccbuild
+          ls -lh gccbuild.tar.gz
+
+      - name: Upload built compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: gccbuild
+          path: gccbuild.tar.gz
+          retention-days: 1
+
+  benchmark:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Download built compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: gccbuild
+
+      - name: Restore built compiler
+        run: |
+          tar -C "$RUNNER_TEMP" -xzf gccbuild.tar.gz
+          test -x "$RUNNER_TEMP/gccbuild/gcc/xg++"
+
+      # Runtime libs in case the restored compiler needs them at link/compile
+      # time, plus ccache (used as a comparison baseline in the benchmark).
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache libgmp-dev libmpfr-dev libmpc-dev libisl-dev
+
+      # When dispatched with reset_cache=true, delete the persisted cache entry
+      # (so the restore below finds nothing) and remove any local copy, giving
+      # a forced cold run. gh needs GH_TOKEN; actions:write permits cache
+      # deletion. Best-effort: a missing entry is not an error.
+      - name: Reset compile cache (workflow_dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_cache }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "reset_cache requested: clearing persisted compile cache"
+          rm -rf "$GCC_CC_DIR" || true
+          PREFIX="gcc-cc-${{ runner.os }}-${{ github.ref_name }}-"
+          gh cache list --ref "${{ github.ref }}" --limit 100 --json id,key \
+            --jq ".[] | select(.key | startswith(\"$PREFIX\")) | .id" \
+            | while read -r id; do
+                echo "deleting cache entry id=$id"
+                gh cache delete "$id" || true
+              done
+
+      - name: Restore compile cache
+        # Skip the restore entirely on a forced reset so we start truly cold.
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.reset_cache) }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GCC_CC_DIR }}
+          key: gcc-cc-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            gcc-cc-${{ runner.os }}-${{ github.ref_name }}-
+            gcc-cc-${{ runner.os }}-
+
+      # On a forced reset we skipped actions/cache (which also schedules the
+      # post-run save), so register the cache here to persist this cold run's
+      # freshly populated dir for next time.
+      - name: Save compile cache (after forced reset)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.reset_cache }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GCC_CC_DIR }}
+          key: gcc-cc-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+
+      # 5-way benchmark (no-cache / ours-cold / ours-warm / ccache-cold /
+      # ccache-warm) on a small fixed workload. Writes a Markdown table to the
+      # run UI ($GITHUB_STEP_SUMMARY) and the log.
+      - name: Benchmark in-compiler cache
+        run: node "$GITHUB_WORKSPACE/.github/scripts/ci-bench-cache.mjs" "$RUNNER_TEMP/gccbuild"
+
+      # Exercise the persisted cache so the post-run actions/cache save captures
+      # populated entries that a later run on this ref can reuse.
+      - name: Warm persisted compile cache
+        run: |
+          mkdir -p "$GCC_CC_DIR"
+          BUILD="$RUNNER_TEMP/gccbuild"
+          XGCC="$BUILD/gcc/xgcc -B$BUILD/gcc"
+          printf 'int main(void){return 0;}\n' > "$RUNNER_TEMP/warm.c"
+          GCC_COMPILE_CACHE_DEBUG=1 $XGCC -O2 -fcompile-cache="$GCC_CC_DIR" \
+            -c "$RUNNER_TEMP/warm.c" -o "$RUNNER_TEMP/warm.o"
+          echo "persisted cache now holds $(find "$GCC_CC_DIR" -name '*.o' | wc -l) object(s)"

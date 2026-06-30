@@ -43,6 +43,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "dumpfile.h"
 #include "file-prefix-map.h"    /* add_*_prefix_map()  */
 #include "context.h"
+#include "compile-cache.h"
 
 #ifndef DOLLARS_IN_IDENTIFIERS
 # define DOLLARS_IN_IDENTIFIERS true
@@ -1300,6 +1301,37 @@ void
 c_common_parse_file (void)
 {
   auto dumps = g->get_dumps ();
+
+  /* Pin -frandom-seed (if the user did not) so codegen name generation is
+     reproducible and the assembly cache can ever hit.  Must be before any
+     parsing/codegen begins.  No-op when caching is disabled.  PCH state is a
+     C/C++-specific fact the back-end cache object cannot see, so pass it in.  */
+  compile_cache_init_determinism (pch_file != NULL || flag_pch_preprocess);
+
+  /* Stage 5 pre-parse fast-path: before parsing anything, try to serve this
+     TU's object from the manifest cache (hash the main source + flags + search
+     paths -> recorded include set -> re-stat the headers -> cached .o).  On a
+     hit the cached .o is placed at the output and the hit flag is set, so we
+     return immediately WITHOUT parsing or running the back-end: compile_file()
+     sees compile_cache_hit_p() and skips the back-end, finalize() skips the
+     (now-NULL) asm stream, and compile_cache_store() no-ops on the hit.  This
+     is single-TU only (the cache gates on num_in_fnames == 1), so an early
+     return here cannot strand a later input file.  */
+  {
+    /* Hash the file actually NAMED ON THE COMMAND LINE (in_fnames[0]), NOT
+       main_input_filename.  For a preprocessed input (.i/.ii) libcpp resets
+       main_input_filename to the ORIGINAL source recorded in the leading
+       "# 1 \"...\"" line marker, so main_input_filename would be the .cc while
+       the file on disk is the .ii.  The DRIVER, which has no preprocessed
+       content to parse, can only hash the input file it was handed (the .ii).
+       Keying both sides on in_fnames[0] makes the driver's manifest key match
+       cc1plus's -- the #1 requirement for the driver-level serve to ever hit.
+       For an ordinary .cc input the two are identical, so nothing changes.  */
+    const char *src = (num_in_fnames == 1 ? in_fnames[0] : NULL);
+    if (src && compile_cache_try_serve_manifest (parse_in, src))
+      return;
+  }
+
   for (unsigned int i = 0;;)
     {
       c_finish_options ();
@@ -1327,6 +1359,13 @@ c_common_parse_file (void)
     }
 
   c_parse_final_cleanups ();
+
+  /* The include closure is now complete.  Try to serve cached assembly; on a
+     hit this writes the .s into asm_out_file and sets a TU-global so the
+     back-end is skipped back in compile_file().  parse_in carries the include
+     closure for the key.  */
+  (void) compile_cache_try_serve (parse_in);
+
   dumps->dump_finish (TDI_original);
 }
 

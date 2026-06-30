@@ -49,7 +49,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "insn-attr.h"
 #include "output.h"
 #include "toplev.h"
-#include "integrated-as.h"
+#include "compile-cache.h"
 #include "expr.h"
 #include "intl.h"
 #include "tree-diagnostic.h"
@@ -95,6 +95,8 @@ along with GCC; see the file COPYING3.  If not see
 #include "gcc-urlifier.h"
 
 #include "selftest.h"
+
+#include "gas-embed.h"		/* for -fintegrated-as (gas_assemble_buffer) */
 
 #ifdef HAVE_isl
 #include <isl/version.h>
@@ -165,11 +167,13 @@ const char *user_label_prefix;
 
 FILE *asm_out_file;
 
-/* When assembling in-process (the integrated-assembler fold), asm_out_file is
-   an open_memstream() handle and these capture the buffer it writes into.
-   After fclose(asm_out_file) they hold the complete assembly text, which is
-   then handed to gas_assemble_buffer() to produce the object file (or, for
-   -S, written to the .s output and not assembled).  */
+/* The integrated assembler is always on: cc1plus folds the GNU assembler
+   (libgas, gcc/gas-embed.h) into the compiler so a compile-to-object is a
+   single process.  When the output is a real object file, asm_out_file is an
+   open_memstream() handle and these capture the buffer it writes into.  After
+   fclose(asm_out_file) they hold the complete assembly text, which is then
+   handed to gas_assemble_buffer() to produce the object file (or, for -S,
+   written verbatim to the .s output and not assembled).  */
 static char *asm_mem_buf;
 static size_t asm_mem_size;
 /* True when asm_out_file is an open_memstream() handle (set in
@@ -473,7 +477,10 @@ compile_file (void)
   /* Compilation is now finished except for writing
      what's left of the symbol table output.  */
 
-  if (flag_syntax_only || flag_wpa)
+  /* On a compilation-cache hit, the .s has already been written into
+     asm_out_file by compile_cache_try_serve() during parsing; skip the
+     back-end entirely.  */
+  if (flag_syntax_only || flag_wpa || compile_cache_hit_p ())
     return;
  
   /* Reset maximum_field_alignment, it can be adjusted by #pragma pack
@@ -2036,12 +2043,24 @@ finalize ()
       bool used_memstream = asm_using_memstream;
       if (ferror (asm_out_file) != 0)
 	fatal_error (input_location, "error writing to %s: %m", asm_file_name);
-      /* Closing the memstream flushes the assembly text into asm_mem_buf and
-	 sets asm_mem_size to its length.  */
+      /* For the integrated-assembler path asm_out_file is an open_memstream;
+	 closing it flushes the captured assembly text into asm_mem_buf and
+	 sets asm_mem_size to its length.  For the plain text-file path (stdout
+	 / bit bucket) this is just the normal close.  */
       if (fclose (asm_out_file) != 0)
 	fatal_error (input_location, "error closing %s: %m", asm_file_name);
       asm_out_file = NULL;
 
+      /* The integrated assembler is always on: when the output was a real
+	 object file, init_asm_output captured the back-end's assembly into an
+	 in-memory stream instead of a text file.  Now either write that text
+	 verbatim to the .s output (-S) or assemble it in-process to the object,
+	 with no forked `as` and no temporary .s file.
+
+	 On a compilation-cache HIT none of this runs: the serve path already
+	 placed the cached .o at asm_file_name and closed the (empty) memstream,
+	 setting asm_out_file = NULL, so this whole block is skipped and
+	 compile_cache_store() below no-ops.  */
       if (used_memstream)
 	{
 	  if (flag_asm_output_only)
@@ -2064,9 +2083,12 @@ finalize ()
 	    {
 	      /* Compile-to-object: assemble the buffered text in-process,
 		 writing the object straight to asm_file_name (the .o path the
-		 driver handed us).  No forked `as`, no temporary .s file.  */
-	      int rc = gas_assemble_buffer (asm_mem_buf, asm_mem_size,
-					    asm_file_name, NULL);
+		 driver handed us).  gas_assemble_buffer is the libgas entry
+		 point declared in gas-embed.h.  No forked `as`, no temporary
+		 .s file.  A broken TU (seen_error) is not fed to the
+		 assembler.  */
+	      int rc = gas_assemble_buffer (asm_mem_buf ? asm_mem_buf : "",
+					    asm_mem_size, asm_file_name);
 	      if (rc != 0)
 		fatal_error (input_location,
 			     "integrated assembler failed on %qs (code %d)",
@@ -2226,6 +2248,11 @@ do_compile ()
       timevar_start (TV_PHASE_FINALIZE);
 
       finalize ();
+
+      /* If this was a cache miss, the back-end has now produced and
+	 finalize() has closed the .s file; publish it to the cache.  No-op
+	 on a hit, on error, or when caching is disabled.  */
+      compile_cache_store ();
 
       timevar_stop (TV_PHASE_FINALIZE);
     }
