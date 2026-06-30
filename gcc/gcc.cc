@@ -1287,12 +1287,13 @@ static const char *cc1_options =
  %1 %{!Q:-quiet} %(cpp_debug_options) %{m*} %{aux-info*}\
  %{g*} %{O*} %{W*&pedantic*} %{w} %{std*&ansi&trigraphs}\
  %{v:-version} %{pg:-p} %{p} %{f*} %{undef}\
- %{S|fsyntax-only:%{fintegrated-as:-fno-integrated-as}}\
  %{Qn:-fno-ident} %{Qy:} %{-help:--help}\
  %{-target-help:--target-help}\
  %{-version:--version}\
  %{-help=*:--help=%*}\
- %{!fsyntax-only:%{S:%W{o*}%{!o*:-o %w%b.s}}}\
+ %{!fsyntax-only:\
+   %{S:-fasm-output-only %W{o*}%{!o*:-o %w%b.s}}\
+   %{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}}\
  %{fsyntax-only:-o %j} %{-param*}\
  %{coverage:-fprofile-arcs -ftest-coverage}\
  %{fprofile-arcs|fcondition-coverage|fprofile-generate*|coverage:\
@@ -1310,24 +1311,19 @@ static const char *asm_options =
 ASM_COMPRESS_DEBUG_SPEC
 "%a %Y %{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}";
 
+/* Integrated assembler: cc1plus assembles in-process via libgas, so there is
+   no separate `as` stage.  The object's -o name is handed to cc1plus by
+   cc1_options (the %{!S:...%O} arm), and cc1plus writes the object directly.
+   This spec therefore emits no ` | as` pipeline at all -- the compile-to-object
+   is a single process.  The compare-debug dump-opt hook is kept because it
+   rewrites cc1's own -o dump naming and must still run.  This fold is
+   unconditional and permanent: there is no -fno- form and no fork-`as`
+   fallback for a compile.  (Hand-written .s inputs still use `as`; that is a
+   separate spec, see the assembler_spec/@assembler path, and is left alone.)  */
 static const char *invoke_as =
-#ifdef AS_NEEDS_DASH_FOR_PIPED_INPUT
 "%{!fwpa*:\
-   %{fintegrated-as:\
-     %{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}}\
-   %{!fintegrated-as:\
-     %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
-     %{!S:-o %|.s |\n as %(asm_options) %|.s %A }}\
+   %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
   }";
-#else
-"%{!fwpa*:\
-   %{fintegrated-as:\
-     %{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}}\
-   %{!fintegrated-as:\
-     %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
-     %{!S:-o %|.s |\n as %(asm_options) %m.s %A }}\
-  }";
-#endif
 
 /* Some compilers have limits on line lengths, and the multilib_select
    and/or multilib_matches strings can be very long, so we build them at
@@ -5918,11 +5914,15 @@ driver_try_serve_from_cache (void)
   free (argv);
 
   /* Scan for: the cache dir, integrated-as state, disqualifying modes, the
-     source file, and the output object.  */
+     source file, and the output object.  The integrated assembler is always
+     on (common.opt: fintegrated-as Init(1) RejectNegative), and the driver no
+     longer puts -fintegrated-as on the cc1 command line, so default this true;
+     the OPT_fintegrated_as case below only ever re-affirms it (a negated form
+     is rejected at decode and cannot reach here).  */
   const char *cache_dir = NULL;
   const char *src_path = NULL;
   const char *out_path = NULL;
-  bool integrated_as = false;
+  bool integrated_as = true;
   bool disqualify = false;
   bool saw_g = false;
   for (unsigned i = 1; i < decoded_count; i++)
@@ -5934,7 +5934,7 @@ driver_try_serve_from_cache (void)
 	  cache_dir = o->arg;
 	  break;
 	case OPT_fintegrated_as:
-	  integrated_as = (o->value != 0);	/* -fno-integrated-as -> 0 */
+	  integrated_as = (o->value != 0);	/* always 1; negation rejected */
 	  break;
 	case OPT_o:
 	  out_path = o->arg;

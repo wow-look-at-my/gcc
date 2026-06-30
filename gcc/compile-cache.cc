@@ -1966,6 +1966,7 @@ compile_cache_store (void)
   char *obj_path = cc_object_sidecar_path (bin_path);
   bool ok = cc_place_object (asm_file_name, obj_path);
 
+
   /* Make the cache object read-only (0444) as the docstring promises: an
      accidental in-place rewrite of the cache (objcopy/strip --in-place) then
      fails loudly instead of silently corrupting it.  When the object was
@@ -1997,6 +1998,8 @@ compile_cache_store (void)
 	    ok = false;		/* hard xattr error -> abandon this entry */
 	}
     }
+  else
+    unlink (obj_path);		/* clean up a placed-but-unannotated object */
 
   if (ok)
     {
