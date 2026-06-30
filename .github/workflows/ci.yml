@@ -242,4 +242,4 @@ jobs:
           printf 'int main(void){return 0;}\n' > "$RUNNER_TEMP/warm.c"
           GCC_COMPILE_CACHE_DEBUG=1 $XGCC -O2 -fcompile-cache="$GCC_CC_DIR" \
             -c "$RUNNER_TEMP/warm.c" -o "$RUNNER_TEMP/warm.o"
-          echo "persisted cache now holds $(find "$GCC_CC_DIR" -name '*.bin' | wc -l) object(s)"
+          echo "persisted cache now holds $(find "$GCC_CC_DIR" -name '*.o' | wc -l) object(s)"
