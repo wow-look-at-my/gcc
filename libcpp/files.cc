@@ -557,8 +557,25 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
 	 exactly as the ENOENT path below would, so behaviour -- the set
 	 of headers found, diagnostics, and the nonexistent_file_hash
 	 bookkeeping -- is byte-for-byte identical to actually calling
-	 open().  Only the redundant failing open() syscall disappears.  */
+	 open().  Only the redundant failing open() syscall disappears.
+
+	 The shortcut is confined to genuine directory-resident header
+	 lookups.  It must never fire for the pseudo-file paths that reach
+	 this code:
+	   - The empty file name is <stdin> (and the main input file "-"
+	     resolves to it); it is opened as fd 0 by open_file, is never a
+	     readdir entry, and must not be treated as "absent".
+	   - pfile->no_search_path is the synthetic directory used for the
+	     main file, -include of an absolute path, and preprocessed
+	     input.  Its name is "" so build_dir_name_index would index the
+	     current working directory, which has nothing to do with the
+	     file being opened.
+	 Requiring a non-empty single-component name and a real search
+	 directory keeps the optimization for the include-search case while
+	 falling through to open_file for every pseudo-file.  */
       bool skip_open = (plain_path
+			&& file->name[0] != '\0'
+			&& file->dir != &pfile->no_search_path
 			&& strchr (file->name, '/') == NULL
 #ifdef HAVE_DOS_BASED_FILE_SYSTEM
 			&& strchr (file->name, '\\') == NULL
