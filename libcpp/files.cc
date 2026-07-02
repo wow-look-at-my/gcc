@@ -477,8 +477,9 @@ build_dir_name_index (cpp_dir *dir)
 
    The caller must ensure NAME contains no directory separator: readdir
    only lists top-level entries, so a multi-component name such as
-   "QtCore/qobject.h" is never a direct child and the index does not
-   apply to it (the caller falls back to open() for those).  */
+   "QtCore/qobject.h" is never itself an entry.  Multi-component
+   lookups go through index_proves_absent below, which tests only the
+   leading component here.  */
 
 static bool
 name_absent_from_dir (cpp_dir *dir, const char *name)
@@ -494,6 +495,71 @@ name_absent_from_dir (cpp_dir *dir, const char *name)
     return false;	/* Present (or possibly present): must open.  */
 
   return true;		/* Provably absent: safe to skip the open.  */
+}
+
+/* Return true iff opening the path DIR/FNAME (as built by
+   append_file_to_dir) is provably going to fail with ENOENT according
+   to DIR's filename index, so the open() can be skipped.
+
+   A single-component FNAME is a direct index membership test, exactly
+   as before.
+
+   For a multi-component FNAME such as "QtCore/qstring.h", path
+   resolution must first look up the LEADING component ("QtCore") as a
+   direct entry of DIR; if the index proves that entry does not exist,
+   open (DIR/FNAME) must fail with ENOENT no matter what the remaining
+   components are.  Only ABSENCE of the leading component is used:
+   when it is present -- as a subdirectory, a symlink to anything, or
+   even a plain file (the ENOTDIR case, which open_file already maps
+   to ENOENT) -- we return false and the real open() runs, letting the
+   OS resolve the tail exactly as before.  Deeper components are never
+   tested: readdir only enumerates top-level entries, and the first
+   component is where the systematic miss cost is.
+
+   Multi-component names containing "." or ".." or empty components
+   ("A/./B", "A/../B", "A//B", a trailing '/') always return false:
+   their resolution is not a plain top-level-entry lookup, so they
+   stay on the raw open() path.  */
+
+static bool
+index_proves_absent (cpp_dir *dir, const char *fname)
+{
+  const char *sep = strchr (fname, '/');
+  if (sep == NULL)
+    /* Single component: FNAME itself must be an entry of DIR.  */
+    return name_absent_from_dir (dir, fname);
+
+  /* Multi-component: only trust the leading-component test when every
+     component is a plain name.  */
+  const char *p = fname;
+  for (;;)
+    {
+      const char *q = strchr (p, '/');
+      size_t len = q ? (size_t) (q - p) : strlen (p);
+      if (len == 0
+	  || (p[0] == '.' && (len == 1 || (len == 2 && p[1] == '.'))))
+	return false;
+      if (q == NULL)
+	break;
+      p = q + 1;
+    }
+
+  /* NUL-terminate a copy of the leading component for the index
+     lookup.  Include-name components are short; spill to the heap
+     only for pathological lengths.  */
+  size_t comp_len = (size_t) (sep - fname);
+  char buf[64];
+  char *comp = buf;
+  if (comp_len >= sizeof buf)
+    comp = XNEWVEC (char, comp_len + 1);
+  memcpy (comp, fname, comp_len);
+  comp[comp_len] = '\0';
+
+  bool absent = name_absent_from_dir (dir, comp);
+
+  if (comp != buf)
+    free (comp);
+  return absent;
 }
 
 /* Try to open the path FILE->name appended to FILE->dir.  This is
@@ -563,10 +629,11 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
 
       /* Before issuing the real open() for DIR/name, consult the
 	 directory's filename index.  When the path is the plain
-	 DIR/name form, name is a single component (readdir only lists
-	 top-level entries, so multi-component names like
-	 "QtCore/qobject.h" must fall through to open()), and the index
-	 proves name is absent from the directory, the open() is
+	 DIR/name form and the index proves the lookup must fail --
+	 for a single-component name, the name is not an entry of the
+	 directory; for a multi-component name like "QtCore/qobject.h",
+	 its leading component is not an entry, so path resolution
+	 cannot even begin (see index_proves_absent) -- the open() is
 	 guaranteed to fail with ENOENT.  Skip it and record the miss
 	 exactly as the ENOENT path below would, so behaviour -- the set
 	 of headers found, diagnostics, and the nonexistent_file_hash
@@ -590,11 +657,14 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
       bool skip_open = (plain_path
 			&& file->name[0] != '\0'
 			&& file->dir != &pfile->no_search_path
-			&& strchr (file->name, '/') == NULL
 #ifdef HAVE_DOS_BASED_FILE_SYSTEM
+			/* Backslash-separated and drive-qualified names
+			   have DOS-specific resolution rules; keep them
+			   on the raw open() path.  */
 			&& strchr (file->name, '\\') == NULL
+			&& !HAS_DRIVE_SPEC (file->name)
 #endif
-			&& name_absent_from_dir (file->dir, file->name));
+			&& index_proves_absent (file->dir, file->name));
 
       if (!skip_open && open_file (file))
 	return true;
