@@ -34,9 +34,12 @@ jobs:
           df -h
 
       - name: Install build dependencies
+        # libgoogle-perftools-dev ships libtcmalloc_minimal.a, which
+        # cc1/cc1plus link statically when present (gcc/cp/Make-lang.in
+        # TCMALLOC_LIBS); the build degrades gracefully without it.
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev
+          sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev libgoogle-perftools-dev
 
       # This branch's cc1plus links the embedded GNU assembler (libgas.a) for
       # -fintegrated-as, so the build needs a "combined tree": binutils 2.42's
