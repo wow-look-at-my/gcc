@@ -9,6 +9,11 @@ on:
         type: boolean
         required: false
         default: false
+      build_pgo:
+        description: 'Also run the package-pgo job (PGO-built release package)'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -34,9 +39,12 @@ jobs:
           df -h
 
       - name: Install build dependencies
+        # libgoogle-perftools-dev ships libtcmalloc_minimal.a, which
+        # cc1/cc1plus link statically when present (gcc/cp/Make-lang.in
+        # TCMALLOC_LIBS); the build degrades gracefully without it.
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev
+          sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev libgoogle-perftools-dev
 
       # This branch's cc1plus links the embedded GNU assembler (libgas.a) for
       # -fintegrated-as, so the build needs a "combined tree": binutils 2.42's
@@ -157,6 +165,171 @@ jobs:
           name: gccbuild
           path: gccbuild.tar.gz
           retention-days: 1
+
+  # PGO-built release package: instrumented build -> deterministic training
+  # workload (contrib/perf-train) -> profile-use rebuild. Measured ~-8% cc1plus
+  # wall on large template-heavy TUs with byte-identical compiler output, at
+  # roughly 2x compiler-build cost -- so this job runs ONLY on pushes to the
+  # release branch (develop-matt/v14) or on manual dispatch with build_pgo=true.
+  # It must never gate PR verification and is not a required check; the plain
+  # `build` job remains the artifact every other job consumes.
+  package-pgo:
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/develop-matt/v14') ||
+      (github.event_name == 'workflow_dispatch' && inputs.build_pgo)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev libgoogle-perftools-dev
+
+      # Combined-tree setup: identical to the `build` job (see the comments
+      # there for the why of each step).
+      - name: Fetch binutils 2.42
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          curl -fL -o binutils.tar.xz https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.xz
+          tar xf binutils.tar.xz
+          test -d binutils-2.42/gas
+
+      - name: Set up combined tree (symlinks)
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          BU="$GITHUB_WORKSPACE/binutils-2.42"
+          for d in bfd opcodes gas libsframe libctf; do
+            ln -sfn "$BU/$d" "$GITHUB_WORKSPACE/$d"
+          done
+          for entry in "$BU"/include/*; do
+            name="$(basename "$entry")"
+            case "$name" in
+              ChangeLog*|MAINTAINERS|COPYING*) continue ;;
+            esac
+            if [ ! -e "$GITHUB_WORKSPACE/include/$name" ]; then
+              ln -sfn "$entry" "$GITHUB_WORKSPACE/include/$name"
+            fi
+          done
+
+      - name: Apply gas integrated-as patch
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          patch -p1 -d binutils-2.42/gas < contrib/gas-embed/gas-integrated-as.patch
+          test -f binutils-2.42/gas/embed.c
+
+      # ---------- PGO phase A: instrumented compiler ----------
+      # CFLAGS_FOR_TARGET/CXXFLAGS_FOR_TARGET are pinned plain: the toplevel
+      # defaults them from CFLAGS, which would leak -fprofile-generate into
+      # target-library conftests (libgomp's run-test conftest then fails with
+      # "cannot run C compiled programs") and pointlessly instrument target
+      # libs. Only the HOST compiler is profiled; compiling target libs WITH
+      # the instrumented compiler is itself free training.
+      - name: Configure GCC (instrumented)
+        run: |
+          mkdir -p "$RUNNER_TEMP/gccbuild-gen"
+          cd "$RUNNER_TEMP/gccbuild-gen"
+          "$GITHUB_WORKSPACE/configure" \
+            --disable-bootstrap --enable-languages=c,c++ --disable-multilib \
+            --with-system-zlib --disable-nls --disable-werror \
+            MAKEINFO=true \
+            CFLAGS='-g -O2 -fprofile-generate' \
+            CXXFLAGS='-g -O2 -fprofile-generate' \
+            LDFLAGS='-fprofile-generate' \
+            CFLAGS_FOR_TARGET='-g -O2' \
+            CXXFLAGS_FOR_TARGET='-g -O2'
+
+      # build-libgas.sh gets EXTRA_CFLAGS so the objects it compiles and the
+      # trailing gas_embed_test harness link carry the same profile flags as
+      # the archives (instrumented archives reference __gcov_*, which only
+      # resolves when the harness link is instrumented too).
+      # configure-target-libstdc++-v3 generates the complete libstdc++ header
+      # tree (no library build) -- all the training compiles need, since they
+      # are -c only.
+      - name: Build instrumented compiler (all-gcc)
+        run: |
+          cd "$RUNNER_TEMP/gccbuild-gen"
+          make -j"$(nproc)" all-libiberty MAKEINFO=true
+          make -j"$(nproc)" all-bfd all-opcodes all-gas MAKEINFO=true
+          export GAS_SRC="$GITHUB_WORKSPACE/gas"
+          export GAS_EMBED_DIR="$GITHUB_WORKSPACE/contrib/gas-embed"
+          EXTRA_CFLAGS='-fprofile-generate' \
+            bash "$GAS_EMBED_DIR/build-libgas.sh" "$RUNNER_TEMP/gccbuild-gen"
+          test -f "$RUNNER_TEMP/gccbuild-gen/libgas.a"
+          make -j"$(nproc)" all-gcc MAKEINFO=true
+          make configure-target-libstdc++-v3 MAKEINFO=true
+          test -f "$RUNNER_TEMP/gccbuild-gen/x86_64-pc-linux-gnu/libstdc++-v3/include/vector"
+
+      # ---------- PGO phase A2: training run ----------
+      # Deterministic committed workload (contrib/perf-train, see its README).
+      # The instrumented cc1/cc1plus write .gcda next to the objects in
+      # gccbuild-gen automatically (absolute paths are baked in at compile
+      # time). The build itself already contributed gen-tool/selftest profiles.
+      - name: Train (contrib/perf-train)
+        run: |
+          GEN="$RUNNER_TEMP/gccbuild-gen"
+          T=x86_64-pc-linux-gnu
+          XGXX="$GEN/gcc/xg++ -B$GEN/gcc -nostdinc++ -I$GEN/$T/libstdc++-v3/include/$T -I$GEN/$T/libstdc++-v3/include -I$GITHUB_WORKSPACE/libstdc++-v3/libsupc++"
+          XGCC="$GEN/gcc/xgcc -B$GEN/gcc"
+          PT="$GITHUB_WORKSPACE/contrib/perf-train"
+          $XGXX -O0 -c "$PT/train-stl.cpp"       -o "$RUNNER_TEMP/t.o"
+          $XGXX -O2 -c "$PT/train-stl.cpp"       -o "$RUNNER_TEMP/t.o"
+          $XGXX -O2 -c "$PT/train-templates.cpp" -o "$RUNNER_TEMP/t.o"
+          $XGCC -O0 -c "$PT/train-c.c"           -o "$RUNNER_TEMP/t.o"
+          $XGCC -O2 -c "$PT/train-c.c"           -o "$RUNNER_TEMP/t.o"
+          echo "gcda files: $(find "$GEN" -name '*.gcda' | wc -l)"
+
+      # ---------- PGO phase B: optimized compiler ----------
+      - name: Configure GCC (profile-use)
+        run: |
+          mkdir -p "$RUNNER_TEMP/gccbuild-pgo"
+          cd "$RUNNER_TEMP/gccbuild-pgo"
+          "$GITHUB_WORKSPACE/configure" \
+            --disable-bootstrap --enable-languages=c,c++ --disable-multilib \
+            --with-system-zlib --disable-nls --disable-werror \
+            MAKEINFO=true \
+            CFLAGS='-g -O2 -fprofile-use -fprofile-correction' \
+            CXXFLAGS='-g -O2 -fprofile-use -fprofile-correction' \
+            CFLAGS_FOR_TARGET='-g -O2' \
+            CXXFLAGS_FOR_TARGET='-g -O2'
+          # Mirror the profile data so each object's .gcda sits where the new
+          # objects will be written (that is where -fprofile-use looks).
+          (cd "$RUNNER_TEMP/gccbuild-gen" && find . -name '*.gcda' -print0 | tar cf - --null -T -) \
+            | tar xf - -C "$RUNNER_TEMP/gccbuild-pgo"
+
+      - name: Build GCC (PGO-optimized)
+        run: |
+          cd "$RUNNER_TEMP/gccbuild-pgo"
+          make -j"$(nproc)" all-libiberty MAKEINFO=true
+          make -j"$(nproc)" all-bfd all-opcodes all-gas MAKEINFO=true
+          export GAS_SRC="$GITHUB_WORKSPACE/gas"
+          export GAS_EMBED_DIR="$GITHUB_WORKSPACE/contrib/gas-embed"
+          EXTRA_CFLAGS='-fprofile-use -fprofile-correction' \
+            bash "$GAS_EMBED_DIR/build-libgas.sh" "$RUNNER_TEMP/gccbuild-pgo"
+          test -f "$RUNNER_TEMP/gccbuild-pgo/libgas.a"
+          make -j"$(nproc)" all-gcc MAKEINFO=true
+          rm -rf "$RUNNER_TEMP/gccbuild-gen"   # reclaim runner disk
+          make -j"$(nproc)" all-target-libstdc++-v3 MAKEINFO=true
+
+      # Same packaging shape as the `build` job so downstream consumers can
+      # treat the two artifacts interchangeably.
+      - name: Package PGO compiler
+        run: |
+          mv "$RUNNER_TEMP/gccbuild-pgo" "$RUNNER_TEMP/gccbuild"
+          tar -C "$RUNNER_TEMP" -czf gccbuild-pgo.tar.gz gccbuild
+          ls -lh gccbuild-pgo.tar.gz
+
+      - name: Upload PGO compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: gccbuild-pgo
+          path: gccbuild-pgo.tar.gz
+          retention-days: 7
 
   benchmark:
     needs: build

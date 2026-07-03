@@ -14,6 +14,14 @@ GAS_SRC="${GAS_SRC:-/home/user/gcc-14/gas}"
 # GAS_EMBED_DIR is contrib/gas-embed (holds gas_embed_test.c).  Override for CI.
 GAS_EMBED_DIR="${GAS_EMBED_DIR:-/home/user/gcc-14/contrib/gas-embed}"
 GASB="$BUILD/gas"
+# Compiler and extra flags for the objects and the test harness built by THIS
+# script.  Instrumented/PGO tree builds must pass flags matching the tree's
+# CFLAGS (e.g. EXTRA_CFLAGS='-fprofile-generate'): the harness links the
+# combined-tree archives, and if those were compiled with -fprofile-generate
+# they reference __gcov_* symbols that only resolve when the harness link
+# uses the same flag.  Defaults preserve the historical plain build.
+CC="${CC:-x86_64-linux-gnu-gcc}"
+EXTRA_CFLAGS="${EXTRA_CFLAGS:-}"
 
 # The exact compile flags the gas Makefile uses for gas/*.o (run from $GASB).
 # (Captured from `make V=1 messages.o`.)
@@ -27,11 +35,11 @@ cd "$GASB"
 
 echo ">>> compiling embed.o"
 # shellcheck disable=SC2086
-x86_64-linux-gnu-gcc $CFLAGS_GAS -c -o embed.o "$GAS_SRC/embed.c"
+$CC $CFLAGS_GAS $EXTRA_CFLAGS -c -o embed.o "$GAS_SRC/embed.c"
 
 echo ">>> compiling as-embed.o (as.c with main renamed)"
 # shellcheck disable=SC2086
-x86_64-linux-gnu-gcc $CFLAGS_GAS -Dmain=gas_unused_main -c -o as-embed.o "$GAS_SRC/as.c"
+$CC $CFLAGS_GAS $EXTRA_CFLAGS -Dmain=gas_unused_main -c -o as-embed.o "$GAS_SRC/as.c"
 
 echo ">>> building libgas.a"
 # All top-level gas *.o EXCEPT the original as.o (it has the real main); this
@@ -89,7 +97,7 @@ fi
 
 echo ">>> building harness gas_embed_test"
 # shellcheck disable=SC2086
-gcc "$GAS_EMBED_DIR/gas_embed_test.c" \
+$CC $EXTRA_CFLAGS "$GAS_EMBED_DIR/gas_embed_test.c" \
   "$BUILD/libgas.a" \
   "$BUILD/bfd/.libs/libbfd.a" \
   "$BUILD/opcodes/libopcodes.a" \

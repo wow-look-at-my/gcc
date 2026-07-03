@@ -169,6 +169,15 @@ needed; GCC's own `$(ZSTD_LIB)` configure variable does the same for the
 `GAS_LIBS` link in `gcc/cp/Make-lang.in`. Without zstd (no libzstd-dev), the
 archives have no `ZSTD_*` references and `-lzstd` is neither needed nor linked.
 
+`build-libgas.sh` env knobs: `GAS_SRC` (gas source dir) and `GAS_EMBED_DIR`
+(this directory) point it at a checkout, as before; `CC` and `EXTRA_CFLAGS`
+select the compiler and extra flags for the objects it compiles and the test
+harness link. Instrumented/PGO trees MUST pass matching flags (e.g.
+`EXTRA_CFLAGS='-fprofile-generate'`): the harness links the combined-tree
+archives, and instrumented archives reference `__gcov_*` symbols that only
+resolve when the harness link carries the same flag. Defaults reproduce the
+historical plain build.
+
 ## Proof
 
 Two layers of evidence:
