@@ -597,39 +597,11 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
       char *copy;
       void **pp;
 
-      /* We try to canonicalize system headers.  For DOS based file
-       * system, we always try to shorten non-system headers, as DOS
-       * has a tighter constraint on max path length.  */
-      if ((CPP_OPTION (pfile, canonical_system_headers) && file->dir->sysp)
-#ifdef HAVE_DOS_BASED_FILE_SYSTEM
-	  || !file->dir->sysp
-#endif
-	 )
-	{
-	  char * canonical_path = maybe_shorter_path (path);
-	  if (canonical_path)
-	    {
-	      /* The canonical path was newly allocated.  Let's free the
-		 non-canonical one.  */
-	      free (path);
-	      path = canonical_path;
-	    }
-	}
-
-      hv = htab_hash_string (path);
-      if (htab_find_with_hash (pfile->nonexistent_file_hash, path, hv) != NULL)
-	{
-	  file->err_no = ENOENT;
-	  return false;
-	}
-
-      file->path = path;
-      if (pch_open_file (pfile, file, invalid_pch))
-	return true;
-
-      /* Before issuing the real open() for DIR/name, consult the
-	 directory's filename index.  When the path is the plain
-	 DIR/name form and the index proves the lookup must fail --
+      /* Before spending any per-candidate syscalls on DIR/name -- the
+	 canonicalization below is a full realpath() component walk (one
+	 readlink per path component), and the lookup ends in an open()
+	 -- consult the directory's filename index.  When the path is the
+	 plain DIR/name form and the index proves the lookup must fail --
 	 for a single-component name, the name is not an entry of the
 	 directory; for a multi-component name like "QtCore/qobject.h",
 	 its leading component is not an entry, so path resolution
@@ -638,7 +610,7 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
 	 exactly as the ENOENT path below would, so behaviour -- the set
 	 of headers found, diagnostics, and the nonexistent_file_hash
 	 bookkeeping -- is byte-for-byte identical to actually calling
-	 open().  Only the redundant failing open() syscall disappears.
+	 open().  Only the redundant failing syscalls disappear.
 
 	 The shortcut is confined to genuine directory-resident header
 	 lookups.  It must never fire for the pseudo-file paths that reach
@@ -665,6 +637,48 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
 			&& !HAS_DRIVE_SPEC (file->name)
 #endif
 			&& index_proves_absent (file->dir, file->name));
+
+      /* We try to canonicalize system headers.  For DOS based file
+       * system, we always try to shorten non-system headers, as DOS
+       * has a tighter constraint on max path length.
+
+       * Skipped when the index has already proven the lookup must fail:
+       * lrealpath's result would be discarded anyway -- a miss resets
+       * file->path to file->name below, so the canonical spelling's only
+       * remaining use would be as the nonexistent_file_hash key, and
+       * recording the miss under the plain DIR/name spelling instead
+       * keys the cache on exactly the string a later probe of the same
+       * candidate rebuilds (append_file_to_dir is deterministic).  This
+       * is what makes provably-absent candidates cost zero syscalls
+       * rather than a full realpath() walk each.  (A path's resolution
+       * changing mid-compile is not a supported scenario.)  */
+      if (!skip_open
+	  && ((CPP_OPTION (pfile, canonical_system_headers) && file->dir->sysp)
+#ifdef HAVE_DOS_BASED_FILE_SYSTEM
+	      || !file->dir->sysp
+#endif
+	     ))
+	{
+	  char * canonical_path = maybe_shorter_path (path);
+	  if (canonical_path)
+	    {
+	      /* The canonical path was newly allocated.  Let's free the
+		 non-canonical one.  */
+	      free (path);
+	      path = canonical_path;
+	    }
+	}
+
+      hv = htab_hash_string (path);
+      if (htab_find_with_hash (pfile->nonexistent_file_hash, path, hv) != NULL)
+	{
+	  file->err_no = ENOENT;
+	  return false;
+	}
+
+      file->path = path;
+      if (pch_open_file (pfile, file, invalid_pch))
+	return true;
 
       if (!skip_open && open_file (file))
 	return true;
