@@ -844,6 +844,20 @@ struct cpp_dir
      constructed by append_file_to_dir.  */
   char *(*construct) (const char *header, cpp_dir *dir);
 
+  /* Lazily-built in-memory index of the top-level filenames in this
+     directory, used to skip provably-failing open()s during include
+     resolution (see find_file_in_dir in files.cc).  Built once via
+     opendir/readdir on first use.  Managed entirely within files.cc;
+     opaque here to avoid leaking hashtab.h into the public header.
+     NAME_INDEX is a hash set of the directory's entry names; it is
+     only valid when NAME_INDEX_STATE == 1.  */
+  void *name_index;
+
+  /* State of NAME_INDEX: 0 = not yet built, 1 = built and usable,
+     2 = unavailable (opendir/readdir failed; always fall back to
+     open()).  Declared as unsigned char to keep the struct compact.  */
+  unsigned char name_index_state;
+
   /* The C front end uses these to recognize duplicated
      directories in the search path.  */
   INO_T_CPP;
