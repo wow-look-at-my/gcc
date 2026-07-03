@@ -662,14 +662,28 @@ struct cc_closure_state
   struct sha1_ctx *ctx;
 };
 
-/* Callback: hash one included file's path + exact bytes into the digest, and
-   record its identity (path + size + per-file SHA-1) for the inputs table.
-   Both the key and the object metadata are produced from this single walk.  */
+/* Callback: fold one included file's path + content DIGEST into the TU key,
+   and record its identity (path + size + per-file SHA-1) for the inputs table.
+   Both the key and the object metadata are produced from this single walk.
+
+   CONTENT_SHA1, when non-NULL, is the 20-byte SHA-1 of the file's raw on-disk
+   bytes that libcpp computed once when the compiler first read the file.  We
+   feed that stored digest straight into the key (and reuse it as the inputs-
+   table per-file hash) -- so a cache MISS never re-opens or re-reads the
+   include closure just to hash it.  Only when no digest is available (a file
+   that did not go through read_file_guts) does libcpp hand us BUFFER/SIZE and
+   we hash the bytes ourselves, preserving correctness on that fallback path.
+
+   Note this folds the per-file 20-byte digest into the key in dedup'd
+   all_files order, in place of the file's raw bytes -- the same content
+   commitment (a SHA-1 over the raw on-disk bytes), in the same walk order, but
+   it changes the key VALUE, which is why CC_KEY_SCHEMA_VERSION is bumped.  */
 static bool
 cc_hash_one_file (const char *path, const unsigned char *buffer,
-		  size_t size, void *user)
+		  size_t size, const unsigned char *content_sha1, void *user)
 {
   struct cc_closure_state *st = (struct cc_closure_state *) user;
+
   /* The file's CONTENTS are always part of the key; its PATH only when the
      produced bytes depend on it (under -g -- see cc_paths_affect_output_p).
      Dropping the path off the non-debug key is what makes an identical header
@@ -677,15 +691,26 @@ cc_hash_one_file (const char *path, const unsigned char *buffer,
      table below still records the real path for diagnostics either way.  */
   if (cc_paths_affect_output_p ())
     cc_hash_str (st->ctx, CC_TAG_FILE_PATH, path);
-  cc_hash_component (st->ctx, CC_TAG_FILE_BODY, buffer, size);
 
-  /* Per-file SHA-1 for the inputs table (independent of the TU key digest).  */
+  /* Per-file SHA-1 (also the inputs-table per-file hash).  Prefer the stored
+     raw-bytes digest from libcpp (no re-read); otherwise hash the bytes we
+     were handed.  */
   unsigned char fh[20];
-  struct sha1_ctx fctx;
-  sha1_init_ctx (&fctx);
-  if (size)
-    sha1_process_bytes (buffer, size, &fctx);
-  sha1_finish_ctx (&fctx, fh);
+  if (content_sha1)
+    memcpy (fh, content_sha1, 20);
+  else
+    {
+      struct sha1_ctx fctx;
+      sha1_init_ctx (&fctx);
+      if (size)
+	sha1_process_bytes (buffer, size, &fctx);
+      sha1_finish_ctx (&fctx, fh);
+    }
+
+  /* Commit the file's content to the TU key via its 20-byte digest.  Framed
+     under CC_TAG_FILE_BODY (a 1-byte tag + 8-byte length + the 20 digest
+     bytes) -- the closure is walked in the unchanged all_files order.  */
+  cc_hash_component (st->ctx, CC_TAG_FILE_BODY, fh, 20);
 
   /* Capture st_mtime for the manifest stat-shortcut (size+mtime match accepts
      a header on a hit without re-reading it).  Best-effort: a failed stat

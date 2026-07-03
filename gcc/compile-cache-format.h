@@ -162,8 +162,13 @@ enum cc_tag
   CC_TAG_SEARCH_PATH = 12 /* an include-search-path value (manifest key only) */
 };
 
-/* Key-schema version (shared by the object key OK and the manifest key MK).  */
-#define CC_KEY_SCHEMA_VERSION 4u
+/* Key-schema version (shared by the object key OK and the manifest key MK).
+   Bumped 4 -> 5: the object key now commits each included file's content via
+   the 20-byte SHA-1 of its RAW on-disk bytes (computed once at read time in
+   libcpp's read_file_guts and folded into the key in all_files order), in
+   place of folding the file's raw bytes in directly.  This changes the key
+   VALUE, so the bump cleanly invalidates pre-existing cache entries.  */
+#define CC_KEY_SCHEMA_VERSION 5u
 
 /* Little-endian store helpers.  */
 static inline void
