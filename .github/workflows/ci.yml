@@ -224,6 +224,12 @@ jobs:
           test -f binutils-2.42/gas/embed.c
 
       # ---------- PGO phase A: instrumented compiler ----------
+      # CFLAGS_FOR_TARGET/CXXFLAGS_FOR_TARGET are pinned plain: the toplevel
+      # defaults them from CFLAGS, which would leak -fprofile-generate into
+      # target-library conftests (libgomp's run-test conftest then fails with
+      # "cannot run C compiled programs") and pointlessly instrument target
+      # libs. Only the HOST compiler is profiled; compiling target libs WITH
+      # the instrumented compiler is itself free training.
       - name: Configure GCC (instrumented)
         run: |
           mkdir -p "$RUNNER_TEMP/gccbuild-gen"
@@ -234,7 +240,9 @@ jobs:
             MAKEINFO=true \
             CFLAGS='-g -O2 -fprofile-generate' \
             CXXFLAGS='-g -O2 -fprofile-generate' \
-            LDFLAGS='-fprofile-generate'
+            LDFLAGS='-fprofile-generate' \
+            CFLAGS_FOR_TARGET='-g -O2' \
+            CXXFLAGS_FOR_TARGET='-g -O2'
 
       # build-libgas.sh gets EXTRA_CFLAGS so the objects it compiles and the
       # trailing gas_embed_test harness link carry the same profile flags as
@@ -286,7 +294,9 @@ jobs:
             --with-system-zlib --disable-nls --disable-werror \
             MAKEINFO=true \
             CFLAGS='-g -O2 -fprofile-use -fprofile-correction' \
-            CXXFLAGS='-g -O2 -fprofile-use -fprofile-correction'
+            CXXFLAGS='-g -O2 -fprofile-use -fprofile-correction' \
+            CFLAGS_FOR_TARGET='-g -O2' \
+            CXXFLAGS_FOR_TARGET='-g -O2'
           # Mirror the profile data so each object's .gcda sits where the new
           # objects will be written (that is where -fprofile-use looks).
           (cd "$RUNNER_TEMP/gccbuild-gen" && find . -name '*.gcda' -print0 | tar cf - --null -T -) \
