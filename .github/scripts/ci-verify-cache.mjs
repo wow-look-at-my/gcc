@@ -747,6 +747,129 @@ const o3 = path.join(work, 'a3.o');
     '); same-dir -g re-compile HIT (' + hitA2 + ')\n');
 }
 
+// ---- checks 11-13: transparent auto-PCH (-fauto-pch / GCC_AUTO_PCH) -------
+//
+// The driver detects a TU whose leading lines are only comments/blanks and
+// #include <...> directives, builds a PCH for that prelude once under
+// CACHE/pch/<key>/, and injects "-include <stub>" into later compiles that
+// share the (normalized) prelude + flag cell. These checks assert the three
+// load-bearing behaviors: exactly-once generation + reuse with byte-identical
+// objects (11), include-closure invalidation on a header edit -- no stale PCH
+// (12), and the any-stderr-means-negative-entry rule that keeps diagnostics
+// byte-identical (13).
+
+// Parse "auto-pch: <what> ..." decision lines from stderr.
+function parsePch(stderr) {
+  const re = /auto-pch: ([a-z-]+)/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(stderr)) !== null) out.push(m[1]);
+  return out;
+}
+
+// compile() with auto-PCH enabled (env) + decision logging.
+function compilePch(driver, src, obj, cacheDir, extra) {
+  const args = [
+    '-O2', '-c', src, '-o', obj,
+    '-fcompile-cache=' + cacheDir, '-fintegrated-as', B,
+  ].concat(extra || []);
+  const res = spawnSync(driver, args, {
+    env: { ...debugEnv, GCC_AUTO_PCH: '1', GCC_AUTO_PCH_DEBUG: '1' },
+    encoding: 'utf8',
+  });
+  if (res.error) fail('failed to spawn ' + driver + ': ' + res.error.message);
+  return { status: res.status, stderr: res.stderr || '', pch: parsePch(res.stderr || '') };
+}
+
+{
+  const dir = path.join(work, 'apch');
+  const inc = path.join(dir, 'inc');
+  fs.mkdirSync(inc, { recursive: true });
+  const cache = path.join(dir, 'cache');
+  fs.mkdirSync(cache);
+  writeHeader(path.join(inc, 'ap1.h'),
+    '#ifndef AP1_H\n#define AP1_H\ninline int ap1() { return 10; }\n#endif\n');
+  writeHeader(path.join(inc, 'ap2.h'),
+    '#ifndef AP2_H\n#define AP2_H\ninline int ap2() { return 20; }\n#endif\n');
+  writeHeader(path.join(inc, 'ap3.h'),
+    '#ifndef AP3_H\n#define AP3_H\ninline int ap3() { return 30; }\n#endif\n');
+  const prelude = '#include <ap1.h>\n#include <ap2.h>\n#include <ap3.h>\n';
+  const tu1 = path.join(dir, 'tu1.cpp');
+  const tu2 = path.join(dir, 'tu2.cpp');
+  fs.writeFileSync(tu1, '// banner one\n' + prelude +
+    'int use1() { return ap1() + ap2() + ap3(); }\n');
+  fs.writeFileSync(tu2, '/* different banner, same line count */\n' + prelude +
+    'int use2() { return ap1() * ap2() - ap3(); }\n');
+  const I = '-I' + inc;
+
+  // check 11: seed compiler-id, then gen+inject, then share; byte-identical.
+  // The seed must be a DIFFERENT source: probe/inject runs before the .o
+  // serve, and a warm .o hit (same source, same flags) correctly skips PCH
+  // generation entirely -- so re-compiling the seed TU would only ever
+  // manifest-hit, never gen.
+  const tu0 = path.join(dir, 'tu0.cpp');
+  fs.writeFileSync(tu0, '// seed banner\n' + prelude +
+    'int use0() { return ap1(); }\n');
+  compile(XGPP, tu0, path.join(dir, 'seed.o'), cache, [I]); // writes compiler-id
+  let r = compilePch(XGPP, tu1, path.join(dir, 't1a.o'), cache, [I]);
+  if (r.status !== 0) fail('check 11: compile failed\n' + r.stderr);
+  if (!r.pch.includes('gen-ok') || !r.pch.includes('inject'))
+    fail('check 11: expected gen-ok + inject, got: ' + r.pch.join(',') + '\n' + r.stderr);
+  r = compilePch(XGPP, tu2, path.join(dir, 't2a.o'), cache, [I]);
+  if (!r.pch.includes('inject') || r.pch.includes('gen-ok'))
+    fail('check 11: expected shared-prelude inject without regen, got: '
+         + r.pch.join(',') + '\n' + r.stderr);
+  // feature-off reference: a plain driver run (no cache, no auto-pch).
+  const off = spawnSync(XGPP, ['-O2', '-c', tu2, '-o', path.join(dir, 't2plain.o'),
+    '-fintegrated-as', B, I], { encoding: 'utf8' });
+  if (off.status !== 0) fail('check 11: plain compile failed\n' + off.stderr);
+  if (Buffer.compare(readObj(path.join(dir, 't2a.o')),
+		     readObj(path.join(dir, 't2plain.o'))) !== 0)
+    fail('check 11: injected object differs from plain compile');
+  const gchs = fs.globSync(path.join(cache, 'pch', '*', '*', 'stub.h.gch'));
+  if (gchs.length !== 1)
+    fail('check 11: expected exactly 1 stub.h.gch, found ' + gchs.length);
+  process.stdout.write('check 11 OK: auto-PCH gen once + shared inject, byte-identical object\n');
+
+  // check 12: edit a prelude header -> manifest invalidates -> regen, fresh .o.
+  writeHeader(path.join(inc, 'ap2.h'),
+    '#ifndef AP2_H\n#define AP2_H\ninline int ap2() { return 21; }\n#endif\n');
+  r = compilePch(XGPP, tu1, path.join(dir, 't1b.o'), cache, [I]);
+  if (!r.pch.includes('gen-ok'))
+    fail('check 12: expected regeneration after header edit, got: '
+         + r.pch.join(',') + '\n' + r.stderr);
+  const off2 = spawnSync(XGPP, ['-O2', '-c', tu1, '-o', path.join(dir, 't1plain.o'),
+    '-fintegrated-as', B, I], { encoding: 'utf8' });
+  if (off2.status !== 0) fail('check 12: plain compile failed\n' + off2.stderr);
+  if (Buffer.compare(readObj(path.join(dir, 't1b.o')),
+		     readObj(path.join(dir, 't1plain.o'))) !== 0)
+    fail('check 12: STALE PCH: post-edit object differs from plain compile');
+  process.stdout.write('check 12 OK: prelude-header edit regenerates the PCH, no stale object\n');
+
+  // check 13: a prelude that WARNS is negative-cached; diagnostics identical.
+  writeHeader(path.join(inc, 'apw.h'),
+    '#ifndef APW_H\n#define APW_H\n#warning "apw"\ninline int apw() { return 1; }\n#endif\n');
+  const tuw = path.join(dir, 'tuw.cpp');
+  fs.writeFileSync(tuw, '#include <ap1.h>\n#include <ap2.h>\n#include <apw.h>\n'
+    + 'int usew() { return apw(); }\n');
+  r = compilePch(XGPP, tuw, path.join(dir, 'tw1.o'), cache, [I]);
+  if (!r.pch.includes('gen-fail') || !r.pch.includes('negative-store'))
+    fail('check 13: expected gen-fail + negative-store for a warning prelude, got: '
+         + r.pch.join(',') + '\n' + r.stderr);
+  // Second compile: negative entry honored; stderr must equal a plain compile.
+  const on2 = spawnSync(XGPP, ['-O2', '-c', tuw, '-o', path.join(dir, 'tw2.o'),
+    '-fcompile-cache=' + cache, '-fintegrated-as', B, I],
+    { env: { ...process.env, GCC_AUTO_PCH: '1' }, encoding: 'utf8' });
+  const offw = spawnSync(XGPP, ['-O2', '-c', tuw, '-o', path.join(dir, 'twoff.o'),
+    '-fintegrated-as', B, I], { encoding: 'utf8' });
+  if (on2.status !== 0 || offw.status !== 0)
+    fail('check 13: compiles failed\n' + on2.stderr + offw.stderr);
+  if (on2.stderr !== offw.stderr)
+    fail('check 13: stderr differs between auto-pch-on (negative) and plain:\n--- on ---\n'
+         + on2.stderr + '--- off ---\n' + offw.stderr);
+  process.stdout.write('check 13 OK: warning prelude -> negative entry, stderr byte-identical\n');
+}
+
 // ---- cleanup + success ---------------------------------------------------
 try {
   fs.rmSync(work, { recursive: true, force: true });

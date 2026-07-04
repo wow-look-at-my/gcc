@@ -6426,6 +6426,17 @@ driver_auto_pch_generate (struct driver_apch_plan *plan)
       char *prog = find_a_program (argbuf[0]);
       const char *exe = prog ? prog : argbuf[0];
 
+      /* The PCH build's stderr must contain only real diagnostics -- ANY
+	 output marks the entry negative.  The spawned cc1plus inherits our
+	 environment, and GCC_COMPILE_CACHE_DEBUG would make it print benign
+	 "compile-cache:" chatter to stderr; neutralize it for the child
+	 (empty means off on both sides) and restore afterwards.  */
+      const char *saved_dbg = env.get ("GCC_COMPILE_CACHE_DEBUG");
+      char *saved_dbg_dup = saved_dbg && saved_dbg[0]
+			    ? xstrdup (saved_dbg) : NULL;
+      if (saved_dbg_dup)
+	xputenv ("GCC_COMPILE_CACHE_DEBUG=");
+
       struct timeval tv0, tv1;
       gettimeofday (&tv0, NULL);
       int status = -1, errnum = 0;
@@ -6435,6 +6446,14 @@ driver_auto_pch_generate (struct driver_apch_plan *plan)
 				gen.address ()),
 		   "cc1plus (auto-pch)", NULL, err_tmp, &status, &errnum);
       gettimeofday (&tv1, NULL);
+
+      if (saved_dbg_dup)
+	{
+	  char *restore = concat ("GCC_COMPILE_CACHE_DEBUG=", saved_dbg_dup,
+				  NULL);
+	  xputenv (restore);
+	  free (saved_dbg_dup);
+	}
 
       /* Any stderr at all disqualifies the PCH (see the function comment).  */
       struct stat est;
