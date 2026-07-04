@@ -60,7 +60,7 @@ jobs:
   # assumes nothing (no checkout, no toolchain): its whole job is to tell us
   # what this runner actually is.
   census:
-    runs-on: [self-hosted]
+    runs-on: unraid-gpu-runner  # label attempt 2: runner-name label ([self-hosted] was never claimed)
     timeout-minutes: 15
     steps:
       - name: Environment census
@@ -120,7 +120,7 @@ jobs:
   bench:
     needs: census
     if: github.event_name == 'workflow_dispatch' && inputs.suite != 'census'
-    runs-on: [self-hosted]
+    runs-on: unraid-gpu-runner  # label attempt 2: runner-name label ([self-hosted] was never claimed)
     timeout-minutes: 300
     env:
       BENCH_REF: ${{ inputs.bench_ref }}
