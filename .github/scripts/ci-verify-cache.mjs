@@ -870,6 +870,95 @@ function compilePch(driver, src, obj, cacheDir, extra) {
   process.stdout.write('check 13 OK: warning prelude -> negative entry, stderr byte-identical\n');
 }
 
+// ---- check 14: PCH object bytes -- determinism + manual-PCH parity --------
+//
+// Checks 11/12 byte-compare a PCH-consuming object against a NO-pch compile.
+// That identity holds for preludes like theirs but is NOT guaranteed in
+// general: loading a PCH restores shared trees for header-defined entities,
+// so varasm emits one merged constant pool for anonymous string/numeric
+// literals, where a fresh parse materializes per-use duplicates in
+// per-function .rodata.*.str1.* SHF_MERGE sections with .LC labels (observed
+// on {fmt}; global symbols, section inventory of named data, and the
+// normalized instruction stream are identical -- the linker merges the
+// literals anyway). This is stock-PCH-inherent: a hand-built -x c++-header
+// PCH diverges from the plain compile in exactly the same way. See the
+// -fauto-pch section of gcc/doc/invoke.texi.
+//
+// The invariants that DO hold universally, asserted here on a
+// string-literal-bearing prelude:
+//   (a) determinism: two independent caches produce byte-identical
+//       PCH-consuming objects for the same TU + options;
+//   (b) manual parity: the auto-PCH object equals the object compiled
+//       against a hand-built PCH (driver -x c++-header, consumed via
+//       -include) -- which also gives the driver's c++-header spec path
+//       (the -o/--output-pch collision fix) its own CI coverage.
+// Deliberately NO assertion against the no-PCH object, in either direction.
+{
+  const dir = path.join(work, 'apch14');
+  const inc = path.join(dir, 'inc');
+  fs.mkdirSync(inc, { recursive: true });
+  writeHeader(path.join(inc, 'as1.h'),
+    '#ifndef AS1_H\n#define AS1_H\ninline const char *as1() '
+    + '{ return "as1: a mergeable literal shared by prelude and body"; }\n#endif\n');
+  writeHeader(path.join(inc, 'as2.h'),
+    '#ifndef AS2_H\n#define AS2_H\ninline const char *as2() '
+    + '{ return "as2: another mergeable string literal"; }\n#endif\n');
+  writeHeader(path.join(inc, 'as3.h'),
+    '#ifndef AS3_H\n#define AS3_H\n#include <as1.h>\ninline const char *as3() '
+    + '{ return as1() + 5; }\n#endif\n');
+  const prelude = '#include <as1.h>\n#include <as2.h>\n#include <as3.h>\n';
+  const I = '-I' + inc;
+  const seed = path.join(dir, 'seed.cpp');
+  fs.writeFileSync(seed, '// seed banner\n' + prelude + 'int s14() { return 14; }\n');
+  const tu = path.join(dir, 'tu.cpp');
+  fs.writeFileSync(tu, '// tu banner\n' + prelude
+    + 'static const char *own = "tu-own literal";\n'
+    + 'unsigned long u14() { return (unsigned long)(as1()[0] + as2()[1] + as3()[2] + own[3]); }\n');
+
+  // (a) determinism across independent caches.
+  const pchObjs = [];
+  for (const tag of ['a', 'b']) {
+    const cache = path.join(dir, 'cache_' + tag);
+    fs.mkdirSync(cache);
+    // Seed the compiler-id sidecar with a DIFFERENT TU (same reason as check 11).
+    compile(XGPP, seed, path.join(dir, 'seed_' + tag + '.o'), cache, [I]);
+    const obj = path.join(dir, 'tu_' + tag + '.o');
+    const r = compilePch(XGPP, tu, obj, cache, [I]);
+    if (r.status !== 0) fail('check 14: compile (' + tag + ') failed\n' + r.stderr);
+    if (!r.pch.includes('gen-ok') || !r.pch.includes('inject'))
+      fail('check 14: expected gen-ok + inject in cache ' + tag + ', got: '
+           + r.pch.join(',') + '\n' + r.stderr);
+    pchObjs.push(obj);
+  }
+  if (Buffer.compare(readObj(pchObjs[0]), readObj(pchObjs[1])) !== 0)
+    fail('check 14: PCH-consuming objects differ between independent caches');
+
+  // (b) manual parity: driver-built stock PCH, consumed via -include.
+  const prel = path.join(dir, 'prel.h');
+  fs.writeFileSync(prel, prelude);
+  const gch = spawnSync(XGPP, ['-O2', '-x', 'c++-header', prel,
+    '-o', prel + '.gch', '-fintegrated-as', B, I], { encoding: 'utf8' });
+  if (gch.status !== 0)
+    fail('check 14: driver -x c++-header PCH build failed (spec regression?)\n'
+         + (gch.stderr || ''));
+  // Prove the .gch is actually consumed before trusting the byte-compare.
+  const probe = spawnSync(XGPP, ['-O2', '-include', prel, '-H', '-fsyntax-only',
+    tu, B, I], { encoding: 'utf8' });
+  if (!(probe.stderr || '').split('\n').some((l) => l.startsWith('! ')))
+    fail('check 14: manual PCH not consumed (-H shows no "!" line):\n'
+         + (probe.stderr || ''));
+  const mobj = path.join(dir, 'manual.o');
+  const man = spawnSync(XGPP, ['-O2', '-c', tu, '-o', mobj, '-include', prel,
+    '-fintegrated-as', B, I], { encoding: 'utf8' });
+  if (man.status !== 0)
+    fail('check 14: manual-PCH compile failed\n' + (man.stderr || ''));
+  if (man.stderr) fail('check 14: manual-PCH compile warned\n' + man.stderr);
+  if (Buffer.compare(readObj(pchObjs[0]), readObj(mobj)) !== 0)
+    fail('check 14: auto-PCH object differs from manual stock-PCH object');
+  process.stdout.write(
+    'check 14 OK: PCH objects deterministic across caches + identical to manual -x c++-header PCH\n');
+}
+
 // ---- cleanup + success ---------------------------------------------------
 try {
   fs.rmSync(work, { recursive: true, force: true });
