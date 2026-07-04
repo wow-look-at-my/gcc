@@ -42,10 +42,17 @@ census -> build (matrix: base?/tip) -> shards (matrix: one cell each) -> aggrega
   speedup; realism: tip syscall drop), flags contradictions as SURPRISE, and
   publishes the one-stop `perf-lab-results` artifact.
 
-Composed wall time on hosted runners is ~40-45 min end to end (census ~1 min,
-two parallel ~15-min builds + packaging, the slowest shard -- huge-O2, median
-of 5 per side -- ~25-30 min, aggregate ~1 min), vs ~4-5 h for the old single
-sequential job that built both compilers and ran every cell back to back.
+Wall-time budget on hosted runners: census ~1 min, the two build legs run in
+parallel (~13 min compile + ~1 min packaging each, measured), then every cell
+measures simultaneously, so a suite costs roughly `build + slowest shard`
+(huge-O2, median of 5 per side, is the long pole) + ~1 min aggregate --
+~30-35 min for `composed`, and `full` costs about the same as `composed`
+because the pch shards ride the same fan-out instead of extending a serial
+tail. The old single sequential job measured 43m24s for `composed` (two
+serial ~12.5-min builds + 16m54s suite, run 28703247565) and was budgeted up
+to 4-5 h/350-min timeout back when a hosted build was estimated at ~1 h; the
+sharded shape also isolates cell failures (`fail-fast: false`) and gives
+every cell its own 60-min timeout.
 
 ## One-click usage
 
