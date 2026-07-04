@@ -1292,8 +1292,7 @@ static const char *cc1_options =
  %{-version:--version}\
  %{-help=*:--help=%*}\
  %{!fsyntax-only:\
-   %{S:-fasm-output-only %W{o*}%{!o*:-o %w%b.s}}\
-   %{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}}\
+   %{S:-fasm-output-only %W{o*}%{!o*:-o %w%b.s}}}\
  %{fsyntax-only:-o %j} %{-param*}\
  %{coverage:-fprofile-arcs -ftest-coverage}\
  %{fprofile-arcs|fcondition-coverage|fprofile-generate*|coverage:\
@@ -1312,17 +1311,23 @@ ASM_COMPRESS_DEBUG_SPEC
 "%a %Y %{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}";
 
 /* Integrated assembler: cc1plus assembles in-process via libgas, so there is
-   no separate `as` stage.  The object's -o name is handed to cc1plus by
-   cc1_options (the %{!S:...%O} arm), and cc1plus writes the object directly.
-   This spec therefore emits no ` | as` pipeline at all -- the compile-to-object
-   is a single process.  The compare-debug dump-opt hook is kept because it
-   rewrites cc1's own -o dump naming and must still run.  This fold is
-   unconditional and permanent: there is no -fno- form and no fork-`as`
-   fallback for a compile.  (Hand-written .s inputs still use `as`; that is a
-   separate spec, see the assembler_spec/@assembler path, and is left alone.)  */
+   no separate `as` stage.  This spec therefore emits no ` | as` pipeline at
+   all -- the compile-to-object is a single process.  The object's -o name is
+   handed to cc1plus HERE (the %{!S:...%O} arm below, the same construct stock
+   GCC's asm_options handed to `as`), NOT in cc1_options: only the specs that
+   actually compile to an object reference %(invoke_as), while the PCH specs
+   (@c-header / @c++-header et al.) supply their own `-o %g.s` plus
+   --output-pch and must NOT receive a second -o (cc1 rejects a duplicate
+   with "output filename specified twice").  The compare-debug dump-opt hook
+   is kept because it rewrites cc1's own -o dump naming and must still run.
+   This fold is unconditional and permanent: there is no -fno- form and no
+   fork-`as` fallback for a compile.  (Hand-written .s inputs still use `as`;
+   that is a separate spec, see the assembler_spec/@assembler path, and is
+   left alone.)  */
 static const char *invoke_as =
 "%{!fwpa*:\
    %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
+   %{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}\
   }";
 
 /* Some compilers have limits on line lengths, and the multilib_select
@@ -1481,12 +1486,12 @@ static const struct compiler default_compilers[] =
 		%(cpp_options) -o %{save-temps*:%b.i} %{!save-temps*:%g.i} \n\
 		    cc1 -fpreprocessed %{save-temps*:%b.i} %{!save-temps*:%g.i} \
 			%(cc1_options)\
-			%{!fsyntax-only:%{!S:-o %g.s} \
+			%{!fsyntax-only:%{!S:-fasm-output-only -o %g.s} \
 			    %{!fdump-ada-spec*:%{!o*:--output-pch %w%i.gch}\
 					       %W{o*:--output-pch %w%*}}%{!S:%V}}}\
 	  %{!save-temps*:%{!traditional-cpp:%{!no-integrated-cpp:\
 		cc1 %(cpp_unique_options) %(cc1_options)\
-		    %{!fsyntax-only:%{!S:-o %g.s} \
+		    %{!fsyntax-only:%{!S:-fasm-output-only -o %g.s} \
 		        %{!fdump-ada-spec*:%{!o*:--output-pch %w%i.gch}\
 					   %W{o*:--output-pch %w%*}}%{!S:%V}}}}}}}}", 0, 0, 0},
   {".i", "@cpp-output", 0, 0, 0},
@@ -5947,6 +5952,12 @@ driver_try_serve_from_cache (void)
 	case OPT_S:
 	case OPT_fsyntax_only:
 	  disqualify = true;	/* not a compile-to-object */
+	  break;
+	case OPT__output_pch:
+	  /* PCH generation (-x c++-header): the real product is the .gch, and
+	     the -o is only a discarded temp .s.  Serving a cached object here
+	     would skip cc1plus and never write the PCH.  */
+	  disqualify = true;
 	  break;
 	case OPT_g:
 	case OPT_ggdb:
