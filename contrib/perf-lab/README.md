@@ -1,16 +1,18 @@
-# perf-lab -- self-hosted benchmark rig
+# perf-lab -- benchmark rig (GitHub-hosted runners, dispatch-only)
 
-Real-hardware compile-time benchmarking for this fork's performance work
-(include-path dir index, GGC 512M cap + `MADV_HUGEPAGE`, static tcmalloc,
-readlink skip, cache hash-on-read; merged as PR #13 / `f7a3fd96a`). The
-integration sandbox those wins were first measured in could not express the
-THP win at all (`thp_fault_alloc=0` system-wide), so the headline
-MADV_HUGEPAGE number -- minor faults -92%, wall -10.6% on the original
-hugetlb-proxy measurement -- needs a THP-capable host to reproduce. That is
-what this rig is for.
+Compile-time benchmarking for this fork's performance work (include-path dir
+index, GGC 512M cap + `MADV_HUGEPAGE`, static tcmalloc, readlink skip, cache
+hash-on-read; merged as PR #13 / `f7a3fd96a`). The integration sandbox those
+wins were first measured in could not express the THP win at all
+(`thp_fault_alloc=0` system-wide), so the headline MADV_HUGEPAGE number --
+minor faults -92%, wall -10.6% on the original hugetlb-proxy measurement --
+needs a THP-capable host to reproduce. The `census` suite reports whether the
+hosted runner environment is one (its THP mode is the first datum every run
+collects).
 
-Runs on the repo's self-hosted runner (`unraid-gpu-runner`: Ryzen 3800X,
-128 GB RAM, Unraid) via `.github/workflows/perf-lab.yml`.
+Runs on GitHub-hosted runners (`ubuntu-latest`) via
+`.github/workflows/perf-lab.yml`, and only on manual `workflow_dispatch` --
+there is no push trigger, and no job targets self-hosted hardware.
 
 ## One-click usage
 
@@ -22,9 +24,13 @@ Actions -> perf-lab -> Run workflow:
 | `bench_ref` | ref whose compiler is benchmarked ("tip"), default `develop-matt/v14` |
 
 The composed base is pinned to `5226232bb` (the PR #13 merge base) in the
-workflow env. Every push to the bootstrap branch also runs the `census` job
-only -- a near-instant probe of what the runner actually is (toolchain, THP
-mode, disk); the bench job is dispatch-only.
+workflow env. Every dispatch first runs the near-instant `census` job -- a
+probe of what the runner environment actually is (toolchain, THP mode,
+disk) -- and, unless `suite=census`, then the bench job.
+
+Runtime budget on hosted `ubuntu-latest` (4 vCPU): `quick` is dominated by
+the ~1 h tip compiler build; `composed` and `full` build **two** full GCCs
+(base + tip) and take ~4-5 h end to end (the job timeout is 350 minutes).
 
 Results land in three places: the run's `$GITHUB_STEP_SUMMARY` (markdown
 tables), the `perf-lab-results` artifact (raw TSV, per-run `/usr/bin/time -v`

@@ -1,8 +1,8 @@
 #!/bin/bash
-# perf-lab: install build + measurement dependencies on the self-hosted runner.
+# perf-lab: install build + measurement dependencies on the runner.
 #
-# Defensive: the runner's userland is unknown (possibly a Docker container on
-# an Unraid host). Strategy:
+# Defensive: written to cope with any Debian-ish userland, not just the
+# GitHub-hosted ubuntu image. Strategy:
 #   1. apt-get exists and we are root            -> plain apt-get
 #   2. apt-get exists, not root, passwordless sudo -> sudo -n apt-get
 #   3. no apt-get (or no way to run it)          -> check whether a usable

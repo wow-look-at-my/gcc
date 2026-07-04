@@ -10,8 +10,8 @@
 # Each SRC tree gets its OWN binutils extraction patched with its OWN
 # contrib/gas-embed patch (the gas-embed dir differs between base and tip).
 #
-# DLCACHE (default ./dl) persists the binutils tarball across runs on a
-# self-hosted runner; the tarball is sha256-pinned.
+# DLCACHE (default ./dl) lets the base and tip builds within one job share
+# a single binutils download; the tarball is sha256-pinned.
 set -euo pipefail
 
 SRC=${1:?usage: build-gcc.sh SRC BUILD [DLCACHE]}

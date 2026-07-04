@@ -1,12 +1,13 @@
 name: perf-lab
 
-# Self-hosted benchmark rig: real-hardware compile-time numbers for this
-# fork's perf work (dir index, GGC 512M cap + MADV_HUGEPAGE, tcmalloc,
-# readlink skip, hash-on-read), measured on the repo's own runner
-# (unraid-gpu-runner). See contrib/perf-lab/README.md.
+# Benchmark rig: compile-time numbers for this fork's perf work (dir index,
+# GGC 512M cap + MADV_HUGEPAGE, tcmalloc, readlink skip, hash-on-read),
+# measured on GitHub-hosted runners. See contrib/perf-lab/README.md.
 #
-# ci.yml stays untouched: this is a different trigger (manual dispatch on
-# self-hosted hardware), not another hosted-CI workflow.
+# Hosted runners only, dispatch-only. Nothing here targets self-hosted
+# hardware, and nothing runs on push: every run is a deliberate manual
+# dispatch. ci.yml stays untouched: this is a different trigger, not
+# another per-push CI workflow.
 
 on:
   workflow_dispatch:
@@ -28,20 +29,12 @@ on:
         description: 'Git ref whose compiler gets benchmarked (the "tip" side)'
         type: string
         default: develop-matt/v14
-  # TEMPORARY bootstrap trigger while the rig is being brought up on the
-  # self-hosted runner; a push only runs the near-instant census job (the
-  # bench job is dispatch-only). Removed once the rig is stable.
-  push:
-    branches: [claude/tender-johnson-bdlvyf]
-    paths:
-      - 'contrib/perf-lab/**'
-      - '.github/workflows/perf-lab.yml'
 
 permissions:
   contents: read
 
-# One benchmark at a time on the physical box: runs queue, never overlap,
-# and a queued run must not cancel a measurement in flight.
+# One benchmark at a time: runs queue politely and never cancel a
+# measurement in flight.
 concurrency:
   group: perf-lab
   cancel-in-progress: false
@@ -56,11 +49,13 @@ env:
   PERF_LAB_BASE_SHA: 5226232bbe76093d3b7ef87d1925f36fb5b4bd58
 
 jobs:
-  # Near-instant environment probe. Runs on every trigger, gates nothing,
-  # assumes nothing (no checkout, no toolchain): its whole job is to tell us
-  # what this runner actually is.
+  # Near-instant environment probe. Gates nothing, assumes nothing (no
+  # checkout, no toolchain): its whole job is to tell us what the hosted
+  # runner environment actually is -- CPU model, core count, and above all
+  # the transparent-hugepage mode, which decides whether the MADV_HUGEPAGE
+  # win is expressible here at all.
   census:
-    runs-on: [self-hosted]  # resting default; also tried label `unraid-gpu-runner` -- neither was claimed while the runner was offline (2026-07-04)
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Environment census
@@ -113,15 +108,19 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-  # The actual rig. Dispatch-only (push runs census only), skipped for
-  # suite=census. Builds the bench_ref compiler (and for composed/full the
-  # pre-optimization base) with the exact ci.yml combined-tree recipe, then
-  # runs the suite. See contrib/perf-lab/run-suite.sh for the protocol.
+  # The actual rig, skipped for suite=census. Builds the bench_ref compiler
+  # (and for composed/full the pre-optimization base) with the exact ci.yml
+  # combined-tree recipe, then runs the suite. See
+  # contrib/perf-lab/run-suite.sh for the protocol.
+  #
+  # Runtime on hosted ubuntu-latest (4 vCPU): quick is dominated by the
+  # ~1 h tip build; `composed` and `full` build TWO full GCCs and take
+  # ~4-5 h total, hence the 350-minute timeout.
   bench:
     needs: census
-    if: github.event_name == 'workflow_dispatch' && inputs.suite != 'census'
-    runs-on: [self-hosted]  # resting default; also tried label `unraid-gpu-runner` -- neither was claimed while the runner was offline (2026-07-04)
-    timeout-minutes: 300
+    if: inputs.suite != 'census'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
     env:
       BENCH_REF: ${{ inputs.bench_ref }}
     steps:
