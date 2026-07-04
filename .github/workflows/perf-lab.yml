@@ -1,0 +1,198 @@
+name: perf-lab
+
+# Self-hosted benchmark rig: real-hardware compile-time numbers for this
+# fork's perf work (dir index, GGC 512M cap + MADV_HUGEPAGE, tcmalloc,
+# readlink skip, hash-on-read), measured on the repo's own runner
+# (unraid-gpu-runner). See contrib/perf-lab/README.md.
+#
+# ci.yml stays untouched: this is a different trigger (manual dispatch on
+# self-hosted hardware), not another hosted-CI workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: >-
+          census = environment probe only; quick = stl+big -O2 on tip;
+          composed = base-vs-tip A/B incl. THP fault deltas; pch = PCH
+          ceiling; full = composed+pch
+        type: choice
+        options:
+          - census
+          - quick
+          - composed
+          - pch
+          - full
+        default: quick
+      bench_ref:
+        description: 'Git ref whose compiler gets benchmarked (the "tip" side)'
+        type: string
+        default: develop-matt/v14
+  # TEMPORARY bootstrap trigger while the rig is being brought up on the
+  # self-hosted runner; a push only runs the near-instant census job (the
+  # bench job is dispatch-only). Removed once the rig is stable.
+  push:
+    branches: [claude/tender-johnson-bdlvyf]
+    paths:
+      - 'contrib/perf-lab/**'
+      - '.github/workflows/perf-lab.yml'
+
+permissions:
+  contents: read
+
+# One benchmark at a time on the physical box: runs queue, never overlap,
+# and a queued run must not cancel a measurement in flight.
+concurrency:
+  group: perf-lab
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Pre-optimization baseline for the composed A/B: develop-matt/v14 at the
+  # PR #13 merge base (the compiler the merged wins were measured against).
+  PERF_LAB_BASE_SHA: 5226232bbe76093d3b7ef87d1925f36fb5b4bd58
+
+jobs:
+  # Near-instant environment probe. Runs on every trigger, gates nothing,
+  # assumes nothing (no checkout, no toolchain): its whole job is to tell us
+  # what this runner actually is.
+  census:
+    runs-on: [self-hosted]
+    timeout-minutes: 15
+    steps:
+      - name: Environment census
+        run: |
+          {
+            echo '## perf-lab census'
+            echo '```'
+            echo "RUNNER_NAME=${RUNNER_NAME:-<unset>}"
+            echo "RUNNER_OS=${RUNNER_OS:-<unset>} RUNNER_ARCH=${RUNNER_ARCH:-<unset>}"
+            echo "hostname=$(hostname 2>/dev/null || echo n/a)"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "--- uname -a"
+            uname -a || true
+            echo "--- /etc/os-release"
+            cat /etc/os-release 2>/dev/null || echo "(missing)"
+            echo "--- nproc"
+            nproc || true
+            echo "--- free -h"
+            free -h 2>/dev/null || echo "(free missing)"
+            echo "--- lscpu (model/topology)"
+            lscpu 2>/dev/null | grep -iE 'model name|vendor|socket|core|thread|mhz|numa' || echo "(lscpu missing)"
+            echo "--- transparent_hugepage/enabled"
+            cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo "(no THP sysfs)"
+            echo "--- transparent_hugepage/defrag"
+            cat /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || echo "(no defrag sysfs)"
+            echo "--- vm.nr_hugepages"
+            cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo "(missing)"
+            echo "--- /proc/vmstat thp counters"
+            grep -E '^thp_(fault_alloc|collapse_alloc)' /proc/vmstat 2>/dev/null || echo "(none)"
+            echo "--- toolchain presence"
+            for c in gcc g++ make flex bison m4 patch curl xz tar git \
+                     apt-get dpkg sudo docker taskset strace python3 node; do
+              printf '%-10s %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo MISSING)"
+            done
+            printf '%-10s %s\n' "time-v" "$([ -x /usr/bin/time ] && echo /usr/bin/time || echo MISSING)"
+            echo "--- gcc --version"
+            gcc --version 2>/dev/null | head -n1 || echo "(no gcc)"
+            echo "--- g++ --version"
+            g++ --version 2>/dev/null | head -n1 || echo "(no g++)"
+            echo "--- id"
+            id || true
+            echo "--- passwordless sudo"
+            if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+              echo "yes"
+            else
+              echo "no (or sudo missing)"
+            fi
+            echo "--- df -h workspace"
+            df -h "$GITHUB_WORKSPACE" 2>/dev/null || df -h . 2>/dev/null || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # The actual rig. Dispatch-only (push runs census only), skipped for
+  # suite=census. Builds the bench_ref compiler (and for composed/full the
+  # pre-optimization base) with the exact ci.yml combined-tree recipe, then
+  # runs the suite. See contrib/perf-lab/run-suite.sh for the protocol.
+  bench:
+    needs: census
+    if: github.event_name == 'workflow_dispatch' && inputs.suite != 'census'
+    runs-on: [self-hosted]
+    timeout-minutes: 300
+    env:
+      BENCH_REF: ${{ inputs.bench_ref }}
+    steps:
+      - name: Check out harness (this branch)
+        uses: actions/checkout@v4
+        with:
+          path: rig
+
+      - name: Prepare workspace
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          rm -rf build-tip build-base bench-work results
+          mkdir -p results dl
+          df -h "$GITHUB_WORKSPACE" || true
+
+      - name: Install dependencies
+        run: bash rig/contrib/perf-lab/install-deps.sh
+
+      - name: Check out bench_ref (tip)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.bench_ref }}
+          path: src-tip
+          fetch-depth: 1
+
+      - name: Check out pre-optimization base
+        if: inputs.suite == 'composed' || inputs.suite == 'full'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PERF_LAB_BASE_SHA }}
+          path: src-base
+          fetch-depth: 1
+
+      - name: Build tip compiler
+        run: >-
+          bash rig/contrib/perf-lab/build-gcc.sh
+          "$GITHUB_WORKSPACE/src-tip"
+          "$GITHUB_WORKSPACE/build-tip"
+          "$GITHUB_WORKSPACE/dl"
+
+      - name: Build base compiler
+        if: inputs.suite == 'composed' || inputs.suite == 'full'
+        run: >-
+          bash rig/contrib/perf-lab/build-gcc.sh
+          "$GITHUB_WORKSPACE/src-base"
+          "$GITHUB_WORKSPACE/build-base"
+          "$GITHUB_WORKSPACE/dl"
+
+      - name: Generate benchmark TUs
+        run: bash rig/contrib/perf-lab/gen-benches.sh "$GITHUB_WORKSPACE/bench-work"
+
+      - name: Run suite
+        env:
+          BENCH_DIR: ${{ github.workspace }}/bench-work
+          RESULTS_DIR: ${{ github.workspace }}/results
+        run: |
+          case "${{ inputs.suite }}" in
+            composed|full)
+              bash rig/contrib/perf-lab/run-suite.sh "${{ inputs.suite }}" \
+                "$GITHUB_WORKSPACE/build-tip" "$GITHUB_WORKSPACE/build-base"
+              ;;
+            *)
+              bash rig/contrib/perf-lab/run-suite.sh "${{ inputs.suite }}" \
+                "$GITHUB_WORKSPACE/build-tip"
+              ;;
+          esac
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-lab-results
+          path: results/
+          if-no-files-found: warn
