@@ -144,6 +144,61 @@ ccs_debug_line (const cc_serve_ctx *ctx, const char *action, const char *key,
   fflush (stderr);
 }
 
+/* Validate the CC_MAN_HDR_REC_SIZE records of one manifest entry against the
+   filesystem: every recorded file must still exist with the recorded size +
+   mtime (stat shortcut) or, failing that, re-hash to the recorded SHA-1.
+   MAN/MLEN is the whole manifest buffer; RECS_OFF/HDR_COUNT locate the entry's
+   records.  VERIFY_HASH forces the content re-hash.  Shared by the warm .o
+   serve and the auto-PCH probe.  */
+static bool
+ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
+		   uint32_t hdr_count, bool verify_hash)
+{
+  for (uint32_t hi = 0; hi < hdr_count; hi++)
+    {
+      const unsigned char *rec = man + recs_off
+				 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+      uint32_t path_off = cc_get_u32 (rec + CC_MHR_OFF_PATH);
+      uint64_t want_size = cc_get_u64 (rec + CC_MHR_OFF_SIZE);
+      uint64_t want_mtime = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
+      const unsigned char *want_hash = rec + CC_MHR_OFF_HASH;
+
+      if (path_off + 4 > mlen)
+	return false;
+      uint32_t plen = cc_get_u32 (man + path_off);
+      if ((uint64_t) path_off + 4 + plen + 1 > mlen)
+	return false;
+      const char *hpath = (const char *) (man + path_off + 4);
+
+      struct stat stt;
+      if (stat (hpath, &stt) != 0)
+	return false;
+
+      if (!verify_hash
+	  && (uint64_t) stt.st_size == want_size
+	  && (uint64_t) stt.st_mtime == want_mtime)
+	continue;
+
+      size_t got_len = 0;
+      unsigned char *body = ccs_read_file (hpath, &got_len);
+      if (!body || (uint64_t) got_len != want_size)
+	{
+	  free (body);
+	  return false;
+	}
+      unsigned char got_hash[20];
+      struct sha1_ctx fctx;
+      sha1_init_ctx (&fctx);
+      if (got_len)
+	sha1_process_bytes (body, got_len, &fctx);
+      sha1_finish_ctx (&fctx, got_hash);
+      free (body);
+      if (memcmp (got_hash, want_hash, 20) != 0)
+	return false;
+    }
+  return true;
+}
+
 /* ------------------------------------------------------------------------ */
 /* Option predicates (SHARED with compile-cache.cc -- keep in lockstep)     */
 /* ------------------------------------------------------------------------ */
@@ -168,6 +223,14 @@ cc_option_affects_output_p (const cl_decoded_option *decoded)
     case OPT_dumpbase_ext:
     case OPT_dumpdir:
     case OPT_fcompile_cache_:
+    /* The auto-PCH plumbing options do not change the produced bytes: the
+       injected -include (which does, and is keyed) carries the content
+       commitment, and the consumed PCH's closure is folded into the key
+       explicitly by the store-side merge.  Excluding these keeps a TU's key
+       stable across -fauto-pch on/off when no PCH ends up injected.  */
+    case OPT_fauto_pch:
+    case OPT_fauto_pch_store_:
+    case OPT_fauto_pch_ref_:
       return false;
     default:
       break;
@@ -693,62 +756,8 @@ compile_cache_serve_object (const cc_serve_ctx *ctx, const char *src_path,
       if (recs_off + recs_len > mlen)
 	break;
 
-      bool all_match = true;
-      for (uint32_t hi = 0; hi < hdr_count && all_match; hi++)
-	{
-	  const unsigned char *rec = man + recs_off
-				     + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
-	  uint32_t path_off = cc_get_u32 (rec + CC_MHR_OFF_PATH);
-	  uint64_t want_size = cc_get_u64 (rec + CC_MHR_OFF_SIZE);
-	  uint64_t want_mtime = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
-	  const unsigned char *want_hash = rec + CC_MHR_OFF_HASH;
-
-	  if (path_off + 4 > mlen)
-	    {
-	      all_match = false;
-	      break;
-	    }
-	  uint32_t plen = cc_get_u32 (man + path_off);
-	  if ((uint64_t) path_off + 4 + plen + 1 > mlen)
-	    {
-	      all_match = false;
-	      break;
-	    }
-	  const char *hpath = (const char *) (man + path_off + 4);
-
-	  struct stat stt;
-	  if (stat (hpath, &stt) != 0)
-	    {
-	      all_match = false;
-	      break;
-	    }
-
-	  if (!ctx->verify_hash
-	      && (uint64_t) stt.st_size == want_size
-	      && (uint64_t) stt.st_mtime == want_mtime)
-	    continue;
-
-	  size_t got_len = 0;
-	  unsigned char *body = ccs_read_file (hpath, &got_len);
-	  if (!body || (uint64_t) got_len != want_size)
-	    {
-	      free (body);
-	      all_match = false;
-	      break;
-	    }
-	  unsigned char got_hash[20];
-	  struct sha1_ctx fctx;
-	  sha1_init_ctx (&fctx);
-	  if (got_len)
-	    sha1_process_bytes (body, got_len, &fctx);
-	  sha1_finish_ctx (&fctx, got_hash);
-	  free (body);
-	  if (memcmp (got_hash, want_hash, 20) != 0)
-	    {
-	      all_match = false;
-	      break;
-	    }
-	}
+      bool all_match = ccs_records_match (man, mlen, recs_off, hdr_count,
+					  ctx->verify_hash);
 
       if (all_match)
 	{
@@ -767,4 +776,401 @@ compile_cache_serve_object (const cc_serve_ctx *ctx, const char *src_path,
   free (man);
   ccs_debug_line (ctx, "manifest-miss", mk_hex, out_path);
   return false;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Transparent auto-PCH (driver side)                                       */
+/* ------------------------------------------------------------------------ */
+
+/* The driver detects a TU whose leading lines are a "prelude" -- nothing but
+   comments, blank lines, and #include <...> directives -- and transparently
+   builds + reuses a precompiled header for that prelude, keyed by the prelude
+   BYTES + the flag cell + the compiler id, validated on every use against the
+   include closure recorded when the .gch was built.  The functions here are
+   the pure/probing parts (no spawning, no argv editing -- that lives in
+   gcc.cc): the prelude scanner, the entry-key/path derivation, and the probe.
+   Everything is driver-linkable: no libcpp, no backend globals.  */
+
+/* Scan SRC/LEN (raw source bytes) for a leading include-only prelude and
+   produce the NORMALIZED stub for it.  Accepts, from the top (skipping a
+   UTF-8 BOM): horizontal/vertical whitespace, // and (multi-line) block
+   comments, and #include <...> logical lines (backslash-newline splices
+   honored; anything else after the closing '>' except whitespace/comments
+   stops the scan; the '#' must also be the first non-blank byte on its
+   physical line).  Stops at the first other construct.
+
+   The normalized stub preserves the LINE STRUCTURE of the prefix -- every
+   physical line up to the last accepted include keeps its position -- but
+   the bytes of an include logical line are copied VERBATIM while every
+   other (comment/blank) line becomes an empty line.  Two TUs whose leading
+   comments differ in TEXT but not in LINE COUNT therefore normalize to the
+   same stub and share one PCH; and because line numbers agree with the TU,
+   diagnostics that point into the stub (include-chain roots, carets on
+   include lines) match a plain compile byte-for-byte.  The TU itself is
+   still compiled whole, so its real comments are re-lexed and comment
+   diagnostics (-Wcomment etc.) fire identically either way.
+
+   On success sets *NORM/*NORM_LEN to an xmalloc'd normalized stub and
+   *INCLUDE_COUNT to the number of accepted includes; with no accepted
+   include, *NORM is NULL and the count 0.  Returns true (scan is always
+   usable).  */
+
+/* Skip a backslash-newline splice at P (also \r\n).  Returns bytes skipped.  */
+static size_t
+ccp_splice_len (const unsigned char *p, const unsigned char *end)
+{
+  if (p < end && *p == '\\')
+    {
+      if (p + 1 < end && p[1] == '\n')
+	return 2;
+      if (p + 2 < end && p[1] == '\r' && p[2] == '\n')
+	return 3;
+      if (p + 1 < end && p[1] == '\r')
+	return 2;
+    }
+  return 0;
+}
+
+bool
+cc_auto_pch_scan_prelude (const unsigned char *src, size_t len,
+			  unsigned char **norm, size_t *norm_len,
+			  unsigned *include_count)
+{
+  const unsigned char *p = src;
+  const unsigned char *end = src + len;
+  const unsigned char *accepted_end = NULL;	/* after last include's NL */
+  unsigned count = 0;
+
+  /* Byte ranges of accepted include LOGICAL lines (start of the physical
+     line the directive starts on, through the newline that ends the logical
+     line), for the normalization pass below.  */
+  struct range { size_t lo, hi; };
+  range *incs = NULL;
+  unsigned nincs = 0, cincs = 0;
+
+  *norm = NULL;
+  *norm_len = 0;
+  *include_count = 0;
+
+  /* UTF-8 BOM.  */
+  if (len >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF)
+    p += 3;
+
+  const unsigned char *line_start = p;	/* current physical line start */
+  bool line_blank_so_far = true;	/* only ws seen on this line */
+
+  while (p < end)
+    {
+      size_t sp;
+
+      if (*p == '\n' || *p == '\r')
+	{
+	  p++;
+	  if (p <= end && p[-1] == '\r' && p < end && *p == '\n')
+	    p++;
+	  line_start = p;
+	  line_blank_so_far = true;
+	  continue;
+	}
+      if (*p == ' ' || *p == '\t' || *p == '\v' || *p == '\f')
+	{
+	  p++;
+	  continue;
+	}
+      if ((sp = ccp_splice_len (p, end)) != 0)
+	{
+	  p += sp;
+	  line_start = p;
+	  continue;
+	}
+
+      /* Comments count as whitespace between constructs, but any comment
+	 makes the line no longer blank-prefixed for a following '#'.  */
+      if (*p == '/' && p + 1 < end && p[1] == '/')
+	{
+	  line_blank_so_far = false;
+	  p += 2;
+	  while (p < end && *p != '\n')
+	    {
+	      if ((sp = ccp_splice_len (p, end)) != 0)
+		p += sp;	/* spliced line continues the // comment */
+	      else
+		p++;
+	    }
+	  continue;
+	}
+      if (*p == '/' && p + 1 < end && p[1] == '*')
+	{
+	  line_blank_so_far = false;
+	  p += 2;
+	  while (p + 1 < end && !(*p == '*' && p[1] == '/'))
+	    p++;
+	  if (p + 1 >= end)
+	    break;		/* unterminated comment: stop scan */
+	  p += 2;
+	  continue;
+	}
+
+      /* Directive?  The '#' must be the first non-blank byte on its line so
+	 the whole physical line can be copied verbatim into the stub.  */
+      if (*p != '#' || !line_blank_so_far)
+	break;
+      const unsigned char *inc_lo = line_start;
+      p++;
+      while (p < end && (*p == ' ' || *p == '\t'
+			 || (sp = ccp_splice_len (p, end)) != 0))
+	p += (*p == ' ' || *p == '\t') ? 1 : sp;
+      if ((size_t) (end - p) < 7 || memcmp (p, "include", 7) != 0)
+	break;
+      p += 7;
+      /* Next must not be an identifier char ("include_next" etc).  */
+      if (p < end && (ISALNUM (*p) || *p == '_'))
+	break;
+      while (p < end && (*p == ' ' || *p == '\t'
+			 || (sp = ccp_splice_len (p, end)) != 0))
+	p += (*p == ' ' || *p == '\t') ? 1 : sp;
+      if (p >= end || *p != '<')
+	break;			/* v1: angle-bracket includes only */
+      p++;
+      while (p < end && *p != '>' && *p != '\n')
+	{
+	  if ((sp = ccp_splice_len (p, end)) != 0)
+	    p += sp;
+	  else
+	    p++;
+	}
+      if (p >= end || *p != '>')
+	break;			/* newline/EOF before '>': malformed */
+      p++;
+
+      /* Rest of the logical line: whitespace and comments only.  */
+      bool line_ok = true;
+      bool at_eol = false;
+      while (p < end && !at_eol)
+	{
+	  if (*p == '\n')
+	    {
+	      p++;
+	      at_eol = true;
+	    }
+	  else if (*p == '\r')
+	    p++;
+	  else if (*p == ' ' || *p == '\t' || *p == '\v' || *p == '\f')
+	    p++;
+	  else if ((sp = ccp_splice_len (p, end)) != 0)
+	    p += sp;
+	  else if (*p == '/' && p + 1 < end && p[1] == '/')
+	    {
+	      p += 2;
+	      while (p < end && *p != '\n')
+		{
+		  if ((sp = ccp_splice_len (p, end)) != 0)
+		    p += sp;
+		  else
+		    p++;
+		}
+	    }
+	  else if (*p == '/' && p + 1 < end && p[1] == '*')
+	    {
+	      p += 2;
+	      while (p + 1 < end && !(*p == '*' && p[1] == '/'))
+		p++;
+	      if (p + 1 >= end)
+		{
+		  line_ok = false;
+		  break;
+		}
+	      p += 2;
+	    }
+	  else
+	    {
+	      line_ok = false;
+	      break;
+	    }
+	}
+      if (!line_ok)
+	break;
+
+      if (nincs == cincs)
+	{
+	  cincs = cincs ? cincs * 2 : 16;
+	  incs = XRESIZEVEC (range, incs, cincs);
+	}
+      incs[nincs].lo = (size_t) (inc_lo - src);
+      incs[nincs].hi = (size_t) (p - src);
+      nincs++;
+      count++;
+      accepted_end = p;		/* after the include line's newline (or EOF) */
+      line_start = p;
+      line_blank_so_far = true;
+    }
+
+  if (accepted_end && count)
+    {
+      /* Normalization pass: include ranges verbatim, everything between
+	 them line-count-preserving blank lines.  */
+      size_t plen = (size_t) (accepted_end - src);
+      unsigned char *out = (unsigned char *) xmalloc (plen + 1);
+      size_t o = 0;
+      size_t pos = 0;
+      for (unsigned i = 0; i < nincs; i++)
+	{
+	  for (size_t b = pos; b < incs[i].lo; b++)
+	    if (src[b] == '\n')
+	      out[o++] = '\n';
+	  memcpy (out + o, src + incs[i].lo, incs[i].hi - incs[i].lo);
+	  o += incs[i].hi - incs[i].lo;
+	  pos = incs[i].hi;
+	}
+      out[o] = 0;
+      *norm = out;
+      *norm_len = o;
+      *include_count = count;
+    }
+  free (incs);
+  return true;
+}
+
+/* Compute the auto-PCH entry base path for CTX + the prelude bytes:
+   "<cache_dir>/pch/<2hex>/<38hex>" (no trailing slash; caller appends
+   "/stub.h" etc. and creates directories).  Key = schema tag + key schema
+   version + salt + compiler checksum + lang + every output-affecting
+   canonicalized option (the SAME classifier as the manifest key, minus -o /
+   dump paths by construction) + the prelude bytes.  Deliberately NOT keyed:
+   the TU's path or name (preludes are shared across TUs).  Returns a freshly
+   xmalloc'd string.  */
+char *
+cc_auto_pch_entry_base (const cc_serve_ctx *ctx,
+			const unsigned char *prelude, size_t plen)
+{
+  struct sha1_ctx sctx;
+  sha1_init_ctx (&sctx);
+
+  ccs_hash_str (&sctx, CC_TAG_LANG, "gcc-auto-pch-v1");
+  {
+    unsigned char v[4];
+    unsigned ver = CC_KEY_SCHEMA_VERSION;
+    for (int i = 0; i < 4; i++)
+      v[i] = (unsigned char) (ver >> (8 * i));
+    ccs_hash_component (&sctx, CC_TAG_VERSION, v, sizeof (v));
+  }
+  {
+    const char *salt = getenv ("GCC_COMPILE_CACHE_SALT");
+    if (salt && salt[0])
+      ccs_hash_str (&sctx, CC_TAG_SALT, salt);
+  }
+  ccs_hash_component (&sctx, CC_TAG_CHECKSUM, ctx->checksum, 16);
+  ccs_hash_str (&sctx, CC_TAG_LANG, ctx->lang_name);
+
+  for (unsigned i = 1; i < ctx->decoded_count; i++)
+    {
+      const cl_decoded_option *o = &ctx->decoded[i];
+      if (o->opt_index == OPT_SPECIAL_input_file)
+	continue;
+      if (!cc_option_affects_output_p (o))
+	continue;
+      for (size_t k = 0; k < o->canonical_option_num_elements; k++)
+	ccs_hash_str (&sctx, CC_TAG_OPT, o->canonical_option[k]);
+    }
+
+  ccs_hash_component (&sctx, CC_TAG_FILE_BODY, prelude, plen);
+
+  unsigned char raw[20];
+  sha1_finish_ctx (&sctx, raw);
+  char hex[41];
+  cc_hex (raw, hex);
+
+  size_t n = strlen (ctx->cache_dir) + strlen ("/pch/") + 2 + 1 + 38 + 1;
+  char *base = (char *) xmalloc (n);
+  snprintf (base, n, "%s/pch/%c%c/%s", ctx->cache_dir, hex[0], hex[1],
+	    hex + 2);
+  return base;
+}
+
+/* Probe the entry at BASE.  Returns:
+     CC_APCH_USABLE   -- stub + gch + manifest all present and valid: inject.
+     CC_APCH_NEGATIVE -- a valid "do not use" marker: compile normally, do
+			 not regenerate (its manifest still matched).
+     CC_APCH_ABSENT   -- nothing usable (or a stale entry whose closure no
+			 longer matches): candidate for (re)generation.
+   Validity = the manifest's records still match the filesystem (stat
+   shortcut / re-hash, exactly like a warm .o hit) AND the stub bytes equal
+   the TU's prelude bytes.  A negative entry with a manifest revalidates the
+   same way, so a header edit lifts the negative automatically; a negative
+   without a manifest expires after 10 minutes (mtime).  */
+enum cc_auto_pch_probe_result
+cc_auto_pch_probe (const cc_serve_ctx *ctx, const char *base,
+		   const unsigned char *prelude, size_t plen)
+{
+  size_t bl = strlen (base);
+  char *pbuf = (char *) xmalloc (bl + 32);
+
+  /* Manifest first: both positive and negative entries carry one.  */
+  snprintf (pbuf, bl + 32, "%s/manifest", base);
+  size_t mlen = 0;
+  unsigned char *man = ccs_read_file (pbuf, &mlen);
+  bool man_ok = false;
+  if (man
+      && mlen >= CC_MANIFEST_HEADER_SIZE
+      && memcmp (man + CC_MAN_OFF_MAGIC, CC_MANIFEST_MAGIC, CC_MAGIC_LEN) == 0
+      && cc_get_u16 (man + CC_MAN_OFF_VERSION) == CC_MANIFEST_VERSION)
+    {
+      uint32_t ecount = cc_get_u32 (man + CC_MAN_OFF_ENTRY_COUNT);
+      uint64_t eoff = cc_get_u64 (man + CC_MAN_OFF_ENTRIES_OFF);
+      if (ecount == 1 && eoff + 32 <= mlen)
+	{
+	  uint32_t hdr_count = cc_get_u32 (man + eoff + 28);
+	  uint64_t recs_off = eoff + 32;
+	  if (recs_off + (uint64_t) hdr_count * CC_MAN_HDR_REC_SIZE <= mlen)
+	    man_ok = ccs_records_match (man, mlen, recs_off, hdr_count,
+					ctx->verify_hash);
+	}
+    }
+  free (man);
+
+  /* Negative marker?  */
+  snprintf (pbuf, bl + 32, "%s/negative", base);
+  struct stat nst;
+  if (stat (pbuf, &nst) == 0)
+    {
+      if (man_ok)
+	{
+	  free (pbuf);
+	  return CC_APCH_NEGATIVE;	/* still-valid "don't use" */
+	}
+      /* Closure changed (or no manifest): retry, but rate-limit the
+	 no-manifest case to one regeneration attempt per 10 minutes.  */
+      if (mlen == 0 && time (NULL) - nst.st_mtime < 600)
+	{
+	  free (pbuf);
+	  return CC_APCH_NEGATIVE;
+	}
+      free (pbuf);
+      return CC_APCH_ABSENT;
+    }
+
+  if (!man_ok)
+    {
+      free (pbuf);
+      return CC_APCH_ABSENT;
+    }
+
+  /* Stub must byte-equal the prelude (key preimage check + completeness).  */
+  snprintf (pbuf, bl + 32, "%s/stub.h", base);
+  size_t slen = 0;
+  unsigned char *stub = ccs_read_file (pbuf, &slen);
+  bool stub_ok = (stub && slen == plen && memcmp (stub, prelude, plen) == 0);
+  free (stub);
+  if (!stub_ok)
+    {
+      free (pbuf);
+      return CC_APCH_ABSENT;
+    }
+
+  /* The .gch itself (renamed last at gen time = entry-complete marker).  */
+  snprintf (pbuf, bl + 32, "%s/stub.h.gch", base);
+  struct stat gst;
+  bool gch_ok = (stat (pbuf, &gst) == 0 && gst.st_size > 0);
+  free (pbuf);
+  return gch_ok ? CC_APCH_USABLE : CC_APCH_ABSENT;
 }

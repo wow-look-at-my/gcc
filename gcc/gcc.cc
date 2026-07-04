@@ -6000,6 +6000,504 @@ driver_try_serve_from_cache (void)
   return served;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Transparent auto-PCH (Stage 6): detect a shared #include prelude, build a */
+/* .gch for it once (keyed by prelude bytes + flag cell + compiler id), and  */
+/* inject -include <stub> into the cc1plus command on every later TU.        */
+/* ------------------------------------------------------------------------ */
+
+/* True if GCC_AUTO_PCH_DEBUG is set (lazily probed).  */
+static bool
+driver_apch_debug_p (void)
+{
+  static int dbg = -1;
+  if (dbg == -1)
+    {
+      const char *e = env.get ("GCC_AUTO_PCH_DEBUG");
+      dbg = (e && e[0]) ? 1 : 0;
+    }
+  return dbg == 1;
+}
+
+static void
+driver_apch_log (const char *what, const char *detail)
+{
+  if (!driver_apch_debug_p ())
+    return;
+  fprintf (stderr, "auto-pch: %s%s%s\n", what, detail ? " " : "",
+	   detail ? detail : "");
+  fflush (stderr);
+}
+
+/* mkdir -p for PATH (must be absolute or cwd-relative).  Best-effort; the
+   caller's subsequent open/rename reports real failures.  */
+static void
+driver_apch_mkdirs (const char *path)
+{
+  char *tmp = xstrdup (path);
+  for (char *p = tmp + 1; *p; p++)
+    if (IS_DIR_SEPARATOR (*p))
+      {
+	*p = '\0';
+	mkdir (tmp, 0777);
+	*p = DIR_SEPARATOR;
+      }
+  mkdir (tmp, 0777);
+  free (tmp);
+}
+
+/* Everything driver_auto_pch_probe_inject () learns that
+   driver_auto_pch_generate () needs.  */
+struct driver_apch_plan
+{
+  bool gen;			/* entry absent: generate after a serve miss */
+  char *base;			/* entry base path (xmalloc'd) */
+  unsigned char *prelude;	/* prelude bytes (xmalloc'd) */
+  size_t plen;
+  char *src_arg;		/* the source token as it appears in argbuf
+				   (owned copy) */
+};
+
+static void
+driver_apch_plan_free (struct driver_apch_plan *plan)
+{
+  free (plan->base);
+  free (plan->prelude);
+  free (plan->src_arg);
+  plan->base = NULL;
+  plan->prelude = NULL;
+  plan->src_arg = NULL;
+  plan->gen = false;
+}
+
+/* Append the injection options for entry BASE to ARGBUF.  */
+static void
+driver_apch_inject (const char *base)
+{
+  const char *stub = concat (base, "/stub.h", NULL);
+  argbuf.safe_push ("-include");
+  argbuf.safe_push (stub);
+  argbuf.safe_push (concat ("-fauto-pch-ref=", stub, NULL));
+  driver_apch_log ("inject", stub);
+}
+
+/* Cap on how much of the source the prelude scanner looks at.  A prelude
+   longer than this is truncated at the last accepted include inside the cap,
+   which stays sound (the stub is still a byte-exact prefix).  */
+#define APCH_SCAN_CAP (64 * 1024)
+
+/* Minimum number of #include <...> lines to bother with a PCH.  */
+#define APCH_MIN_INCLUDES 3
+
+/* Phase 1, BEFORE the driver .o-serve probe: decide whether this command is
+   auto-PCH eligible; if a valid entry exists, inject it NOW so the serve
+   probe (and cc1plus) see the final argv -- the manifest key covers the
+   injected options, which is what makes driver/cc1plus key agreement hold in
+   PCH mode.  If the entry is absent, record a generation plan; the caller
+   runs it only after the .o serve declines (a warm .o hit needs no PCH).  */
+static void
+driver_auto_pch_probe_inject (struct driver_apch_plan *plan)
+{
+  plan->gen = false;
+  plan->base = NULL;
+  plan->prelude = NULL;
+  plan->plen = 0;
+  plan->src_arg = NULL;
+
+  if (argbuf.length () < 2)
+    return;
+  if (verbose_only_flag)
+    return;
+
+  /* Only C++ compiles in v1.  */
+  const char *prog = lbasename (argbuf[0]);
+  if (strcmp (prog, "cc1plus") != 0)
+    return;
+
+  /* Enabled?  Cheap env probe first; -fauto-pch is checked in the scan.  */
+  const char *env_on = env.get ("GCC_AUTO_PCH");
+  bool enabled = (env_on && env_on[0] && strcmp (env_on, "0") != 0);
+
+  unsigned int argc = argbuf.length ();
+  const char **argv = XNEWVEC (const char *, argc);
+  for (unsigned i = 0; i < argbuf.length (); i++)
+    argv[i] = argbuf[i];
+
+  struct cl_decoded_option *decoded = NULL;
+  unsigned int decoded_count = 0;
+  decode_cmdline_options_to_array (argc, argv,
+				   CL_LANG_ALL | CL_COMMON | CL_TARGET
+				   | CL_DRIVER,
+				   &decoded, &decoded_count);
+  free (argv);
+
+  const char *cache_dir = NULL;
+  const char *src_path = NULL;
+  bool disqualify = false;
+  bool saw_g = false;
+  bool have_out = false;
+
+  for (unsigned i = 1; i < decoded_count && !disqualify; i++)
+    {
+      const cl_decoded_option *o = &decoded[i];
+      switch (o->opt_index)
+	{
+	case OPT_fauto_pch:
+	  enabled = (o->value != 0);
+	  break;
+	case OPT_fcompile_cache_:
+	  cache_dir = o->arg;
+	  break;
+	case OPT_o:
+	  have_out = true;
+	  break;
+	case OPT_SPECIAL_input_file:
+	  if (src_path)
+	    disqualify = true;		/* one input only */
+	  else
+	    src_path = o->arg;
+	  break;
+	case OPT_g:
+	case OPT_ggdb:
+	case OPT_gdwarf:
+	case OPT_gdwarf_:
+	  saw_g = true;
+	  break;
+
+	/* Not a plain compile-to-object.  */
+	case OPT_E:
+	case OPT_S:
+	case OPT_fsyntax_only:
+	case OPT__output_pch:
+	case OPT_fpreprocessed:
+	/* The user runs their own PCH / prefix-header setup.  */
+	case OPT_include:
+	case OPT_imacros:
+	case OPT_fpch_preprocess:
+	case OPT_fpch_deps:
+	/* Dependency output: v1 keeps .d files byte-identical by simply not
+	   engaging (the PCH would swallow the prelude headers from them).  */
+	case OPT_M:
+	case OPT_MM:
+	case OPT_MD:
+	case OPT_MMD:
+	case OPT_MF:
+	case OPT_MG:
+	case OPT_MP:
+	case OPT_MQ:
+	case OPT_MT:
+	case OPT_fdeps_format_:
+	case OPT_fdeps_file_:
+	case OPT_fdeps_target_:
+	/* Modules / header units have their own pipeline.  */
+	case OPT_fmodules_ts:
+	case OPT_fmodule_header:
+	case OPT_fmodule_header_:
+	case OPT_fmodule_only:
+	/* Profiling bakes run/path state; keep v1 narrow.  */
+	case OPT_fprofile_generate:
+	case OPT_fprofile_generate_:
+	case OPT_fprofile_use:
+	case OPT_fprofile_use_:
+	case OPT_fprofile_arcs:
+	case OPT_ftest_coverage:
+	case OPT_p:
+	case OPT_pg:
+	/* Plugins can see arbitrary state.  */
+	case OPT_fplugin_:
+	case OPT_fplugin_arg_:
+	/* Diagnostic modes whose stderr the injection would alter.  */
+	case OPT_H:
+	case OPT_version:
+	  disqualify = true;
+	  break;
+
+	/* The internal marker the specs put on every non-object compile
+	   (-S and the PCH specs): the driver's -S itself never reaches the
+	   cc1plus argv, this does.  */
+	case OPT_fasm_output_only:
+	  disqualify = true;
+	  break;
+
+	default:
+	  break;
+	}
+    }
+
+  /* The cache dir can come from the flag (visible in the decoded argv) or
+     from the environment -- same resolution the compiler side uses.  */
+  if (!cache_dir || !cache_dir[0])
+    cache_dir = env.get ("GCC_COMPILE_CACHE_DIR");
+
+  if (!enabled || disqualify || !cache_dir || !cache_dir[0]
+      || !src_path || !src_path[0] || !strcmp (src_path, "-") || !have_out)
+    {
+      if (enabled && !disqualify && (!cache_dir || !cache_dir[0]))
+	driver_apch_log ("off", "no compile cache dir (flag or env)");
+      free (decoded);
+      return;
+    }
+
+  /* Compiler id (written by cc1plus on the first miss-store).  Without it we
+     cannot key the entry; the very first compile into a cold cache proceeds
+     plain and the next one picks the feature up.  */
+  unsigned char checksum[16];
+  char *lang = NULL;
+  if (!driver_read_compiler_id (cache_dir, checksum, &lang))
+    {
+      driver_apch_log ("off", "no compiler-id sidecar yet (cold cache)");
+      free (decoded);
+      return;
+    }
+
+  /* Read the head of the source and scan for a prelude, producing the
+     normalized stub (include lines verbatim, comment/blank lines blanked,
+     line positions preserved).  */
+  unsigned char *head = NULL;
+  size_t head_len = 0;
+  {
+    FILE *f = fopen (src_path, "rb");
+    if (f)
+      {
+	head = (unsigned char *) xmalloc (APCH_SCAN_CAP);
+	head_len = fread (head, 1, APCH_SCAN_CAP, f);
+	fclose (f);
+      }
+  }
+  unsigned char *norm = NULL;
+  size_t plen = 0;
+  unsigned nincl = 0;
+  if (head)
+    cc_auto_pch_scan_prelude (head, head_len, &norm, &plen, &nincl);
+  free (head);
+  if (!norm || nincl < APCH_MIN_INCLUDES || plen == 0)
+    {
+      if (driver_apch_debug_p ())
+	{
+	  char msg[96];
+	  snprintf (msg, sizeof (msg), "%u include(s) in prelude of %s",
+		    nincl, src_path);
+	  driver_apch_log ("skip", msg);
+	}
+      free (norm);
+      free (lang);
+      free (decoded);
+      return;
+    }
+
+  cc_serve_ctx ctx;
+  ctx.cache_dir = cache_dir;
+  ctx.checksum = checksum;
+  ctx.lang_name = lang;
+  ctx.decoded = decoded;
+  ctx.decoded_count = decoded_count;
+  ctx.paths_affect_output = saw_g;
+  ctx.cwd = "";
+  {
+    const char *verify = env.get ("GCC_COMPILE_CACHE_VERIFY");
+    ctx.verify_hash = (verify && !strcmp (verify, "hash"));
+  }
+  ctx.debug = driver_apch_debug_p ();
+
+  char *base = cc_auto_pch_entry_base (&ctx, norm, plen);
+  enum cc_auto_pch_probe_result pr
+    = cc_auto_pch_probe (&ctx, base, norm, plen);
+
+  switch (pr)
+    {
+    case CC_APCH_USABLE:
+      driver_apch_inject (base);
+      free (base);
+      free (norm);
+      break;
+    case CC_APCH_NEGATIVE:
+      driver_apch_log ("negative", base);
+      free (base);
+      free (norm);
+      break;
+    case CC_APCH_ABSENT:
+      plan->gen = true;
+      plan->base = base;
+      plan->prelude = norm;
+      plan->plen = plen;
+      plan->src_arg = xstrdup (src_path);
+      driver_apch_log ("plan-gen", base);
+      break;
+    }
+
+  free (lang);
+  free (decoded);
+}
+
+/* Phase 2, after the .o serve declined: build the .gch for PLAN (won via an
+   O_EXCL lock; losers just compile plain this once), store stub + manifest +
+   gch under the entry (gch renamed last = completeness marker), and inject.
+   ANY failure -- non-zero exit OR any stderr from the PCH build -- writes a
+   "negative" marker instead: the prelude provokes parse-time diagnostics
+   that a PCH would swallow from later TUs, so this key must compile plain
+   (keeping stderr byte-identical by construction).  */
+static void
+driver_auto_pch_generate (struct driver_apch_plan *plan)
+{
+  if (!plan->gen || !plan->base)
+    return;
+
+  const char *base = plan->base;
+  driver_apch_mkdirs (base);
+
+  /* One generator per entry.  */
+  char *lock = concat (base, "/gen.lock", NULL);
+  int lfd = open (lock, O_CREAT | O_EXCL | O_WRONLY, 0644);
+  if (lfd < 0)
+    {
+      struct stat lst;
+      if (stat (lock, &lst) == 0 && time (NULL) - lst.st_mtime > 300)
+	{
+	  unlink (lock);		/* steal a stale lock */
+	  lfd = open (lock, O_CREAT | O_EXCL | O_WRONLY, 0644);
+	}
+      if (lfd < 0)
+	{
+	  driver_apch_log ("lock-busy", base);
+	  free (lock);
+	  return;			/* compile plain this once */
+	}
+    }
+  close (lfd);
+
+  long pid = (long) getpid ();
+  char *gch_tmp = xasprintf ("%s/gch.tmp%ld", base, pid);
+  char *man_tmp = xasprintf ("%s/manifest.tmp%ld", base, pid);
+  char *asm_tmp = xasprintf ("%s/asm.tmp%ld", base, pid);
+  char *err_tmp = xasprintf ("%s/err.tmp%ld", base, pid);
+  char *stub_final = concat (base, "/stub.h", NULL);
+  char *gch_final = concat (base, "/stub.h.gch", NULL);
+  char *man_final = concat (base, "/manifest", NULL);
+  char *neg_final = concat (base, "/negative", NULL);
+  bool ok = false;
+
+  /* Write the (normalized) stub AT ITS FINAL PATH before building: the .gch
+     bakes the stub's file name into its line table, and the injection-time
+     remap (and any diagnostics before it) must see the stable entry path,
+     never a temp name.  We hold the gen lock, and the entry only counts as
+     complete once the gch itself is renamed in below, so publishing the
+     inert stub early is safe.  */
+  {
+    FILE *sf = fopen (stub_final, "wb");
+    if (sf)
+      {
+	ok = (fwrite (plan->prelude, 1, plan->plen, sf) == plan->plen);
+	ok = (fclose (sf) == 0) && ok;
+      }
+  }
+
+  if (ok)
+    {
+      /* Build the PCH-build argv from this compile's argv: same flag cell,
+	 stub as input, PCH as output, asm to a discarded temp, and the
+	 internal option that makes cc1plus write the closure manifest.  */
+      vec<const char *> gen;
+      gen.create (argbuf.length () + 8);
+      for (unsigned i = 0; i < argbuf.length (); i++)
+	{
+	  const char *a = argbuf[i];
+	  if (!strcmp (a, "-o") || !strcmp (a, "-dumpbase")
+	      || !strcmp (a, "-dumpbase-ext") || !strcmp (a, "-dumpdir"))
+	    {
+	      i++;			/* skip the option and its argument */
+	      continue;
+	    }
+	  if (plan->src_arg && !strcmp (a, plan->src_arg))
+	    {
+	      gen.safe_push (stub_final);	/* the stub replaces the source */
+	      continue;
+	    }
+	  gen.safe_push (a);
+	}
+      gen.safe_push ("-fasm-output-only");
+      gen.safe_push ("-o");
+      gen.safe_push (asm_tmp);
+      gen.safe_push ("--output-pch");
+      gen.safe_push (gch_tmp);
+      char *store_opt = concat ("-fauto-pch-store=", man_tmp, NULL);
+      gen.safe_push (store_opt);
+      gen.safe_push (NULL);
+
+      char *prog = find_a_program (argbuf[0]);
+      const char *exe = prog ? prog : argbuf[0];
+
+      struct timeval tv0, tv1;
+      gettimeofday (&tv0, NULL);
+      int status = -1, errnum = 0;
+      const char *errmsg
+	= pex_one (PEX_LAST | PEX_SEARCH, exe,
+		   CONST_CAST2 (char * const *, const char **,
+				gen.address ()),
+		   "cc1plus (auto-pch)", NULL, err_tmp, &status, &errnum);
+      gettimeofday (&tv1, NULL);
+
+      /* Any stderr at all disqualifies the PCH (see the function comment).  */
+      struct stat est;
+      bool err_empty = (stat (err_tmp, &est) != 0 || est.st_size == 0);
+      ok = (errmsg == NULL && status == 0 && err_empty);
+
+      if (driver_apch_debug_p ())
+	{
+	  long ms = (tv1.tv_sec - tv0.tv_sec) * 1000
+		    + (tv1.tv_usec - tv0.tv_usec) / 1000;
+	  char msg[128];
+	  snprintf (msg, sizeof (msg), "status=%d stderr=%s wall=%ldms",
+		    status, err_empty ? "empty" : "NONEMPTY", ms);
+	  driver_apch_log (ok ? "gen-ok" : "gen-fail", msg);
+	}
+
+      free (prog);
+      free (store_opt);
+      gen.release ();
+    }
+
+  if (ok)
+    {
+      /* Completeness order: manifest first, gch LAST (the stub is already
+	 at its final path).  */
+      ok = (rename (man_tmp, man_final) == 0
+	    && rename (gch_tmp, gch_final) == 0);
+      if (ok)
+	driver_apch_inject (base);
+    }
+
+  if (!ok)
+    {
+      /* Negative entry: keep the manifest when the build produced one (rc==0
+	 warnings case) so a later header edit revalidates and retries.  */
+      struct stat mst;
+      if (stat (man_tmp, &mst) == 0 && mst.st_size > 0)
+	rename (man_tmp, man_final);
+      FILE *nf = fopen (neg_final, "wb");
+      if (nf)
+	{
+	  fputs ("auto-pch: prelude unusable (build failed or warned)\n", nf);
+	  fclose (nf);
+	}
+      driver_apch_log ("negative-store", base);
+    }
+
+  unlink (gch_tmp);
+  unlink (man_tmp);
+  unlink (asm_tmp);
+  unlink (err_tmp);
+  unlink (lock);
+  free (gch_tmp);
+  free (man_tmp);
+  free (asm_tmp);
+  free (err_tmp);
+  free (stub_final);
+  free (gch_final);
+  free (man_final);
+  free (neg_final);
+  free (lock);
+}
+
 /* Process the spec SPEC and run the commands specified therein.
    Returns 0 if the spec is successfully processed; -1 if failed.  */
 
@@ -6020,13 +6518,31 @@ do_spec (const char *spec)
 
       set_collect_gcc_options ();
 
+      /* Auto-PCH phase 1: if a valid prelude PCH exists for this command,
+	 inject -include <stub> BEFORE the serve probe, so the manifest key
+	 (computed identically here and in cc1plus) covers the final argv.
+	 If the entry is absent, PLAN records a deferred generation.  */
+      struct driver_apch_plan apch_plan;
+      driver_auto_pch_probe_inject (&apch_plan);
+
       /* Driver-level compile-cache serve (Stage 5.2): if this assembled
 	 command is an integrated-as compile-to-object with -fcompile-cache and
 	 the cache holds a warm hit, place the cached .o now and SKIP the spawn
 	 entirely -- no cc1/cc1plus, no as.  On a miss we fall through and run
 	 the command normally (cc1plus then compiles + stores, as before).  */
       if (argbuf.length () > 0 && driver_try_serve_from_cache ())
-	return 0;
+	{
+	  driver_apch_plan_free (&apch_plan);
+	  return 0;
+	}
+
+      /* Auto-PCH phase 2: the .o serve declined, so this TU will really
+	 compile -- build the missing .gch now (one-time cost, amortized by
+	 every later TU sharing the prelude) and inject it for this compile
+	 too.  Never runs when phase 1 already injected or bailed.  */
+      if (apch_plan.gen)
+	driver_auto_pch_generate (&apch_plan);
+      driver_apch_plan_free (&apch_plan);
 
       if (argbuf.length () > 0)
 	value = execute ();
