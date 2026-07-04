@@ -181,7 +181,20 @@ jobs:
       # artifact (kind=archive -- the payload is a tarball, not a bare
       # binary; curl streams the ~1 GiB file from disk, with the token in a
       # curl config file so it stays off argv) -> publish release.
+      #
+      # KNOWN LIMITATION (why continue-on-error): pazer.build's only ingress
+      # is a Cloudflare Tunnel, and Cloudflare's edge caps a request body at
+      # ~100 MiB -- the ~1 GiB single PUT draws an instant Cloudflare 413
+      # before it ever reaches buildhost (whose own cap is 2 GiB; the nginx
+      # behind the tunnel streams with client_max_body_size 2g). buildhost
+      # has no chunked/resumable upload for release artifacts today (only
+      # its OCI push side accepts chunked blobs), so this step is expected
+      # to fail until buildhost grows one (or a Cloudflare-free upload
+      # path). A registry failure must never fail `build` and skip the
+      # benchmark job again: the step is continue-on-error, warns loudly,
+      # and the GHA artifact above is the fallback.
       - name: Publish to buildhost
+        continue-on-error: true
         uses: wow-look-at-my/actions@typescript#latest
         with:
           script: |
@@ -189,46 +202,57 @@ jobs:
             const project = "gcc";
             const tarball = "gccbuild.tar.gz";
 
-            // getIDToken also registers the JWT as a masked secret.
-            const token = await core.getIDToken(server);
+            try {
+              // getIDToken also registers the JWT as a masked secret.
+              const token = await core.getIDToken(server);
 
-            // Retry transient edge errors (5xx, or an empty-body CDN 404
-            // during a buildhost rolling deploy) with backoff, like the org
-            // buildhost-publish action, so a brief deploy window cannot
-            // waste a ~40-minute build.
-            const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-            const api = async (method: string, urlPath: string, body?: string) => {
-              const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
-              if (body !== undefined) headers["Content-Type"] = "application/json";
-              for (let attempt = 1; ; attempt++) {
-                try {
-                  const resp = await fetch(`${server}${urlPath}`, { method, headers, body });
-                  const text = await resp.text();
-                  const transient = resp.status >= 500 || (resp.status === 404 && text.trim() === "");
-                  if (attempt === 5 || !transient) return { status: resp.status, text };
-                  core.warning(`${method} ${urlPath} -> HTTP ${resp.status} (transient, attempt ${attempt}/5)`);
-                } catch (e) {
-                  if (attempt === 5) throw e;
-                  core.warning(`${method} ${urlPath} -> ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
+              // Retry transient edge errors (5xx, or an empty-body CDN 404
+              // during a buildhost rolling deploy) with backoff, like the org
+              // buildhost-publish action, so a brief deploy window cannot
+              // waste a ~40-minute build.
+              const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+              const api = async (method: string, urlPath: string, body?: string) => {
+                const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+                if (body !== undefined) headers["Content-Type"] = "application/json";
+                for (let attempt = 1; ; attempt++) {
+                  try {
+                    const resp = await fetch(`${server}${urlPath}`, { method, headers, body });
+                    const text = await resp.text();
+                    const transient = resp.status >= 500 || (resp.status === 404 && text.trim() === "");
+                    if (attempt === 5 || !transient) return { status: resp.status, text };
+                    core.warning(`${method} ${urlPath} -> HTTP ${resp.status} (transient, attempt ${attempt}/5)`);
+                  } catch (e) {
+                    if (attempt === 5) throw e;
+                    core.warning(`${method} ${urlPath} -> ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
+                  }
+                  await sleep(1000 * 2 ** (attempt - 1));
                 }
-                await sleep(1000 * 2 ** (attempt - 1));
-              }
-            };
+              };
 
-            const create = await api("POST", `/api/v1/projects/${project}/releases`,
-              JSON.stringify({ git_branch: github.ref_name, git_commit: github.sha }));
-            if (create.status !== 201) throw new Error(`create release failed (HTTP ${create.status}): ${create.text}`);
-            const version: string = JSON.parse(create.text).version;
-            core.info(`Created release ${project}/${version}`);
+              const create = await api("POST", `/api/v1/projects/${project}/releases`,
+                JSON.stringify({ git_branch: github.ref_name, git_commit: github.sha }));
+              if (create.status !== 201) throw new Error(`create release failed (HTTP ${create.status}): ${create.text}`);
+              const version: string = JSON.parse(create.text).version;
+              core.info(`Created release ${project}/${version}`);
 
-            const cfg = path.join(os.tmpdir(), "buildhost-auth-cfg");
-            fs.writeFileSync(cfg, `header = "Authorization: Bearer ${token}"\n`, { mode: 0o600 });
-            const uploadURL = `${server}/api/v1/projects/${project}/releases/${version}/artifacts/linux/amd64?kind=archive`;
-            await $`curl -sS --fail-with-body --retry 4 -X PUT -K ${cfg} -H ${`X-Artifact-Filename: ${tarball}`} --data-binary ${`@${tarball}`} ${uploadURL}`;
+              const cfg = path.join(os.tmpdir(), "buildhost-auth-cfg");
+              fs.writeFileSync(cfg, `header = "Authorization: Bearer ${token}"\n`, { mode: 0o600 });
+              const uploadURL = `${server}/api/v1/projects/${project}/releases/${version}/artifacts/linux/amd64?kind=archive`;
+              await $`curl -sS --fail-with-body --retry 4 -X PUT -K ${cfg} -H ${`X-Artifact-Filename: ${tarball}`} --data-binary ${`@${tarball}`} ${uploadURL}`;
 
-            const pub = await api("POST", `/api/v1/projects/${project}/releases/${version}/publish`);
-            if (pub.status !== 200) throw new Error(`publish failed (HTTP ${pub.status}): ${pub.text}`);
-            core.info(`Published ${project}/${version} -> https://dl.pazer.build/${project}?branch=${github.ref_name}&os=linux&arch=amd64`);
+              const pub = await api("POST", `/api/v1/projects/${project}/releases/${version}/publish`);
+              if (pub.status !== 200) throw new Error(`publish failed (HTTP ${pub.status}): ${pub.text}`);
+              core.info(`Published ${project}/${version} -> https://dl.pazer.build/${project}?branch=${github.ref_name}&os=linux&arch=amd64`);
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              core.warning(
+                `buildhost publish FAILED -- this build was NOT published to ` +
+                `https://dl.pazer.build/${project}?branch=${github.ref_name}. Known blocker: Cloudflare's ` +
+                `edge caps request bodies at ~100 MiB, so the ~1 GiB single PUT draws a Cloudflare 413 ` +
+                `until buildhost offers a chunked artifact upload (see the step comment in ci.yml). ` +
+                `The gccbuild GHA artifact (1-day retention) is unaffected; downstream jobs continue.`);
+              core.setFailed(`buildhost publish failed (non-blocking, continue-on-error): ${msg}`);
+            }
 
   # PGO-built release package: instrumented build -> deterministic training
   # workload (contrib/perf-train) -> profile-use rebuild. Measured ~-8% cc1plus
@@ -400,7 +424,11 @@ jobs:
       # namespace only ("gcc" and "gcc/<...>"), so the PGO package nests
       # under gcc rather than a sibling "gcc-pgo" the token could not create.
       #   https://dl.pazer.build/gcc/pgo?branch=develop-matt/v14&os=linux&arch=amd64
+      # continue-on-error for the same Cloudflare ~100 MiB body cap (413)
+      # documented on the `build` job's publish step: a registry failure
+      # must not fail package-pgo; the gccbuild-pgo GHA artifact remains.
       - name: Publish PGO build to buildhost
+        continue-on-error: true
         uses: wow-look-at-my/actions@typescript#latest
         with:
           script: |
@@ -408,41 +436,52 @@ jobs:
             const project = "gcc/pgo";
             const tarball = "gccbuild-pgo.tar.gz";
 
-            const token = await core.getIDToken(server);
+            try {
+              const token = await core.getIDToken(server);
 
-            const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-            const api = async (method: string, urlPath: string, body?: string) => {
-              const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
-              if (body !== undefined) headers["Content-Type"] = "application/json";
-              for (let attempt = 1; ; attempt++) {
-                try {
-                  const resp = await fetch(`${server}${urlPath}`, { method, headers, body });
-                  const text = await resp.text();
-                  const transient = resp.status >= 500 || (resp.status === 404 && text.trim() === "");
-                  if (attempt === 5 || !transient) return { status: resp.status, text };
-                  core.warning(`${method} ${urlPath} -> HTTP ${resp.status} (transient, attempt ${attempt}/5)`);
-                } catch (e) {
-                  if (attempt === 5) throw e;
-                  core.warning(`${method} ${urlPath} -> ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
+              const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+              const api = async (method: string, urlPath: string, body?: string) => {
+                const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+                if (body !== undefined) headers["Content-Type"] = "application/json";
+                for (let attempt = 1; ; attempt++) {
+                  try {
+                    const resp = await fetch(`${server}${urlPath}`, { method, headers, body });
+                    const text = await resp.text();
+                    const transient = resp.status >= 500 || (resp.status === 404 && text.trim() === "");
+                    if (attempt === 5 || !transient) return { status: resp.status, text };
+                    core.warning(`${method} ${urlPath} -> HTTP ${resp.status} (transient, attempt ${attempt}/5)`);
+                  } catch (e) {
+                    if (attempt === 5) throw e;
+                    core.warning(`${method} ${urlPath} -> ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
+                  }
+                  await sleep(1000 * 2 ** (attempt - 1));
                 }
-                await sleep(1000 * 2 ** (attempt - 1));
-              }
-            };
+              };
 
-            const create = await api("POST", `/api/v1/projects/${project}/releases`,
-              JSON.stringify({ git_branch: github.ref_name, git_commit: github.sha }));
-            if (create.status !== 201) throw new Error(`create release failed (HTTP ${create.status}): ${create.text}`);
-            const version: string = JSON.parse(create.text).version;
-            core.info(`Created release ${project}/${version}`);
+              const create = await api("POST", `/api/v1/projects/${project}/releases`,
+                JSON.stringify({ git_branch: github.ref_name, git_commit: github.sha }));
+              if (create.status !== 201) throw new Error(`create release failed (HTTP ${create.status}): ${create.text}`);
+              const version: string = JSON.parse(create.text).version;
+              core.info(`Created release ${project}/${version}`);
 
-            const cfg = path.join(os.tmpdir(), "buildhost-auth-cfg");
-            fs.writeFileSync(cfg, `header = "Authorization: Bearer ${token}"\n`, { mode: 0o600 });
-            const uploadURL = `${server}/api/v1/projects/${project}/releases/${version}/artifacts/linux/amd64?kind=archive`;
-            await $`curl -sS --fail-with-body --retry 4 -X PUT -K ${cfg} -H ${`X-Artifact-Filename: ${tarball}`} --data-binary ${`@${tarball}`} ${uploadURL}`;
+              const cfg = path.join(os.tmpdir(), "buildhost-auth-cfg");
+              fs.writeFileSync(cfg, `header = "Authorization: Bearer ${token}"\n`, { mode: 0o600 });
+              const uploadURL = `${server}/api/v1/projects/${project}/releases/${version}/artifacts/linux/amd64?kind=archive`;
+              await $`curl -sS --fail-with-body --retry 4 -X PUT -K ${cfg} -H ${`X-Artifact-Filename: ${tarball}`} --data-binary ${`@${tarball}`} ${uploadURL}`;
 
-            const pub = await api("POST", `/api/v1/projects/${project}/releases/${version}/publish`);
-            if (pub.status !== 200) throw new Error(`publish failed (HTTP ${pub.status}): ${pub.text}`);
-            core.info(`Published ${project}/${version} -> https://dl.pazer.build/${project}?branch=${github.ref_name}&os=linux&arch=amd64`);
+              const pub = await api("POST", `/api/v1/projects/${project}/releases/${version}/publish`);
+              if (pub.status !== 200) throw new Error(`publish failed (HTTP ${pub.status}): ${pub.text}`);
+              core.info(`Published ${project}/${version} -> https://dl.pazer.build/${project}?branch=${github.ref_name}&os=linux&arch=amd64`);
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              core.warning(
+                `buildhost publish FAILED -- this PGO build was NOT published to ` +
+                `https://dl.pazer.build/${project}?branch=${github.ref_name}. Known blocker: Cloudflare's ` +
+                `edge caps request bodies at ~100 MiB, so the ~1 GiB single PUT draws a Cloudflare 413 ` +
+                `until buildhost offers a chunked artifact upload (see the build job's publish step ` +
+                `comment in ci.yml). The gccbuild-pgo GHA artifact (7-day retention) is unaffected.`);
+              core.setFailed(`buildhost publish failed (non-blocking, continue-on-error): ${msg}`);
+            }
 
   benchmark:
     needs: build
