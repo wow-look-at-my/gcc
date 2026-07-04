@@ -96,6 +96,15 @@ struct cpp_reader;
    Cheap; the result is cached internally.  */
 extern bool compile_cache_enabled_p (void);
 
+/* True if a cache directory is configured at all (-fcompile-cache= or
+   GCC_COMPILE_CACHE_DIR), without any eligibility checks and without
+   latching compile_cache_enabled_p ()'s internal tri-state.  Safe to call
+   early (right after option decoding), when the full gating state
+   (lang hooks, asm_file_name, PCH mode, ...) does not exist yet.  Used to
+   decide whether libcpp should record per-file content digests at read
+   time (cpp_opts->hash_file_contents).  */
+extern bool compile_cache_configured_p (void);
+
 /* Record PCH state (PCH_ACTIVE true when creating or consuming a PCH) and,
    if the user did not set -frandom-seed, pin it to a single fixed value so
    codegen is reproducible and the cache can ever hit.  No-op when caching is

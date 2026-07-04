@@ -549,6 +549,19 @@ cc_option_affects_output_p (const cl_decoded_option *decoded)
 /* ------------------------------------------------------------------------ */
 
 bool
+compile_cache_configured_p (void)
+{
+  /* Deliberately does NOT touch cc_enabled / cc_dir: this runs early (from
+     c_common_post_options, before asm_file_name and friends exist), and
+     latching the tri-state here would freeze compile_cache_enabled_p () on
+     incomplete state.  */
+  const char *dir = compile_cache_dir;
+  if (!dir || !dir[0])
+    dir = getenv ("GCC_COMPILE_CACHE_DIR");
+  return dir && dir[0];
+}
+
+bool
 compile_cache_enabled_p (void)
 {
   if (cc_enabled != -1)

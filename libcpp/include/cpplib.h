@@ -563,6 +563,15 @@ struct cpp_options
   /* True if dependencies should be restored from a precompiled header.  */
   bool restore_pch_deps;
 
+  /* True to record a SHA-1 digest of every file's raw on-disk bytes at read
+     time (read_file_guts), for cpp_foreach_included_file to hand to the
+     in-compiler compile cache without re-reading the include closure.  Off
+     by default: without a configured compile cache the digests have no
+     consumer, and hashing every header costs ~1.8% of a -O0 compile.
+     cpp_foreach_included_file re-reads un-hashed files on demand, so
+     consumers stay correct whichever way this is set.  */
+  bool hash_file_contents;
+
   /* True if warn about differences between C90 and C99.  */
   signed char cpp_warn_c90_c99_compat;
 

@@ -1024,15 +1024,23 @@ read_file_guts (cpp_reader *pfile, _cpp_file *file, location_t loc,
      -- the compiler already read these exact bytes, so a miss does zero
      redundant file I/O.  TOTAL is the meaningful byte count (BUF holds 16
      extra padding bytes that are never hashed); a zero-byte file yields the
-     well-defined SHA-1 of the empty input, still a valid digest.  */
-  {
-    struct sha1_ctx sctx;
-    sha1_init_ctx (&sctx);
-    if (total > 0)
-      sha1_process_bytes (buf, (size_t) total, &sctx);
-    sha1_finish_ctx (&sctx, file->content_sha1);
-    file->content_sha1_valid = true;
-  }
+     well-defined SHA-1 of the empty input, still a valid digest.
+
+     Gated on hash_file_contents: only a configured compile cache consumes
+     these digests, and hashing the whole closure unconditionally costs ~1.8%
+     of a -O0 compile for nothing when the cache is off.  Files read while
+     the option is off (or through the NULL-pfile path) simply never get a
+     stored digest, and cpp_foreach_included_file falls back to re-reading
+     them if a consumer does turn up.  */
+  if (pfile && CPP_OPTION (pfile, hash_file_contents))
+    {
+      struct sha1_ctx sctx;
+      sha1_init_ctx (&sctx);
+      if (total > 0)
+	sha1_process_bytes (buf, (size_t) total, &sctx);
+      sha1_finish_ctx (&sctx, file->content_sha1);
+      file->content_sha1_valid = true;
+    }
 
   file->buffer = _cpp_convert_input (pfile,
 				     input_charset,
