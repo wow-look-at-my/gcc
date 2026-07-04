@@ -14,12 +14,13 @@ set -euo pipefail
 # libgoogle-perftools-dev: libtcmalloc_minimal.a, statically linked by the
 # tip compiler when present (base ignores it -- that asymmetry is part of the
 # measured win).  time: /usr/bin/time -v.  strace: syscall counting (optional
-# but cheap).  util-linux: taskset.
+# but cheap).  util-linux: taskset.  zstd: pack/unpack the compiler-{side}
+# artifacts that move builds from the build jobs to the measurement shards.
 PKGS=(
   build-essential flex bison m4 patch
   libgmp-dev libmpfr-dev libmpc-dev libisl-dev
   zlib1g-dev libzstd-dev libgoogle-perftools-dev
-  curl ca-certificates xz-utils time strace util-linux git
+  curl ca-certificates xz-utils time strace util-linux git zstd
 )
 
 summary() {
