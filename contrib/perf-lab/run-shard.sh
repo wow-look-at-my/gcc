@@ -464,3 +464,11 @@ if [ "$VERDICT" = NOISY ]; then
   say "NOISY: the two sides' min..max wall ranges overlap -- this shard does not claim a direction."
 fi
 echo "SHARD $CELL COMPLETE verdict=$VERDICT"
+# A shard with zero usable runs on a side is a broken shard, not a result:
+# exit nonzero so the job goes red instead of hollow-green (the results
+# artifact still uploads -- that workflow step runs on always()). NOISY is
+# an honest result and stays green.
+if [ "$VERDICT" = FAILED ]; then
+  echo "::error::shard $CELL produced no usable runs on at least one side (see tv.d/ in the shard artifact)"
+  exit 1
+fi

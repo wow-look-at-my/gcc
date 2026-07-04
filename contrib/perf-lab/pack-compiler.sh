@@ -53,12 +53,27 @@ mkdir -p "$PKG/gcc" "$PKG/$T/libstdc++-v3" "$PKG/src/libstdc++-v3"
 cp -a "$BUILD/gcc/xg++" "$BUILD/gcc/cc1plus" "$PKG/gcc/"
 [ -f "$BUILD/gcc/specs" ] && cp -a "$BUILD/gcc/specs" "$PKG/gcc/"
 [ -f "$BUILD/gcc/as" ]    && cp -a "$BUILD/gcc/as"    "$PKG/gcc/"
-cp -a "$BUILD/gcc/include" "$PKG/gcc/include"
-[ -d "$BUILD/gcc/include-fixed" ] && cp -a "$BUILD/gcc/include-fixed" "$PKG/gcc/include-fixed"
-cp -a "$BUILD/$T/libstdc++-v3/include" "$PKG/$T/libstdc++-v3/include"
-cp -a "$SRC/libstdc++-v3/libsupc++" "$PKG/src/libstdc++-v3/libsupc++"
+# Header trees are copied with -L (dereference): the build tree's libstdc++
+# include dir is ~800 SYMLINKS into the SOURCE tree. The source tree exists
+# on the build runner, so shipped links resolve THERE -- but they dangle on
+# the measurement shards and every compile dies with "vector: No such file
+# or directory" (quick run 28704282166 failed exactly this way).
+cp -RL "$BUILD/gcc/include" "$PKG/gcc/include"
+[ -d "$BUILD/gcc/include-fixed" ] && cp -RL "$BUILD/gcc/include-fixed" "$PKG/gcc/include-fixed"
+cp -RL "$BUILD/$T/libstdc++-v3/include" "$PKG/$T/libstdc++-v3/include"
+cp -RL "$SRC/libstdc++-v3/libsupc++" "$PKG/src/libstdc++-v3/libsupc++"
 printf 'src\n' > "$PKG/.perf-lab-src"
 cp "$BUILD/.perf-lab-sha" "$PKG/.perf-lab-sha"
+
+# ---- machine-independence guard ----------------------------------------------
+# No symlink may ship: a link that resolves HERE (source tree present) can
+# dangle on the shard runner, and the smoke compile below cannot see that.
+NLINKS=$(find "$PKG" -type l | wc -l | tr -d ' ')
+if [ "$NLINKS" -ne 0 ]; then
+  echo "::error::$NLINKS symlink(s) in staged package -- they would dangle on the shard runner:"
+  find "$PKG" -type l | head -20
+  exit 1
+fi
 
 # ---- prove the staged package is self-sufficient ----------------------------
 printf '#include <vector>\nint f(){ std::vector<int> v{1,2,3}; return (int)v.size(); }\n' \
