@@ -18,6 +18,10 @@ on:
 permissions:
   contents: read
   actions: write
+  # Mint short-lived GHA OIDC tokens: the "Publish to buildhost" steps in
+  # `build` and `package-pgo` authenticate to pazer.build with one instead
+  # of a static secret (the project auto-provisions server-side).
+  id-token: write
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -165,6 +169,66 @@ jobs:
           name: gccbuild
           path: gccbuild.tar.gz
           retention-days: 1
+
+      # Durable publish: push the same tarball to buildhost (pazer.build, the
+      # org package registry) so every branch's builds outlive the 1-day GHA
+      # artifact and stay downloadable per branch:
+      #   https://dl.pazer.build/gcc?branch=<branch>&os=linux&arch=amd64
+      # Auth is the job's GHA OIDC token (audience = the server URL; needs the
+      # workflow-level `id-token: write`); the project auto-provisions on the
+      # first publish. Same REST sequence as the org's buildhost-publish
+      # action: create release (recording git branch + commit) -> upload
+      # artifact (kind=archive -- the payload is a tarball, not a bare
+      # binary; curl streams the ~1 GiB file from disk, with the token in a
+      # curl config file so it stays off argv) -> publish release.
+      - name: Publish to buildhost
+        uses: wow-look-at-my/actions@typescript#latest
+        with:
+          script: |
+            const server = "https://pazer.build";
+            const project = "gcc";
+            const tarball = "gccbuild.tar.gz";
+
+            // getIDToken also registers the JWT as a masked secret.
+            const token = await core.getIDToken(server);
+
+            // Retry transient edge errors (5xx, or an empty-body CDN 404
+            // during a buildhost rolling deploy) with backoff, like the org
+            // buildhost-publish action, so a brief deploy window cannot
+            // waste a ~40-minute build.
+            const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+            const api = async (method: string, urlPath: string, body?: string) => {
+              const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+              if (body !== undefined) headers["Content-Type"] = "application/json";
+              for (let attempt = 1; ; attempt++) {
+                try {
+                  const resp = await fetch(`${server}${urlPath}`, { method, headers, body });
+                  const text = await resp.text();
+                  const transient = resp.status >= 500 || (resp.status === 404 && text.trim() === "");
+                  if (attempt === 5 || !transient) return { status: resp.status, text };
+                  core.warning(`${method} ${urlPath} -> HTTP ${resp.status} (transient, attempt ${attempt}/5)`);
+                } catch (e) {
+                  if (attempt === 5) throw e;
+                  core.warning(`${method} ${urlPath} -> ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
+                }
+                await sleep(1000 * 2 ** (attempt - 1));
+              }
+            };
+
+            const create = await api("POST", `/api/v1/projects/${project}/releases`,
+              JSON.stringify({ git_branch: github.ref_name, git_commit: github.sha }));
+            if (create.status !== 201) throw new Error(`create release failed (HTTP ${create.status}): ${create.text}`);
+            const version: string = JSON.parse(create.text).version;
+            core.info(`Created release ${project}/${version}`);
+
+            const cfg = path.join(os.tmpdir(), "buildhost-auth-cfg");
+            fs.writeFileSync(cfg, `header = "Authorization: Bearer ${token}"\n`, { mode: 0o600 });
+            const uploadURL = `${server}/api/v1/projects/${project}/releases/${version}/artifacts/linux/amd64?kind=archive`;
+            await $`curl -sS --fail-with-body --retry 4 -X PUT -K ${cfg} -H ${`X-Artifact-Filename: ${tarball}`} --data-binary ${`@${tarball}`} ${uploadURL}`;
+
+            const pub = await api("POST", `/api/v1/projects/${project}/releases/${version}/publish`);
+            if (pub.status !== 200) throw new Error(`publish failed (HTTP ${pub.status}): ${pub.text}`);
+            core.info(`Published ${project}/${version} -> https://dl.pazer.build/${project}?branch=${github.ref_name}&os=linux&arch=amd64`);
 
   # PGO-built release package: instrumented build -> deterministic training
   # workload (contrib/perf-train) -> profile-use rebuild. Measured ~-8% cc1plus
@@ -330,6 +394,55 @@ jobs:
           name: gccbuild-pgo
           path: gccbuild-pgo.tar.gz
           retention-days: 7
+
+      # Durable publish, same as the `build` job (see the comments there) --
+      # but to project gcc/pgo: the repo's OIDC grant covers its own
+      # namespace only ("gcc" and "gcc/<...>"), so the PGO package nests
+      # under gcc rather than a sibling "gcc-pgo" the token could not create.
+      #   https://dl.pazer.build/gcc/pgo?branch=develop-matt/v14&os=linux&arch=amd64
+      - name: Publish PGO build to buildhost
+        uses: wow-look-at-my/actions@typescript#latest
+        with:
+          script: |
+            const server = "https://pazer.build";
+            const project = "gcc/pgo";
+            const tarball = "gccbuild-pgo.tar.gz";
+
+            const token = await core.getIDToken(server);
+
+            const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+            const api = async (method: string, urlPath: string, body?: string) => {
+              const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+              if (body !== undefined) headers["Content-Type"] = "application/json";
+              for (let attempt = 1; ; attempt++) {
+                try {
+                  const resp = await fetch(`${server}${urlPath}`, { method, headers, body });
+                  const text = await resp.text();
+                  const transient = resp.status >= 500 || (resp.status === 404 && text.trim() === "");
+                  if (attempt === 5 || !transient) return { status: resp.status, text };
+                  core.warning(`${method} ${urlPath} -> HTTP ${resp.status} (transient, attempt ${attempt}/5)`);
+                } catch (e) {
+                  if (attempt === 5) throw e;
+                  core.warning(`${method} ${urlPath} -> ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
+                }
+                await sleep(1000 * 2 ** (attempt - 1));
+              }
+            };
+
+            const create = await api("POST", `/api/v1/projects/${project}/releases`,
+              JSON.stringify({ git_branch: github.ref_name, git_commit: github.sha }));
+            if (create.status !== 201) throw new Error(`create release failed (HTTP ${create.status}): ${create.text}`);
+            const version: string = JSON.parse(create.text).version;
+            core.info(`Created release ${project}/${version}`);
+
+            const cfg = path.join(os.tmpdir(), "buildhost-auth-cfg");
+            fs.writeFileSync(cfg, `header = "Authorization: Bearer ${token}"\n`, { mode: 0o600 });
+            const uploadURL = `${server}/api/v1/projects/${project}/releases/${version}/artifacts/linux/amd64?kind=archive`;
+            await $`curl -sS --fail-with-body --retry 4 -X PUT -K ${cfg} -H ${`X-Artifact-Filename: ${tarball}`} --data-binary ${`@${tarball}`} ${uploadURL}`;
+
+            const pub = await api("POST", `/api/v1/projects/${project}/releases/${version}/publish`);
+            if (pub.status !== 200) throw new Error(`publish failed (HTTP ${pub.status}): ${pub.text}`);
+            core.info(`Published ${project}/${version} -> https://dl.pazer.build/${project}?branch=${github.ref_name}&os=linux&arch=amd64`);
 
   benchmark:
     needs: build
