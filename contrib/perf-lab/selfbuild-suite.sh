@@ -233,6 +233,17 @@ LIBCPP_ARGS=(-I"$WS/libcpp" -I"$WB/libcpp" -I"$WS/include" -I"$WS/libcpp/include
   -g -O2
   -W -Wall -Wno-narrowing -Wwrite-strings -Wmissing-format-attribute
   -pedantic -Wno-long-long -fno-exceptions -fno-rtti -c)
+# cp/module.o is the ONE workload file with per-file defines
+# (cp/Make-lang.in: CFLAGS-cp/module.o += -DHOST_MACHINE/-DTARGET_MACHINE;
+# its MODULE_VERSION define is DEVPHASE-gated and absent on this release
+# branch -- verified against the real build's make -n output). Values are
+# pinned literals on purpose: the suite targets x86_64 Linux runners and
+# the workload argv must never vary run-to-run. A sweep of the other 40
+# files' real compile lines found no other per-file flags. Missing these
+# two defines failed cp/module.cc on every stage in the first anchor
+# dispatches (runs 28727557771 / 28727562357 / 28727587950).
+MODULE_EXTRA=(-DHOST_MACHINE='"x86_64-pc-linux-gnu"'
+  -DTARGET_MACHINE='"x86_64-pc-linux-gnu"')
 
 # Workload file list -> one generated command script per file. The same
 # scripts run in every pass (serial and -jN), so the compile argv is
@@ -259,9 +270,10 @@ for f in "${FILES[@]}"; do
   src=$WS/$f
   test -f "$src" || { echo "::error::workload file missing: $src"; exit 1; }
   case $f in
-    libcpp/*)  args=("${LIBCPP_ARGS[@]}") ;;
-    gcc/cp/*)  args=("${CP_ARGS[@]}") ;;
-    gcc/*)     args=("${GCC_ARGS[@]}") ;;
+    libcpp/*)          args=("${LIBCPP_ARGS[@]}") ;;
+    gcc/cp/module.cc)  args=("${MODULE_EXTRA[@]}" "${CP_ARGS[@]}") ;;
+    gcc/cp/*)          args=("${CP_ARGS[@]}") ;;
+    gcc/*)             args=("${GCC_ARGS[@]}") ;;
     *) echo "::error::unclassifiable workload path: $f"; exit 1 ;;
   esac
   n=$(printf '%03d' "$i")
@@ -317,7 +329,11 @@ parallel_pass() { # PASS -> wall seconds on stdout; fails if any compile failed
   t1=$(now)
   if [ -s "$FAILLOG" ]; then
     echo "::error::$pass pass: $(wc -l < "$FAILLOG") compile(s) failed:" >&2
-    sed "s|$CMDD/||" "$FAILLOG" >&2
+    while IFS= read -r failed; do
+      fn=$(basename "$failed" .sh)
+      echo "--- ${FILES[10#$fn]} (idx $fn) stderr head:" >&2
+      head -n 15 "$ERRD/$fn.err" >&2 || true
+    done < "$FAILLOG"
     return 1
   fi
   [ "$rc" -eq 0 ] || { echo "::error::$pass pass: xargs rc=$rc with empty fail log" >&2; return 1; }
@@ -344,7 +360,11 @@ while [ "$p" -le "$PASSES" ]; do
   done
   t1=$(now)
   if [ "$FAILED" -ne 0 ]; then
-    echo "::error::serial pass s$p had compile failures (see $TSV and err/)"
+    echo "::error::serial pass s$p had compile failures (see $TSV):"
+    awk -F'\t' -v pp="s$p" '$1==pp && $8!=0 {print "  " $3 " rc=" $8}' "$TSV"
+    awk -F'\t' -v pp="s$p" '$1==pp && $8!=0 {print $2}' "$TSV" | while IFS= read -r fn; do
+      echo "--- idx $fn stderr head:"; head -n 15 "$ERRD/$fn.err" || true
+    done
     exit 1
   fi
   sum=$(awk -F'\t' -v pp="s$p" '$1==pp {s+=$4} END{printf "%.2f", s}' "$TSV")
