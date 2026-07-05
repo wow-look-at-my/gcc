@@ -37,6 +37,8 @@
 #include "diagnostic.h"		/* global_dc, diagnostic_count, pp_buffer */
 #include "diagnostic-core.h"	/* seen_error, fatal_error */
 #include "../libcpp/include/cpplib.h"  /* cpp_foreach_included_file */
+#include "../libcpp/include/mkdeps.h"  /* deps_add_dep: complete the .d on a
+					  pre-parse manifest hit */
 #include "sha1.h"
 #include "compile-cache-format.h"	/* shared on-disk format + LE helpers */
 #include "compile-cache-serve.h"	/* shared driver-usable serve unit */
@@ -184,8 +186,9 @@ static bool cc_tu_has_unverifiable_probe = false;
 struct cc_input
 {
   char *path;			/* xstrdup'd path */
-  uint64_t size;		/* byte count */
-  uint64_t mtime;		/* st_mtime (seconds) for the stat shortcut */
+  uint64_t size;		/* byte count (of the hashed content) */
+  struct cc_statid id;		/* full stat identity for the stat shortcut */
+  uint32_t mhr_flags;		/* CC_MHR_FLAG_* (HAS_STATID when ID holds) */
   unsigned char hash[20];	/* raw SHA-1 of the bytes */
 };
 
@@ -243,7 +246,8 @@ cc_meta_clear (void)
 }
 
 static void
-cc_meta_add_input (const char *path, uint64_t size, uint64_t mtime,
+cc_meta_add_input (const char *path, uint64_t size,
+		   const struct cc_statid *id, uint32_t mhr_flags,
 		   const unsigned char hash[20])
 {
   if (cc_meta.input_count == cc_meta.input_cap)
@@ -256,8 +260,52 @@ cc_meta_add_input (const char *path, uint64_t size, uint64_t mtime,
   cc_input *in = &cc_meta.inputs[cc_meta.input_count++];
   in->path = xstrdup (path);
   in->size = size;
-  in->mtime = mtime;
+  in->id = *id;
+  in->mhr_flags = mhr_flags;
   memcpy (in->hash, hash, 20);
+}
+
+/* Second of the compile's start, for the stat-identity "too new" guard
+   below.  Set (once) in compile_cache_init_determinism (), which runs at the
+   very start of c_common_parse_file -- before the preprocessor reads any
+   header.  */
+static time_t cc_compile_start_time = 0;
+
+/* Capture PATH's full stat identity into *ID for a header record whose
+   hashed content was READ_SIZE bytes.  Returns CC_MHR_FLAG_HAS_STATID when
+   the identity can be TRUSTED to describe those hashed bytes, else 0 (with
+   *ID zeroed):
+
+     - the stat must succeed and report exactly READ_SIZE bytes (a differing
+       size means the file changed between cpp reading it and now, so the
+       identity describes different content than the hash);
+     - the file's mtime and ctime must predate this compile's start second
+       (ccache's bar): a file written during or after the compile started
+       could be rewritten again with an indistinguishable same-second stamp,
+       so its identity cannot vouch for its content yet.  The next store
+       refreshes it; until then a serve simply re-hashes that one file.  */
+static uint32_t
+cc_capture_statid (const char *path, uint64_t read_size,
+		   struct cc_statid *id)
+{
+  memset (id, 0, sizeof (*id));
+  struct stat stt;
+  if (stat (path, &stt) != 0)
+    return 0;
+  cc_statid_from_stat (&stt, id);
+  if (id->size != read_size)
+    {
+      memset (id, 0, sizeof (*id));
+      return 0;
+    }
+  if (cc_compile_start_time > 0
+      && ((time_t) id->mtime_s >= cc_compile_start_time
+	  || (time_t) id->ctime_s >= cc_compile_start_time))
+    {
+      memset (id, 0, sizeof (*id));
+      return 0;
+    }
+  return CC_MHR_FLAG_HAS_STATID;
 }
 
 /* Append one probe record (deep-copying every string) to the growable vec
@@ -803,16 +851,13 @@ cc_hash_one_file (const char *path, const unsigned char *buffer,
      bytes) -- the closure is walked in the unchanged all_files order.  */
   cc_hash_component (st->ctx, CC_TAG_FILE_BODY, fh, 20);
 
-  /* Capture st_mtime for the manifest stat-shortcut (size+mtime match accepts
-     a header on a hit without re-reading it).  Best-effort: a failed stat
-     records mtime 0, which simply forces a content re-hash on the next hit.  */
-  uint64_t mtime = 0;
-  {
-    struct stat stt;
-    if (stat (path, &stt) == 0)
-      mtime = (uint64_t) stt.st_mtime;
-  }
-  cc_meta_add_input (path, (uint64_t) size, mtime, fh);
+  /* Capture the file's full stat identity for the manifest stat-shortcut (an
+     identity match accepts a header on a hit without re-reading it).
+     Best-effort: an untrusted identity (stat failure, changed size, too-new
+     stamps) just forces a content re-hash on the next hit.  */
+  struct cc_statid id;
+  uint32_t mflags = cc_capture_statid (path, (uint64_t) size, &id);
+  cc_meta_add_input (path, (uint64_t) size, &id, mflags, fh);
   return true;			/* keep walking */
 }
 
@@ -926,19 +971,27 @@ cc_merge_gch_manifest (struct sha1_ctx *ctx)
 				     + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
 	  const char *hpath
 	    = cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
-	  if (!hpath)
+	  uint32_t mflags = cc_get_u32 (rec + CC_MHR_OFF_FLAGS);
+	  if (!hpath || (mflags & ~CC_MHR_FLAG_KNOWN_MASK))
 	    {
-	      ok = false;
+	      ok = false;	/* unknown flag bits: future format */
 	      break;
 	    }
 	  uint64_t sz = cc_get_u64 (rec + CC_MHR_OFF_SIZE);
-	  uint64_t mt = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
+	  struct cc_statid id;
+	  id.size = sz;
+	  id.mtime_s = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
+	  id.ctime_s = cc_get_u64 (rec + CC_MHR_OFF_CTIME);
+	  id.dev = cc_get_u64 (rec + CC_MHR_OFF_DEV);
+	  id.ino = cc_get_u64 (rec + CC_MHR_OFF_INO);
+	  id.mtime_ns = cc_get_u32 (rec + CC_MHR_OFF_MTIME_NSEC);
+	  id.ctime_ns = cc_get_u32 (rec + CC_MHR_OFF_CTIME_NSEC);
 	  const unsigned char *h = rec + CC_MHR_OFF_HASH;
 
 	  if (cc_paths_affect_output_p ())
 	    cc_hash_str (ctx, CC_TAG_FILE_PATH, hpath);
 	  cc_hash_component (ctx, CC_TAG_FILE_BODY, h, 20);
-	  cc_meta_add_input (hpath, sz, mt, h);
+	  cc_meta_add_input (hpath, sz, &id, mflags, h);
 	}
 
       /* (b) The prelude's recorded probes: fold the results into the key
@@ -1243,6 +1296,14 @@ compile_cache_init_determinism (bool pch_active)
 {
   /* Record PCH state before any gating decision is cached.  */
   cc_pch_active = pch_active;
+
+  /* Anchor the stat-identity "too new" guard (cc_capture_statid) at the
+     compile's start, before the preprocessor reads any file.  Deliberately
+     ahead of the enabled_p gate: the auto-PCH gch store also captures
+     identities, and it runs in PCH-build compiles where the .o cache is
+     disabled.  */
+  if (cc_compile_start_time == 0)
+    cc_compile_start_time = time (NULL);
 
   if (!compile_cache_enabled_p ())
     return;
@@ -1712,6 +1773,32 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
   if (!compile_cache_enabled_p ())
     return false;
 
+  /* Dependency output.  A pre-parse hit skips preprocessing, so libcpp's
+     deps hold only the main file and the -MT/-MQ targets; on a hit below the
+     recorded closure is fed into the deps object (deps_add_dep) so
+     c_common_finish still writes a complete .d -- the -MD contract.  Forms
+     the records cannot reproduce decline the manifest serve instead (the
+     deep path recomputes exact deps): -MM/-MMD exclude system headers, which
+     the records do not distinguish; -MG adds missing-file entries; module /
+     P1689 dependency formats record more than files.  */
+  class mkdeps *mdeps = NULL;
+  {
+    const cpp_options *copts = cpp_get_options (pfile);
+    if (copts->deps.style != DEPS_NONE
+	|| copts->deps.fdeps_format != FDEPS_FMT_NONE)
+      {
+	if (copts->deps.style == DEPS_USER
+	    || copts->deps.fdeps_format != FDEPS_FMT_NONE
+	    || copts->deps.missing_files
+	    || copts->deps.modules)
+	  {
+	    cc_debug_line ("manifest-skip-deps-form", NULL);
+	    return false;
+	  }
+	mdeps = cpp_get_deps (pfile);
+      }
+  }
+
   /* Note on __has_include: probes never enter the include closure, so the
      header records alone cannot notice one flipping absent<->present between
      runs.  Each manifest entry therefore carries the probe records its TU
@@ -1724,15 +1811,11 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
      construction.  (void pfile.)  */
   (void) pfile;
 
-  /* Optional airtight mode: GCC_COMPILE_CACHE_VERIFY=hash forces a full
-     content re-hash of every header on a hit instead of the size+mtime stat
-     shortcut.  Even this still skips parse/codegen/assemble.  */
-  bool verify_hash = false;
-  {
-    const char *v = getenv ("GCC_COMPILE_CACHE_VERIFY");
-    if (v && !strcmp (v, "hash"))
-      verify_hash = true;
-  }
+  /* Optional airtight mode: GCC_COMPILE_CACHE_VERIFY=hash (alias:
+     GCC_COMPILE_CACHE_PARANOID=1) forces a full content re-hash of every
+     header on a hit instead of the stat-identity shortcut.  Even this still
+     skips parse/codegen/assemble.  */
+  bool verify_hash = cc_verify_hash_env_p ();
 
   if (!cc_compute_manifest_key (src_path))
     return false;
@@ -1783,6 +1866,22 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
 	  if (cc_serve_from_bin (ok_hex, /*require_no_fe_diag=*/true,
 				 "manifest-hit"))
 	    {
+	      /* Complete the dependency info from the entry's records (the
+		 include closure).  The main file is already in the deps --
+		 libcpp added it when the main buffer was stacked -- so skip
+		 its record to avoid a duplicate.  */
+	      if (mdeps)
+		for (uint32_t hi = 0; hi < ent.hdr_count; hi++)
+		  {
+		    const unsigned char *rec
+		      = man + ent.hdr_recs_off
+			+ (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+		    const char *hpath
+		      = cc_man_string (man, mlen,
+				       cc_get_u32 (rec + CC_MHR_OFF_PATH));
+		    if (hpath && strcmp (hpath, src_path) != 0)
+		      deps_add_dep (mdeps, hpath);
+		  }
 	      free (man);
 	      return true;
 	    }
@@ -1854,6 +1953,28 @@ cc_blob_add_string (cc_blob *b, const char *s)
   unsigned char nul = 0;
   cc_blob_append (b, &nul, 1);
   return off;
+}
+
+/* Emit one v3 header record for IN into ENTRIES.  PATH_OFF_ABS is the
+   already-final absolute file offset of IN's path string.  Shared by the .o
+   manifest store and the auto-PCH gch manifest store so both write identical
+   record bytes.  */
+static void
+cc_emit_hdr_rec (cc_blob *entries, uint32_t path_off_abs, const cc_input *in)
+{
+  unsigned char nrec[CC_MAN_HDR_REC_SIZE];
+  memset (nrec, 0, sizeof (nrec));
+  cc_put_u32 (nrec + CC_MHR_OFF_PATH, path_off_abs);
+  cc_put_u32 (nrec + CC_MHR_OFF_FLAGS, in->mhr_flags);
+  cc_put_u64 (nrec + CC_MHR_OFF_SIZE, in->size);
+  cc_put_u64 (nrec + CC_MHR_OFF_MTIME, in->id.mtime_s);
+  cc_put_u64 (nrec + CC_MHR_OFF_CTIME, in->id.ctime_s);
+  cc_put_u64 (nrec + CC_MHR_OFF_DEV, in->id.dev);
+  cc_put_u64 (nrec + CC_MHR_OFF_INO, in->id.ino);
+  cc_put_u32 (nrec + CC_MHR_OFF_MTIME_NSEC, in->id.mtime_ns);
+  cc_put_u32 (nrec + CC_MHR_OFF_CTIME_NSEC, in->id.ctime_ns);
+  memcpy (nrec + CC_MHR_OFF_HASH, in->hash, 20);
+  cc_blob_append (entries, nrec, CC_MAN_HDR_REC_SIZE);
 }
 
 /* Write BYTES (LEN bytes) to PATH atomically (temp + rename), then make PATH
@@ -2107,13 +2228,14 @@ cc_store_manifest (uint32_t warnings, uint32_t werrors)
 	  const char *hpath
 	    = cc_man_string (old, old_len,
 			     cc_get_u32 (rec + CC_MHR_OFF_PATH));
+	  /* Copy the record verbatim (flags + size + stat identity + hash);
+	     only the path offset is buffer-relative and must be re-aimed at
+	     the new string area.  */
 	  unsigned char nrec[CC_MAN_HDR_REC_SIZE];
+	  memcpy (nrec, rec, CC_MAN_HDR_REC_SIZE);
 	  cc_put_u32 (nrec + CC_MHR_OFF_PATH,
 		      (uint32_t) string_area_off
 		      + cc_blob_add_string (&strings, hpath));
-	  memcpy (nrec + CC_MHR_OFF_SIZE, rec + CC_MHR_OFF_SIZE, 8);
-	  memcpy (nrec + CC_MHR_OFF_MTIME, rec + CC_MHR_OFF_MTIME, 8);
-	  memcpy (nrec + CC_MHR_OFF_HASH, rec + CC_MHR_OFF_HASH, 20);
 	  cc_blob_append (&entries, nrec, CC_MAN_HDR_REC_SIZE);
 	}
 
@@ -2173,16 +2295,11 @@ cc_store_manifest (uint32_t warnings, uint32_t werrors)
     cc_blob_append (&entries, head, CC_MAN_ENT_HEAD_SIZE);
 
     for (unsigned i = 0; i < cc_meta.input_count; i++)
-      {
-	unsigned char nrec[CC_MAN_HDR_REC_SIZE];
-	cc_put_u32 (nrec + CC_MHR_OFF_PATH,
-		    (uint32_t) string_area_off
-		    + cc_blob_add_string (&strings, cc_meta.inputs[i].path));
-	cc_put_u64 (nrec + CC_MHR_OFF_SIZE, cc_meta.inputs[i].size);
-	cc_put_u64 (nrec + CC_MHR_OFF_MTIME, cc_meta.inputs[i].mtime);
-	memcpy (nrec + CC_MHR_OFF_HASH, cc_meta.inputs[i].hash, 20);
-	cc_blob_append (&entries, nrec, CC_MAN_HDR_REC_SIZE);
-      }
+      cc_emit_hdr_rec (&entries,
+		       (uint32_t) string_area_off
+		       + cc_blob_add_string (&strings,
+					     cc_meta.inputs[i].path),
+		       &cc_meta.inputs[i]);
 
     for (unsigned i = 0; i < cc_meta.probe_count; i++)
       {
@@ -2431,12 +2548,8 @@ cc_apch_collect_one (const char *path, const unsigned char *buffer,
       sha1_finish_ctx (&fctx, fh);
     }
 
-  uint64_t mtime = 0;
-  {
-    struct stat stt;
-    if (stat (path, &stt) == 0)
-      mtime = (uint64_t) stt.st_mtime;
-  }
+  struct cc_statid id;
+  uint32_t mflags = cc_capture_statid (path, (uint64_t) size, &id);
 
   if (st->n == st->cap)
     {
@@ -2447,7 +2560,8 @@ cc_apch_collect_one (const char *path, const unsigned char *buffer,
   cc_input *in = &st->v[st->n++];
   in->path = xstrdup (path);
   in->size = size;
-  in->mtime = mtime;
+  in->id = id;
+  in->mhr_flags = mflags;
   memcpy (in->hash, fh, 20);
   return true;
 }
@@ -2535,16 +2649,10 @@ compile_cache_auto_pch_store (cpp_reader *pfile)
       cc_blob_append (&entries, head, CC_MAN_ENT_HEAD_SIZE);
 
       for (unsigned i = 0; i < st.n; i++)
-	{
-	  unsigned char nrec[CC_MAN_HDR_REC_SIZE];
-	  cc_put_u32 (nrec + CC_MHR_OFF_PATH,
-		      (uint32_t) string_area_off
-		      + cc_blob_add_string (&strings, st.v[i].path));
-	  cc_put_u64 (nrec + CC_MHR_OFF_SIZE, st.v[i].size);
-	  cc_put_u64 (nrec + CC_MHR_OFF_MTIME, st.v[i].mtime);
-	  memcpy (nrec + CC_MHR_OFF_HASH, st.v[i].hash, 20);
-	  cc_blob_append (&entries, nrec, CC_MAN_HDR_REC_SIZE);
-	}
+	cc_emit_hdr_rec (&entries,
+			 (uint32_t) string_area_off
+			 + cc_blob_add_string (&strings, st.v[i].path),
+			 &st.v[i]);
 
       for (unsigned i = 0; i < ps.n; i++)
 	{

@@ -36,6 +36,51 @@
 
 struct cl_decoded_option;
 
+/* ---- Stat identity (manifest v3 stat shortcut) ---- */
+
+/* The full stat identity of one recorded file, as compared by the serve-time
+   stat shortcut (ccache's inode-cache bar: size + mtime sec/nsec + ctime
+   sec/nsec + dev + ino all matching lets a hit skip re-hashing the bytes; any
+   difference falls back to the content re-hash).  Extracted by
+   cc_statid_from_stat below, which the STORE side (compile-cache.cc) and the
+   SERVE side (compile-cache-serve.cc) both inline -- one definition, so both
+   agree byte-for-byte on every platform, including the nsec availability
+   #if.  */
+struct cc_statid
+{
+  uint64_t size;
+  uint64_t mtime_s;
+  uint64_t ctime_s;
+  uint64_t dev;
+  uint64_t ino;
+  uint32_t mtime_ns;
+  uint32_t ctime_ns;
+};
+
+/* Fill *ID from *ST.  struct stat is visible here via system.h (every
+   includer pulls it in first).  Hosts without st_mtim/st_ctim nanosecond
+   fields record 0 on both sides, which compares consistently.  */
+static inline void
+cc_statid_from_stat (const struct stat *st, struct cc_statid *id)
+{
+  id->size = (uint64_t) st->st_size;
+  id->mtime_s = (uint64_t) st->st_mtime;
+  id->ctime_s = (uint64_t) st->st_ctime;
+  id->dev = (uint64_t) st->st_dev;
+  id->ino = (uint64_t) st->st_ino;
+#if defined (__linux__) || defined (__GLIBC__) || defined (__FreeBSD__) \
+    || defined (__NetBSD__) || defined (__OpenBSD__) || defined (__sun)
+  id->mtime_ns = (uint32_t) st->st_mtim.tv_nsec;
+  id->ctime_ns = (uint32_t) st->st_ctim.tv_nsec;
+#elif defined (__APPLE__)
+  id->mtime_ns = (uint32_t) st->st_mtimespec.tv_nsec;
+  id->ctime_ns = (uint32_t) st->st_ctimespec.tv_nsec;
+#else
+  id->mtime_ns = 0;
+  id->ctime_ns = 0;
+#endif
+}
+
 /* Everything the serve unit needs, supplied by the caller from its own world.
    The driver and cc1plus each fill this from their own globals; the serve code
    itself touches no global compiler state, so the manifest key it computes is
@@ -71,18 +116,36 @@ struct cc_serve_ctx
   /* Current working directory, used only when paths_affect_output.  */
   const char *cwd;
 
-  /* GCC_COMPILE_CACHE_VERIFY=hash forces a full per-header content re-hash on a
-     hit instead of the size+mtime stat shortcut.  */
+  /* GCC_COMPILE_CACHE_VERIFY=hash (alias GCC_COMPILE_CACHE_PARANOID=1) forces
+     a full per-header content re-hash on a hit instead of the stat-identity
+     shortcut; see cc_verify_hash_env_p ().  */
   bool verify_hash;
 
   /* GCC_COMPILE_CACHE_DEBUG: emit "compile-cache: <action> <key12> <out>".  */
   bool debug;
+
+  /* Driver-tier dependency-file synthesis.  When DEPS_PATH is non-NULL, a
+     served manifest hit must also write a make-style dependency file there
+     honoring the -MD contract (every file of the include closure, system
+     headers included) -- the recorded header set IS that closure, so the
+     driver can emit the .d without running the preprocessor.  The driver
+     only requests this for the forms it can reproduce exactly (-MD with an
+     explicit dependency file and at least one -MT/-MQ target, optional
+     -MP); for anything else it declines the serve instead and cc1plus's
+     tier takes over.  All three pointers are borrowed.  A hit that fails to
+     write the file reports a miss (the object may already be placed; the
+     ensuing real compile simply overwrites it and writes its own .d).  */
+  const char *deps_path;		/* dependency file (-MF / -MD arg) */
+  const char *const *deps_targets;	/* target names, command-line order */
+  const bool *deps_target_quoted;	/* per-target: munge like -MQ */
+  unsigned deps_target_count;
+  bool deps_phony;			/* -MP: phony target per header */
 };
 
 /* ---- Shared manifest-entry access (one interpreter for the v2 bytes) ---- */
 
-/* Parsed byte locations of one manifest entry (v2 layout: 40-byte head,
-   HDR_COUNT 40-byte header records, PROBE_COUNT variable-length probe
+/* Parsed byte locations of one manifest entry (v3 layout: 40-byte head,
+   HDR_COUNT 80-byte header records, PROBE_COUNT variable-length probe
    records; see compile-cache-format.h).  Offsets are absolute within the
    manifest buffer.  */
 struct cc_man_entry
@@ -110,8 +173,15 @@ extern bool cc_man_entry_parse (const unsigned char *man, size_t mlen,
 extern const char *cc_man_string (const unsigned char *man, size_t mlen,
 				  uint32_t off);
 
+/* True when the environment requests the airtight serve mode
+   (GCC_COMPILE_CACHE_VERIFY=hash, or its alias GCC_COMPILE_CACHE_PARANOID
+   set non-empty and not "0"): every header content re-hashes on a hit
+   instead of the stat-identity shortcut.  One definition (in the serve
+   unit) so the driver and cc1plus honor identical spellings.  */
+extern bool cc_verify_hash_env_p (void);
+
 /* Re-validate ENT against the filesystem: every header record must still
-   resolve (size+mtime stat shortcut, else content re-hash; VERIFY_HASH
+   resolve (full stat-identity shortcut, else content re-hash; VERIFY_HASH
    forces the re-hash) and every probe record must still reproduce (each
    candidate path still absent; a FOUND probe's resolved path still present
    and not a directory).  Entries with unknown flag bits never validate.

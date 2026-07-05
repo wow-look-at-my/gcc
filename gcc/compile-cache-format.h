@@ -79,11 +79,17 @@ enum cc_meta_off
    __has_include probes (see CC_MAN_ENT_* / CC_MAN_PROBE_*), so TUs that probe
    (i.e. any real C++ TU, via bits/c++config.h) are servable pre-parse instead
    of being disqualified wholesale; the entry head grew 32 -> 40 bytes to gain
-   the probe count and an entry-flags word.  The version bump makes v1
-   manifests unreadable by v2 (and vice versa), which is the intended clean
-   invalidation.  */
+   the probe count and an entry-flags word.
+   Version 3: each header record carries the file's FULL stat identity
+   (size, mtime sec+nsec, ctime sec+nsec, dev, ino -- see CC_MHR_*) instead of
+   size + mtime-seconds only, so the serve-time stat shortcut matches ccache's
+   safety bar: a same-second same-size rewrite that restores mtime (touch -d)
+   still advances ctime and is caught without hashing the bytes.  The record
+   grew 40 -> 80 bytes and gained a flags word (CC_MHR_FLAG_*).  Each version
+   bump makes older manifests unreadable (and vice versa) -- the intended
+   clean invalidation.  */
 #define CC_MANIFEST_MAGIC      "CCMANIFS"	/* 8 bytes, no NUL stored */
-#define CC_MANIFEST_VERSION    2u
+#define CC_MANIFEST_VERSION    3u
 #define CC_MANIFEST_HEADER_SIZE  32u
 
 /* Compiler-id sidecar: a tiny file at "DIR/compiler-id" that cc1plus writes on
@@ -167,15 +173,36 @@ enum cc_man_ent_off
 #define CC_MAN_EFLAG_UNVERIFIED_PROBES  0x1u
 #define CC_MAN_EFLAG_KNOWN_MASK         0x1u
 
-/* Per-header record inside a manifest entry: 40 bytes.  */
-#define CC_MAN_HDR_REC_SIZE  40u
+/* Per-header record inside a manifest entry: 80 bytes (v3).  SIZE is the
+   byte count of the content the HASH was computed over (what cpp read); the
+   stat-identity fields describe the on-disk file at store time and are only
+   meaningful when CC_MHR_FLAG_HAS_STATID is set (the store side clears it
+   when the identity could not be proven to describe the hashed bytes: stat
+   failure, a stat size differing from the read size, or a file so recently
+   written that a same-stamp rewrite could hide behind it).  Without the
+   flag -- or on any identity mismatch -- the serve side falls back to a full
+   content re-hash, exactly as before.  */
+#define CC_MAN_HDR_REC_SIZE  80u
 enum cc_man_hdr_rec_off
 {
   CC_MHR_OFF_PATH = 0,		/* u32 -> resolved abs path string */
-  CC_MHR_OFF_SIZE = 4,		/* u64  file size                  */
-  CC_MHR_OFF_MTIME = 12,	/* u64  st_mtime (seconds)         */
-  CC_MHR_OFF_HASH = 20		/* u8[20] raw SHA-1                */
+  CC_MHR_OFF_FLAGS = 4,		/* u32  CC_MHR_FLAG_*              */
+  CC_MHR_OFF_SIZE = 8,		/* u64  content size (hashed bytes) */
+  CC_MHR_OFF_MTIME = 16,	/* u64  st_mtime (seconds)         */
+  CC_MHR_OFF_CTIME = 24,	/* u64  st_ctime (seconds)         */
+  CC_MHR_OFF_DEV = 32,		/* u64  st_dev                     */
+  CC_MHR_OFF_INO = 40,		/* u64  st_ino                     */
+  CC_MHR_OFF_MTIME_NSEC = 48,	/* u32  st_mtim.tv_nsec (0 if N/A) */
+  CC_MHR_OFF_CTIME_NSEC = 52,	/* u32  st_ctim.tv_nsec (0 if N/A) */
+  CC_MHR_OFF_HASH = 56		/* u8[20] raw SHA-1                */
+  /* Bytes 76..79 reserved (written zero).  */
 };
+
+/* Header-record flag bits (CC_MHR_OFF_FLAGS).  A record with unknown flag
+   bits must be treated as never matching (same policy as entry/probe
+   flags).  */
+#define CC_MHR_FLAG_HAS_STATID  0x1u	/* stat-identity fields are trusted */
+#define CC_MHR_FLAG_KNOWN_MASK  0x1u
 
 /* Per-probe record inside a manifest entry: one recorded __has_include
    evaluation.  16-byte fixed part, then N_CANDIDATES u32 string offsets --

@@ -124,6 +124,18 @@ ccs_read_file (const char *path, size_t *len)
   return buf;
 }
 
+/* True when the environment requests the airtight serve mode; see the
+   declaration in compile-cache-serve.h.  */
+bool
+cc_verify_hash_env_p (void)
+{
+  const char *v = getenv ("GCC_COMPILE_CACHE_VERIFY");
+  if (v && !strcmp (v, "hash"))
+    return true;
+  v = getenv ("GCC_COMPILE_CACHE_PARANOID");
+  return v && v[0] && strcmp (v, "0") != 0;
+}
+
 /* Emit one debug line:  "compile-cache: <action> <key12> <output>".  */
 static void
 ccs_debug_line (const cc_serve_ctx *ctx, const char *action, const char *key,
@@ -145,11 +157,15 @@ ccs_debug_line (const cc_serve_ctx *ctx, const char *action, const char *key,
 }
 
 /* Validate the CC_MAN_HDR_REC_SIZE records of one manifest entry against the
-   filesystem: every recorded file must still exist with the recorded size +
-   mtime (stat shortcut) or, failing that, re-hash to the recorded SHA-1.
-   MAN/MLEN is the whole manifest buffer; RECS_OFF/HDR_COUNT locate the entry's
-   records.  VERIFY_HASH forces the content re-hash.  Shared by the warm .o
-   serve and the auto-PCH probe.  */
+   filesystem: every recorded file must still exist with the recorded FULL
+   stat identity -- size, mtime sec+nsec, ctime sec+nsec, dev, ino (the stat
+   shortcut, ccache's inode-cache bar; only trusted when the record carries
+   CC_MHR_FLAG_HAS_STATID) -- or, failing that, re-hash to the recorded SHA-1.
+   A same-size rewrite that restores mtime (touch -d) still advances ctime,
+   so it falls through to the re-hash and is caught.  MAN/MLEN is the whole
+   manifest buffer; RECS_OFF/HDR_COUNT locate the entry's records.
+   VERIFY_HASH forces the content re-hash.  Shared by the warm .o serve and
+   the auto-PCH probe.  */
 static bool
 ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
 		   uint32_t hdr_count, bool verify_hash)
@@ -159,9 +175,12 @@ ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
       const unsigned char *rec = man + recs_off
 				 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
       uint32_t path_off = cc_get_u32 (rec + CC_MHR_OFF_PATH);
+      uint32_t rflags = cc_get_u32 (rec + CC_MHR_OFF_FLAGS);
       uint64_t want_size = cc_get_u64 (rec + CC_MHR_OFF_SIZE);
-      uint64_t want_mtime = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
       const unsigned char *want_hash = rec + CC_MHR_OFF_HASH;
+
+      if (rflags & ~CC_MHR_FLAG_KNOWN_MASK)
+	return false;		/* written by a future format: never match */
 
       if (path_off + 4 > mlen)
 	return false;
@@ -174,10 +193,19 @@ ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
       if (stat (hpath, &stt) != 0)
 	return false;
 
-      if (!verify_hash
-	  && (uint64_t) stt.st_size == want_size
-	  && (uint64_t) stt.st_mtime == want_mtime)
-	continue;
+      if (!verify_hash && (rflags & CC_MHR_FLAG_HAS_STATID))
+	{
+	  struct cc_statid id;
+	  cc_statid_from_stat (&stt, &id);
+	  if (id.size == want_size
+	      && id.mtime_s == cc_get_u64 (rec + CC_MHR_OFF_MTIME)
+	      && id.ctime_s == cc_get_u64 (rec + CC_MHR_OFF_CTIME)
+	      && id.dev == cc_get_u64 (rec + CC_MHR_OFF_DEV)
+	      && id.ino == cc_get_u64 (rec + CC_MHR_OFF_INO)
+	      && id.mtime_ns == cc_get_u32 (rec + CC_MHR_OFF_MTIME_NSEC)
+	      && id.ctime_ns == cc_get_u32 (rec + CC_MHR_OFF_CTIME_NSEC))
+	    continue;
+	}
 
       size_t got_len = 0;
       unsigned char *body = ccs_read_file (hpath, &got_len);
@@ -775,6 +803,119 @@ ccs_serve_from_bin (const cc_serve_ctx *ctx, const char *ok_hex,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Dependency-file synthesis (driver-tier manifest hit)                     */
+/* ------------------------------------------------------------------------ */
+
+/* Write NAME to F with Make quoting, byte-compatible with libcpp's
+   mkdeps.cc munge(): backslashes directly preceding a space/tab double, the
+   space/tab itself is backslash-escaped, '#' is backslash-escaped, '$'
+   doubles.  */
+static bool
+ccs_deps_munge (FILE *f, const char *name)
+{
+  for (const char *p = name; *p; p++)
+    {
+      switch (*p)
+	{
+	case ' ':
+	case '\t':
+	  for (const char *q = p - 1; q >= name && *q == '\\'; q--)
+	    if (putc ('\\', f) == EOF)
+	      return false;
+	  if (putc ('\\', f) == EOF)
+	    return false;
+	  break;
+	case '#':
+	  if (putc ('\\', f) == EOF)
+	    return false;
+	  break;
+	case '$':
+	  if (putc ('$', f) == EOF)
+	    return false;
+	  break;
+	default:
+	  break;
+	}
+      if (putc (*p, f) == EOF)
+	return false;
+    }
+  return true;
+}
+
+/* Write the make-style dependency file CTX requested (ctx->deps_path) for a
+   manifest hit on ENT: the -MT/-MQ targets, then every header-record path of
+   the entry -- which IS the TU's include closure, main source included, i.e.
+   exactly the set -MD would have produced (system headers and all).  Under
+   -MP (ctx->deps_phony) a phony target follows for every dependency except
+   the main source SRC_PATH, matching cpp.  Layout is one logical rule (no
+   column wrapping); consumers parse it identically.  Returns false on any
+   write failure, after which the caller must treat the serve as a miss (the
+   real compile then writes its own file).  */
+static bool
+ccs_write_deps (const cc_serve_ctx *ctx, const unsigned char *man,
+		size_t mlen, const struct cc_man_entry *ent,
+		const char *src_path)
+{
+  FILE *f = fopen (ctx->deps_path, "w");
+  if (!f)
+    return false;
+
+  bool ok = true;
+  for (unsigned i = 0; ok && i < ctx->deps_target_count; i++)
+    {
+      if (i && putc (' ', f) == EOF)
+	ok = false;
+      if (!ok)
+	break;
+      if (ctx->deps_target_quoted && ctx->deps_target_quoted[i])
+	ok = ccs_deps_munge (f, ctx->deps_targets[i]);
+      else
+	ok = (fputs (ctx->deps_targets[i], f) != EOF);
+    }
+  if (ok)
+    ok = (putc (':', f) != EOF);
+
+  for (uint32_t hi = 0; ok && hi < ent->hdr_count; hi++)
+    {
+      const unsigned char *rec = man + ent->hdr_recs_off
+				 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+      const char *hpath
+	= cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
+      if (!hpath)
+	{
+	  ok = false;
+	  break;
+	}
+      ok = (putc (' ', f) != EOF) && ccs_deps_munge (f, hpath);
+    }
+  if (ok)
+    ok = (putc ('\n', f) != EOF);
+
+  if (ok && ctx->deps_phony)
+    for (uint32_t hi = 0; ok && hi < ent->hdr_count; hi++)
+      {
+	const unsigned char *rec = man + ent->hdr_recs_off
+				   + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+	const char *hpath
+	  = cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
+	if (!hpath)
+	  {
+	    ok = false;
+	    break;
+	  }
+	if (strcmp (hpath, src_path) == 0)
+	  continue;		/* cpp emits no phony rule for the source */
+	ok = ccs_deps_munge (f, hpath) && (fputs (":\n", f) != EOF);
+      }
+
+  if (fclose (f) != 0)
+    ok = false;
+  if (!ok)
+    unlink (ctx->deps_path);	/* no torn file: miss -> real compile */
+  return ok;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Public entry point                                                       */
 /* ------------------------------------------------------------------------ */
 
@@ -876,7 +1017,13 @@ compile_cache_serve_object (const cc_serve_ctx *ctx, const char *src_path,
 	{
 	  char ok_hex[41];
 	  cc_hex (ent.ok_raw, ok_hex);
-	  if (ccs_serve_from_bin (ctx, ok_hex, out_path, "manifest-hit"))
+	  if (ccs_serve_from_bin (ctx, ok_hex, out_path, "manifest-hit")
+	      /* A requested dependency file is part of the contract: the
+		 entry's records are the closure, so write it here.  On a
+		 write failure fall through as a miss -- the real compile
+		 overwrites the placed .o and emits its own file.  */
+	      && (!ctx->deps_path
+		  || ccs_write_deps (ctx, man, mlen, &ent, src_path)))
 	    {
 	      free (man);
 	      return true;

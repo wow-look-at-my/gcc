@@ -5930,6 +5930,26 @@ driver_try_serve_from_cache (void)
   bool integrated_as = true;
   bool disqualify = false;
   bool saw_g = false;
+
+  /* Dependency-output state.  A served hit must also honor the -MD contract
+     (write the .d file ninja/make will read), so collect the request here;
+     the manifest's header records ARE the include closure, letting the serve
+     unit synthesize the file.  Forms whose output the records cannot
+     reproduce exactly decline the driver serve below (cc1plus's tier -- or
+     the real compile -- then produces the file with cpp's own semantics):
+     -M/-MM (dependency-only modes), -MMD/-MM (system headers excluded, which
+     the records do not distinguish), -MG (missing-header rules), or a -MD
+     lacking an explicit target/file on the cc1 line (cpp's default-target
+     derivation is not reimplemented here).  */
+  bool deps_md = false;		/* -MD (cc1 form carries the default file) */
+  bool deps_unsupported = false;/* -M/-MM/-MMD/-MG seen */
+  const char *deps_md_file = NULL;	/* -MD's own argument */
+  const char *deps_mf = NULL;		/* -MF argument (overrides) */
+  bool deps_phony = false;		/* -MP */
+  const char **deps_tgts = XNEWVEC (const char *, decoded_count);
+  bool *deps_tgt_quoted = XNEWVEC (bool, decoded_count);
+  unsigned deps_tgt_count = 0;
+
   for (unsigned i = 1; i < decoded_count; i++)
     {
       const cl_decoded_option *o = &decoded[i];
@@ -5965,9 +5985,43 @@ driver_try_serve_from_cache (void)
 	case OPT_gdwarf_:
 	  saw_g = true;
 	  break;
+	case OPT_MD:
+	  deps_md = true;
+	  deps_md_file = o->arg;
+	  break;
+	case OPT_MF:
+	  deps_mf = o->arg;
+	  break;
+	case OPT_MT:
+	case OPT_MQ:
+	  deps_tgts[deps_tgt_count] = o->arg;
+	  deps_tgt_quoted[deps_tgt_count] = (o->opt_index == OPT_MQ);
+	  deps_tgt_count++;
+	  break;
+	case OPT_MP:
+	  deps_phony = true;
+	  break;
+	case OPT_M:
+	case OPT_MM:
+	case OPT_MMD:
+	case OPT_MG:
+	  deps_unsupported = true;
+	  break;
 	default:
 	  break;
 	}
+    }
+
+  /* Resolve the dependency request: -MF wins over -MD's own file.  An
+     unsupported form (or a supported one missing its file/targets) declines
+     the serve entirely rather than serving an object while leaving the
+     build system's dependency info silently empty or wrong.  */
+  const char *deps_path = NULL;
+  if (deps_md || deps_unsupported)
+    {
+      deps_path = deps_mf ? deps_mf : deps_md_file;
+      if (deps_unsupported || !deps_md || !deps_path || deps_tgt_count == 0)
+	disqualify = true;
     }
 
   bool served = false;
@@ -5978,7 +6032,6 @@ driver_try_serve_from_cache (void)
       char *lang = NULL;
       if (driver_read_compiler_id (cache_dir, checksum, &lang))
 	{
-	  const char *verify = env.get ("GCC_COMPILE_CACHE_VERIFY");
 	  char *cwd = getpwd ();
 	  cc_serve_ctx ctx;
 	  ctx.cache_dir = cache_dir;
@@ -5988,14 +6041,21 @@ driver_try_serve_from_cache (void)
 	  ctx.decoded_count = decoded_count;
 	  ctx.paths_affect_output = saw_g;
 	  ctx.cwd = cwd ? cwd : "";
-	  ctx.verify_hash = (verify && !strcmp (verify, "hash"));
+	  ctx.verify_hash = cc_verify_hash_env_p ();
 	  ctx.debug = driver_cc_debug_p ();
+	  ctx.deps_path = deps_path;
+	  ctx.deps_targets = deps_tgts;
+	  ctx.deps_target_quoted = deps_tgt_quoted;
+	  ctx.deps_target_count = deps_tgt_count;
+	  ctx.deps_phony = deps_phony;
 	  served = compile_cache_serve_object (&ctx, src_path, out_path);
 	  free (lang);
 	}
     }
 
   /* decoded uses the opts obstack; the array itself is heap.  */
+  free (deps_tgts);
+  free (deps_tgt_quoted);
   free (decoded);
   return served;
 }
@@ -6293,11 +6353,13 @@ driver_auto_pch_probe_inject (struct driver_apch_plan *plan)
   ctx.decoded_count = decoded_count;
   ctx.paths_affect_output = saw_g;
   ctx.cwd = "";
-  {
-    const char *verify = env.get ("GCC_COMPILE_CACHE_VERIFY");
-    ctx.verify_hash = (verify && !strcmp (verify, "hash"));
-  }
+  ctx.verify_hash = cc_verify_hash_env_p ();
   ctx.debug = driver_apch_debug_p ();
+  ctx.deps_path = NULL;		/* the auto-PCH probe serves no object */
+  ctx.deps_targets = NULL;
+  ctx.deps_target_quoted = NULL;
+  ctx.deps_target_count = 0;
+  ctx.deps_phony = false;
 
   char *base = cc_auto_pch_entry_base (&ctx, norm, plen);
   enum cc_auto_pch_probe_result pr
