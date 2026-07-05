@@ -30,9 +30,14 @@ Recorded 2026-07-04; see `ENV.md` for the full environment and
 
 3. **Warm speedup: fork cache 1.8x vs ccache 3.9x** (156.8 s vs 73.6 s
    against the ~283 s no-cache baseline), on the same compiler and the
-   same workload. Cause: in a fresh build directory the driver-level
-   manifest lookup MISSES and every TU falls back to the full
-   preprocess+hash path before finding its deep (post-preprocess) hit.
+   same workload. Cause: `cc_store_manifest` skips the manifest store
+   for any TU that evaluated `__has_include`, and libstdc++'s
+   `bits/c++config.h` (in every standard header's closure) always does —
+   so no manifest is ever stored for a real C++ TU, the pre-parse fast
+   path never fires, and every TU falls back to the full preprocess+hash
+   path before finding its deep (post-preprocess) hit. (Not a
+   build-dir/cwd keying issue — the manifest key is build-dir-independent
+   for `-g0` builds; see `DIAGNOSIS.md` for the full analysis.)
    Probe evidence (`GCC_COMPILE_CACHE_DEBUG=1` recompile of a real TU
    against the warm cache):
 
@@ -43,8 +48,9 @@ Recorded 2026-07-04; see `ENV.md` for the full environment and
 
    The residual per-TU work is visible in user time: 437 s (fork warm) vs
    112 s (ccache warm), and in the warm ninja log only 83 of 418 object
-   edges finish in <500 ms. Making the manifest hit across build dirs
-   (path-independent manifest keys) is the obvious next lever.
+   edges finish in <500 ms. Recording `__has_include` probes in the
+   manifest and re-verifying them at serve time (see `DIAGNOSIS.md`) is
+   the obvious next lever.
 
 4. **Correctness: all 418 objects are byte-identical** (sha256) across
    fork no-cache, fork-cache-cold and fork-cache-warm
