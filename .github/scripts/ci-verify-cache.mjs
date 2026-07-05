@@ -959,6 +959,244 @@ function compilePch(driver, src, obj, cacheDir, extra) {
     'check 14 OK: PCH objects deterministic across caches + identical to manual -x c++-header PCH\n');
 }
 
+// ---- checks 15-18: __has_include probes in the manifest fast path ---------
+// A TU that evaluates __has_include used to be disqualified from the manifest
+// ("manifest-skip-has-include") -- which was every real C++ TU, because
+// libstdc++'s bits/c++config.h probes <pstl/pstl_config.h> and <tbb/tbb.h>.
+// Probes are now RECORDED in the manifest entry (operand + result + the
+// candidate paths the search proved absent) and re-verified at serve time,
+// and their results fold into the object key. These checks pin:
+//   15. a real std-header C++ TU stores a manifest and gets a pre-parse
+//       manifest-hit on the warm compile;
+//   16. a NEGATIVE probe (header absent) does not serve stale after the
+//       probed header APPEARS -- full recompile, new key, new behavior;
+//   17. a POSITIVE probe does not serve stale after the header is DELETED
+//       (and the multi-entry manifest serves the matching original state);
+//   18. the carve-outs still disqualify: __has_include_next
+//       ("manifest-skip-has-include-next") and relative quote-form probes
+//       ("manifest-skip-has-include"), while the deep post-parse cache still
+//       hits for them.
+
+// ---- 15. C++ std-header TU: manifest stored + pre-parse manifest-hit ------
+{
+  // The in-tree xg++ has no default C++ include path; point it at the
+  // build-tree libstdc++ headers (and the in-srcdir libsupc++), like a
+  // build-tree caller would.
+  function findLibstdcxxIncludes(root) {
+    let incs = [];
+    try {
+      incs = fs.globSync(path.join(root, '*', 'libstdc++-v3', 'include'));
+    } catch {
+      incs = [];
+    }
+    if (incs.length === 0) {
+      // Node without fs.globSync: scan one level of build subdirs.
+      let ents = [];
+      try {
+        ents = fs.readdirSync(root, { withFileTypes: true });
+      } catch {
+        ents = [];
+      }
+      for (const e of ents) {
+        if (!e.isDirectory()) continue;
+        const p = path.join(root, e.name, 'libstdc++-v3', 'include');
+        if (fs.existsSync(p)) incs.push(p);
+      }
+    }
+    for (const inc of incs) {
+      let ents = [];
+      try {
+        ents = fs.readdirSync(inc, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of ents) {
+        if (e.isDirectory() &&
+            fs.existsSync(path.join(inc, e.name, 'bits', 'c++config.h'))) {
+          return { inc, tgtInc: path.join(inc, e.name) };
+        }
+      }
+    }
+    return null;
+  }
+  function findSrcdir(root) {
+    let mk;
+    try {
+      mk = fs.readFileSync(path.join(root, 'Makefile'), 'utf8');
+    } catch {
+      return null;
+    }
+    const m = mk.match(/^srcdir\s*=\s*(.+)\s*$/m);
+    return m ? path.resolve(root, m[1].trim()) : null;
+  }
+  const hdrs = findLibstdcxxIncludes(buildDir);
+  if (!hdrs) fail('check 15: could not locate build-tree libstdc++ headers under ' + buildDir);
+  const srcdir = findSrcdir(buildDir);
+  const supDir = srcdir ? path.join(srcdir, 'libstdc++-v3', 'libsupc++') : null;
+  const XI = ['-nostdinc++', '-I' + hdrs.tgtInc, '-I' + hdrs.inc]
+    .concat(supDir && fs.existsSync(supDir) ? ['-I' + supDir] : []);
+
+  const dir = path.join(work, 'probe-std');
+  fs.mkdirSync(dir);
+  const src = path.join(dir, 'stdtu.cpp');
+  fs.writeFileSync(
+    src,
+    '#include <string>\n' +
+    'int main(){ std::string s("hello"); return (int) s.size(); }\n'
+  );
+  const cache = path.join(dir, 'cache');
+  const o1 = path.join(dir, 's1.o');
+  const o2 = path.join(dir, 's2.o');
+
+  const r1 = compile(XGPP, src, o1, cache, XI);
+  if (/compile-cache: manifest-skip-has-include/.test(r1.stderr)) {
+    fail('check 15: std-header TU still disqualified from the manifest ' +
+         '(manifest-skip-has-include)\n' + r1.stderr);
+  }
+  if (!/compile-cache: manifest-store /.test(r1.stderr)) {
+    fail('check 15: expected a manifest-store on the cold std-header compile\n' + r1.stderr);
+  }
+  const r2 = compile(XGPP, src, o2, cache, XI);
+  if (!/compile-cache: manifest-hit /.test(r2.stderr)) {
+    fail('check 15: expected a pre-parse manifest-hit on the warm std-header compile\n' + r2.stderr);
+  }
+  if (Buffer.compare(readObj(o1), readObj(o2)) !== 0) {
+    fail('check 15: manifest-served std-header object is not byte-identical');
+  }
+  process.stdout.write(
+    'check 15 OK: std-header C++ TU stores a manifest and manifest-hits warm, byte-identical\n');
+}
+
+// ---- 16+17. probe soundness: header appears / disappears ------------------
+{
+  const dir = path.join(work, 'probe-flip');
+  const idir = path.join(dir, 'inc');
+  fs.mkdirSync(idir, { recursive: true });
+  const src = path.join(dir, 'p.c');
+  // Deliberately NO #include of the probed header: its appearance then flips
+  // the probe result WITHOUT changing the include closure, which is exactly
+  // the case a closure-only key cannot see -- without the probe-result key
+  // component, r3 below would be a stale deep "hit".
+  fs.writeFileSync(
+    src,
+    '#if __has_include(<maybe_probe.h>)\n' +
+    '#define PROBE_VAL 42\n' +
+    '#else\n' +
+    '#define PROBE_VAL 1\n' +
+    '#endif\n' +
+    'int main(void){ return PROBE_VAL; }\n'
+  );
+  const cache = path.join(dir, 'cache');
+  const XI = ['-I' + idir];
+  const o = (n) => path.join(dir, 'p' + n + '.o');
+
+  // Cold: negative probe recorded, manifest stored.
+  const r1 = compile(XGCC, src, o(1), cache, XI);
+  if (!/compile-cache: manifest-store /.test(r1.stderr)) {
+    fail('check 16: expected manifest-store on the cold negative-probe compile\n' + r1.stderr);
+  }
+  const key1 = keyFor(r1.keys, 'miss');
+  // Warm: pre-parse manifest serve.
+  const r2 = compile(XGCC, src, o(2), cache, XI);
+  if (!/compile-cache: manifest-hit /.test(r2.stderr)) {
+    fail('check 16: expected manifest-hit on the warm negative-probe compile\n' + r2.stderr);
+  }
+  // The probed header APPEARS: serving the old object would be stale.
+  writeHeader(path.join(idir, 'maybe_probe.h'), '#define PROBE_VAL 42\n');
+  const r3 = compile(XGCC, src, o(3), cache, XI);
+  if (/compile-cache: manifest-hit /.test(r3.stderr)) {
+    fail('check 16: STALE manifest-hit after the probed header appeared\n' + r3.stderr);
+  }
+  const key3 = keyFor(r3.keys, 'miss');
+  if (!key3) fail('check 16: expected a full recompile (miss) after the probed header appeared\n' + r3.stderr);
+  if (key3 === key1) {
+    fail('check 16: object key unchanged although the probe result flipped ' +
+         '(probe results must fold into the key)');
+  }
+  const exe = path.join(dir, 'p.out');
+  let code = linkAndRun(XGCC, o(3), exe);
+  if (code !== 42) fail('check 16: post-appearance program returned ' + code + ', expected 42');
+  process.stdout.write(
+    'check 16 OK: negative probe invalidates when the header appears (no stale serve; new key; runs 42)\n');
+
+  // Warm again with the header present (positive-probe entry now cached).
+  const r4 = compile(XGCC, src, o(4), cache, XI);
+  if (!/compile-cache: manifest-hit /.test(r4.stderr)) {
+    fail('check 17: expected manifest-hit on the warm positive-probe compile\n' + r4.stderr);
+  }
+  // The probed header DISAPPEARS: the positive entry must not serve; the
+  // ORIGINAL negative entry is valid again and legitimately serves the
+  // original object (multi-entry manifest round-trip).
+  fs.rmSync(path.join(idir, 'maybe_probe.h'));
+  const r5 = compile(XGCC, src, o(5), cache, XI);
+  const hit5 = keyFor(r5.keys, 'hit');
+  if (!hit5 || hit5 !== key1) {
+    fail('check 17: after deleting the probed header, expected the ORIGINAL ' +
+         'entry (' + key1 + ') to serve; got ' + hit5 + '\n' + r5.stderr);
+  }
+  if (Buffer.compare(readObj(o(5)), readObj(o(1))) !== 0) {
+    fail('check 17: round-trip object differs from the original');
+  }
+  code = linkAndRun(XGCC, o(5), exe);
+  if (code !== 1) fail('check 17: post-deletion program returned ' + code + ', expected 1');
+  process.stdout.write(
+    'check 17 OK: positive probe invalidates when the header disappears; original entry serves again\n');
+}
+
+// ---- 18. carve-outs: __has_include_next / quote form still disqualify -----
+{
+  const dir = path.join(work, 'probe-skip');
+  const dA = path.join(dir, 'a');
+  const dB = path.join(dir, 'b');
+  fs.mkdirSync(dA, { recursive: true });
+  fs.mkdirSync(dB, { recursive: true });
+  fs.writeFileSync(
+    path.join(dA, 'x_next.h'),
+    '#if __has_include_next(<x_next.h>)\n#define HAVE_NEXT 1\n#else\n#define HAVE_NEXT 0\n#endif\n'
+  );
+  fs.writeFileSync(path.join(dB, 'x_next.h'), '#define UNUSED_B 1\n');
+  const srcNext = path.join(dir, 'n.c');
+  fs.writeFileSync(srcNext, '#include <x_next.h>\nint main(void){ return HAVE_NEXT; }\n');
+  const cache = path.join(dir, 'cache');
+
+  const rn1 = compile(XGCC, srcNext, path.join(dir, 'n1.o'), cache,
+                      ['-I' + dA, '-I' + dB]);
+  if (!/compile-cache: manifest-skip-has-include-next /.test(rn1.stderr)) {
+    fail('check 18: expected manifest-skip-has-include-next for a __has_include_next TU\n' + rn1.stderr);
+  }
+  if (/compile-cache: manifest-store /.test(rn1.stderr)) {
+    fail('check 18: __has_include_next TU must not store a manifest\n' + rn1.stderr);
+  }
+  const rn2 = compile(XGCC, srcNext, path.join(dir, 'n2.o'), cache,
+                      ['-I' + dA, '-I' + dB]);
+  if (/compile-cache: manifest-hit /.test(rn2.stderr)) {
+    fail('check 18: __has_include_next TU must not manifest-hit\n' + rn2.stderr);
+  }
+  if (!keyFor(rn2.keys, 'hit')) {
+    fail('check 18: __has_include_next TU should still deep-hit post-parse\n' + rn2.stderr);
+  }
+
+  // Relative quote-form probe: the search starts at the probing file's own
+  // directory, which the pre-parse serve cannot reconstruct -> skip (the
+  // plain tag, not the -next one).
+  fs.writeFileSync(path.join(dir, 'qprobe.h'), '#define HAVE_Q 1\n');
+  const srcQ = path.join(dir, 'q.c');
+  fs.writeFileSync(
+    srcQ,
+    '#if __has_include("qprobe.h")\n#define QV 3\n#else\n#define QV 0\n#endif\n' +
+    'int main(void){ return QV; }\n'
+  );
+  const rq = compile(XGCC, srcQ, path.join(dir, 'q1.o'), cache);
+  if (!/compile-cache: manifest-skip-has-include [0-9a-f]/.test(rq.stderr)) {
+    fail('check 18: expected manifest-skip-has-include for a relative quote-form probe\n' + rq.stderr);
+  }
+  if (/compile-cache: manifest-store /.test(rq.stderr)) {
+    fail('check 18: quote-form probe TU must not store a manifest\n' + rq.stderr);
+  }
+  process.stdout.write(
+    'check 18 OK: __has_include_next and quote-form probes still skip the manifest (deep cache intact)\n');
+}
+
 // ---- cleanup + success ---------------------------------------------------
 try {
   fs.rmSync(work, { recursive: true, force: true });
