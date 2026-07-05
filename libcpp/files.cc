@@ -2622,11 +2622,25 @@ record_has_include_probe (cpp_reader *pfile, const char *fname,
      still existing and every candidate below still absent then implies the
      same result over the same chain.  That rules out __has_include_next (the
      searched chain depends on where the probing file sits on the include
-     stack) and relative quote probes (the search starts at the probing
-     file's own directory); -remap rewrites candidate paths in ways the plain
-     joins below do not reproduce.  */
+     stack); -remap rewrites candidate paths in ways the plain joins below do
+     not reproduce.
+
+     Relative QUOTE-form probes are verifiable too, even though their search
+     starts at the probing file's own directory: the candidates below are
+     joined AT PROBE TIME against the exact chain cpp walked (the probing
+     file's directory included), so a consumer needs no include-stack
+     reconstruction -- and it only trusts the record when the rest of the
+     manifest entry matched, which pins the probing file itself (path and
+     content, hence its directory) and every search-path option value, i.e.
+     the whole chain.  This reaches far beyond quote-happy user code: glibc's
+     own bits/statx.h and bits/unistd_ext.h evaluate
+     __has_include ("linux/stat.h") / ("linux/close_range.h"), so every TU
+     touching <sys/stat.h> or <unistd.h> would otherwise lose its manifest.
+     A relative candidate join (from a relative includer path or search dir)
+     re-verifies against the consumer's cwd -- exactly the cwd whose
+     hypothetical compile a serve claims to reproduce, the same binding
+     relative header-record paths already have.  */
   bool verifiable = (type != IT_INCLUDE_NEXT
-		     && (angle_brackets || IS_ABSOLUTE_PATH (fname))
 		     && !CPP_OPTION (pfile, remap)
 		     && (!found || (resolved != NULL && file->dir != NULL)));
 
@@ -2664,18 +2678,29 @@ record_has_include_probe (cpp_reader *pfile, const char *fname,
     flags |= CPP_HI_PROBE_VERIFIABLE;
 
   /* Dedupe: an identical evaluation (same operand, same flags, same
-     resolution) is recorded once.  Same-operand records with DIFFERENT
-     results stay separate; only position-dependent forms can produce them,
-     and those are unverifiable, so a consumer keys on them without ever
-     trying to re-verify both.  */
+     resolution, same proved-absent candidates) is recorded once.  The
+     candidate lists are part of the identity: the same quote-form operand
+     probed from two different directories yields the same boolean and
+     resolution but DIFFERENT absence proofs, and dropping the second
+     record's candidates would let a file appearing in only that chain
+     change the second probe's resolution unnoticed.  Same-operand records
+     with DIFFERENT results stay separate; only position-dependent forms can
+     produce them, and those are unverifiable, so a consumer keys on them
+     without ever trying to re-verify both.  */
   for (unsigned i = 0; i < pfile->hi_probe_count; i++)
     {
       const struct cpp_hi_probe *p = &pfile->hi_probes[i];
       if (p->flags == flags
 	  && strcmp (p->name, fname) == 0
 	  && ((p->resolved == NULL) == (resolved == NULL))
-	  && (resolved == NULL || strcmp (p->resolved, resolved) == 0))
+	  && (resolved == NULL || strcmp (p->resolved, resolved) == 0)
+	  && p->n_candidates == n_candidates)
 	{
+	  bool same = true;
+	  for (unsigned k = 0; same && k < n_candidates; k++)
+	    same = (strcmp (p->candidates[k], candidates[k]) == 0);
+	  if (!same)
+	    continue;
 	  for (unsigned k = 0; k < n_candidates; k++)
 	    free (candidates[k]);
 	  free (candidates);
