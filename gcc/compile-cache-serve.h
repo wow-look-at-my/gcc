@@ -79,6 +79,48 @@ struct cc_serve_ctx
   bool debug;
 };
 
+/* ---- Shared manifest-entry access (one interpreter for the v2 bytes) ---- */
+
+/* Parsed byte locations of one manifest entry (v2 layout: 40-byte head,
+   HDR_COUNT 40-byte header records, PROBE_COUNT variable-length probe
+   records; see compile-cache-format.h).  Offsets are absolute within the
+   manifest buffer.  */
+struct cc_man_entry
+{
+  const unsigned char *ok_raw;	/* the entry's 20-byte object key */
+  uint32_t warnings;
+  uint32_t werrors;
+  uint32_t eflags;		/* CC_MAN_EFLAG_* */
+  uint32_t hdr_count;
+  uint32_t probe_count;
+  uint64_t hdr_recs_off;
+  uint64_t probe_recs_off;
+  uint64_t next_off;		/* one past this entry's last record */
+};
+
+/* Parse + bounds-check the entry at OFF in MAN/MLEN into *OUT (walking its
+   variable-length probe records to find NEXT_OFF).  Returns false on any
+   truncation / malformation, after which the caller must stop walking the
+   manifest.  */
+extern bool cc_man_entry_parse (const unsigned char *man, size_t mlen,
+				uint64_t off, struct cc_man_entry *out);
+
+/* Fetch a length-prefixed string from the manifest string area with bounds
+   checks; NULL if OFF is out of range.  */
+extern const char *cc_man_string (const unsigned char *man, size_t mlen,
+				  uint32_t off);
+
+/* Re-validate ENT against the filesystem: every header record must still
+   resolve (size+mtime stat shortcut, else content re-hash; VERIFY_HASH
+   forces the re-hash) and every probe record must still reproduce (each
+   candidate path still absent; a FOUND probe's resolved path still present
+   and not a directory).  Entries with unknown flag bits never validate.
+   Shared by the driver serve, the cc1plus pre-parse serve, and the auto-PCH
+   probe, so all three accept exactly the same states.  */
+extern bool cc_man_entry_records_valid (const unsigned char *man, size_t mlen,
+					const struct cc_man_entry *ent,
+					bool verify_hash);
+
 /* Try to answer a warm hit for source SRC_PATH, placing the cached object at
    OUT_PATH, using CTX.  Computes the manifest key MK from the source bytes +
    CTX (identically on the driver and in cc1plus), reads the manifest, and for

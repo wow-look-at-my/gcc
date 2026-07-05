@@ -20796,7 +20796,10 @@ and reuse it on a later compilation of identical input, skipping the
 compiler back end entirely on a cache hit.  The cache is content-addressed:
 the lookup key is a hash over the compiler's own version, the source
 language and dialect, the exact bytes of the complete preprocessed source
-closure (every included file's contents), and the code-generation- and
+closure (every included file's contents), the result of every
+@code{__has_include} and @code{__has_include_next} test the translation
+unit evaluated (a header can appear or disappear without changing the
+closure's contents, flipping such a test), and the code-generation- and
 ABI-relevant command-line options.  A change to any of these produces a new
 key, so a stale result is never served.
 

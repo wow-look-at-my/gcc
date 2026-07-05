@@ -200,6 +200,125 @@ ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Shared manifest-entry access (the ONE interpreter of the v2 entry bytes)  */
+/* ------------------------------------------------------------------------ */
+
+/* Fetch a length-prefixed + NUL string from the manifest string area with
+   bounds checks; NULL if OFF is out of range.  */
+const char *
+cc_man_string (const unsigned char *man, size_t mlen, uint32_t off)
+{
+  if ((uint64_t) off + 4 > mlen)
+    return NULL;
+  uint32_t slen = cc_get_u32 (man + off);
+  if ((uint64_t) off + 4 + slen + 1 > mlen)
+    return NULL;
+  return (const char *) (man + off + 4);
+}
+
+/* Parse + bounds-check the manifest entry at OFF into *OUT.  The probe
+   records are variable-length, so finding NEXT_OFF walks them (checking each
+   fits); the header records are fixed-size.  Returns false on truncation.  */
+bool
+cc_man_entry_parse (const unsigned char *man, size_t mlen, uint64_t off,
+		    struct cc_man_entry *out)
+{
+  if (off + CC_MAN_ENT_HEAD_SIZE > mlen)
+    return false;
+  const unsigned char *ent = man + off;
+  out->ok_raw = ent + CC_MENT_OFF_OK;
+  out->warnings = cc_get_u32 (ent + CC_MENT_OFF_WARNINGS);
+  out->werrors = cc_get_u32 (ent + CC_MENT_OFF_WERRORS);
+  out->eflags = cc_get_u32 (ent + CC_MENT_OFF_FLAGS);
+  out->hdr_count = cc_get_u32 (ent + CC_MENT_OFF_HDR_COUNT);
+  out->probe_count = cc_get_u32 (ent + CC_MENT_OFF_PROBE_COUNT);
+
+  out->hdr_recs_off = off + CC_MAN_ENT_HEAD_SIZE;
+  uint64_t recs_len = (uint64_t) out->hdr_count * CC_MAN_HDR_REC_SIZE;
+  if (out->hdr_recs_off + recs_len > mlen)
+    return false;
+  out->probe_recs_off = out->hdr_recs_off + recs_len;
+
+  uint64_t cur = out->probe_recs_off;
+  for (uint32_t pi = 0; pi < out->probe_count; pi++)
+    {
+      if (cur + CC_MAN_PROBE_REC_FIXED_SIZE > mlen)
+	return false;
+      uint32_t ncand = cc_get_u32 (man + cur + CC_MPR_OFF_NCAND);
+      uint64_t rec_len
+	= CC_MAN_PROBE_REC_FIXED_SIZE + (uint64_t) ncand * 4;
+      if (cur + rec_len > mlen)
+	return false;
+      cur += rec_len;
+    }
+  out->next_off = cur;
+  return true;
+}
+
+/* Re-verify ENT's probe records against the filesystem with pure stat()
+   logic; the candidates are pre-joined paths, so no include-search
+   reconstruction happens here.  Conservative on every edge: any state the
+   store side did not prove (a candidate now existing, a resolved path gone
+   or turned into a directory, unknown flag bits) rejects the entry -- the
+   caller then falls back to a real compile, which recomputes the truth.  */
+static bool
+ccs_probes_match (const unsigned char *man, size_t mlen,
+		  const struct cc_man_entry *ent)
+{
+  uint64_t cur = ent->probe_recs_off;
+  for (uint32_t pi = 0; pi < ent->probe_count; pi++)
+    {
+      const unsigned char *rec = man + cur;
+      uint32_t pflags = cc_get_u32 (rec + CC_MPR_OFF_FLAGS);
+      uint32_t ncand = cc_get_u32 (rec + CC_MPR_OFF_NCAND);
+      cur += CC_MAN_PROBE_REC_FIXED_SIZE + (uint64_t) ncand * 4;
+
+      if (pflags & ~CC_MPR_FLAG_KNOWN_MASK)
+	return false;		/* written by a future format: never match */
+
+      /* Every candidate the store-side search proved absent must still be
+	 absent -- a file appearing there would change the resolution (or
+	 flip a negative probe to found).  */
+      for (uint32_t ci = 0; ci < ncand; ci++)
+	{
+	  uint32_t coff = cc_get_u32 (rec + CC_MAN_PROBE_REC_FIXED_SIZE
+				      + ci * 4);
+	  const char *cand = cc_man_string (man, mlen, coff);
+	  if (!cand)
+	    return false;
+	  struct stat stt;
+	  if (stat (cand, &stt) == 0)
+	    return false;	/* appeared -> stale */
+	}
+
+      /* A FOUND probe's resolved path must still exist; a directory does
+	 not count (cpp's open_file treats those as ENOENT).  */
+      if (pflags & CC_MPR_FLAG_FOUND)
+	{
+	  const char *resolved
+	    = cc_man_string (man, mlen, cc_get_u32 (rec + CC_MPR_OFF_RESOLVED));
+	  struct stat stt;
+	  if (!resolved || stat (resolved, &stt) != 0
+	      || S_ISDIR (stt.st_mode))
+	    return false;
+	}
+    }
+  return true;
+}
+
+/* Header records + probe records; see compile-cache-serve.h.  */
+bool
+cc_man_entry_records_valid (const unsigned char *man, size_t mlen,
+			    const struct cc_man_entry *ent, bool verify_hash)
+{
+  if (ent->eflags & ~CC_MAN_EFLAG_KNOWN_MASK)
+    return false;		/* written by a future format: never match */
+  return ccs_records_match (man, mlen, ent->hdr_recs_off, ent->hdr_count,
+			    verify_hash)
+	 && ccs_probes_match (man, mlen, ent);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Option predicates (SHARED with compile-cache.cc -- keep in lockstep)     */
 /* ------------------------------------------------------------------------ */
 
@@ -741,28 +860,22 @@ compile_cache_serve_object (const cc_serve_ctx *ctx, const char *src_path,
       return false;
     }
 
-  /* Walk each entry (candidate header set).  */
+  /* Walk each entry (candidate header set + its recorded probes).  */
   uint64_t cur = entries_off;
   for (uint32_t ei = 0; ei < entry_count; ei++)
     {
-      if (cur + 20 + 4 + 4 + 4 > mlen)
-	break;
-      const unsigned char *ent = man + cur;
-      unsigned char ok_raw[20];
-      memcpy (ok_raw, ent + 0, 20);
-      uint32_t hdr_count = cc_get_u32 (ent + 28);
-      uint64_t recs_off = cur + 32;
-      uint64_t recs_len = (uint64_t) hdr_count * CC_MAN_HDR_REC_SIZE;
-      if (recs_off + recs_len > mlen)
-	break;
+      struct cc_man_entry ent;
+      if (!cc_man_entry_parse (man, mlen, cur, &ent))
+	break;			/* truncated manifest -> stop */
 
-      bool all_match = ccs_records_match (man, mlen, recs_off, hdr_count,
-					  ctx->verify_hash);
-
-      if (all_match)
+      /* Only flag-free entries are servable objects (the auto-PCH gch
+	 manifest is the sole writer of flagged entries, and it lives under
+	 its own path, but stay strict).  */
+      if (ent.eflags == 0
+	  && cc_man_entry_records_valid (man, mlen, &ent, ctx->verify_hash))
 	{
 	  char ok_hex[41];
-	  cc_hex (ok_raw, ok_hex);
+	  cc_hex (ent.ok_raw, ok_hex);
 	  if (ccs_serve_from_bin (ctx, ok_hex, out_path, "manifest-hit"))
 	    {
 	      free (man);
@@ -770,7 +883,7 @@ compile_cache_serve_object (const cc_serve_ctx *ctx, const char *src_path,
 	    }
 	}
 
-      cur = recs_off + recs_len;
+      cur = ent.next_off;
     }
 
   free (man);
@@ -1110,20 +1223,22 @@ cc_auto_pch_probe (const cc_serve_ctx *ctx, const char *base,
   size_t mlen = 0;
   unsigned char *man = ccs_read_file (pbuf, &mlen);
   bool man_ok = false;
+  bool man_unverified_probes = false;
   if (man
       && mlen >= CC_MANIFEST_HEADER_SIZE
       && memcmp (man + CC_MAN_OFF_MAGIC, CC_MANIFEST_MAGIC, CC_MAGIC_LEN) == 0
-      && cc_get_u16 (man + CC_MAN_OFF_VERSION) == CC_MANIFEST_VERSION)
+      && cc_get_u16 (man + CC_MAN_OFF_VERSION) == CC_MANIFEST_VERSION
+      && cc_get_u32 (man + CC_MAN_OFF_ENTRY_COUNT) == 1)
     {
-      uint32_t ecount = cc_get_u32 (man + CC_MAN_OFF_ENTRY_COUNT);
-      uint64_t eoff = cc_get_u64 (man + CC_MAN_OFF_ENTRIES_OFF);
-      if (ecount == 1 && eoff + 32 <= mlen)
+      struct cc_man_entry ent;
+      if (cc_man_entry_parse (man, mlen,
+			      cc_get_u64 (man + CC_MAN_OFF_ENTRIES_OFF), &ent)
+	  && (ent.eflags & ~CC_MAN_EFLAG_KNOWN_MASK) == 0)
 	{
-	  uint32_t hdr_count = cc_get_u32 (man + eoff + 28);
-	  uint64_t recs_off = eoff + 32;
-	  if (recs_off + (uint64_t) hdr_count * CC_MAN_HDR_REC_SIZE <= mlen)
-	    man_ok = ccs_records_match (man, mlen, recs_off, hdr_count,
-					ctx->verify_hash);
+	  man_unverified_probes
+	    = (ent.eflags & CC_MAN_EFLAG_UNVERIFIED_PROBES) != 0;
+	  man_ok = cc_man_entry_records_valid (man, mlen, &ent,
+					       ctx->verify_hash);
 	}
     }
   free (man);
@@ -1153,6 +1268,19 @@ cc_auto_pch_probe (const cc_serve_ctx *ctx, const char *base,
     {
       free (pbuf);
       return CC_APCH_ABSENT;
+    }
+
+  /* The gch build evaluated __has_include probes its manifest cannot
+     re-verify (quote form / -remap / header maps / _next): such a probe
+     flipping would make the .gch stale with no record noticing, so the PCH
+     must not be injected.  The entry is otherwise intact, so treat it as a
+     standing "do not use" (the TU compiles normally and evaluates its
+     probes itself); a header edit still lifts it via the manifest
+     mismatch -> ABSENT -> regeneration path above.  */
+  if (man_unverified_probes)
+    {
+      free (pbuf);
+      return CC_APCH_NEGATIVE;
     }
 
   /* Stub must byte-equal the prelude (key preimage check + completeness).  */

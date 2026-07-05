@@ -74,9 +74,16 @@ enum cc_meta_off
   /* diagnostics blob (DIAG_LEN bytes) follows at CC_META_REC_SIZE.  */
 };
 
-/* Manifest object (ccache-style "direct mode" index).  */
+/* Manifest object (ccache-style "direct mode" index).
+   Version 2: each entry carries, after its header records, the TU's recorded
+   __has_include probes (see CC_MAN_ENT_* / CC_MAN_PROBE_*), so TUs that probe
+   (i.e. any real C++ TU, via bits/c++config.h) are servable pre-parse instead
+   of being disqualified wholesale; the entry head grew 32 -> 40 bytes to gain
+   the probe count and an entry-flags word.  The version bump makes v1
+   manifests unreadable by v2 (and vice versa), which is the intended clean
+   invalidation.  */
 #define CC_MANIFEST_MAGIC      "CCMANIFS"	/* 8 bytes, no NUL stored */
-#define CC_MANIFEST_VERSION    1u
+#define CC_MANIFEST_VERSION    2u
 #define CC_MANIFEST_HEADER_SIZE  32u
 
 /* Compiler-id sidecar: a tiny file at "DIR/compiler-id" that cc1plus writes on
@@ -135,6 +142,31 @@ enum cc_manifest_hdr_off
   CC_MAN_OFF_RESERVED    = 24	/* u64      reserved             */
 };
 
+/* Fixed head of one manifest entry (v2): 40 bytes, followed by HDR_COUNT
+   40-byte header records (CC_MHR_*), then PROBE_COUNT variable-length probe
+   records (CC_MPR_*).  */
+#define CC_MAN_ENT_HEAD_SIZE  40u
+enum cc_man_ent_off
+{
+  CC_MENT_OFF_OK          = 0,	/* u8[20] object key OK              */
+  CC_MENT_OFF_WARNINGS    = 20,	/* u32    stored warning count       */
+  CC_MENT_OFF_WERRORS     = 24,	/* u32    stored werror count        */
+  CC_MENT_OFF_FLAGS       = 28,	/* u32    CC_MAN_EFLAG_*             */
+  CC_MENT_OFF_HDR_COUNT   = 32,	/* u32    number of header records   */
+  CC_MENT_OFF_PROBE_COUNT = 36	/* u32    number of probe records    */
+};
+
+/* Entry flag bits (CC_MENT_OFF_FLAGS).  UNVERIFIED_PROBES marks an entry
+   whose TU evaluated __has_include probes that are NOT covered by its probe
+   records (quote-form/-remap/header-map/_next probes the serve side cannot
+   re-verify).  The .o manifest store refuses to write such entries at all;
+   only the auto-PCH gch manifest writes them, and its consumers must then
+   not trust probe stability (the driver answers NEGATIVE -- compile without
+   the PCH; the gch-merge distrusts the TU key).  An entry with unknown flag
+   bits must be treated as never matching.  */
+#define CC_MAN_EFLAG_UNVERIFIED_PROBES  0x1u
+#define CC_MAN_EFLAG_KNOWN_MASK         0x1u
+
 /* Per-header record inside a manifest entry: 40 bytes.  */
 #define CC_MAN_HDR_REC_SIZE  40u
 enum cc_man_hdr_rec_off
@@ -144,6 +176,32 @@ enum cc_man_hdr_rec_off
   CC_MHR_OFF_MTIME = 12,	/* u64  st_mtime (seconds)         */
   CC_MHR_OFF_HASH = 20		/* u8[20] raw SHA-1                */
 };
+
+/* Per-probe record inside a manifest entry: one recorded __has_include
+   evaluation.  16-byte fixed part, then N_CANDIDATES u32 string offsets --
+   the fully joined paths the store-side search proved ABSENT, in search
+   order.  A serve re-verifies the probe with pure stat() logic: every
+   candidate must still be absent, and a FOUND probe's resolved path must
+   still exist (and not be a directory -- cpp treats those as ENOENT).  Only
+   verifiable probes are ever written (CPP_HI_PROBE_VERIFIABLE upstream).  */
+#define CC_MAN_PROBE_REC_FIXED_SIZE  16u
+enum cc_man_probe_rec_off
+{
+  CC_MPR_OFF_FLAGS    = 0,	/* u32  CC_MPR_FLAG_*                    */
+  CC_MPR_OFF_NAME     = 4,	/* u32 -> operand spelling string        */
+  CC_MPR_OFF_RESOLVED = 8,	/* u32 -> resolved path string (FOUND
+				   only; 0 -- never a valid string
+				   offset -- otherwise)                  */
+  CC_MPR_OFF_NCAND    = 12	/* u32  candidate count                  */
+  /* N_CANDIDATES u32 string offsets follow at
+     CC_MAN_PROBE_REC_FIXED_SIZE.  */
+};
+
+/* Probe record flag bits (CC_MPR_OFF_FLAGS).  A record with unknown flag
+   bits must be treated as never matching.  */
+#define CC_MPR_FLAG_FOUND       0x1u	/* the probe returned 1 */
+#define CC_MPR_FLAG_BRACKET     0x2u	/* <...> operand form   */
+#define CC_MPR_FLAG_KNOWN_MASK  0x3u
 
 /* Component tags (one byte each), participating in the keys.  */
 enum cc_tag
@@ -159,16 +217,21 @@ enum cc_tag
   CC_TAG_VERSION = 9,	/* key-schema version */
   CC_TAG_SALT = 10,	/* GCC_COMPILE_CACHE_SALT */
   CC_TAG_SRC_BODY = 11,	/* main source file bytes (manifest key only) */
-  CC_TAG_SEARCH_PATH = 12 /* an include-search-path value (manifest key only) */
+  CC_TAG_SEARCH_PATH = 12, /* an include-search-path value (manifest key only) */
+  CC_TAG_HAS_INCLUDE = 13 /* one __has_include probe's result (object key) */
 };
 
 /* Key-schema version (shared by the object key OK and the manifest key MK).
-   Bumped 4 -> 5: the object key now commits each included file's content via
-   the 20-byte SHA-1 of its RAW on-disk bytes (computed once at read time in
-   libcpp's read_file_guts and folded into the key in all_files order), in
-   place of folding the file's raw bytes in directly.  This changes the key
-   VALUE, so the bump cleanly invalidates pre-existing cache entries.  */
-#define CC_KEY_SCHEMA_VERSION 5u
+   Bumped 5 -> 6: the object key now commits every evaluated __has_include /
+   __has_include_next probe's RESULT (operand spelling + form + found bit,
+   under CC_TAG_HAS_INCLUDE; deliberately NOT the resolved path, which would
+   break the non-debug key's build-tree independence).  A probe can flip
+   absent<->present without changing the include closure (it usually only
+   changes a #define), so a closure-only key would keep serving the stale
+   object -- and, since a hit stores nothing, would also never refresh the
+   manifest that now records probes.  The bump cleanly invalidates
+   pre-existing entries.  */
+#define CC_KEY_SCHEMA_VERSION 6u
 
 /* Little-endian store helpers.  */
 static inline void
