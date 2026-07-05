@@ -71,3 +71,78 @@ extra stat()s per serve, and should close most of the 156.8 s → 73.6 s gap to 
 (whose direct mode demonstrably serves these same TUs). An interim smaller win with the
 same machinery: keep skipping only TUs that had a *negative* probe, storing positive-probe
 files as header records.
+
+## Fix implemented (2026-07-05)
+
+Landed on this branch; manifest format v2, key schema v6.
+
+### What is recorded
+
+`_cpp_has_header` (libcpp/files.cc) now records every **actually evaluated**
+`__has_include` / `__has_include_next` probe on the `cpp_reader` (probes
+short-circuited by `skip_eval` are dead — they cannot affect the output — and are
+not recorded): operand spelling post macro expansion, form (`<>` vs `""` vs
+`_next`), FOUND bit, the resolved path (found probes), and the **candidate
+paths** the search proved absent (the plain `dir/name` joins of every chain dir
+strictly before the found dir; the whole chain for a negative probe), computed at
+probe time against the exact chain cpp searched. Accessors:
+`cpp_foreach_has_include_probe`, `cpp_used_has_include_next` (mirrors
+`cpp_foreach_included_file` style). Identical evaluations dedupe to one record.
+
+### Where the records go
+
+1. **Object key OK** (`cc_compute_key`): each probe's *result* (spelling + form
+   + found bit, `CC_TAG_HAS_INCLUDE`, deliberately no paths) folds into the key.
+   This closes a second latent hole the diagnosis implied but did not spell out:
+   a probe can flip absent↔present **without changing the include closure** (it
+   usually only changes a `#define`), so the closure-content key alone would keep
+   deep-serving the stale object — and, since a hit stores nothing, would never
+   refresh the manifest either. Key schema 5 → 6.
+2. **Manifest** (`cc_store_manifest`, format v2): each entry carries its probe
+   records after the header records (entry head 32 → 40 bytes: adds entry flags +
+   probe count). Manifest version 1 → 2 invalidates old manifests cleanly.
+3. **Serve** (shared `cc_man_entry_records_valid` in compile-cache-serve.cc, used
+   by the driver serve, the cc1plus pre-parse serve, and the auto-PCH probe):
+   after the existing header re-validation, every probe re-verifies with pure
+   `stat()` logic — every recorded candidate must still be **absent** (a file
+   appearing earlier would change resolution / flip a negative probe), and a
+   FOUND probe's resolved path must still **exist** (and not be a directory,
+   matching cpp's `open_file`). Any mismatch → entry stale → normal deep path.
+   No include-search reconstruction happens at serve time: the candidates are
+   pre-joined absolute paths captured from cpp's own search.
+
+### Carve-outs (disqualify at store, never serve wrong)
+
+- `__has_include_next` → no manifest, new tag `manifest-skip-has-include-next`
+  (its result depends on the probing file's include-stack position).
+- Relative quote-form probes (search starts at the includer's own directory),
+  `-remap`, header-map (`dir->construct`) dirs → probe marked unverifiable → no
+  manifest, old tag `manifest-skip-has-include`. Absolute-path probes of either
+  form remain verifiable. Angle probes — the hot path, `bits/c++config.h`'s
+  `<pstl/pstl_config.h>` / `<tbb/tbb.h>` — are fully covered.
+- Auto-PCH: the gch manifest records the pch build's verifiable probes (the
+  driver re-verifies them before injecting); a pch whose build evaluated an
+  unverifiable probe is flagged (`CC_MAN_EFLAG_UNVERIFIED_PROBES`) and answers
+  NEGATIVE (compile without PCH). The gch merge imports the pch's probe records
+  into the consuming TU's key + manifest.
+
+### Enforcement
+
+`.github/scripts/ci-verify-cache.mjs` checks 15–18: std-header TU
+manifest-store + warm pre-parse manifest-hit; negative probe invalidates when
+the header appears (no stale serve, key changes); positive probe invalidates on
+deletion (and the multi-entry manifest legitimately serves the original state
+again); `_next` / quote-form still skip with their tags while the deep cache
+still hits.
+
+### Measured (llama.cpp fork-cache A/B, plain non-PGO tree, this branch)
+
+| config | wall | user | notes |
+|---|---|---|---|
+| warm rebuild, BROKEN manifests (pre-fix, results2 `fork-cache-warm`) | 156.8 s | 437 s | deep hits only |
+| warm rebuild, FIX (`fix-cache-warm`) | XX_WALL s | XX_USER s | manifest pre-parse serves |
+| ccache warm (same compiler, reference) | 73.6 s | 112 s | direct mode |
+| cold populate, FIX (`fix-cache-cold`) | XX_COLD_WALL s | XX_COLD_USER s | vs 398–408 s nocache |
+
+Warm-debug rebuild manifest-hit count: XX_MHITS of 418 C/C++ edges
+(XX_SKIPS remaining skips). objhash cold-vs-warm: XX_OBJHASH.
