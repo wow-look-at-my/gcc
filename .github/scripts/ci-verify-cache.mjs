@@ -1390,25 +1390,28 @@ function sleepSecs(s) {
   const o = (n) => path.join(dir, 'd' + n + '.o');
   const d = (n) => path.join(dir, 'd' + n + '.d');
 
-  // Parse a make depfile into its sorted set of prerequisites.
+  // Parse a make depfile into its sorted SET of prerequisites.  Duplicates
+  // collapse: make/ninja ignore multiplicity, and the manifest legitimately
+  // records the same path twice when cpp reached it via two search anchors
+  // (e.g. the preincluded stdc-predef.h).
   const depSet = (p) => {
     const txt = fs.readFileSync(p, 'utf8');
     const ci = txt.indexOf(':');
     const body = ci >= 0 ? txt.slice(ci + 1) : txt;
-    return body
-      .replace(/\\\n/g, ' ')
-      .split(/\s+/)
-      .filter((s) => s && !s.endsWith(':'))
-      .sort()
-      .join('\n');
+    return [...new Set(
+      body
+        .replace(/\\\n/g, ' ')
+        .split(/\s+/)
+        .filter((s) => s && !s.endsWith(':'))
+    )].sort().join('\n');
   };
 
-  // NOTE: the M-family option VALUES participate in the keys (catch-all
-  // conservative keying), and the cc1-level -MD argument is derived from -o
-  // by the driver specs -- so each cold/warm pair below repeats the IDENTICAL
-  // command line (same -o, same -MF), deleting the .d in between to prove
-  // the hit recreates it.  Real builds (ninja/make) have exactly this
-  // stability per TU.
+  // NOTE: the M-family option values are EXCLUDED from the keys (they shape
+  // only the .d side channel, regenerated from the live command line on
+  // every serve).  The pairs below still repeat the identical command line
+  // and delete the .d in between -- the point under test is that the hit
+  // RECREATES the file, not cross-flag key sharing (check 20/21 cover key
+  // behavior).
 
   // (a) driver-tier form: -MD -MT -MF all explicit.
   const argsA = ['-I' + dir, '-MD', '-MT', 'fixed-target.o', '-MF', d(1)];
@@ -1431,24 +1434,34 @@ function sleepSecs(s) {
   }
 
   // (b) -MD without -MT (the driver spec adds -MQ <output> to the cc1 line;
-  // the serving tier must still leave the complete file).
+  // the serving tier must still leave the complete file).  Because the
+  // M-family options are excluded from the keys, this DIFFERENT dependency
+  // spelling must hit entry (a) directly -- cross-flag key sharing -- and
+  // still synthesize its own .d.
   const argsB = ['-I' + dir, '-MD', '-MF', d(2)];
   const r3 = compile(XGCC, src, o(2), cache, argsB);
-  if (!/compile-cache: manifest-store /.test(r3.stderr)) {
-    fail('check 22: expected manifest-store on the cold -MD-no-MT compile\n' + r3.stderr);
+  if (!/compile-cache: manifest-hit /.test(r3.stderr)) {
+    fail('check 22: expected a manifest-hit for -MD without -MT (M-opts are unkeyed)\n' + r3.stderr);
+  }
+  if (!fs.existsSync(d(2))) {
+    fail('check 22: -MD without -MT left no dependency file on a hit');
+  }
+  if (realSetA !== depSet(d(2))) {
+    fail('check 22: -MD-without-MT deps differ from the real compile\n--- real ---\n' +
+         realSetA + '\n--- got ---\n' + depSet(d(2)));
   }
   const realSetB = depSet(d(2));
   fs.rmSync(d(2));
   const r4 = compile(XGCC, src, o(2), cache, argsB);
   if (!/compile-cache: manifest-hit /.test(r4.stderr)) {
-    fail('check 22: expected a manifest-hit for -MD without -MT\n' + r4.stderr);
+    fail('check 22: expected a manifest-hit on the repeat -MD-no-MT compile\n' + r4.stderr);
   }
   if (!fs.existsSync(d(2))) {
-    fail('check 22: -MD without -MT left no dependency file on a hit');
+    fail('check 22: repeat hit did not recreate the deleted .d');
   }
   if (realSetB !== depSet(d(2))) {
-    fail('check 22: -MD-without-MT deps differ from the real compile\n--- real ---\n' +
-         realSetB + '\n--- got ---\n' + depSet(d(2)));
+    fail('check 22: recreated deps differ\n--- before ---\n' +
+         realSetB + '\n--- after ---\n' + depSet(d(2)));
   }
 
   // (c) -MMD: never served from the manifest (the records carry no

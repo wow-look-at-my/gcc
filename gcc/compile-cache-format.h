@@ -257,8 +257,16 @@ enum cc_tag
    changes a #define), so a closure-only key would keep serving the stale
    object -- and, since a hit stores nothing, would also never refresh the
    manifest that now records probes.  The bump cleanly invalidates
-   pre-existing entries.  */
-#define CC_KEY_SCHEMA_VERSION 6u
+   pre-existing entries.
+   Bumped 6 -> 7: the dependency-output options (-MD/-MMD/-MF/-MT/-MQ/-MP/
+   -M/-MM/-MG/-Mmodules/-fdeps-*) no longer participate in the keys -- they
+   shape only the .d side channel, which every serve regenerates from the
+   live command line, and the driver spec derives the cc1-level -MD argument
+   from -o, so keying them made the key vary with the output path even
+   though the object bytes do not.  The classifier change alters key
+   material, so the bump keeps old and new binaries from half-sharing a
+   cache.  */
+#define CC_KEY_SCHEMA_VERSION 7u
 
 /* Little-endian store helpers.  */
 static inline void

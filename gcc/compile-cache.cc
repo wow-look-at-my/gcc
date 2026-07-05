@@ -1779,8 +1779,16 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
      c_common_finish still writes a complete .d -- the -MD contract.  Forms
      the records cannot reproduce decline the manifest serve instead (the
      deep path recomputes exact deps): -MM/-MMD exclude system headers, which
-     the records do not distinguish; -MG adds missing-file entries; module /
-     P1689 dependency formats record more than files.  */
+     the records do not distinguish; -MG (explicit opt-in) adds missing-file
+     entries; -fdeps-* (explicit opt-in) emits structured P1689 output.
+     deps.modules is deliberately NOT a decline condition: c-family
+     initialization defaults it to TRUE on every compile (c-opts.cc
+     c_common_init_options) -- it only means "IF module dependencies exist,
+     also list them" -- so treating it as a form signal would kill the
+     manifest for every ordinary -MD build, i.e. the entire ninja/cmake hot
+     path.  TUs that actually import modules are outside the cache's
+     supported territory regardless of dependency output (their .gcm inputs
+     are invisible to the include-closure walk).  */
   class mkdeps *mdeps = NULL;
   {
     const cpp_options *copts = cpp_get_options (pfile);
@@ -1789,8 +1797,7 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
       {
 	if (copts->deps.style == DEPS_USER
 	    || copts->deps.fdeps_format != FDEPS_FMT_NONE
-	    || copts->deps.missing_files
-	    || copts->deps.modules)
+	    || copts->deps.missing_files)
 	  {
 	    cc_debug_line ("manifest-skip-deps-form", NULL);
 	    return false;

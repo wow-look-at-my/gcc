@@ -378,6 +378,30 @@ cc_option_affects_output_p (const cl_decoded_option *decoded)
     case OPT_fauto_pch:
     case OPT_fauto_pch_store_:
     case OPT_fauto_pch_ref_:
+    /* Dependency-output plumbing: shapes only the .d side channel, never
+       the object bytes, and every serve regenerates the .d from the LIVE
+       command line (driver synthesis / libcpp's own deps machinery) -- so
+       keying these would only split identical objects across entries.
+       Concretely poisonous: the driver spec derives the cc1-level -MD
+       argument from -o, so keying it would make the key vary with the
+       output path even though the object does not.  -M/-MM/-MG are
+       dependency-only modes (no object is produced) and never reach a
+       cacheable compile; excluded for consistency.  ccache excludes the
+       same family from its hash.  */
+    case OPT_MD:
+    case OPT_MMD:
+    case OPT_MF:
+    case OPT_MT:
+    case OPT_MQ:
+    case OPT_MP:
+    case OPT_M:
+    case OPT_MM:
+    case OPT_MG:
+    case OPT_Mmodules:
+    case OPT_Mno_modules:
+    case OPT_fdeps_file_:
+    case OPT_fdeps_format_:
+    case OPT_fdeps_target_:
       return false;
     default:
       break;
