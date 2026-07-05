@@ -19,11 +19,11 @@ protocol below the table).
 
 | Stage (optimization added) | Landed in | SHA / recipe | Self-build wall (workload v1, hosted 4-vCPU, cold cache) | Δ vs previous stage | perf-lab run | Notes |
 |---|---|---|---|---|---|---|
-| stock upstream GCC (fork point) | upstream `releases/gcc-14`, 14.4.1-prerelease | `820ff02b98af` (plain recipe) | ? | — | ? | last upstream commit before any fork work; all rows below are cumulative on top of this |
+| stock upstream GCC (fork point) | upstream `releases/gcc-14`, 14.4.1-prerelease | `820ff02b98af` (plain recipe) | ? | — | [28727557771](https://github.com/wow-look-at-my/gcc/actions/runs/28727557771) (in flight) | last upstream commit before any fork work; all rows below are cumulative on top of this |
 | `.o` compile cache + single-process (no-spawn) driver | [#2](https://github.com/wow-look-at-my/gcc/pull/2), merged 2026-06-29 | `91cd3c559eed` (combined-tree recipe from here on) | ? | ? | ? | cache is opt-in (`-fcompile-cache=`); this table measures the cache-off cold path |
 | unconditional integrated assembler | [#5](https://github.com/wow-look-at-my/gcc/pull/5), merged 2026-06-29 | `625cae8cf3a8` | ? | ? | ? | #5 landed before #4 (git first-parent order) |
 | compile cache: hardlinked objects + xattr metadata | [#4](https://github.com/wow-look-at-my/gcc/pull/4), merged 2026-06-29 | `24352cdc537b` | ? | ? | ? | |
-| compile cache: no-sidecar rework | [#7](https://github.com/wow-look-at-my/gcc/pull/7), merged 2026-06-30 | `5226232bbe76` | ? | ? | ? | pre-#13 anchor; the composed-A/B "base" side |
+| compile cache: no-sidecar rework | [#7](https://github.com/wow-look-at-my/gcc/pull/7), merged 2026-06-30 | `5226232bbe76` | ? | ? | [28727562357](https://github.com/wow-look-at-my/gcc/actions/runs/28727562357) (in flight) | pre-#13 anchor; the composed-A/B "base" side |
 | GGC THP advise (`MADV_HUGEPAGE` on the GC heap) | [#13](https://github.com/wow-look-at-my/gcc/pull/13) c1/12 | `cfb70b36d96e` † | ? | ? | ? | needs a THP-capable host to express; hosted runners run THP `[always]` |
 | include-path dir index (single-component) | [#13](https://github.com/wow-look-at-my/gcc/pull/13) c2/12 | `9cc7fbcd7250` † | ? | ? | ? | |
 | dir-index stdin/pseudo-file fix | [#13](https://github.com/wow-look-at-my/gcc/pull/13) c3/12 | `0a335499e693` † | ? | ? | ? | correctness fix for the row above |
@@ -36,7 +36,7 @@ protocol below the table).
 | driver PCH spec fix (`-x c++-header`) | [#14](https://github.com/wow-look-at-my/gcc/pull/14) c3/14 | `8d60f8b239de` † | ? | ? | ? | correctness only, no perf claim |
 | SHA-1 hash-on-read gate (hash only with cache configured) | [#14](https://github.com/wow-look-at-my/gcc/pull/14) c5/14 | `2c8db5e713ee` † | ? | ? | ? | gives back the unconditional hashing cost of the #13 hash-on-read row (−1.86% instr on fmt −O0, cache off) |
 | transparent auto-PCH (`-fauto-pch`, opt-in) | [#14](https://github.com/wow-look-at-my/gcc/pull/14) c6/14 | `4e2e8ea470b2` † | ? | ? | ? | off by default, so the cold path this table measures is unchanged by design; warm-cache wins (1.29–1.38× at −O0) live in the [#14 tables](https://github.com/wow-look-at-my/gcc/pull/14) |
-| fork tip (= #14 merge) | [#14](https://github.com/wow-look-at-my/gcc/pull/14), merged 2026-07-05 | `5c426dfddb81` | ? | ? | ? | current `develop-matt/v14` |
+| fork tip (= #14 merge) | [#14](https://github.com/wow-look-at-my/gcc/pull/14), merged 2026-07-05 | `5c426dfddb81` | ? | ? | [28727587950](https://github.com/wow-look-at-my/gcc/actions/runs/28727587950) (in flight) | current `develop-matt/v14` |
 | PGO-built compiler (same source as tip) | ci.yml `package-pgo` job | build-recipe variant, not a commit | ? | ? | ? | not yet dispatchable via selfbuild (needs a recipe=pgo suite variant); bench-corpus: −2.7…−9.4% vs the plain tip build |
 
 † These SHAs sit inside squash-merged PRs, so they are on no branch — but
