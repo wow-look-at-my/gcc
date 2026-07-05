@@ -1518,11 +1518,42 @@ typedef bool (*cpp_included_file_cb) (const char *path,
 extern bool cpp_foreach_included_file (cpp_reader *,
 				       cpp_included_file_cb, void *);
 
-/* True if __has_include / __has_include_next was evaluated during this TU.
-   The in-compiler cache uses this to bypass its pre-parse manifest fast-path
-   for such TUs (a header probed by __has_include but never #include'd is not
-   in the include closure, so the manifest cannot notice it appearing).  */
+/* True if __has_include / __has_include_next was evaluated during this TU
+   (including probes short-circuited by a false #if operand, which are never
+   recorded below).  */
 extern bool cpp_used_has_include (cpp_reader *);
+
+/* True if specifically __has_include_next was evaluated during this TU.  Its
+   result depends on the include-stack position of the probing file, which a
+   consumer cannot re-verify without preprocessing, so the in-compiler cache
+   keeps such TUs off its pre-parse manifest fast-path.  */
+extern bool cpp_used_has_include_next (cpp_reader *);
+
+/* Flag bits describing one recorded __has_include evaluation.  */
+#define CPP_HI_PROBE_FOUND	0x1	/* the probe returned 1 */
+#define CPP_HI_PROBE_BRACKET	0x2	/* <...> operand (else "...") */
+#define CPP_HI_PROBE_NEXT	0x4	/* __has_include_next */
+#define CPP_HI_PROBE_VERIFIABLE	0x8	/* re-checkable from the records:
+					   RESOLVED (when found) still exists
+					   and every CANDIDATE still absent
+					   reproduces the probe's search */
+
+/* Callback invoked once per recorded __has_include / __has_include_next
+   evaluation of this TU, deduplicated: NAME is the operand spelling after
+   macro expansion, FLAGS a CPP_HI_PROBE_* mask, RESOLVED the path the probe
+   resolved to (NULL unless CPP_HI_PROBE_FOUND), and CANDIDATES the
+   N_CANDIDATES fully joined paths the search proved absent, in search order
+   (empty unless CPP_HI_PROBE_VERIFIABLE).  Return false to stop the walk.  */
+typedef bool (*cpp_has_include_probe_cb) (const char *name, unsigned flags,
+					  const char *resolved,
+					  const char *const *candidates,
+					  unsigned n_candidates, void *user);
+
+/* Walk every recorded __has_include / __has_include_next evaluation of this
+   TU, invoking CB for each.  Stops early (returning false) if CB returns
+   false; returns true otherwise.  */
+extern bool cpp_foreach_has_include_probe (cpp_reader *,
+					   cpp_has_include_probe_cb, void *);
 
 extern void cpp_make_system_header (cpp_reader *, int, int);
 extern bool cpp_push_include (cpp_reader *, const char *);

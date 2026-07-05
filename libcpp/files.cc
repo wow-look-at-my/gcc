@@ -1774,6 +1774,20 @@ _cpp_cleanup_files (cpp_reader *pfile)
   /* The quote chain is the superset of the bracket chain, so freeing it
      once covers both.  */
   free_dir_name_indices (pfile->quote_include);
+
+  /* The recorded __has_include probes (see cpp_reader::hi_probes).  */
+  for (unsigned i = 0; i < pfile->hi_probe_count; i++)
+    {
+      struct cpp_hi_probe *p = &pfile->hi_probes[i];
+      free (p->name);
+      free (p->resolved);
+      for (unsigned k = 0; k < p->n_candidates; k++)
+	free (p->candidates[k]);
+      free (p->candidates);
+    }
+  free (pfile->hi_probes);
+  pfile->hi_probes = NULL;
+  pfile->hi_probe_count = pfile->hi_probe_cap = 0;
 }
 
 /* Make the parser forget about files it has seen.  This can be useful
@@ -2459,6 +2473,34 @@ cpp_used_has_include (cpp_reader *pfile)
   return pfile && pfile->used_has_include;
 }
 
+/* True if specifically __has_include_next was evaluated during this TU.  */
+
+bool
+cpp_used_has_include_next (cpp_reader *pfile)
+{
+  return pfile && pfile->used_has_include_next;
+}
+
+/* Walk every recorded __has_include / __has_include_next evaluation,
+   invoking CB for each until it returns false.  See cpplib.h.  */
+
+bool
+cpp_foreach_has_include_probe (cpp_reader *pfile,
+			       cpp_has_include_probe_cb cb, void *user)
+{
+  if (!pfile)
+    return true;
+  for (unsigned i = 0; i < pfile->hi_probe_count; i++)
+    {
+      const struct cpp_hi_probe *p = &pfile->hi_probes[i];
+      if (!cb (p->name, p->flags, p->resolved,
+	       const_cast<const char *const *> (p->candidates),
+	       p->n_candidates, user))
+	return false;
+    }
+  return true;
+}
+
 /* Read the pchf_data structure from F.  */
 
 bool
@@ -2553,6 +2595,108 @@ check_file_against_entries (cpp_reader *pfile ATTRIBUTE_UNUSED,
 		  pchf_compare) != NULL;
 }
 
+/* Record one evaluated __has_include / __has_include_next probe (see
+   cpp_reader::hi_probes and cpp_foreach_has_include_probe).  FNAME /
+   ANGLE_BRACKETS / TYPE identify the probe, START_DIR is the head of the
+   chain that was searched (NULL when there was none to search) and FILE is
+   _cpp_find_file's answer (NULL likewise).  Identical evaluations dedupe to
+   one record.  */
+static void
+record_has_include_probe (cpp_reader *pfile, const char *fname,
+			  int angle_brackets, enum include_type type,
+			  cpp_dir *start_dir, _cpp_file *file)
+{
+  bool found = file && file->err_no != ENOENT;
+  const char *resolved = (found && file->path) ? file->path : NULL;
+
+  unsigned flags = 0;
+  if (found)
+    flags |= CPP_HI_PROBE_FOUND;
+  if (angle_brackets)
+    flags |= CPP_HI_PROBE_BRACKET;
+  if (type == IT_INCLUDE_NEXT)
+    flags |= CPP_HI_PROBE_NEXT;
+
+  /* A probe is VERIFIABLE when a consumer can reproduce its search from the
+     record alone, with no include-stack context: the resolved path (if any)
+     still existing and every candidate below still absent then implies the
+     same result over the same chain.  That rules out __has_include_next (the
+     searched chain depends on where the probing file sits on the include
+     stack) and relative quote probes (the search starts at the probing
+     file's own directory); -remap rewrites candidate paths in ways the plain
+     joins below do not reproduce.  */
+  bool verifiable = (type != IT_INCLUDE_NEXT
+		     && (angle_brackets || IS_ABSOLUTE_PATH (fname))
+		     && !CPP_OPTION (pfile, remap)
+		     && (!found || (resolved != NULL && file->dir != NULL)));
+
+  /* The candidate paths the search proved absent: the plain DIR/FNAME joins
+     of every chain dir strictly before the one the file was found in (every
+     chain dir for a not-found probe).  cpp may canonicalize a candidate
+     before probing it (maybe_shorter_path), but the plain join resolves to
+     the same file, so an existence re-check against the join is faithful.  */
+  char **candidates = NULL;
+  unsigned n_candidates = 0;
+  if (verifiable)
+    {
+      cpp_dir *stop = found ? file->dir : NULL;
+      unsigned n = 0;
+      cpp_dir *d = start_dir;
+      for (; d && d != stop; d = d->next)
+	{
+	  if (d->construct)
+	    break;		/* header map: joins are not the probes */
+	  n++;
+	}
+      /* Bail if a constructed dir intervened, the found dir is itself
+	 constructed, or it was never reached walking from START_DIR (the
+	 answer then came from outside this chain).  */
+      if (d != stop || (found && file->dir->construct))
+	verifiable = false;
+      else if (n)
+	{
+	  candidates = XNEWVEC (char *, n);
+	  for (d = start_dir; d != stop; d = d->next)
+	    candidates[n_candidates++] = append_file_to_dir (fname, d);
+	}
+    }
+  if (verifiable)
+    flags |= CPP_HI_PROBE_VERIFIABLE;
+
+  /* Dedupe: an identical evaluation (same operand, same flags, same
+     resolution) is recorded once.  Same-operand records with DIFFERENT
+     results stay separate; only position-dependent forms can produce them,
+     and those are unverifiable, so a consumer keys on them without ever
+     trying to re-verify both.  */
+  for (unsigned i = 0; i < pfile->hi_probe_count; i++)
+    {
+      const struct cpp_hi_probe *p = &pfile->hi_probes[i];
+      if (p->flags == flags
+	  && strcmp (p->name, fname) == 0
+	  && ((p->resolved == NULL) == (resolved == NULL))
+	  && (resolved == NULL || strcmp (p->resolved, resolved) == 0))
+	{
+	  for (unsigned k = 0; k < n_candidates; k++)
+	    free (candidates[k]);
+	  free (candidates);
+	  return;
+	}
+    }
+
+  if (pfile->hi_probe_count == pfile->hi_probe_cap)
+    {
+      pfile->hi_probe_cap = pfile->hi_probe_cap ? 2 * pfile->hi_probe_cap : 8;
+      pfile->hi_probes = XRESIZEVEC (struct cpp_hi_probe, pfile->hi_probes,
+				     pfile->hi_probe_cap);
+    }
+  struct cpp_hi_probe *p = &pfile->hi_probes[pfile->hi_probe_count++];
+  p->name = xstrdup (fname);
+  p->resolved = resolved ? xstrdup (resolved) : NULL;
+  p->candidates = candidates;
+  p->n_candidates = n_candidates;
+  p->flags = flags;
+}
+
 /* Return true if the file FNAME is found in the appropriate include file path
    as indicated by ANGLE_BRACKETS.  */
 
@@ -2563,9 +2707,15 @@ _cpp_has_header (cpp_reader *pfile, const char *fname, int angle_brackets,
   cpp_dir *start_dir = search_path_head (pfile, fname, angle_brackets, type,
 					 /* suppress_diagnostic = */ true);
   if (!start_dir)
-    return false;
+    {
+      record_has_include_probe (pfile, fname, angle_brackets, type,
+				NULL, NULL);
+      return false;
+    }
   _cpp_file *file = _cpp_find_file (pfile, fname, start_dir, angle_brackets,
 				    _cpp_FFK_HAS_INCLUDE, 0);
+  record_has_include_probe (pfile, fname, angle_brackets, type,
+			    start_dir, file);
   return file->err_no != ENOENT;
 }
 
