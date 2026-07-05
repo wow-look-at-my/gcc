@@ -53,7 +53,7 @@ along with GCC; see the file COPYING3.  If not see
       "  %{fmodules-ts:-fmodule-header %{fpreprocessed:-fdirectives-only}}"
       "  %(cc1_options) %2"
       "  %{!fsyntax-only:"
-      "    %{!S:-o %g.s}"
+      "    %{!S:-fasm-output-only -o %g.s}"
       "    %{!fmodule-*:%{!fmodules-*:%{!fdump-ada-spec*:"
       "	         %{!o*:--output-pch %w%i.gch}%W{o*:--output-pch %w%*}}}}%{!S:%V}}"
       "}}}",
@@ -74,7 +74,7 @@ along with GCC; see the file COPYING3.  If not see
       "    %{fpreprocessed:-fdirectives-only}}"
       "  %(cc1_options) %2"
       "  %{!fsyntax-only:"
-      "    %{!S:-o %g.s}"
+      "    %{!S:-fasm-output-only -o %g.s}"
       "    %{!fmodule-*:%{!fmodules-*:%{!fdump-ada-spec*:"
       "	         %{!o*:--output-pch %w%i.gch}%W{o*:--output-pch %w%*}}}}%{!S:%V}}"
       "}}}",
@@ -94,7 +94,7 @@ along with GCC; see the file COPYING3.  If not see
       "  %{fmodules-ts:-fmodule-header=user %{fpreprocessed:-fdirectives-only}}"
       "  %(cc1_options) %2"
       "  %{!fsyntax-only:"
-      "    %{!S:-o %g.s}"
+      "    %{!S:-fasm-output-only -o %g.s}"
       "    %{!fmodule-*:%{!fmodules-*:%{!fdump-ada-spec*:"
       "	         %{!o*:--output-pch %w%i.gch}%W{o*:--output-pch %w%*}}}}%{!S:%V}}"
       "}}}",
@@ -109,7 +109,7 @@ along with GCC; see the file COPYING3.  If not see
       "  %{!save-temps*:%{!no-integrated-cpp:%(cpp_unique_options)}}"
       "  %(cc1_options) %2"
       "  %{!fsyntax-only:"
-      "    %{fmodule-only:%{!S:-o %g.s%V}}"
+      "    %{fmodule-only:%{!S:-fasm-output-only -o %g.s%V}}"
       "    %{!fmodule-only:%(invoke_as)}}"
       "}}}",
       CPLUSPLUS_CPP_SPEC, 0, 0},

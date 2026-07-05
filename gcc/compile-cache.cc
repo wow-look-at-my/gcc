@@ -124,6 +124,17 @@ static const char *cc_dir = NULL;
    end (which can see flag_pch_preprocess / pch_file) before any gating.  */
 static bool cc_pch_active = false;
 
+/* PCH consumption state (set from c_common_read_pch via
+   compile_cache_note_pch_read, DURING parsing -- after enabled_p gating).
+   A consumed FOREIGN pch (anything but the auto-PCH stub this compile was
+   handed via -fauto-pch-ref) hides its baked-in include closure from the
+   cpp_foreach_included_file walk, so neither a trustworthy key nor a
+   closure-complete manifest can be built: serve/store must bail.  Our own
+   stub is fine -- its recorded closure is merged back in from the gch
+   manifest by cc_merge_gch_manifest ().  */
+static bool cc_pch_consumed = false;
+static bool cc_pch_consumed_ours = false;
+
 /* The 40-char lowercase-hex SHA-1 key for this TU, computed by
    compile_cache_try_serve() and reused by compile_cache_store().  */
 static char cc_key_hex[41];
@@ -549,6 +560,19 @@ cc_option_affects_output_p (const cl_decoded_option *decoded)
 /* ------------------------------------------------------------------------ */
 
 bool
+compile_cache_configured_p (void)
+{
+  /* Deliberately does NOT touch cc_enabled / cc_dir: this runs early (from
+     c_common_post_options, before asm_file_name and friends exist), and
+     latching the tri-state here would freeze compile_cache_enabled_p () on
+     incomplete state.  */
+  const char *dir = compile_cache_dir;
+  if (!dir || !dir[0])
+    dir = getenv ("GCC_COMPILE_CACHE_DIR");
+  return dir && dir[0];
+}
+
+bool
 compile_cache_enabled_p (void)
 {
   if (cc_enabled != -1)
@@ -742,6 +766,85 @@ cc_options_append (char **opts, const char *tok)
   *opts = joined;
 }
 
+/* Auto-PCH: fold the consumed .gch's recorded include closure (the gch
+   manifest next to the -fauto-pch-ref stub) into the TU key and the inputs
+   table.  With a PCH loaded, libcpp never stacks the prelude headers, so the
+   cpp_foreach_included_file walk cannot see them -- without this merge the
+   stored manifest would validate a TU whose prelude headers changed and
+   serve a stale object.  The merged records use the digests captured when
+   the .gch was built, which the driver's probe re-validated against the
+   filesystem before injecting.  Returns false on any parse problem (the
+   caller must then distrust the key).  */
+static bool
+cc_merge_gch_manifest (struct sha1_ctx *ctx)
+{
+  const char *stub = flag_auto_pch_ref;
+  if (!stub || !stub[0])
+    return false;
+
+  /* dirname (stub) + "/manifest".  */
+  const char *slash = NULL;
+  for (const char *p = stub; *p; p++)
+    if (IS_DIR_SEPARATOR (*p))
+      slash = p;
+  if (!slash)
+    return false;
+  char *man_path = (char *) xmalloc ((slash - stub) + sizeof ("/manifest"));
+  memcpy (man_path, stub, slash - stub);
+  strcpy (man_path + (slash - stub), "/manifest");
+
+  size_t mlen = 0;
+  unsigned char *man = cc_read_file (man_path, &mlen);
+  free (man_path);
+
+  bool ok = false;
+  if (man
+      && mlen >= CC_MANIFEST_HEADER_SIZE
+      && memcmp (man + CC_MAN_OFF_MAGIC, CC_MANIFEST_MAGIC, CC_MAGIC_LEN) == 0
+      && cc_get_u16 (man + CC_MAN_OFF_VERSION) == CC_MANIFEST_VERSION
+      && cc_get_u32 (man + CC_MAN_OFF_ENTRY_COUNT) == 1)
+    {
+      uint64_t eoff = cc_get_u64 (man + CC_MAN_OFF_ENTRIES_OFF);
+      if (eoff + 32 <= mlen)
+	{
+	  uint32_t hc = cc_get_u32 (man + eoff + 28);
+	  uint64_t recs = eoff + 32;
+	  if (recs + (uint64_t) hc * CC_MAN_HDR_REC_SIZE <= mlen)
+	    {
+	      ok = true;
+	      for (uint32_t hi = 0; hi < hc && ok; hi++)
+		{
+		  const unsigned char *rec
+		    = man + recs + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+		  uint32_t poff = cc_get_u32 (rec + CC_MHR_OFF_PATH);
+		  if ((uint64_t) poff + 4 > mlen)
+		    {
+		      ok = false;
+		      break;
+		    }
+		  uint32_t plen = cc_get_u32 (man + poff);
+		  if ((uint64_t) poff + 4 + plen + 1 > mlen)
+		    {
+		      ok = false;
+		      break;
+		    }
+		  const char *hpath = (const char *) (man + poff + 4);
+		  uint64_t sz = cc_get_u64 (rec + CC_MHR_OFF_SIZE);
+		  uint64_t mt = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
+		  const unsigned char *h = rec + CC_MHR_OFF_HASH;
+
+		  if (cc_paths_affect_output_p ())
+		    cc_hash_str (ctx, CC_TAG_FILE_PATH, hpath);
+		  cc_hash_component (ctx, CC_TAG_FILE_BODY, h, 20);
+		  cc_meta_add_input (hpath, sz, mt, h);
+		}
+	    }
+	}
+    }
+  free (man);
+  return ok;
+}
+
 /* Compute the SHA-1 key for this TU into cc_key_hex / cc_key_raw /
    cc_key_valid, using PFILE for the include closure, and gather the object
    metadata (source/cwd/target/language/options + inputs table) along the way.
@@ -827,6 +930,12 @@ cc_compute_key (cpp_reader *pfile)
   st.ctx = &ctx;
   if (!cpp_foreach_included_file (pfile, cc_hash_one_file, &st))
     return false;		/* a file could not be re-read; don't trust key */
+
+  /* (3b) Auto-PCH: the consumed .gch replaced the prelude headers in the
+     walk above; commit their recorded identities from the gch manifest so
+     the key + manifest stay closure-complete.  */
+  if (cc_pch_consumed_ours && !cc_merge_gch_manifest (&ctx))
+    return false;
 
   sha1_finish_ctx (&ctx, cc_key_raw);
   cc_hex (cc_key_raw, cc_key_hex);
@@ -1395,6 +1504,17 @@ compile_cache_try_serve (cpp_reader *pfile)
   /* A pre-parse manifest hit already served and set cc_hit; nothing to do.  */
   if (cc_hit)
     return true;
+
+  /* A consumed foreign PCH hides its closure from the walk below: neither
+     the key nor the manifest would cover the prelude headers, so a later
+     header edit could serve a stale object.  Bail (leaving cc_key_valid
+     false, which also disables the store).  The auto-PCH stub is exempt:
+     cc_compute_key merges its recorded closure back in.  */
+  if (cc_pch_consumed && !cc_pch_consumed_ours)
+    {
+      cc_debug_line ("skip-foreign-pch", NULL);
+      return false;
+    }
 
   /* Record whether the parse used __has_include so the store can decide
      whether a manifest entry is sound for this TU (it isn't, if it did).  */
@@ -2047,4 +2167,160 @@ compile_cache_store (void)
   free (obj_path);
   free (bin_path);
   cc_meta_clear ();
+}
+
+/* ------------------------------------------------------------------------ */
+/* Transparent auto-PCH (compiler side)                                     */
+/* ------------------------------------------------------------------------ */
+
+/* Called from c_common_read_pch after a PCH was successfully consumed.
+   ORIG_NAME is the header name the PCH was found for.  Records whether the
+   consumed PCH is the auto-PCH stub this compile was handed
+   (-fauto-pch-ref) or a foreign one; see cc_pch_consumed[_ours].  */
+void
+compile_cache_note_pch_read (const char *orig_name)
+{
+  cc_pch_consumed = true;
+  if (flag_auto_pch_ref && orig_name
+      && filename_cmp (orig_name, flag_auto_pch_ref) == 0)
+    cc_pch_consumed_ours = true;
+}
+
+/* Auto-PCH manifest collection: one included file's identity.  */
+struct cc_apch_collect_state
+{
+  cc_input *v;
+  unsigned n, cap;
+  bool oom_fail;
+};
+
+/* cpp_included_file_cb: record PATH + size + mtime + per-file SHA-1, using
+   the digest libcpp stored at read time when present (the gch build runs
+   with the cache configured, so hash-on-read was active), else hashing the
+   handed bytes -- the exact contract cc_hash_one_file uses.  */
+static bool
+cc_apch_collect_one (const char *path, const unsigned char *buffer,
+		     size_t size, const unsigned char *content_sha1,
+		     void *user)
+{
+  struct cc_apch_collect_state *st = (struct cc_apch_collect_state *) user;
+
+  unsigned char fh[20];
+  if (content_sha1)
+    memcpy (fh, content_sha1, 20);
+  else
+    {
+      struct sha1_ctx fctx;
+      sha1_init_ctx (&fctx);
+      if (size)
+	sha1_process_bytes (buffer, size, &fctx);
+      sha1_finish_ctx (&fctx, fh);
+    }
+
+  uint64_t mtime = 0;
+  {
+    struct stat stt;
+    if (stat (path, &stt) == 0)
+      mtime = (uint64_t) stt.st_mtime;
+  }
+
+  if (st->n == st->cap)
+    {
+      unsigned ncap = st->cap ? st->cap * 2 : 32;
+      st->v = XRESIZEVEC (cc_input, st->v, ncap);
+      st->cap = ncap;
+    }
+  cc_input *in = &st->v[st->n++];
+  in->path = xstrdup (path);
+  in->size = size;
+  in->mtime = mtime;
+  memcpy (in->hash, fh, 20);
+  return true;
+}
+
+/* Called from c_common_write_pch after the .gch was fully written.  When
+   the driver requested it (-fauto-pch-store=PATH on this PCH build), write
+   the include closure this .gch baked in as a single-entry manifest (the
+   same on-disk format the .o cache's manifests use, so the driver validates
+   it with the same code) to PATH.  PATH is a driver-owned temp; the driver
+   renames it into the entry on success, so no atomicity is needed here.
+   Any failure leaves PATH absent/short, which the driver treats as a failed
+   generation (negative entry).  */
+void
+compile_cache_auto_pch_store (cpp_reader *pfile)
+{
+  const char *out = flag_auto_pch_store;
+  if (!out || !out[0] || !pfile)
+    return;
+
+  struct cc_apch_collect_state st;
+  st.v = NULL;
+  st.n = 0;
+  st.cap = 0;
+  st.oom_fail = false;
+
+  bool ok = cpp_foreach_included_file (pfile, cc_apch_collect_one, &st);
+
+  if (ok)
+    {
+      cc_blob strings = { NULL, 0, 0 };
+      cc_blob entries = { NULL, 0, 0 };
+
+      unsigned char head[32];
+      memset (head, 0, sizeof (head));	/* OK slot unused: 20 zero bytes */
+      cc_put_u32 (head + 28, st.n);
+      cc_blob_append (&entries, head, 32);
+      for (unsigned i = 0; i < st.n; i++)
+	{
+	  uint32_t npath = cc_blob_add_string (&strings, st.v[i].path);
+	  unsigned char nrec[CC_MAN_HDR_REC_SIZE];
+	  cc_put_u32 (nrec + CC_MHR_OFF_PATH, npath);	/* rebased below */
+	  cc_put_u64 (nrec + CC_MHR_OFF_SIZE, st.v[i].size);
+	  cc_put_u64 (nrec + CC_MHR_OFF_MTIME, st.v[i].mtime);
+	  memcpy (nrec + CC_MHR_OFF_HASH, st.v[i].hash, 20);
+	  cc_blob_append (&entries, nrec, CC_MAN_HDR_REC_SIZE);
+	}
+
+      uint64_t entries_off = CC_MANIFEST_HEADER_SIZE;
+      uint64_t string_area_off = entries_off + entries.len;
+      for (unsigned i = 0; i < st.n; i++)
+	{
+	  unsigned char *rec = entries.data + 32
+			       + (uint64_t) i * CC_MAN_HDR_REC_SIZE;
+	  uint32_t rel = cc_get_u32 (rec + CC_MHR_OFF_PATH);
+	  cc_put_u32 (rec + CC_MHR_OFF_PATH, rel + (uint32_t) string_area_off);
+	}
+
+      unsigned char mhdr[CC_MANIFEST_HEADER_SIZE];
+      memset (mhdr, 0, sizeof (mhdr));
+      memcpy (mhdr + CC_MAN_OFF_MAGIC, CC_MANIFEST_MAGIC, CC_MAGIC_LEN);
+      cc_put_u16 (mhdr + CC_MAN_OFF_VERSION, (uint16_t) CC_MANIFEST_VERSION);
+      cc_put_u32 (mhdr + CC_MAN_OFF_ENTRY_COUNT, 1);
+      cc_put_u64 (mhdr + CC_MAN_OFF_ENTRIES_OFF, entries_off);
+
+      FILE *f = fopen (out, "wb");
+      ok = (f != NULL);
+      if (ok)
+	{
+	  ok = (fwrite (mhdr, 1, sizeof (mhdr), f) == sizeof (mhdr));
+	  if (ok && entries.len)
+	    ok = (fwrite (entries.data, 1, entries.len, f) == entries.len);
+	  if (ok && strings.len)
+	    ok = (fwrite (strings.data, 1, strings.len, f) == strings.len);
+	  if (fclose (f) != 0)
+	    ok = false;
+	}
+      if (!ok)
+	unlink (out);		/* leave no half-written manifest behind */
+
+      free (entries.data);
+      free (strings.data);
+    }
+
+  cc_debug_line (ok ? "auto-pch-manifest-store" : "auto-pch-manifest-FAIL",
+		 NULL);
+
+  for (unsigned i = 0; i < st.n; i++)
+    free (st.v[i].path);
+  free (st.v);
 }
