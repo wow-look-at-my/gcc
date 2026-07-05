@@ -1256,8 +1256,20 @@ Common Var(flag_compare_elim_after_reload) Optimization
 Perform comparison elimination after register allocation has finished.
 
 fcompile-cache=
-Common Joined RejectNegative Var(compile_cache_dir)
+Common Joined RejectNegative Var(compile_cache_dir) NoDWARFRecord
 Cache assembly output in DIR, keyed by source and options, and reuse it on identical inputs.  Overridden by the GCC_COMPILE_CACHE_DIR environment variable when this is unset.
+
+fauto-pch
+Common Driver Var(flag_auto_pch) NoDWARFRecord
+Automatically build and reuse a precompiled header for a TU's leading run of #include <...> directives, stored in the compile cache directory.  No effect unless the compile cache is configured.  Also enabled by GCC_AUTO_PCH=1 in the environment.
+
+fauto-pch-store=
+Common Joined RejectNegative RejectDriver Undocumented Var(flag_auto_pch_store) NoDWARFRecord
+Internal (driver to cc1plus): write this PCH build's include-closure manifest to the given path.
+
+fauto-pch-ref=
+Common Joined RejectNegative RejectDriver Undocumented Var(flag_auto_pch_ref) NoDWARFRecord
+Internal (driver to cc1plus): this compile consumes the driver-injected auto-PCH stub header at the given path.
 
 fconserve-stack
 Common Var(flag_conserve_stack) Optimization

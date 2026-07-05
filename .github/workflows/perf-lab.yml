@@ -1,0 +1,289 @@
+name: perf-lab
+
+# Benchmark rig: compile-time numbers for this fork's perf work (dir index,
+# GGC 512M cap + MADV_HUGEPAGE, tcmalloc, readlink skip, hash-on-read),
+# measured on GitHub-hosted runners. See contrib/perf-lab/README.md.
+#
+# Pipeline:  census -> build (matrix: base?/tip) -> shards (matrix: one
+# TU x flag cell per job) -> aggregate.  The build legs compile the two
+# GCCs in parallel and ship each as a minimal ~compressed artifact; every
+# measurement cell then runs as its own shard job (self-contained
+# interleaved A/B on one pinned core), and aggregate merges the shard rows
+# into the final table.  Composed wall time target: ~40-45 min, vs ~4-5 h
+# for the old single sequential job.
+#
+# Hosted runners only, dispatch-only. Nothing here targets self-hosted
+# hardware, and nothing runs on push: every run is a deliberate manual
+# dispatch. ci.yml stays untouched: this is a different trigger, not
+# another per-push CI workflow.
+#
+# No workflow-level concurrency group: perf-lab runs may execute
+# concurrently BY DESIGN on hosted runners (each run's jobs get their own
+# isolated VMs, so parallel runs cannot perturb each other's numbers; the
+# per-cell A/B interleaving inside a shard is what controls noise). The
+# never-cancel discipline stands: no run cancels any other, ever -- the
+# one-at-a-time queue was a self-hosted-era artifact and is gone.
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: >-
+          census = environment probe only; quick = stl+big -O2 on tip;
+          composed = base-vs-tip A/B incl. THP fault deltas; pch = PCH
+          ceiling; full = composed+pch
+        type: choice
+        options:
+          - census
+          - quick
+          - composed
+          - pch
+          - full
+        default: quick
+      bench_ref:
+        description: 'Git ref whose compiler gets benchmarked (the "tip" side)'
+        type: string
+        default: develop-matt/v14
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Pre-optimization baseline for the composed A/B: develop-matt/v14 at the
+  # PR #13 merge base (the compiler the merged wins were measured against).
+  PERF_LAB_BASE_SHA: 5226232bbe76093d3b7ef87d1925f36fb5b4bd58
+
+jobs:
+  # Near-instant environment probe. Gates nothing, assumes nothing (no
+  # checkout, no toolchain): its whole job is to tell us what the hosted
+  # runner environment actually is -- CPU model, core count, and above all
+  # the transparent-hugepage mode, which decides whether the MADV_HUGEPAGE
+  # win is expressible here at all.
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Environment census
+        run: |
+          {
+            echo '## perf-lab census'
+            echo '```'
+            echo "RUNNER_NAME=${RUNNER_NAME:-<unset>}"
+            echo "RUNNER_OS=${RUNNER_OS:-<unset>} RUNNER_ARCH=${RUNNER_ARCH:-<unset>}"
+            echo "hostname=$(hostname 2>/dev/null || echo n/a)"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "--- uname -a"
+            uname -a || true
+            echo "--- /etc/os-release"
+            cat /etc/os-release 2>/dev/null || echo "(missing)"
+            echo "--- nproc"
+            nproc || true
+            echo "--- free -h"
+            free -h 2>/dev/null || echo "(free missing)"
+            echo "--- lscpu (model/topology)"
+            lscpu 2>/dev/null | grep -iE 'model name|vendor|socket|core|thread|mhz|numa' || echo "(lscpu missing)"
+            echo "--- transparent_hugepage/enabled"
+            cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo "(no THP sysfs)"
+            echo "--- transparent_hugepage/defrag"
+            cat /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || echo "(no defrag sysfs)"
+            echo "--- vm.nr_hugepages"
+            cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo "(missing)"
+            echo "--- /proc/vmstat thp counters"
+            grep -E '^thp_(fault_alloc|collapse_alloc)' /proc/vmstat 2>/dev/null || echo "(none)"
+            echo "--- toolchain presence"
+            for c in gcc g++ make flex bison m4 patch curl xz tar git \
+                     apt-get dpkg sudo docker taskset strace python3 node; do
+              printf '%-10s %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo MISSING)"
+            done
+            printf '%-10s %s\n' "time-v" "$([ -x /usr/bin/time ] && echo /usr/bin/time || echo MISSING)"
+            echo "--- gcc --version"
+            gcc --version 2>/dev/null | head -n1 || echo "(no gcc)"
+            echo "--- g++ --version"
+            g++ --version 2>/dev/null | head -n1 || echo "(no g++)"
+            echo "--- id"
+            id || true
+            echo "--- passwordless sudo"
+            if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+              echo "yes"
+            else
+              echo "no (or sudo missing)"
+            fi
+            echo "--- df -h workspace"
+            df -h "$GITHUB_WORKSPACE" 2>/dev/null || df -h . 2>/dev/null || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # One compiler build per matrix leg, in parallel: tip (the bench_ref) and,
+  # for the A/B suites, the pinned pre-optimization base. Each leg runs the
+  # exact ci.yml combined-tree recipe, then packages the minimal runnable
+  # subset (xg++, cc1plus, -B dir bits, libstdc++ + libsupc++ headers -- see
+  # contrib/perf-lab/pack-compiler.sh) as a zstd tar artifact for the shards.
+  # Hosted tip build measured at ~14 min; timeout leaves generous slack.
+  build:
+    needs: census
+    if: inputs.suite != 'census'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        side: ${{ (inputs.suite == 'composed' || inputs.suite == 'full') && fromJSON('["base","tip"]') || fromJSON('["tip"]') }}
+    steps:
+      - name: Check out harness (this branch)
+        uses: actions/checkout@v4
+        with:
+          path: rig
+
+      - name: Install dependencies
+        run: bash rig/contrib/perf-lab/install-deps.sh
+
+      - name: Check out ${{ matrix.side }} source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.side == 'base' && env.PERF_LAB_BASE_SHA || inputs.bench_ref }}
+          path: src
+          fetch-depth: 1
+
+      - name: Build ${{ matrix.side }} compiler
+        run: >-
+          bash rig/contrib/perf-lab/build-gcc.sh
+          "$GITHUB_WORKSPACE/src"
+          "$GITHUB_WORKSPACE/build"
+          "$GITHUB_WORKSPACE/dl"
+
+      - name: Package minimal compiler set
+        run: >-
+          bash rig/contrib/perf-lab/pack-compiler.sh
+          "$GITHUB_WORKSPACE/build"
+          "$GITHUB_WORKSPACE/compiler-${{ matrix.side }}.tar.zst"
+
+      - name: Upload compiler artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiler-${{ matrix.side }}
+          path: compiler-${{ matrix.side }}.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+
+  # One measurement cell per shard job. Every shard is self-contained: it
+  # downloads the compiler artifact(s), regenerates its bench TU
+  # deterministically, and runs the full interleaved A/B protocol for its
+  # cell only -- warmups + median-of-7 (5 for huge), sides alternating
+  # run-by-run on the same pinned core, /usr/bin/time -v, plus only the
+  # extras its cell needs (THP deltas, strace, PCH build/verify). Inside a
+  # shard everything is serial on one core; the matrix supplies ALL
+  # parallelism. A shard whose two sides' spreads overlap reports NOISY
+  # rather than pretending significance.
+  shards:
+    needs: build
+    if: inputs.suite != 'census'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # keep this suite->cells map in sync with EXPECTED_CELLS in aggregate
+        cell: ${{ fromJSON('{"census":["none"],"quick":["stl-O2","big-O2"],"composed":["light-O0","stl-O0","stl-O2","big-O2","realism-O0","huge-O2","huge-O2-never"],"pch":["pch-stl-O0","pch-stl-O0g","pch-stl-O2","pch-json-O0","pch-json-O2","pch-big-O2","pch-anchor-O0"],"full":["light-O0","stl-O0","stl-O2","big-O2","realism-O0","huge-O2","huge-O2-never","pch-stl-O0","pch-stl-O0g","pch-stl-O2","pch-json-O0","pch-json-O2","pch-big-O2","pch-anchor-O0"]}')[inputs.suite] }}
+    env:
+      BENCH_REF: ${{ inputs.bench_ref }}
+      # A/B cells need the base compiler; quick/pch cells are tip-only
+      AB: ${{ (inputs.suite == 'composed' || inputs.suite == 'full') && !startsWith(matrix.cell, 'pch-') }}
+    steps:
+      - name: Check out harness (this branch)
+        uses: actions/checkout@v4
+        with:
+          path: rig
+
+      - name: Install dependencies
+        run: bash rig/contrib/perf-lab/install-deps.sh
+
+      - name: Download tip compiler
+        uses: actions/download-artifact@v4
+        with:
+          name: compiler-tip
+          path: dl
+
+      - name: Download base compiler
+        if: env.AB == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: compiler-base
+          path: dl
+
+      - name: Unpack compilers
+        run: |
+          mkdir -p tip
+          tar --zstd -xf dl/compiler-tip.tar.zst -C tip
+          if [ "$AB" = "true" ]; then
+            mkdir -p base
+            tar --zstd -xf dl/compiler-base.tar.zst -C base
+          fi
+          df -h "$GITHUB_WORKSPACE" || true
+
+      - name: Generate benchmark TUs
+        run: bash rig/contrib/perf-lab/gen-benches.sh "$GITHUB_WORKSPACE/bench-work"
+
+      - name: Run shard ${{ matrix.cell }}
+        env:
+          BENCH_DIR: ${{ github.workspace }}/bench-work
+          RESULTS_DIR: ${{ github.workspace }}/results
+        run: |
+          if [ "$AB" = "true" ]; then
+            bash rig/contrib/perf-lab/run-shard.sh "${{ matrix.cell }}" \
+              "$GITHUB_WORKSPACE/tip" "$GITHUB_WORKSPACE/base"
+          else
+            bash rig/contrib/perf-lab/run-shard.sh "${{ matrix.cell }}" \
+              "$GITHUB_WORKSPACE/tip"
+          fi
+
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.cell }}
+          path: results/
+          if-no-files-found: warn
+
+  # Merge every shard's summary row into the final table (cell | base | tip
+  # | ratio | spread | verdict), check each confident result against the
+  # expected direction of the merged wins, flag surprises, and publish the
+  # one-stop perf-lab-results artifact. Runs even when some shards failed
+  # (fail-fast is off; missing cells are reported as MISSING).
+  aggregate:
+    needs: shards
+    if: ${{ always() && needs.shards.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SUITE: ${{ inputs.suite }}
+      # keep in sync with the shards matrix map above
+      EXPECTED_CELLS: ${{ join(fromJSON('{"census":["none"],"quick":["stl-O2","big-O2"],"composed":["light-O0","stl-O0","stl-O2","big-O2","realism-O0","huge-O2","huge-O2-never"],"pch":["pch-stl-O0","pch-stl-O0g","pch-stl-O2","pch-json-O0","pch-json-O2","pch-big-O2","pch-anchor-O0"],"full":["light-O0","stl-O0","stl-O2","big-O2","realism-O0","huge-O2","huge-O2-never","pch-stl-O0","pch-stl-O0g","pch-stl-O2","pch-json-O0","pch-json-O2","pch-big-O2","pch-anchor-O0"]}')[inputs.suite], ' ') }}
+    steps:
+      - name: Check out harness (this branch)
+        uses: actions/checkout@v4
+        with:
+          path: rig
+
+      - name: Download shard results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards-in
+
+      - name: Aggregate shard results
+        run: >-
+          bash rig/contrib/perf-lab/aggregate-shards.sh
+          "$GITHUB_WORKSPACE/shards-in"
+          "$GITHUB_WORKSPACE/results"
+
+      - name: Upload merged results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-lab-results
+          path: results/
+          if-no-files-found: warn

@@ -98,4 +98,32 @@ extern bool compile_cache_serve_object (const cc_serve_ctx *ctx,
 					const char *src_path,
 					const char *out_path);
 
+/* ---- Transparent auto-PCH (driver side; see the section in the .cc) ---- */
+
+/* Scan raw source bytes for a leading include-only prelude and produce the
+   NORMALIZED stub for it: include logical lines verbatim, all other lines
+   blanked, line positions preserved (see the .cc).  Sets *NORM (xmalloc'd;
+   NULL when no include was accepted), *NORM_LEN, and *INCLUDE_COUNT.  */
+extern bool cc_auto_pch_scan_prelude (const unsigned char *src, size_t len,
+				      unsigned char **norm, size_t *norm_len,
+				      unsigned *include_count);
+
+/* Derive the cache entry base path "<dir>/pch/<2hex>/<38hex>" for this
+   prelude under CTX's flag cell + compiler id.  xmalloc'd.  */
+extern char *cc_auto_pch_entry_base (const cc_serve_ctx *ctx,
+				     const unsigned char *prelude,
+				     size_t plen);
+
+/* Probe result for cc_auto_pch_probe.  */
+enum cc_auto_pch_probe_result
+{
+  CC_APCH_USABLE,	/* entry valid: inject -include <base>/stub.h */
+  CC_APCH_ABSENT,	/* no (valid) entry: candidate for generation */
+  CC_APCH_NEGATIVE	/* valid do-not-use marker: compile normally */
+};
+
+extern enum cc_auto_pch_probe_result
+cc_auto_pch_probe (const cc_serve_ctx *ctx, const char *base,
+		   const unsigned char *prelude, size_t plen);
+
 #endif /* GCC_COMPILE_CACHE_SERVE_H */
