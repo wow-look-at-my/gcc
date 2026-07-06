@@ -1,0 +1,82 @@
+# GCC testsuite gate + corpus validation
+
+How this fork proves it is a **drop-in replacement** for upstream GCC 14.4.1:
+a dejagnu-testsuite diff gate against a vanilla baseline, plus a corpus of
+real projects built with the shipping compiler. Everything lives in
+`.github/workflows/ci.yml`.
+
+## The pieces
+
+| job | trigger | what it does |
+|---|---|---|
+| `testsuite-baseline` | dispatch with `build_baseline=true` | Builds **pristine upstream GCC at the fork point** (commit `820ff02b9` "Bump BASE-VER.", releases/gcc-14, 14.4.1 -- no fork patches, no binutils/libgas overlay) and runs `check-gcc`, `check-g++` and the libstdc++ suite in two shards. |
+| `testsuite-baseline-publish` | same dispatch | Tars the three baseline `.sum` files (+ `BASELINE-INFO.txt` provenance) and publishes them to buildhost project `gcc/testsuite-baseline`. |
+| `testsuite` | pushes to `develop-matt/v14`, or dispatch with `run_testsuite=true` | Runs the same three suites against the fork compiler (the `gccbuild` artifact from `build`), downloads the latest published baseline, and **fails on any new FAIL or XPASS** (see gate semantics below). Not on every push: the suites are multi-hour, a deliberate deviation from the org's plain `on: push` default. |
+| `corpus` | pushes to `develop-matt/v14`, or dispatch with `run_corpus=true` | Builds openssl / zlib-ng / sqlite / fmt / llama.cpp with the shipping `gcc-dist`: cache OFF, cache ON cold, cache ON warm in a fresh build dir. Asserts builds + quick tests pass, **warm objects are byte-identical to cold**, and the warm build really served from the cache (per-project hit floors; the llama.cpp RelWithDebInfo leg requires >= 300 cross-directory manifest hits through `-ffile-prefix-map=<builddir>=.`, exercising the prefix-mapped `-g` keys). |
+
+## Gate semantics (`.github/scripts/testsuite-diff.mjs`)
+
+For each `.sum` pair the job runs `contrib/compare_tests` (embedded in the
+report, informational) and gates on its own parse:
+
+- **new FAIL** -- a test that FAILs now but did not FAIL in the baseline.
+  Mirrors compare_tests normalization: `XFAIL` and `ERROR` count as FAIL on
+  both sides, so `PASS -> XFAIL` gates and `XFAIL -> FAIL` does not; a test
+  absent from the baseline that FAILs now gates too.
+- **new XPASS** -- a test XPASSing now that did not XPASS in the baseline
+  (compare_tests folds XPASS into PASS, so this class is gated here).
+
+Progressions (new PASSes, fixed FAILs) and disappeared tests never gate.
+The fork's `.sum` files plus the diff report are uploaded as the
+`testsuite-sums-<shard>` artifact on every run, pass or fail.
+
+## Generating / regenerating the baseline
+
+The `testsuite` job **cannot pass until a baseline has been published once**
+(it fails fast, before running any suite, with a pointer here). Publish one
+with:
+
+```
+gh workflow run ci.yml -R wow-look-at-my/gcc --ref <branch> -f build_baseline=true
+```
+
+Result: `https://dl.pazer.build/gcc/testsuite-baseline?os=linux&arch=amd64`
+(anonymous download; the gate always takes the latest published version,
+regardless of branch -- the baseline is a property of the fork point, not of
+a branch). Regenerate when:
+
+- the fork rebases onto a new upstream commit (update the fork-point sha in
+  `ci.yml` and here first), or
+- the runner image moves enough to shift environment-dependent tests --
+  skew shows up as unexplained paired diffs in the gate report.
+
+## Waiving known-benign diffs
+
+`.github/testsuite-known-diffs.txt` is consulted before failing. One entry
+per line, `#` comments ignored:
+
+```
+<test text>              # waives the test in every .sum
+<sum>:<test text>        # one .sum only, e.g.:
+g++.sum:g++.dg/opt/pr12345.C  -std=c++17 (test for excess errors)
+```
+
+The text must match the `.sum` line after `FAIL: `/`XPASS: ` exactly
+(trimmed). Take entries verbatim from the gate's `GATE new FAIL:`/`GATE new
+XPASS:` log lines or the report artifact, and annotate each with a comment
+saying why it is benign. The gate logs unused entries so stale waivers can
+be pruned.
+
+## Corpus notes
+
+- Sources are pinned (openssl-3.3.1, zlib-ng 2.2.1, sqlite amalgamation
+  3.46.1, fmt 11.0.2, llama.cpp b9891) in `.github/scripts/ci-corpus.mjs`.
+- `SOURCE_DATE_EPOCH` is pinned so openssl's `buildinf.h` timestamp cannot
+  break the cold/warm byte-identity assertion.
+- Byte identity is only asserted cold-vs-warm (both compiled with
+  `-fcompile-cache`): the cache-OFF build differs legitimately under `-g`
+  because `DW_AT_producer` records the extra flag.
+- The hit floors exist because byte identity alone cannot distinguish "warm
+  serve" from "deterministic recompile"; a floor shortfall means the serve
+  path regressed. Failure evidence (per-phase cache-debug logs, object-hash
+  manifests) lands in the `corpus-logs-<project>` artifact.
