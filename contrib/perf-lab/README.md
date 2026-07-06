@@ -60,8 +60,24 @@ Actions -> perf-lab -> Run workflow:
 
 | input | meaning |
 |---|---|
-| `suite` | `census` (environment probe only), `quick` (tip-only stl-O2 + big-O2 shards), `composed` (base-vs-tip A/B: light-O0, stl-O0, stl-O2, big-O2, realism-O0, huge-O2, huge-O2-never), `pch` (PCH ceiling: pch-stl-O0/O0g/O2, pch-json-O0/O2, pch-big-O2, pch-anchor-O0, tip only), `full` (composed + pch shards) |
+| `suite` | `census` (environment probe only), `quick` (tip-only stl-O2 + big-O2 shards), `composed` (base-vs-tip A/B: light-O0, stl-O0, stl-O2, big-O2, realism-O0, huge-O2, huge-O2-never), `pch` (PCH ceiling: pch-stl-O0/O0g/O2, pch-json-O0/O2, pch-big-O2, pch-anchor-O0, tip only), `full` (composed + pch shards), `selfbuild` (one stage's compiler compiles the pinned GCC-source workload; feeds the repo-root README table) |
 | `bench_ref` | ref whose compiler is benchmarked ("tip"), default `develop-matt/v14` |
+| `stage_ref` | selfbuild only: ref/SHA of the stage to measure (SHAs under `refs/pull/N/head` work) |
+| `stage_label` | selfbuild only: optional human label for the emitted README row |
+
+`selfbuild` bypasses the build/shards/aggregate chain entirely: it is one
+self-contained 120-min-budget job (census still runs first) that builds the
+stage compiler with the recipe class its tree demands (combined tree when
+`contrib/gas-embed` is present -- every fork stage from PR #2 on; plain
+upstream recipe for the pre-fork stock point), runs `make all-gcc` on the
+PINNED workload checkout with the system compiler purely to materialize
+generated headers (its wall doubles as a constant-input runner-speed
+calibration), then times the stage compiler compiling every file in
+`selfbuild-workload-v1.txt`: 1 parallel warmup + median-of-3 serial pinned
+pass sums + one `-j4` wall, caches off. Results: step-summary section,
+`selfbuild-results` artifact (summary TSV, raw per-compile TSV, per-file
+medians, ready-to-paste `README-row.md`). Protocol details and the row
+format live in the repo-root `README.md` ("Compile-time performance work").
 
 The composed base is pinned to `5226232bb` (the PR #13 merge base) in the
 workflow env. Every dispatch first runs the near-instant `census` job -- a
@@ -83,6 +99,8 @@ TSV + every shard's raw files), and the per-shard `shard-<cell>` artifacts.
 | `run-shard.sh CELL TIP [BASE]` | ONE cell's complete measurement (the CI path): warmups + interleaved median-of-N A/B on a pinned core, only that cell's extras (THP deltas / strace / PCH build+verify), writes `shard-summary.tsv` and self-reports NOISY when its two sides' ranges overlap |
 | `aggregate-shards.sh SHARDS_IN OUT` | merge shard summaries into the final table, expected-direction checks, SURPRISE flags, one-stop artifact |
 | `run-suite.sh SUITE TIP [BASE]` | the original one-box protocol (all cells sequentially in one process); kept for local runs and as the protocol reference -- the shards run the same per-cell protocol |
+| `selfbuild-suite.sh STAGE_SRC WORKLOAD_SRC [OUT] [DL]` | the `selfbuild` suite: build the stage compiler (recipe auto-detected), prep the pinned workload tree's generated headers, time the stage compiler compiling workload v1 (serial pinned sum median-of-3 + `-j4` wall), emit the README row |
+| `selfbuild-workload-v1.txt` | FROZEN workload v1 file list (16 libcpp + 25 heavyweight gcc/ files, content pinned at the fork point `820ff02b9`); a new workload is a new file + a new README column regime |
 | `tu/` | small TUs + PCH preludes, byte-identical to the ones the merged numbers were measured with |
 
 ## Measurement protocol
