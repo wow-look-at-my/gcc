@@ -51,6 +51,7 @@ extern bool cc_option_affects_output_p (const cl_decoded_option *decoded);
 extern bool cc_option_is_search_path_p (const cl_decoded_option *decoded);
 
 #include <sys/stat.h>
+#include <dirent.h>		/* shard scans for B1 eviction */
 /* For the opportunistic reflink rung of cc_place_object().  Guarded so the
    feature compiles in only where the kernel headers expose FICLONE (Linux);
    elsewhere cc_place_object falls back to hardlink/copy.  The reflink block in
@@ -1675,6 +1676,9 @@ cc_serve_from_bin (const char *ok_hex, bool require_no_fe_diag,
      -fintegrated-as (gating check #10), so asm_file_name is the real .o path
      and asm_out_file is the (still-open, empty-on-a-hit) memstream.  */
   bool placed = cc_place_object (obj_path, asm_file_name);
+  if (placed)
+    /* Mark the entry recently-used so LRU eviction spares it (B1).  */
+    cc_touch_entry (obj_path);
   free (obj_path);
   free (bin_path);
   if (!placed)
@@ -1894,6 +1898,13 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
 		    if (hpath && strcmp (hpath, src_path) != 0)
 		      deps_add_dep (mdeps, hpath);
 		  }
+	      /* Bump the manifest too: it answered this hit (B1).  */
+	      {
+		char *mp = cc_entry_path (cc_manifest_key_hex,
+					  /*make_dirs=*/false);
+		cc_touch_entry (mp);
+		free (mp);
+	      }
 	      free (man);
 	      return true;
 	    }
@@ -1913,6 +1924,278 @@ bool
 compile_cache_hit_p (void)
 {
   return cc_hit;
+}
+
+/* ------------------------------------------------------------------------ */
+/* B1: cache size cap + LRU eviction (store side)                           */
+/* ------------------------------------------------------------------------ */
+
+/* GCC_COMPILE_CACHE_MAX_SIZE=N[K|M|G|T][B] caps the total cache size; unset,
+   0, or unparsable means unlimited -- no stats are maintained and no
+   eviction runs, so the un-capped hot path pays nothing.  Suffixes are
+   powers of 1024, case-insensitive, optional trailing B ("512M", "2g",
+   "1024KB", plain bytes).
+
+   Accounting is ccache-style per shard: each 2-hex subdir owns cap/256.
+   Every store updates a tiny per-shard stats file ("DIR/xx/shard-stats",
+   torn-tolerant text, atomic tmp+rename); when the shard's recorded bytes
+   exceed its budget, the shard is swept: entries are ranked by mtime
+   (last-use -- serve hits bump it via cc_touch_entry) and the oldest are
+   unlinked until the shard is under ~90% of its budget.  Concurrent stores
+   can lose a stats update (read-modify-write race); that only delays a
+   sweep by one store, and every sweep rewrites exact numbers from its own
+   directory scan, so the stats self-heal.  Hardlink-served user objects
+   share the inode with the cache entry, so evicting (unlinking) the cache
+   path never harms an already-served .o.  Evicting an object a manifest
+   still points to degrades to a clean miss at serve time (the serve treats
+   a missing object as a miss, never an error); an evicted manifest is
+   rebuilt by the next store.  The auto-PCH subtree (DIR/pch/...) is not
+   governed by this cap (its entries are directories with their own
+   lifecycle); only the 2-hex object/manifest shards are.  */
+
+#define CC_SHARD_STATS_NAME "shard-stats"
+
+/* Parse the cap once.  0 = unlimited.  */
+static uint64_t
+cc_max_size_bytes (void)
+{
+  static int parsed = 0;
+  static uint64_t cap = 0;
+  if (parsed)
+    return cap;
+  parsed = 1;
+  const char *e = getenv ("GCC_COMPILE_CACHE_MAX_SIZE");
+  if (!e || !e[0])
+    return cap;
+  char *end = NULL;
+  errno = 0;
+  unsigned long long v = strtoull (e, &end, 10);
+  if (errno != 0 || end == e)
+    return cap;
+  uint64_t mult = 1;
+  if (*end == 'k' || *end == 'K')
+    mult = 1024ULL, end++;
+  else if (*end == 'm' || *end == 'M')
+    mult = 1024ULL * 1024, end++;
+  else if (*end == 'g' || *end == 'G')
+    mult = 1024ULL * 1024 * 1024, end++;
+  else if (*end == 't' || *end == 'T')
+    mult = 1024ULL * 1024 * 1024 * 1024, end++;
+  if (*end == 'b' || *end == 'B')
+    end++;
+  if (*end != '\0')
+    return cap;			/* trailing junk: treat as unset */
+  cap = (uint64_t) v * mult;
+  return cap;
+}
+
+/* Read "DIR/xx/shard-stats" ("ccstats1 <bytes> <files>\n").  Any parse
+   failure returns false (caller recounts).  */
+static bool
+cc_shard_stats_read (const char *sdir, uint64_t *bytes, uint64_t *files)
+{
+  char *p = concat (sdir, "/", CC_SHARD_STATS_NAME, NULL);
+  FILE *f = fopen (p, "r");
+  free (p);
+  if (!f)
+    return false;
+  char tag[16];
+  unsigned long long b = 0, n = 0;
+  bool ok = (fscanf (f, "%15s %llu %llu", tag, &b, &n) == 3
+	     && strcmp (tag, "ccstats1") == 0);
+  fclose (f);
+  if (!ok)
+    return false;
+  *bytes = b;
+  *files = n;
+  return true;
+}
+
+/* Atomically (tmp+rename) publish the shard stats.  Best-effort.  */
+static void
+cc_shard_stats_write (const char *sdir, uint64_t bytes, uint64_t files)
+{
+  char *fin = concat (sdir, "/", CC_SHARD_STATS_NAME, NULL);
+  char *tmp = concat (fin, ".tmpXXXXXX", NULL);
+  int fd = mkstemp (tmp);
+  if (fd >= 0)
+    {
+      FILE *f = fdopen (fd, "w");
+      if (f)
+	{
+	  bool ok = (fprintf (f, "ccstats1 %llu %llu\n",
+			      (unsigned long long) bytes,
+			      (unsigned long long) files) > 0);
+	  if (fclose (f) != 0)
+	    ok = false;
+	  if (!ok || rename (tmp, fin) != 0)
+	    unlink (tmp);
+	}
+      else
+	{
+	  close (fd);
+	  unlink (tmp);
+	}
+    }
+  free (tmp);
+  free (fin);
+}
+
+/* One scanned shard entry, for the sweep's LRU ranking.  */
+struct cc_shard_ent
+{
+  char *name;			/* entry basename (xmalloc'd) */
+  uint64_t size;
+  uint64_t mtime_s;
+  uint32_t mtime_ns;
+};
+
+/* Oldest (least recently used) first; basename tie-break for determinism
+   within one mtime tick.  */
+static int
+cc_shard_ent_cmp (const void *pa, const void *pb)
+{
+  const struct cc_shard_ent *a = (const struct cc_shard_ent *) pa;
+  const struct cc_shard_ent *b = (const struct cc_shard_ent *) pb;
+  if (a->mtime_s != b->mtime_s)
+    return a->mtime_s < b->mtime_s ? -1 : 1;
+  if (a->mtime_ns != b->mtime_ns)
+    return a->mtime_ns < b->mtime_ns ? -1 : 1;
+  return strcmp (a->name, b->name);
+}
+
+/* Scan SDIR into a freshly xmalloc'd entry array (caller frees each name +
+   the array); returns the count and total byte size.  Skips ".", "..", the
+   stats file, and in-flight "*.tmp*" temporaries (mkstemp names in this
+   cache always contain ".tmp").  */
+static struct cc_shard_ent *
+cc_shard_scan (const char *sdir, unsigned *count_out, uint64_t *bytes_out)
+{
+  *count_out = 0;
+  *bytes_out = 0;
+  DIR *d = opendir (sdir);
+  if (!d)
+    return NULL;
+  unsigned cap = 0, n = 0;
+  struct cc_shard_ent *ents = NULL;
+  struct dirent *de;
+  while ((de = readdir (d)) != NULL)
+    {
+      const char *nm = de->d_name;
+      if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0')))
+	continue;
+      if (strcmp (nm, CC_SHARD_STATS_NAME) == 0)
+	continue;
+      if (strstr (nm, ".tmp") != NULL)
+	continue;		/* in-flight temp of a concurrent store */
+      char *full = concat (sdir, "/", nm, NULL);
+      struct stat st;
+      if (stat (full, &st) != 0 || !S_ISREG (st.st_mode))
+	{
+	  free (full);
+	  continue;
+	}
+      free (full);
+      if (n == cap)
+	{
+	  cap = cap ? cap * 2 : 32;
+	  ents = XRESIZEVEC (struct cc_shard_ent, ents, cap);
+	}
+      struct cc_statid id;
+      cc_statid_from_stat (&st, &id);
+      ents[n].name = xstrdup (nm);
+      ents[n].size = (uint64_t) st.st_size;
+      ents[n].mtime_s = id.mtime_s;
+      ents[n].mtime_ns = id.mtime_ns;
+      n++;
+      *bytes_out += (uint64_t) st.st_size;
+    }
+  closedir (d);
+  *count_out = n;
+  return ents;
+}
+
+/* Sweep SDIR down to ~90% of BUDGET by unlinking least-recently-used
+   entries, then publish exact stats from this scan.  */
+static void
+cc_shard_sweep (const char *sdir, uint64_t budget)
+{
+  unsigned n = 0;
+  uint64_t total = 0;
+  struct cc_shard_ent *ents = cc_shard_scan (sdir, &n, &total);
+  uint64_t files = n;
+
+  uint64_t target = budget - budget / 10;	/* ~90% */
+  if (total > budget && ents)
+    {
+      qsort (ents, n, sizeof (*ents), cc_shard_ent_cmp);
+      for (unsigned i = 0; i < n && total > target; i++)
+	{
+	  char *full = concat (sdir, "/", ents[i].name, NULL);
+	  if (unlink (full) == 0)
+	    {
+	      total -= ents[i].size;
+	      files--;
+	      if (cc_debug_p ())
+		{
+		  fprintf (stderr, "compile-cache: evict - %s\n", full);
+		  fflush (stderr);
+		}
+	    }
+	  free (full);
+	}
+    }
+
+  cc_shard_stats_write (sdir, total, files);
+  for (unsigned i = 0; i < n; i++)
+    free (ents[i].name);
+  free (ents);
+}
+
+/* Account a completed store into KEY_HEX's shard: DELTA_BYTES bytes
+   (negative when a rewrite shrank the file) and NEW_FILES newly created
+   files.  Sweeps the shard when it exceeds its cap/256 budget.  No-op
+   without a configured cap.  */
+static void
+cc_evict_note_store (const char *key_hex, int64_t delta_bytes, int new_files)
+{
+  uint64_t cap = cc_max_size_bytes ();
+  if (cap == 0)
+    return;
+  uint64_t budget = cap / 256;
+  char shard[3] = { key_hex[0], key_hex[1], '\0' };
+  char *sdir = concat (cc_dir, "/", shard, NULL);
+
+  uint64_t bytes = 0, files = 0;
+  if (cc_shard_stats_read (sdir, &bytes, &files))
+    {
+      /* Apply the delta (clamped: drifted stats must not wrap).  */
+      if (delta_bytes >= 0)
+	bytes += (uint64_t) delta_bytes;
+      else if (bytes > (uint64_t) -delta_bytes)
+	bytes -= (uint64_t) -delta_bytes;
+      else
+	bytes = 0;
+      files += new_files;
+    }
+  else
+    {
+      /* Missing/torn stats (fresh shard, or a cap newly applied to an
+	 existing cache): recount from the directory.  The scan already
+	 includes the just-stored files, so the delta is NOT re-applied.  */
+      unsigned cnt = 0;
+      struct cc_shard_ent *ents = cc_shard_scan (sdir, &cnt, &bytes);
+      files = cnt;
+      for (unsigned i = 0; i < cnt; i++)
+	free (ents[i].name);
+      free (ents);
+    }
+
+  if (bytes > budget)
+    cc_shard_sweep (sdir, budget);	/* rewrites exact stats itself */
+  else
+    cc_shard_stats_write (sdir, bytes, files);
+  free (sdir);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2128,6 +2411,9 @@ cc_store_manifest (uint32_t warnings, uint32_t werrors)
   /* Read any existing manifest so we can preserve its other entries.  */
   size_t old_len = 0;
   unsigned char *old = cc_read_file (man_path, &old_len);
+  /* For B1 accounting below: whether a file is being replaced (rename over
+     it) and how big it was -- the stats track on-disk deltas.  */
+  bool had_old = (old != NULL);
   bool old_valid = (old
 		    && old_len >= CC_MANIFEST_HEADER_SIZE
 		    && memcmp (old + CC_MAN_OFF_MAGIC, CC_MANIFEST_MAGIC,
@@ -2388,7 +2674,15 @@ cc_store_manifest (uint32_t warnings, uint32_t werrors)
       if (rename (tmp, man_path) != 0)
 	unlink (tmp);
       else
-	cc_debug_line ("manifest-store", cc_manifest_key_hex);
+	{
+	  cc_debug_line ("manifest-store", cc_manifest_key_hex);
+	  /* B1: account the manifest write (delta vs the replaced file) in
+	     its shard and evict if over budget.  */
+	  cc_evict_note_store (cc_manifest_key_hex,
+			       (int64_t) total
+			       - (int64_t) (had_old ? old_len : 0),
+			       had_old ? 0 : 1);
+	}
     }
   else if (fd >= 0)
     unlink (tmp);
@@ -2462,6 +2756,7 @@ compile_cache_store (void)
      (ENOTSUP) or the record will not fit (E2BIG/ENOSPC/...), fall back to a
      minimal .bin sidecar carrying the same bytes -- for THIS entry only -- so
      functionality is preserved everywhere.  Logged once.  */
+  bool wrote_bin_meta = false;
   if (ok)
     {
       bool unsupported = false;
@@ -2476,6 +2771,7 @@ compile_cache_store (void)
 		  cc_debug_line ("xattr-fallback", cc_key_hex);
 		}
 	      ok = cc_write_atomic_readonly (bin_path, meta, meta_len);
+	      wrote_bin_meta = ok;
 	    }
 	  else
 	    ok = false;		/* hard xattr error -> abandon this entry */
@@ -2501,6 +2797,27 @@ compile_cache_store (void)
       /* Publish the compiler-id sidecar so the DRIVER can form the same
 	 manifest key (it needs this compiler's checksum + lang name).  */
       cc_write_compiler_id ();
+      /* B1: account the freshly stored object (and the .bin meta sidecar on
+	 the xattr-less fallback) in its shard, evicting LRU entries if the
+	 shard is now over its share of GCC_COMPILE_CACHE_MAX_SIZE.  A store
+	 only happens on an OK miss, so these files are new.  */
+      {
+	int64_t added = 0;
+	int nfiles = 0;
+	struct stat ost;
+	if (stat (obj_path, &ost) == 0)
+	  {
+	    added += (int64_t) ost.st_size;
+	    nfiles++;
+	  }
+	if (wrote_bin_meta && stat (bin_path, &ost) == 0)
+	  {
+	    added += (int64_t) ost.st_size;
+	    nfiles++;
+	  }
+	if (nfiles)
+	  cc_evict_note_store (cc_key_hex, added, nfiles);
+      }
     }
   else
     unlink (obj_path);		/* clean up a placed-but-unannotated object */

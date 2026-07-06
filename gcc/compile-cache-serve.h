@@ -180,6 +180,15 @@ extern const char *cc_man_string (const unsigned char *man, size_t mlen,
    unit) so the driver and cc1plus honor identical spellings.  */
 extern bool cc_verify_hash_env_p (void);
 
+/* Eviction support (GCC_COMPILE_CACHE_MAX_SIZE): best-effort "last used"
+   bump -- set PATH's atime+mtime to now iff its mtime is older than one
+   hour.  Eviction ranks entries by mtime (atime is unreliable under
+   noatime), so every serve tier calls this on the entries it consumed; the
+   1h threshold keeps a hot entry from dirtying its inode on every hit.
+   Never fails loudly (a shared read-only cache simply doesn't bump).  One
+   definition so the driver and cc1plus tiers apply the identical policy.  */
+extern void cc_touch_entry (const char *path);
+
 /* Re-validate ENT against the filesystem: every header record must still
    resolve (full stat-identity shortcut, else content re-hash; VERIFY_HASH
    forces the re-hash) and every probe record must still reproduce (each

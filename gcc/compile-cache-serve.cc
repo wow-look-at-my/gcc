@@ -136,6 +136,31 @@ cc_verify_hash_env_p (void)
   return v && v[0] && strcmp (v, "0") != 0;
 }
 
+/* Last-used bump for LRU eviction; see compile-cache-serve.h.  utimensat is
+   POSIX.1-2008; hosts without it simply skip the bump (eviction still works
+   off store-time mtimes, just without hit refreshes).  Owner-set explicit
+   times work on the 0444 cache objects.  */
+void
+cc_touch_entry (const char *path)
+{
+#if defined (AT_FDCWD) && defined (UTIME_NOW)
+  struct stat st;
+  if (stat (path, &st) != 0)
+    return;
+  time_t now = time (NULL);
+  if (st.st_mtime >= now - 3600)
+    return;			/* fresh enough: skip the inode write */
+  struct timespec ts[2];
+  ts[0].tv_sec = 0;
+  ts[0].tv_nsec = UTIME_NOW;
+  ts[1].tv_sec = 0;
+  ts[1].tv_nsec = UTIME_NOW;
+  (void) utimensat (AT_FDCWD, path, ts, 0);
+#else
+  (void) path;
+#endif
+}
+
 /* Emit one debug line:  "compile-cache: <action> <key12> <output>".  */
 static void
 ccs_debug_line (const cc_serve_ctx *ctx, const char *action, const char *key,
@@ -794,6 +819,9 @@ ccs_serve_from_bin (const cc_serve_ctx *ctx, const char *ok_hex,
     }
 
   bool placed = ccs_place_object (obj_path, out_path);
+  if (placed)
+    /* Mark the entry recently-used so LRU eviction spares it (B1).  */
+    cc_touch_entry (obj_path);
   free (obj_path);
   free (bin_path);
   if (!placed)
@@ -1049,6 +1077,11 @@ compile_cache_serve_object (const cc_serve_ctx *ctx, const char *src_path,
 	      && (!ctx->deps_path
 		  || ccs_write_deps (ctx, man, mlen, &ent, src_path)))
 	    {
+	      /* Bump the manifest too: it answered this hit, so it is as
+		 recently-used as the object it pointed at (B1).  */
+	      char *mp = ccs_entry_path (ctx->cache_dir, mk_hex);
+	      cc_touch_entry (mp);
+	      free (mp);
 	      free (man);
 	      return true;
 	    }
