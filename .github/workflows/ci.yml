@@ -14,6 +14,11 @@ on:
         type: boolean
         required: false
         default: false
+      build_baseline:
+        description: 'Rebuild vanilla GCC at the fork point and (re)publish the testsuite baseline .sums to buildhost (multi-hour)'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -660,3 +665,221 @@ jobs:
           GCC_COMPILE_CACHE_DEBUG=1 $XGCC -O2 -fcompile-cache="$GCC_CC_DIR" \
             -c "$RUNNER_TEMP/warm.c" -o "$RUNNER_TEMP/warm.o"
           echo "persisted cache now holds $(find "$GCC_CC_DIR" -name '*.o' | wc -l) object(s)"
+
+  # ---------------------------------------------------------------------------
+  # GCC-testsuite regression gate -- overview in .github/TESTSUITE.md.
+  #
+  # testsuite-baseline (+ testsuite-baseline-publish) is dispatch-only: it
+  # builds PRISTINE upstream GCC at the fork point and publishes its dejagnu
+  # .sum files to buildhost, where the `testsuite` gate job downloads them and
+  # fails on any new FAIL/XPASS the fork introduces. Regenerate (dispatch with
+  # build_baseline=true) after rebasing the fork onto a new upstream commit,
+  # or when the runner image shifts enough to move environment-dependent
+  # tests (glibc/binutils skew shows up as paired baseline+fork diffs, so a
+  # stale baseline surfaces as noise in the gate report).
+  # ---------------------------------------------------------------------------
+  testsuite-baseline:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.build_baseline
+    # The vanilla build is ~40 min and check-gcc alone is ~3h at -j4, so the
+    # three suites are split across two shards to stay well inside the 6h
+    # hosted-runner job cap (this file otherwise relies on the 360-min
+    # default; these long jobs pin an explicit generous limit).
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: gcc            # C testsuite            -> gcc.sum
+          - shard: gxx-libstdcxx  # C++ + libstdc++ suites -> g++.sum, libstdc++.sum
+    steps:
+      # The fork point: commit 820ff02b9 "Bump BASE-VER." (upstream
+      # releases/gcc-14, BASE-VER 14.4.1) -- the last commit before any fork
+      # patch. NO fork changes, NO binutils overlay, NO libgas. Checked out
+      # into a subdirectory so nothing from the fork workspace leaks in.
+      - uses: actions/checkout@v4
+        with:
+          ref: 820ff02b98af9dda4eb8094322347ab458de351e
+          path: gcc-base
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Install build + testsuite dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libgmp-dev libmpfr-dev libmpc-dev libisl-dev dejagnu
+
+      # Same configure flags as the fork's `build` job MINUS everything the
+      # fork adds (combined tree, libgas). None of the extra flags affects
+      # codegen or test results, but keeping the two configurations identical
+      # means the only .sum delta left is the fork's patches.
+      # --disable-multilib is also load-bearing on its own: the runner has no
+      # 32-bit glibc, so a multilib build of the target libs cannot succeed.
+      - name: Configure vanilla GCC (fork point, out of tree)
+        run: |
+          mkdir -p "$RUNNER_TEMP/base-build"
+          cd "$RUNNER_TEMP/base-build"
+          "$GITHUB_WORKSPACE/gcc-base/configure" \
+            --disable-bootstrap --enable-languages=c,c++ --disable-multilib \
+            --with-system-zlib --disable-nls --disable-werror \
+            MAKEINFO=true
+
+      # Same targets as the fork build: all-gcc + all-target-libstdc++-v3
+      # (which pulls in libgcc). Deliberately NOT `make all`: the fork
+      # artifact has no libgomp/libsanitizer/libatomic either, so tests
+      # needing those runtimes come out UNSUPPORTED on BOTH sides instead of
+      # polluting the diff.
+      - name: Build vanilla GCC
+        run: |
+          cd "$RUNNER_TEMP/base-build"
+          make -j"$(nproc)" all-gcc MAKEINFO=true
+          make -j"$(nproc)" all-target-libstdc++-v3 MAKEINFO=true
+
+      # Dejagnu FAILs do not fail `make check` (a baseline is EXPECTED to
+      # carry some); a nonzero exit here means a testsuite chunk crashed --
+      # tolerate it and let the .sum sanity check below decide. Sharded
+      # per-tool targets run inside the gcc/ build dir because the TOPLEVEL
+      # check-gcc target is `cd gcc && make check`, i.e. every language at
+      # once.
+      - name: Run C testsuite (check-gcc)
+        if: matrix.shard == 'gcc'
+        run: |
+          make -C "$RUNNER_TEMP/base-build/gcc" -j"$(nproc)" -k check-gcc \
+            || echo "::warning::check-gcc make exit $? (tolerated; gating is on the .sum diff)"
+
+      - name: Run C++ + libstdc++ testsuites (check-g++, libstdc++ check)
+        if: matrix.shard == 'gxx-libstdcxx'
+        run: |
+          make -C "$RUNNER_TEMP/base-build/gcc" -j"$(nproc)" -k check-g++ \
+            || echo "::warning::check-g++ make exit $? (tolerated; gating is on the .sum diff)"
+          make -C "$RUNNER_TEMP/base-build/x86_64-pc-linux-gnu/libstdc++-v3" -j"$(nproc)" -k check \
+            || echo "::warning::libstdc++ check make exit $? (tolerated; gating is on the .sum diff)"
+
+      - name: Collect .sum files
+        run: |
+          B="$RUNNER_TEMP/base-build"
+          OUT="$RUNNER_TEMP/sums"
+          mkdir -p "$OUT"
+          case "${{ matrix.shard }}" in
+            gcc)
+              cp "$B/gcc/testsuite/gcc/gcc.sum" "$OUT/" ;;
+            gxx-libstdcxx)
+              cp "$B/gcc/testsuite/g++/g++.sum" "$OUT/"
+              cp "$B/x86_64-pc-linux-gnu/libstdc++-v3/testsuite/libstdc++.sum" "$OUT/" ;;
+          esac
+          # Sanity: every collected .sum must have run through to its summary
+          # block (a crashed runtest leaves a truncated file).
+          for f in "$OUT"/*.sum; do
+            grep -q "Summary ===" "$f" || { echo "::error::$f has no summary block (testsuite crashed?)"; exit 1; }
+            echo "== $f =="
+            grep -E "^# of " "$f" || true
+          done
+
+      - name: Upload baseline .sum files (shard)
+        uses: actions/upload-artifact@v4
+        with:
+          name: testsuite-baseline-sums-${{ matrix.shard }}
+          path: ${{ runner.temp }}/sums/
+          retention-days: 7
+
+  # Fan-in: gather both shards' .sums, tar them, and publish ONE canonical
+  # baseline archive to buildhost project gcc/testsuite-baseline (nested
+  # under gcc/ because the repo's OIDC grant covers its own namespace only,
+  # exactly like gcc/pgo). The `testsuite` gate downloads the LATEST
+  # published version with no branch filter -- the baseline is a property of
+  # the fork point, not of any branch -- via anonymous GET (dl.pazer.build
+  # serves this org's projects publicly; verified with an unauthenticated
+  # probe against the gcc dist).
+  testsuite-baseline-publish:
+    needs: testsuite-baseline
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.build_baseline
+    steps:
+      - name: Download shard .sum files
+        uses: actions/download-artifact@v4
+        with:
+          pattern: testsuite-baseline-sums-*
+          merge-multiple: true
+          path: baseline-sums
+
+      - name: Assemble baseline tarball
+        run: |
+          cd baseline-sums
+          for f in gcc.sum g++.sum libstdc++.sum; do
+            test -s "$f" || { echo "::error::missing $f in shard artifacts"; exit 1; }
+          done
+          {
+            echo "Vanilla GCC testsuite baseline (see .github/TESTSUITE.md)"
+            echo "fork-point-commit: 820ff02b98af9dda4eb8094322347ab458de351e (Bump BASE-VER., releases/gcc-14, 14.4.1)"
+            echo "generated-by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "generated-on: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner-image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          } > BASELINE-INFO.txt
+          cat BASELINE-INFO.txt
+          tar -czf "$GITHUB_WORKSPACE/testsuite-baseline.tar.gz" gcc.sum g++.sum libstdc++.sum BASELINE-INFO.txt
+          ls -l "$GITHUB_WORKSPACE/testsuite-baseline.tar.gz"
+
+      - name: Upload baseline tarball (GHA artifact copy)
+        uses: actions/upload-artifact@v4
+        with:
+          name: testsuite-baseline
+          path: testsuite-baseline.tar.gz
+
+      # Same REST sequence + transient-retry policy as the dist publish in
+      # `build` (see the comments there), with two deliberate differences:
+      # NO continue-on-error (publishing IS this job's purpose -- the
+      # `testsuite` gate cannot run without it), and git_commit records the
+      # FORK POINT the .sums describe rather than the workflow's own sha
+      # (which is preserved inside BASELINE-INFO.txt instead).
+      - name: Publish baseline to buildhost
+        uses: wow-look-at-my/actions@typescript#latest
+        with:
+          script: |
+            const server = "https://pazer.build";
+            const project = "gcc/testsuite-baseline";
+            const tarball = "testsuite-baseline.tar.gz";
+            const forkPoint = "820ff02b98af9dda4eb8094322347ab458de351e";
+
+            try {
+              // getIDToken also registers the JWT as a masked secret.
+              const token = await core.getIDToken(server);
+
+              const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+              const api = async (method: string, urlPath: string, body?: string) => {
+                const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+                if (body !== undefined) headers["Content-Type"] = "application/json";
+                for (let attempt = 1; ; attempt++) {
+                  try {
+                    const resp = await fetch(`${server}${urlPath}`, { method, headers, body });
+                    const text = await resp.text();
+                    const transient = resp.status >= 500 || (resp.status === 404 && text.trim() === "");
+                    if (attempt === 5 || !transient) return { status: resp.status, text };
+                    core.warning(`${method} ${urlPath} -> HTTP ${resp.status} (transient, attempt ${attempt}/5)`);
+                  } catch (e) {
+                    if (attempt === 5) throw e;
+                    core.warning(`${method} ${urlPath} -> ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
+                  }
+                  await sleep(1000 * 2 ** (attempt - 1));
+                }
+              };
+
+              const create = await api("POST", `/api/v1/projects/${project}/releases`,
+                JSON.stringify({ git_branch: github.ref_name, git_commit: forkPoint }));
+              if (create.status !== 201) throw new Error(`create release failed (HTTP ${create.status}): ${create.text}`);
+              const version: string = JSON.parse(create.text).version;
+              core.info(`Created release ${project}/${version}`);
+
+              const cfg = path.join(os.tmpdir(), "buildhost-auth-cfg");
+              fs.writeFileSync(cfg, `header = "Authorization: Bearer ${token}"\n`, { mode: 0o600 });
+              const uploadURL = `${server}/api/v1/projects/${project}/releases/${version}/artifacts/linux/amd64?kind=archive`;
+              await $`curl -sS --fail-with-body --retry 4 -X PUT -K ${cfg} -H ${`X-Artifact-Filename: ${tarball}`} --data-binary ${`@${tarball}`} ${uploadURL}`;
+
+              const pub = await api("POST", `/api/v1/projects/${project}/releases/${version}/publish`);
+              if (pub.status !== 200) throw new Error(`publish failed (HTTP ${pub.status}): ${pub.text}`);
+              core.info(`Published ${project}/${version} -> https://dl.pazer.build/${project}?os=linux&arch=amd64`);
+            } catch (e) {
+              core.setFailed(`baseline publish failed: ${e instanceof Error ? e.message : String(e)}`);
+            }
