@@ -5028,6 +5028,62 @@ process_command (unsigned int decoded_options_count,
 			   CL_DRIVER, &handlers, global_dc);
     }
 
+  /* Audit -Wa,/-Xassembler options (A2).  They are consumed only by the
+     external assembler's %Y substitution in %(asm_options), but the default
+     compile-to-object pipeline has no external assembler: cc1plus assembles
+     in-process via libgas, whose entry point (gas_assemble_buffer) accepts
+     no options -- so on a .c/.cc -> .o compile they used to be dropped
+     SILENTLY.  Never drop them: when any non-empty assembler option is
+     present (an empty -Wa, contributes nothing, matching stock %Y), either
+
+       - the user explicitly forced -fintegrated-as: refuse loudly (the
+	 integrated assembler cannot honor the options; mirrors clang's
+	 unsupported -Wa handling), or
+
+       - otherwise auto-select the external-assembler pipeline for this
+	 whole invocation by injecting -fno-integrated-as: invoke_as's
+	 fallback arm then runs `as` with %Y as stock GCC did, cc1 sees the
+	 flag via %{f*}, and the compile cache skips serve+store
+	 (skip-no-integrated-as).  Noted under -v / GCC_COMPILE_CACHE_DEBUG.
+
+     Hand-written .s/.S inputs always went through the @assembler specs and
+     honor %Y either way; the injected flag is unused by them.  */
+  if (!print_help_list && !print_version && !print_subprocess_help)
+  {
+    /* (--help/--version/--target-help add their own assembler options and
+       run no compile; leave those informational flows alone.)  */
+    bool have_asm_options = false;
+    for (unsigned int ai = 0; ai < assembler_options.length (); ai++)
+      if (assembler_options[ai] && assembler_options[ai][0] != '\0')
+	{
+	  have_asm_options = true;
+	  break;
+	}
+    if (have_asm_options)
+      {
+	int explicit_ias = -1;	/* last explicit -f[no-]integrated-as */
+	for (unsigned int oi = 1; oi < decoded_options_count; oi++)
+	  if (decoded_options[oi].opt_index == OPT_fintegrated_as)
+	    explicit_ias = (decoded_options[oi].value != 0);
+	if (explicit_ias == 1)
+	  fatal_error (input_location,
+		       "%<-Wa,%>/%<-Xassembler%> options cannot be passed to "
+		       "the integrated assembler; remove %<-fintegrated-as%> "
+		       "or the assembler options");
+	else if (explicit_ias == -1)
+	  {
+	    save_switch ("-fno-integrated-as", 0, NULL,
+			 /*validated=*/true, /*known=*/true);
+	    if (verbose_flag || env.get ("GCC_COMPILE_CACHE_DEBUG"))
+	      fnotice (stderr,
+		       "note: -Wa,/-Xassembler options present: using the "
+		       "external assembler for this invocation "
+		       "(compile cache disabled)\n");
+	  }
+	/* explicit_ias == 0: the user already chose the external path.  */
+      }
+  }
+
   /* If the user didn't specify any, default to all configured offload
      targets.  */
   if (ENABLE_OFFLOADING && offload_targets == NULL)
@@ -6054,7 +6110,13 @@ driver_try_serve_from_cache (void)
   /* External-assembler compiles are cache-ineligible by design (soundness
      over speed: the cache stores in-process-assembled objects, and the
      external as's output is not guaranteed byte-identical to them).  Say so
-     under the debug env, mirroring cc1plus's tag.  */
+     under the debug env, mirroring cc1plus's tag.  NOTE: with the current
+     invoke_as, a -fno-integrated-as compile is a two-command `cc1 | as`
+     pipeline whose cc1 command executes from do_spec_1's '\n' break, which
+     has no serve hook -- so in practice cc1's own skip-no-integrated-as tag
+     (gating check #10) is the one that prints; this branch is defensive for
+     any future spec layout that routes such a command through the do_spec
+     end-of-spec path below.  */
   if (cache_dir && cache_dir[0] && !integrated_as && driver_cc_debug_p ())
     {
       fprintf (stderr, "compile-cache: skip-no-integrated-as - %s\n",
