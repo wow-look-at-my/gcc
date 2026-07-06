@@ -93,11 +93,11 @@ function writeHeader(p, content) {
 // EXTRA driver args). Returns { status, stderr, keys } where keys is the
 // parsed list of cache actions. EXTRA is genuinely optional.
 //
-// -fintegrated-as is REQUIRED: Stage 5 caches and serves the in-process
-// (integrated-as) assembled object, and gates itself off entirely without it
-// (compile_cache_enabled_p() -> false, so NO miss/store/hit lines are emitted).
-// It is not the default on this target, so every cache-exercising compile must
-// pass it explicitly or the cache stays disabled and every check sees nothing.
+// -fintegrated-as is the DEFAULT on this target (common.opt Init(1) with
+// libgas linked in) and Stage 5 caches/serves only the in-process assembled
+// object (-fno-integrated-as compiles are cache-ineligible by design:
+// skip-no-integrated-as).  It is still passed explicitly here so the checks
+// keep meaning "the integrated-as cache" even if the default ever changes.
 function compile(driver, src, obj, cacheDir, extra) {
   const args = [
     '-O2', '-c', src, '-o', obj,
@@ -1494,6 +1494,337 @@ function sleepSecs(s) {
 
   process.stdout.write(
     'check 22 OK: hits honor -MD (explicit-MT and spec-MQ forms, equal dep sets); -MMD declines to the deep path\n');
+}
+
+// ---- check 23: -Wa options are never silently dropped (A2) ---------------
+// gas_assemble_buffer() takes no options, so a compile with a non-empty
+// -Wa,... must auto-fall back to the external-as pipeline: the option's
+// effect must be visible in the object (here --defsym plants a symbol whose
+// name must appear in the object's string table), the compile cache must
+// skip both serve and store (skip-no-integrated-as), and an EXPLICIT
+// -fintegrated-as combined with -Wa must be a hard driver error.
+{
+  const dir = path.join(work, 'c23');
+  fs.mkdirSync(dir);
+  const src = path.join(dir, 'wa.c');
+  fs.writeFileSync(src, 'int wa_f(int x) { return x * 3; }\n');
+  const cache = path.join(dir, 'cache');
+  fs.mkdirSync(cache);
+  const obj = path.join(dir, 'wa.o');
+
+  // (a) plain compile (no -Wa): symbol absent, cache stores normally.
+  let r = spawnSync(XGCC, ['-O2', '-c', src, '-o', obj,
+                           '-fcompile-cache=' + cache, B],
+                    { env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0) fail('check 23: plain compile failed\n' + r.stderr);
+  if (readObj(obj).includes('CCVERIFYWA'))
+    fail('check 23: control object unexpectedly contains the defsym name');
+  if (!/compile-cache: store /.test(r.stderr))
+    fail('check 23: control compile did not store\n' + r.stderr);
+
+  // (b) -Wa,--defsym: fallback runs external as; symbol lands in the .o;
+  // cache is skipped with the tag; nothing is served or stored.
+  r = spawnSync(XGCC, ['-O2', '-c', src, '-o', obj,
+                       '-fcompile-cache=' + cache,
+                       '-Wa,--defsym,CCVERIFYWA=41', B],
+                { env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0) fail('check 23: -Wa compile failed\n' + r.stderr);
+  if (!readObj(obj).includes('CCVERIFYWA'))
+    fail('check 23: -Wa,--defsym did not reach the assembler (symbol ' +
+         'missing from the object -- the option was dropped)');
+  if (!/skip-no-integrated-as/.test(r.stderr))
+    fail('check 23: -Wa compile did not tag skip-no-integrated-as\n' + r.stderr);
+  if (/compile-cache: (store|hit|manifest-hit) /.test(r.stderr))
+    fail('check 23: -Wa compile must neither store nor serve\n' + r.stderr);
+
+  // (c) -Xassembler spelling takes the same path.
+  r = spawnSync(XGCC, ['-O2', '-c', src, '-o', obj,
+                       '-Xassembler', '--defsym', '-Xassembler', 'CCVERIFYXA=7',
+                       B],
+                { env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0) fail('check 23: -Xassembler compile failed\n' + r.stderr);
+  if (!readObj(obj).includes('CCVERIFYXA'))
+    fail('check 23: -Xassembler options were dropped');
+
+  // (d) explicit -fintegrated-as + -Wa: loud driver error, never silence.
+  r = spawnSync(XGCC, ['-O2', '-c', src, '-o', obj,
+                       '-Wa,--defsym,CCVERIFYWA=41', '-fintegrated-as', B],
+                { env: debugEnv, encoding: 'utf8' });
+  if (r.status === 0)
+    fail('check 23: -fintegrated-as + -Wa must be an error, got success');
+  if (!/cannot be passed to the integrated assembler/.test(r.stderr))
+    fail('check 23: expected the integrated-assembler conflict error\n' + r.stderr);
+
+  process.stdout.write(
+    'check 23 OK: -Wa/-Xassembler reach the external as (defsym present), ' +
+    'cache skipped with tag, explicit conflict errors\n');
+}
+
+// ---- check 24: -fno-integrated-as pipeline (A1) ---------------------------
+// The restored escape hatch: cc1 writes text, the external as produces the
+// object.  The object must be byte-identical to the integrated one (same
+// binutils 2.42 bits in-process and out), and the compile must be
+// cache-ineligible in BOTH directions: it neither stores nor is served
+// from a warm cache entry stored by an integrated compile.
+{
+  const dir = path.join(work, 'c24');
+  fs.mkdirSync(dir);
+  const src = path.join(dir, 'a1.c');
+  fs.writeFileSync(src,
+    '#include <stdint.h>\n' +
+    'uint32_t a1_f(uint32_t x) { return (x << 3) ^ 0x5a5a5a5au; }\n');
+  const cache = path.join(dir, 'cache');
+  fs.mkdirSync(cache);
+  const objI = path.join(dir, 'a1-int.o');
+  const objE = path.join(dir, 'a1-ext.o');
+
+  // Integrated compile, stores into the cache.
+  let r = compile(XGCC, src, objI, cache);
+  if (!keyFor(r.keys, 'store'))
+    fail('check 24: integrated compile did not store\n' + r.stderr);
+
+  // External compile on the WARM cache: byte-identical object, no serve,
+  // no store, tagged skip.
+  r = spawnSync(XGCC, ['-O2', '-c', src, '-o', objE,
+                       '-fcompile-cache=' + cache, '-fno-integrated-as', B],
+                { env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0)
+    fail('check 24: -fno-integrated-as compile failed\n' + r.stderr);
+  if (!readObj(objE).equals(readObj(objI)))
+    fail('check 24: external-as object differs from the integrated one');
+  if (!/skip-no-integrated-as/.test(r.stderr))
+    fail('check 24: expected the skip-no-integrated-as tag\n' + r.stderr);
+  if (/compile-cache: (store|hit|manifest-hit) /.test(r.stderr))
+    fail('check 24: -fno-integrated-as must neither store nor serve\n' + r.stderr);
+
+  // And it must genuinely be the two-process pipeline: -### shows an as
+  // invocation for the external form, none for the integrated default.
+  const dashes = (args) => spawnSync(XGCC, args.concat('-###'),
+                                     { encoding: 'utf8' }).stderr || '';
+  const extCmds = dashes(['-O2', '-c', src, '-o', objE, '-fno-integrated-as', B]);
+  if (!/\bas\b[^\n]*--64/.test(extCmds))
+    fail('check 24: -### shows no external as command for -fno-integrated-as\n'
+         + extCmds);
+  const intCmds = dashes(['-O2', '-c', src, '-o', objI, B]);
+  if (/\n[^\n]*\bas\b[^\n]*--64/.test(intCmds))
+    fail('check 24: integrated default unexpectedly spawns as\n' + intCmds);
+
+  process.stdout.write(
+    'check 24 OK: -fno-integrated-as compiles via external as, ' +
+    'byte-identical object, cache-skipped both ways\n');
+}
+
+// ---- check 25: GCC_COMPILE_CACHE_MAX_SIZE eviction (B1) -------------------
+// Tiny cap, many stores: shards over their cap/256 budget sweep their
+// least-recently-used entries; a later compile of an evicted TU is a clean
+// miss+store; total cache size stays bounded; a serve hit refreshes a stale
+// entry's mtime (the LRU clock); the PARANOID mode is unaffected.
+{
+  const dir = path.join(work, 'c25');
+  fs.mkdirSync(dir);
+  const cache = path.join(dir, 'cache');
+  fs.mkdirSync(cache);
+  const capEnv = { ...debugEnv, GCC_COMPILE_CACHE_MAX_SIZE: '1M' };
+
+  // 80 distinct TUs with ~2.9K objects (measured: pad[1500] -> 2976 B at
+  // -O2): one object fits a shard's 4096-byte budget (1M/256) even next to
+  // its ~300 B manifest, but any shard receiving TWO objects exceeds it and
+  // must sweep the older one.  With 80 objects over 256 shards the chance
+  // that no shard ever gets two is < 1e-5.
+  const N = 80;
+  const storeKey = [];   // per-TU object key (12 hex) in store order
+  for (let i = 0; i < N; i++) {
+    const s = path.join(dir, 't' + i + '.c');
+    fs.writeFileSync(s,
+      'static const char pad' + i + '[1500] = {1,2,3};\n' +
+      'const char *f' + i + '(int k) { return pad' + i + ' + (k % 1500); }\n');
+    const r = spawnSync(XGCC, ['-O2', '-c', s, '-o', path.join(dir, 't' + i + '.o'),
+                               '-fcompile-cache=' + cache, '-fintegrated-as', B],
+                        { env: capEnv, encoding: 'utf8' });
+    if (r.status !== 0)
+      fail('check 25: store #' + i + ' failed\n' + r.stderr);
+    const k = keyFor(parseKeys(r.stderr), 'store');
+    if (!k) fail('check 25: store #' + i + ' logged no store\n' + r.stderr);
+    storeKey.push(k);
+  }
+
+  // Object entry present?  key12 = shard(2) + 10 more hex of the basename.
+  const objPresent = (k) => {
+    const shard = path.join(cache, k.slice(0, 2));
+    let names = [];
+    try { names = fs.readdirSync(shard); } catch { return false; }
+    return names.some((n) => n.startsWith(k.slice(2)) && n.endsWith('.o'));
+  };
+
+  const evicted = storeKey.filter((k) => !objPresent(k));
+  if (evicted.length === 0)
+    fail('check 25: no object was evicted under a 1M cap after ' + N +
+         ' stores (eviction never ran?)');
+
+  // LRU order: in every shard that holds exactly two of our stores with
+  // exactly one survivor, the survivor must be the LATER store.
+  const byShard = new Map();
+  storeKey.forEach((k, i) => {
+    const s = k.slice(0, 2);
+    if (!byShard.has(s)) byShard.set(s, []);
+    byShard.get(s).push(i);
+  });
+  for (const [, idxs] of byShard) {
+    if (idxs.length !== 2) continue;
+    const alive = idxs.filter((i) => objPresent(storeKey[i]));
+    if (alive.length === 1 && alive[0] !== Math.max(idxs[0], idxs[1]))
+      fail('check 25: LRU violated: older store ' + storeKey[alive[0]] +
+           ' survived while newer ' +
+           storeKey[Math.max(idxs[0], idxs[1])] + ' was evicted');
+  }
+
+  // Global bound: per-shard sweeps imply a total cap (+ transient slack).
+  let total = 0;
+  const stack = [cache];
+  while (stack.length) {
+    const d = stack.pop();
+    for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, ent.name);
+      if (ent.isDirectory()) stack.push(full);
+      else total += fs.statSync(full).size;
+    }
+  }
+  if (total > 1.25 * 1024 * 1024)
+    fail('check 25: cache size ' + total + ' exceeds the 1M cap (+slack)');
+
+  // Recompiling an evicted TU is a clean miss+store, not an error.
+  const ei = storeKey.indexOf(evicted[0]);
+  const r2 = spawnSync(XGCC, ['-O2', '-c', path.join(dir, 't' + ei + '.c'),
+                              '-o', path.join(dir, 're.o'),
+                              '-fcompile-cache=' + cache, '-fintegrated-as', B],
+                       { env: capEnv, encoding: 'utf8' });
+  if (r2.status !== 0)
+    fail('check 25: recompile of evicted TU failed\n' + r2.stderr);
+  if (keyFor(parseKeys(r2.stderr), 'hit'))
+    fail('check 25: evicted TU somehow served a hit\n' + r2.stderr);
+  if (keyFor(parseKeys(r2.stderr), 'store') !== evicted[0])
+    fail('check 25: evicted TU did not re-store under its key\n' + r2.stderr);
+  if (!readObj(path.join(dir, 're.o'))
+        .equals(readObj(path.join(dir, 't' + ei + '.o'))))
+    fail('check 25: re-stored object differs from the original');
+
+  // Serve-hit mtime bump: backdate a surviving entry 2h, hit it, and the
+  // cache file must be fresh again (so LRU spares hot entries).
+  const sk = storeKey.find((k) => objPresent(k));
+  if (!sk)
+    fail('check 25: every object was evicted -- the per-shard budget ' +
+         'cannot even hold one ~2.9K object (cap arithmetic broken?)');
+  const shardDir = path.join(cache, sk.slice(0, 2));
+  const objName = fs.readdirSync(shardDir)
+    .find((n) => n.startsWith(sk.slice(2)) && n.endsWith('.o'));
+  const objPath = path.join(shardDir, objName);
+  const old = new Date(Date.now() - 2 * 3600 * 1000);
+  fs.utimesSync(objPath, old, old);
+  const si = storeKey.indexOf(sk);
+  const r3 = spawnSync(XGCC, ['-O2', '-c', path.join(dir, 't' + si + '.c'),
+                              '-o', path.join(dir, 'hb.o'),
+                              '-fcompile-cache=' + cache, '-fintegrated-as', B],
+                       { env: capEnv, encoding: 'utf8' });
+  if (r3.status !== 0 || !keyFor(parseKeys(r3.stderr), 'hit'))
+    fail('check 25: warm hit for the bump test did not happen\n' + r3.stderr);
+  if (fs.statSync(objPath).mtimeMs < Date.now() - 300 * 1000)
+    fail('check 25: serve hit did not bump the cache entry mtime');
+
+  // PARANOID pass still hits under a cap.
+  const r4 = spawnSync(XGCC, ['-O2', '-c', path.join(dir, 't' + si + '.c'),
+                              '-o', path.join(dir, 'pp.o'),
+                              '-fcompile-cache=' + cache, '-fintegrated-as', B],
+                       { env: { ...capEnv, GCC_COMPILE_CACHE_PARANOID: '1' },
+                         encoding: 'utf8' });
+  if (r4.status !== 0 || !keyFor(parseKeys(r4.stderr), 'hit'))
+    fail('check 25: PARANOID warm hit failed under the cap\n' + r4.stderr);
+
+  process.stdout.write(
+    'check 25 OK: 1M cap evicted ' + evicted.length + '/' + N +
+    ' LRU entries, size bounded, evicted TU re-misses cleanly, ' +
+    'hits bump mtime, PARANOID unaffected\n');
+}
+
+// ---- check 26: prefix-map-aware -g keys (B2) ------------------------------
+// Two build dirs that each map THEMSELVES to "." share manifest keys under
+// -g and serve byte-identical objects across dirs; without maps the -g keys
+// still embed the raw cwd and must miss; and a map that matches neither the
+// source nor the cwd stays IN the key (differing values must miss -- the
+// soundness edge ccache's blanket exclusion gets wrong).
+{
+  const dir = path.join(work, 'c26');
+  const srcDir = path.join(dir, 'src');
+  const dA = path.join(dir, 'dA');
+  const dB = path.join(dir, 'dB');
+  for (const d of [dir, srcDir, dA, dB]) fs.mkdirSync(d);
+  fs.writeFileSync(path.join(srcDir, 'h.h'), '#define HVAL 5\n');
+  const src = path.join(srcDir, 'm.c');
+  fs.writeFileSync(src,
+    '#include "h.h"\nint b2_f(int x) { return x + HVAL; }\n');
+  const cache = path.join(dir, 'cache');
+  fs.mkdirSync(cache);
+
+  const gc = (cwd, out, extra) => spawnSync(
+    XGCC,
+    ['-O2', '-g', '-c', src, '-o', out, '-I' + srcDir,
+     '-fcompile-cache=' + cache, '-fintegrated-as', B].concat(extra),
+    { cwd, env: debugEnv, encoding: 'utf8' });
+
+  // (a) dA cold store with -ffile-prefix-map=$dA=. ...
+  let r = gc(dA, path.join(dA, 'm.o'), ['-ffile-prefix-map=' + dA + '=.']);
+  if (r.status !== 0) fail('check 26: dA compile failed\n' + r.stderr);
+  if (!/compile-cache: manifest-store /.test(r.stderr))
+    fail('check 26: dA did not store a manifest\n' + r.stderr);
+
+  // ... (b) dB with -ffile-prefix-map=$dB=. must manifest-hit and place a
+  // byte-identical object.
+  r = gc(dB, path.join(dB, 'm.o'), ['-ffile-prefix-map=' + dB + '=.']);
+  if (r.status !== 0) fail('check 26: dB compile failed\n' + r.stderr);
+  if (!/compile-cache: manifest-hit /.test(r.stderr))
+    fail('check 26: cross-dir -g manifest hit missing (prefix maps not ' +
+         'folded into the key?)\n' + r.stderr);
+  if (!readObj(path.join(dA, 'm.o')).equals(readObj(path.join(dB, 'm.o'))))
+    fail('check 26: cross-dir served object is not byte-identical');
+
+  // (c) negative: -g WITHOUT maps across dirs must still miss (raw cwd in
+  // both the key and the DWARF).
+  const cache2 = path.join(dir, 'cache2');
+  fs.mkdirSync(cache2);
+  const gc2 = (cwd, out) => spawnSync(
+    XGCC,
+    ['-O2', '-g', '-c', src, '-o', out, '-I' + srcDir,
+     '-fcompile-cache=' + cache2, '-fintegrated-as', B],
+    { cwd, env: debugEnv, encoding: 'utf8' });
+  r = gc2(dA, path.join(dA, 'n.o'));
+  if (r.status !== 0) fail('check 26: negative dA compile failed\n' + r.stderr);
+  r = gc2(dB, path.join(dB, 'n.o'));
+  if (r.status !== 0) fail('check 26: negative dB compile failed\n' + r.stderr);
+  if (/compile-cache: (manifest-hit|hit) /.test(r.stderr))
+    fail('check 26: -g without maps must not hit across dirs\n' + r.stderr);
+  if (readObj(path.join(dA, 'n.o')).equals(readObj(path.join(dB, 'n.o'))))
+    fail('check 26: -g objects from different dirs unexpectedly identical');
+
+  // (d) soundness: two compiles differing ONLY in a map that matches
+  // neither the source nor the cwd must key apart (no serve).
+  const cache3 = path.join(dir, 'cache3');
+  fs.mkdirSync(cache3);
+  const gc3 = (map, out) => spawnSync(
+    XGCC,
+    ['-O2', '-g', '-c', src, '-o', out, '-I' + srcDir,
+     '-fcompile-cache=' + cache3, '-fintegrated-as',
+     '-ffile-prefix-map=' + map, B],
+    { cwd: dA, env: debugEnv, encoding: 'utf8' });
+  r = gc3('/ccverify-xx1=y', path.join(dA, 's1.o'));
+  if (r.status !== 0) fail('check 26: soundness compile 1 failed\n' + r.stderr);
+  r = gc3('/ccverify-xx2=y', path.join(dA, 's2.o'));
+  if (r.status !== 0) fail('check 26: soundness compile 2 failed\n' + r.stderr);
+  if (/compile-cache: (manifest-hit|hit) /.test(r.stderr))
+    fail('check 26: a differing unrelated prefix-map must MISS (it can ' +
+         'rewrite other DWARF paths)\n' + r.stderr);
+
+  process.stdout.write(
+    'check 26 OK: cross-dir -g prefix-map manifest-hit + byte-identical .o; ' +
+    'no-map cross-dir still misses; unrelated-map difference still keys apart\n');
 }
 
 // ---- cleanup + success ---------------------------------------------------
