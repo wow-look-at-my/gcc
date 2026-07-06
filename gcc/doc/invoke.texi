@@ -20796,7 +20796,10 @@ and reuse it on a later compilation of identical input, skipping the
 compiler back end entirely on a cache hit.  The cache is content-addressed:
 the lookup key is a hash over the compiler's own version, the source
 language and dialect, the exact bytes of the complete preprocessed source
-closure (every included file's contents), and the code-generation- and
+closure (every included file's contents), the result of every
+@code{__has_include} and @code{__has_include_next} test the translation
+unit evaluated (a header can appear or disappear without changing the
+closure's contents, flipping such a test), and the code-generation- and
 ABI-relevant command-line options.  A change to any of these produces a new
 key, so a stale result is never served.
 
@@ -20842,6 +20845,23 @@ takes precedence when both are present.  Setting the environment variable
 @env{GCC_COMPILE_CACHE_DEBUG} to a non-empty value prints one diagnostic
 line to standard error per translation unit reporting whether the cache was
 a hit, a miss, or stored.
+
+On a warm hit the recorded include closure is revalidated against the
+filesystem before anything is served.  A file whose complete stat identity
+(size, modification and status-change times at full nanosecond resolution,
+device and inode numbers) matches the record is accepted without re-reading
+it; any difference at all falls back to re-hashing that file's contents, so
+even a rewrite that carefully restores the modification time (for example
+@command{touch -d}) is caught via the advanced change time.  Identities are
+only trusted when the store could prove they describe the hashed bytes;
+files modified while the storing compilation was already running re-verify
+by content until a later store observes them at rest.  Setting the
+environment variable @env{GCC_COMPILE_CACHE_PARANOID} to any non-empty value
+other than @samp{0} (equivalently, @env{GCC_COMPILE_CACHE_VERIFY} to
+@samp{hash}) disables the stat shortcut entirely and re-hashes every
+recorded file's contents on every hit; this trades warm-hit speed for
+end-to-end content verification and is intended for audits and for storage
+whose timestamps or inode numbers cannot be trusted.
 
 Setting the environment variable @env{GCC_COMPILE_CACHE_SALT} to a non-empty
 value mixes that string into every cache key.  Because the key changes, all

@@ -124,6 +124,18 @@ ccs_read_file (const char *path, size_t *len)
   return buf;
 }
 
+/* True when the environment requests the airtight serve mode; see the
+   declaration in compile-cache-serve.h.  */
+bool
+cc_verify_hash_env_p (void)
+{
+  const char *v = getenv ("GCC_COMPILE_CACHE_VERIFY");
+  if (v && !strcmp (v, "hash"))
+    return true;
+  v = getenv ("GCC_COMPILE_CACHE_PARANOID");
+  return v && v[0] && strcmp (v, "0") != 0;
+}
+
 /* Emit one debug line:  "compile-cache: <action> <key12> <output>".  */
 static void
 ccs_debug_line (const cc_serve_ctx *ctx, const char *action, const char *key,
@@ -145,11 +157,15 @@ ccs_debug_line (const cc_serve_ctx *ctx, const char *action, const char *key,
 }
 
 /* Validate the CC_MAN_HDR_REC_SIZE records of one manifest entry against the
-   filesystem: every recorded file must still exist with the recorded size +
-   mtime (stat shortcut) or, failing that, re-hash to the recorded SHA-1.
-   MAN/MLEN is the whole manifest buffer; RECS_OFF/HDR_COUNT locate the entry's
-   records.  VERIFY_HASH forces the content re-hash.  Shared by the warm .o
-   serve and the auto-PCH probe.  */
+   filesystem: every recorded file must still exist with the recorded FULL
+   stat identity -- size, mtime sec+nsec, ctime sec+nsec, dev, ino (the stat
+   shortcut, ccache's inode-cache bar; only trusted when the record carries
+   CC_MHR_FLAG_HAS_STATID) -- or, failing that, re-hash to the recorded SHA-1.
+   A same-size rewrite that restores mtime (touch -d) still advances ctime,
+   so it falls through to the re-hash and is caught.  MAN/MLEN is the whole
+   manifest buffer; RECS_OFF/HDR_COUNT locate the entry's records.
+   VERIFY_HASH forces the content re-hash.  Shared by the warm .o serve and
+   the auto-PCH probe.  */
 static bool
 ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
 		   uint32_t hdr_count, bool verify_hash)
@@ -159,9 +175,12 @@ ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
       const unsigned char *rec = man + recs_off
 				 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
       uint32_t path_off = cc_get_u32 (rec + CC_MHR_OFF_PATH);
+      uint32_t rflags = cc_get_u32 (rec + CC_MHR_OFF_FLAGS);
       uint64_t want_size = cc_get_u64 (rec + CC_MHR_OFF_SIZE);
-      uint64_t want_mtime = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
       const unsigned char *want_hash = rec + CC_MHR_OFF_HASH;
+
+      if (rflags & ~CC_MHR_FLAG_KNOWN_MASK)
+	return false;		/* written by a future format: never match */
 
       if (path_off + 4 > mlen)
 	return false;
@@ -174,10 +193,19 @@ ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
       if (stat (hpath, &stt) != 0)
 	return false;
 
-      if (!verify_hash
-	  && (uint64_t) stt.st_size == want_size
-	  && (uint64_t) stt.st_mtime == want_mtime)
-	continue;
+      if (!verify_hash && (rflags & CC_MHR_FLAG_HAS_STATID))
+	{
+	  struct cc_statid id;
+	  cc_statid_from_stat (&stt, &id);
+	  if (id.size == want_size
+	      && id.mtime_s == cc_get_u64 (rec + CC_MHR_OFF_MTIME)
+	      && id.ctime_s == cc_get_u64 (rec + CC_MHR_OFF_CTIME)
+	      && id.dev == cc_get_u64 (rec + CC_MHR_OFF_DEV)
+	      && id.ino == cc_get_u64 (rec + CC_MHR_OFF_INO)
+	      && id.mtime_ns == cc_get_u32 (rec + CC_MHR_OFF_MTIME_NSEC)
+	      && id.ctime_ns == cc_get_u32 (rec + CC_MHR_OFF_CTIME_NSEC))
+	    continue;
+	}
 
       size_t got_len = 0;
       unsigned char *body = ccs_read_file (hpath, &got_len);
@@ -197,6 +225,125 @@ ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
 	return false;
     }
   return true;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Shared manifest-entry access (the ONE interpreter of the v2 entry bytes)  */
+/* ------------------------------------------------------------------------ */
+
+/* Fetch a length-prefixed + NUL string from the manifest string area with
+   bounds checks; NULL if OFF is out of range.  */
+const char *
+cc_man_string (const unsigned char *man, size_t mlen, uint32_t off)
+{
+  if ((uint64_t) off + 4 > mlen)
+    return NULL;
+  uint32_t slen = cc_get_u32 (man + off);
+  if ((uint64_t) off + 4 + slen + 1 > mlen)
+    return NULL;
+  return (const char *) (man + off + 4);
+}
+
+/* Parse + bounds-check the manifest entry at OFF into *OUT.  The probe
+   records are variable-length, so finding NEXT_OFF walks them (checking each
+   fits); the header records are fixed-size.  Returns false on truncation.  */
+bool
+cc_man_entry_parse (const unsigned char *man, size_t mlen, uint64_t off,
+		    struct cc_man_entry *out)
+{
+  if (off + CC_MAN_ENT_HEAD_SIZE > mlen)
+    return false;
+  const unsigned char *ent = man + off;
+  out->ok_raw = ent + CC_MENT_OFF_OK;
+  out->warnings = cc_get_u32 (ent + CC_MENT_OFF_WARNINGS);
+  out->werrors = cc_get_u32 (ent + CC_MENT_OFF_WERRORS);
+  out->eflags = cc_get_u32 (ent + CC_MENT_OFF_FLAGS);
+  out->hdr_count = cc_get_u32 (ent + CC_MENT_OFF_HDR_COUNT);
+  out->probe_count = cc_get_u32 (ent + CC_MENT_OFF_PROBE_COUNT);
+
+  out->hdr_recs_off = off + CC_MAN_ENT_HEAD_SIZE;
+  uint64_t recs_len = (uint64_t) out->hdr_count * CC_MAN_HDR_REC_SIZE;
+  if (out->hdr_recs_off + recs_len > mlen)
+    return false;
+  out->probe_recs_off = out->hdr_recs_off + recs_len;
+
+  uint64_t cur = out->probe_recs_off;
+  for (uint32_t pi = 0; pi < out->probe_count; pi++)
+    {
+      if (cur + CC_MAN_PROBE_REC_FIXED_SIZE > mlen)
+	return false;
+      uint32_t ncand = cc_get_u32 (man + cur + CC_MPR_OFF_NCAND);
+      uint64_t rec_len
+	= CC_MAN_PROBE_REC_FIXED_SIZE + (uint64_t) ncand * 4;
+      if (cur + rec_len > mlen)
+	return false;
+      cur += rec_len;
+    }
+  out->next_off = cur;
+  return true;
+}
+
+/* Re-verify ENT's probe records against the filesystem with pure stat()
+   logic; the candidates are pre-joined paths, so no include-search
+   reconstruction happens here.  Conservative on every edge: any state the
+   store side did not prove (a candidate now existing, a resolved path gone
+   or turned into a directory, unknown flag bits) rejects the entry -- the
+   caller then falls back to a real compile, which recomputes the truth.  */
+static bool
+ccs_probes_match (const unsigned char *man, size_t mlen,
+		  const struct cc_man_entry *ent)
+{
+  uint64_t cur = ent->probe_recs_off;
+  for (uint32_t pi = 0; pi < ent->probe_count; pi++)
+    {
+      const unsigned char *rec = man + cur;
+      uint32_t pflags = cc_get_u32 (rec + CC_MPR_OFF_FLAGS);
+      uint32_t ncand = cc_get_u32 (rec + CC_MPR_OFF_NCAND);
+      cur += CC_MAN_PROBE_REC_FIXED_SIZE + (uint64_t) ncand * 4;
+
+      if (pflags & ~CC_MPR_FLAG_KNOWN_MASK)
+	return false;		/* written by a future format: never match */
+
+      /* Every candidate the store-side search proved absent must still be
+	 absent -- a file appearing there would change the resolution (or
+	 flip a negative probe to found).  */
+      for (uint32_t ci = 0; ci < ncand; ci++)
+	{
+	  uint32_t coff = cc_get_u32 (rec + CC_MAN_PROBE_REC_FIXED_SIZE
+				      + ci * 4);
+	  const char *cand = cc_man_string (man, mlen, coff);
+	  if (!cand)
+	    return false;
+	  struct stat stt;
+	  if (stat (cand, &stt) == 0)
+	    return false;	/* appeared -> stale */
+	}
+
+      /* A FOUND probe's resolved path must still exist; a directory does
+	 not count (cpp's open_file treats those as ENOENT).  */
+      if (pflags & CC_MPR_FLAG_FOUND)
+	{
+	  const char *resolved
+	    = cc_man_string (man, mlen, cc_get_u32 (rec + CC_MPR_OFF_RESOLVED));
+	  struct stat stt;
+	  if (!resolved || stat (resolved, &stt) != 0
+	      || S_ISDIR (stt.st_mode))
+	    return false;
+	}
+    }
+  return true;
+}
+
+/* Header records + probe records; see compile-cache-serve.h.  */
+bool
+cc_man_entry_records_valid (const unsigned char *man, size_t mlen,
+			    const struct cc_man_entry *ent, bool verify_hash)
+{
+  if (ent->eflags & ~CC_MAN_EFLAG_KNOWN_MASK)
+    return false;		/* written by a future format: never match */
+  return ccs_records_match (man, mlen, ent->hdr_recs_off, ent->hdr_count,
+			    verify_hash)
+	 && ccs_probes_match (man, mlen, ent);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -231,6 +378,30 @@ cc_option_affects_output_p (const cl_decoded_option *decoded)
     case OPT_fauto_pch:
     case OPT_fauto_pch_store_:
     case OPT_fauto_pch_ref_:
+    /* Dependency-output plumbing: shapes only the .d side channel, never
+       the object bytes, and every serve regenerates the .d from the LIVE
+       command line (driver synthesis / libcpp's own deps machinery) -- so
+       keying these would only split identical objects across entries.
+       Concretely poisonous: the driver spec derives the cc1-level -MD
+       argument from -o, so keying it would make the key vary with the
+       output path even though the object does not.  -M/-MM/-MG are
+       dependency-only modes (no object is produced) and never reach a
+       cacheable compile; excluded for consistency.  ccache excludes the
+       same family from its hash.  */
+    case OPT_MD:
+    case OPT_MMD:
+    case OPT_MF:
+    case OPT_MT:
+    case OPT_MQ:
+    case OPT_MP:
+    case OPT_M:
+    case OPT_MM:
+    case OPT_MG:
+    case OPT_Mmodules:
+    case OPT_Mno_modules:
+    case OPT_fdeps_file_:
+    case OPT_fdeps_format_:
+    case OPT_fdeps_target_:
       return false;
     default:
       break;
@@ -656,6 +827,119 @@ ccs_serve_from_bin (const cc_serve_ctx *ctx, const char *ok_hex,
 }
 
 /* ------------------------------------------------------------------------ */
+/* Dependency-file synthesis (driver-tier manifest hit)                     */
+/* ------------------------------------------------------------------------ */
+
+/* Write NAME to F with Make quoting, byte-compatible with libcpp's
+   mkdeps.cc munge(): backslashes directly preceding a space/tab double, the
+   space/tab itself is backslash-escaped, '#' is backslash-escaped, '$'
+   doubles.  */
+static bool
+ccs_deps_munge (FILE *f, const char *name)
+{
+  for (const char *p = name; *p; p++)
+    {
+      switch (*p)
+	{
+	case ' ':
+	case '\t':
+	  for (const char *q = p - 1; q >= name && *q == '\\'; q--)
+	    if (putc ('\\', f) == EOF)
+	      return false;
+	  if (putc ('\\', f) == EOF)
+	    return false;
+	  break;
+	case '#':
+	  if (putc ('\\', f) == EOF)
+	    return false;
+	  break;
+	case '$':
+	  if (putc ('$', f) == EOF)
+	    return false;
+	  break;
+	default:
+	  break;
+	}
+      if (putc (*p, f) == EOF)
+	return false;
+    }
+  return true;
+}
+
+/* Write the make-style dependency file CTX requested (ctx->deps_path) for a
+   manifest hit on ENT: the -MT/-MQ targets, then every header-record path of
+   the entry -- which IS the TU's include closure, main source included, i.e.
+   exactly the set -MD would have produced (system headers and all).  Under
+   -MP (ctx->deps_phony) a phony target follows for every dependency except
+   the main source SRC_PATH, matching cpp.  Layout is one logical rule (no
+   column wrapping); consumers parse it identically.  Returns false on any
+   write failure, after which the caller must treat the serve as a miss (the
+   real compile then writes its own file).  */
+static bool
+ccs_write_deps (const cc_serve_ctx *ctx, const unsigned char *man,
+		size_t mlen, const struct cc_man_entry *ent,
+		const char *src_path)
+{
+  FILE *f = fopen (ctx->deps_path, "w");
+  if (!f)
+    return false;
+
+  bool ok = true;
+  for (unsigned i = 0; ok && i < ctx->deps_target_count; i++)
+    {
+      if (i && putc (' ', f) == EOF)
+	ok = false;
+      if (!ok)
+	break;
+      if (ctx->deps_target_quoted && ctx->deps_target_quoted[i])
+	ok = ccs_deps_munge (f, ctx->deps_targets[i]);
+      else
+	ok = (fputs (ctx->deps_targets[i], f) != EOF);
+    }
+  if (ok)
+    ok = (putc (':', f) != EOF);
+
+  for (uint32_t hi = 0; ok && hi < ent->hdr_count; hi++)
+    {
+      const unsigned char *rec = man + ent->hdr_recs_off
+				 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+      const char *hpath
+	= cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
+      if (!hpath)
+	{
+	  ok = false;
+	  break;
+	}
+      ok = (putc (' ', f) != EOF) && ccs_deps_munge (f, hpath);
+    }
+  if (ok)
+    ok = (putc ('\n', f) != EOF);
+
+  if (ok && ctx->deps_phony)
+    for (uint32_t hi = 0; ok && hi < ent->hdr_count; hi++)
+      {
+	const unsigned char *rec = man + ent->hdr_recs_off
+				   + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+	const char *hpath
+	  = cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
+	if (!hpath)
+	  {
+	    ok = false;
+	    break;
+	  }
+	if (strcmp (hpath, src_path) == 0)
+	  continue;		/* cpp emits no phony rule for the source */
+	ok = ccs_deps_munge (f, hpath) && (fputs (":\n", f) != EOF);
+      }
+
+  if (fclose (f) != 0)
+    ok = false;
+  if (!ok)
+    unlink (ctx->deps_path);	/* no torn file: miss -> real compile */
+  return ok;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Public entry point                                                       */
 /* ------------------------------------------------------------------------ */
 
@@ -741,36 +1025,36 @@ compile_cache_serve_object (const cc_serve_ctx *ctx, const char *src_path,
       return false;
     }
 
-  /* Walk each entry (candidate header set).  */
+  /* Walk each entry (candidate header set + its recorded probes).  */
   uint64_t cur = entries_off;
   for (uint32_t ei = 0; ei < entry_count; ei++)
     {
-      if (cur + 20 + 4 + 4 + 4 > mlen)
-	break;
-      const unsigned char *ent = man + cur;
-      unsigned char ok_raw[20];
-      memcpy (ok_raw, ent + 0, 20);
-      uint32_t hdr_count = cc_get_u32 (ent + 28);
-      uint64_t recs_off = cur + 32;
-      uint64_t recs_len = (uint64_t) hdr_count * CC_MAN_HDR_REC_SIZE;
-      if (recs_off + recs_len > mlen)
-	break;
+      struct cc_man_entry ent;
+      if (!cc_man_entry_parse (man, mlen, cur, &ent))
+	break;			/* truncated manifest -> stop */
 
-      bool all_match = ccs_records_match (man, mlen, recs_off, hdr_count,
-					  ctx->verify_hash);
-
-      if (all_match)
+      /* Only flag-free entries are servable objects (the auto-PCH gch
+	 manifest is the sole writer of flagged entries, and it lives under
+	 its own path, but stay strict).  */
+      if (ent.eflags == 0
+	  && cc_man_entry_records_valid (man, mlen, &ent, ctx->verify_hash))
 	{
 	  char ok_hex[41];
-	  cc_hex (ok_raw, ok_hex);
-	  if (ccs_serve_from_bin (ctx, ok_hex, out_path, "manifest-hit"))
+	  cc_hex (ent.ok_raw, ok_hex);
+	  if (ccs_serve_from_bin (ctx, ok_hex, out_path, "manifest-hit")
+	      /* A requested dependency file is part of the contract: the
+		 entry's records are the closure, so write it here.  On a
+		 write failure fall through as a miss -- the real compile
+		 overwrites the placed .o and emits its own file.  */
+	      && (!ctx->deps_path
+		  || ccs_write_deps (ctx, man, mlen, &ent, src_path)))
 	    {
 	      free (man);
 	      return true;
 	    }
 	}
 
-      cur = recs_off + recs_len;
+      cur = ent.next_off;
     }
 
   free (man);
@@ -1110,20 +1394,22 @@ cc_auto_pch_probe (const cc_serve_ctx *ctx, const char *base,
   size_t mlen = 0;
   unsigned char *man = ccs_read_file (pbuf, &mlen);
   bool man_ok = false;
+  bool man_unverified_probes = false;
   if (man
       && mlen >= CC_MANIFEST_HEADER_SIZE
       && memcmp (man + CC_MAN_OFF_MAGIC, CC_MANIFEST_MAGIC, CC_MAGIC_LEN) == 0
-      && cc_get_u16 (man + CC_MAN_OFF_VERSION) == CC_MANIFEST_VERSION)
+      && cc_get_u16 (man + CC_MAN_OFF_VERSION) == CC_MANIFEST_VERSION
+      && cc_get_u32 (man + CC_MAN_OFF_ENTRY_COUNT) == 1)
     {
-      uint32_t ecount = cc_get_u32 (man + CC_MAN_OFF_ENTRY_COUNT);
-      uint64_t eoff = cc_get_u64 (man + CC_MAN_OFF_ENTRIES_OFF);
-      if (ecount == 1 && eoff + 32 <= mlen)
+      struct cc_man_entry ent;
+      if (cc_man_entry_parse (man, mlen,
+			      cc_get_u64 (man + CC_MAN_OFF_ENTRIES_OFF), &ent)
+	  && (ent.eflags & ~CC_MAN_EFLAG_KNOWN_MASK) == 0)
 	{
-	  uint32_t hdr_count = cc_get_u32 (man + eoff + 28);
-	  uint64_t recs_off = eoff + 32;
-	  if (recs_off + (uint64_t) hdr_count * CC_MAN_HDR_REC_SIZE <= mlen)
-	    man_ok = ccs_records_match (man, mlen, recs_off, hdr_count,
-					ctx->verify_hash);
+	  man_unverified_probes
+	    = (ent.eflags & CC_MAN_EFLAG_UNVERIFIED_PROBES) != 0;
+	  man_ok = cc_man_entry_records_valid (man, mlen, &ent,
+					       ctx->verify_hash);
 	}
     }
   free (man);
@@ -1153,6 +1439,19 @@ cc_auto_pch_probe (const cc_serve_ctx *ctx, const char *base,
     {
       free (pbuf);
       return CC_APCH_ABSENT;
+    }
+
+  /* The gch build evaluated __has_include probes its manifest cannot
+     re-verify (quote form / -remap / header maps / _next): such a probe
+     flipping would make the .gch stale with no record noticing, so the PCH
+     must not be injected.  The entry is otherwise intact, so treat it as a
+     standing "do not use" (the TU compiles normally and evaluates its
+     probes itself); a header edit still lifts it via the manifest
+     mismatch -> ABSENT -> regeneration path above.  */
+  if (man_unverified_probes)
+    {
+      free (pbuf);
+      return CC_APCH_NEGATIVE;
     }
 
   /* Stub must byte-equal the prelude (key preimage check + completeness).  */

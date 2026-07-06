@@ -407,6 +407,23 @@ struct def_pragma_macro {
   unsigned int is_builtin : 1;
 };
 
+/* One recorded __has_include / __has_include_next evaluation (see
+   cpp_reader::hi_probes).  All strings are xmalloc'd copies owned by the
+   record and freed by _cpp_cleanup_files.  FLAGS is a mask of the public
+   CPP_HI_PROBE_* bits (cpplib.h).  CANDIDATES are the fully joined paths the
+   search proved ABSENT, in search order: for a found probe the joins of the
+   chain dirs strictly before the directory the header was found in; for a
+   not-found probe the joins of every chain dir.  They are recorded only for
+   CPP_HI_PROBE_VERIFIABLE probes.  */
+struct cpp_hi_probe
+{
+  char *name;			/* operand spelling, post macro expansion */
+  char *resolved;		/* found: the resolved path, else NULL */
+  char **candidates;		/* paths probed and found absent */
+  unsigned n_candidates;
+  unsigned flags;		/* CPP_HI_PROBE_* */
+};
+
 /* A cpp_reader encapsulates the "state" of a pre-processor run.
    Applying cpp_get_token repeatedly yields a stream of pre-processor
    tokens.  Usually, there is only one cpp_reader object active.  */
@@ -460,14 +477,33 @@ struct cpp_reader
   bool about_to_expand_macro_p;
 
   /* True once __has_include / __has_include_next has been evaluated in this
-     translation unit.  The in-compiler cache's pre-parse manifest fast-path
-     uses this: a header probed by __has_include but never #include'd does not
-     enter the include closure (cpp_foreach_included_file skips files with
-     stack_count == 0), so the manifest cannot detect an absent->present flip
-     of such a probe.  A TU that used __has_include therefore bypasses the
-     manifest fast-path and falls back to a full (post-parse) compile, which
-     re-resolves everything.  Read via cpp_used_has_include().  */
+     translation unit (set even for probes short-circuited by skip_eval).  A
+     header probed by __has_include but never #include'd does not enter the
+     include closure (cpp_foreach_included_file skips files with stack_count
+     == 0), so the in-compiler cache cannot detect an absent->present flip of
+     such a probe from the closure alone; it uses the per-probe records below
+     instead (see cpp_foreach_has_include_probe).  Read via
+     cpp_used_has_include().  */
   bool used_has_include;
+
+  /* Like used_has_include, but set only by __has_include_next.  Its result
+     depends on the include-stack position of the probing file, which the
+     in-compiler cache cannot re-verify outside a real preprocess, so it
+     disqualifies a TU from the cache's pre-parse manifest fast-path.  Read
+     via cpp_used_has_include_next().  */
+  bool used_has_include_next;
+
+  /* Every ACTUALLY EVALUATED __has_include / __has_include_next probe of
+     this translation unit (probes short-circuited by skip_eval are dead --
+     they cannot affect the preprocessed output -- and are not recorded),
+     deduplicated on identical (name, flags, resolved).  Recorded by
+     _cpp_has_header, walked via cpp_foreach_has_include_probe.  The
+     in-compiler cache folds the results into its keys and re-verifies the
+     verifiable ones (candidate paths still absent, resolved path still
+     present) when serving a warm object without preprocessing.  */
+  struct cpp_hi_probe *hi_probes;
+  unsigned hi_probe_count;
+  unsigned hi_probe_cap;
 
   /* Search paths for include files.  */
   struct cpp_dir *quote_include;	/* "" */

@@ -37,6 +37,8 @@
 #include "diagnostic.h"		/* global_dc, diagnostic_count, pp_buffer */
 #include "diagnostic-core.h"	/* seen_error, fatal_error */
 #include "../libcpp/include/cpplib.h"  /* cpp_foreach_included_file */
+#include "../libcpp/include/mkdeps.h"  /* deps_add_dep: complete the .d on a
+					  pre-parse manifest hit */
 #include "sha1.h"
 #include "compile-cache-format.h"	/* shared on-disk format + LE helpers */
 #include "compile-cache-serve.h"	/* shared driver-usable serve unit */
@@ -157,13 +159,24 @@ static bool cc_manifest_key_valid = false;
 static int cc_fe_warnings = 0;
 static int cc_fe_werrors = 0;
 
-/* True if this TU evaluated __has_include / __has_include_next (captured from
-   the cpp_reader at post-parse time).  When set, compile_cache_store () writes
-   NO manifest entry, so the pre-parse fast-path never has a manifest to serve
-   for this TU (its include closure is not a sound predictor -- a probed-but-
-   not-included header can flip absent<->present without changing the closure).
-   The post-parse object cache still applies.  */
-static bool cc_tu_used_has_include = false;
+/* True if this TU evaluated __has_include_next (captured from the cpp_reader
+   at post-parse time).  Its result depends on the include-stack position of
+   the probing file, which the pre-parse serve cannot reconstruct, so
+   compile_cache_store () writes NO manifest entry for such a TU
+   ("manifest-skip-has-include-next").  Plain __has_include no longer
+   disqualifies: its evaluations are recorded per probe (cc_meta.probes),
+   folded into the object key, stored in the manifest, and re-verified at
+   serve time.  The post-parse object cache still applies either way.  */
+static bool cc_tu_used_has_include_next = false;
+
+/* True if this TU evaluated at least one __has_include probe whose search
+   the serve side cannot faithfully re-run from records (relative quote form,
+   -remap, header-map directories -- anything libcpp did not mark
+   CPP_HI_PROBE_VERIFIABLE), or consumed a gch whose manifest carries the
+   CC_MAN_EFLAG_UNVERIFIED_PROBES flag.  Set while collecting probes in
+   cc_compute_key; makes compile_cache_store () skip the manifest
+   ("manifest-skip-has-include") -- the status quo for such TUs.  */
+static bool cc_tu_has_unverifiable_probe = false;
 
 /* ------------------------------------------------------------------------ */
 /* Object metadata, gathered during key computation                         */
@@ -173,9 +186,21 @@ static bool cc_tu_used_has_include = false;
 struct cc_input
 {
   char *path;			/* xstrdup'd path */
-  uint64_t size;		/* byte count */
-  uint64_t mtime;		/* st_mtime (seconds) for the stat shortcut */
+  uint64_t size;		/* byte count (of the hashed content) */
+  struct cc_statid id;		/* full stat identity for the stat shortcut */
+  uint32_t mhr_flags;		/* CC_MHR_FLAG_* (HAS_STATID when ID holds) */
   unsigned char hash[20];	/* raw SHA-1 of the bytes */
+};
+
+/* One recorded __has_include evaluation (mirrors libcpp's record; see
+   cpp_foreach_has_include_probe).  FLAGS is the CPP_HI_PROBE_* mask.  */
+struct cc_probe
+{
+  char *name;			/* operand spelling, post macro expansion */
+  char *resolved;		/* found: resolved path, else NULL */
+  char **candidates;		/* paths the search proved absent */
+  unsigned n_candidates;
+  unsigned flags;
 };
 
 /* Metadata for the object being built on a miss.  All strings xstrdup'd /
@@ -190,6 +215,9 @@ struct cc_metadata
   cc_input *inputs;		/* inputs table */
   unsigned input_count;
   unsigned input_cap;
+  cc_probe *probes;		/* recorded __has_include evaluations */
+  unsigned probe_count;
+  unsigned probe_cap;
 };
 
 static cc_metadata cc_meta;
@@ -205,11 +233,21 @@ cc_meta_clear (void)
   for (unsigned i = 0; i < cc_meta.input_count; i++)
     free (cc_meta.inputs[i].path);
   free (cc_meta.inputs);
+  for (unsigned i = 0; i < cc_meta.probe_count; i++)
+    {
+      free (cc_meta.probes[i].name);
+      free (cc_meta.probes[i].resolved);
+      for (unsigned k = 0; k < cc_meta.probes[i].n_candidates; k++)
+	free (cc_meta.probes[i].candidates[k]);
+      free (cc_meta.probes[i].candidates);
+    }
+  free (cc_meta.probes);
   memset (&cc_meta, 0, sizeof (cc_meta));
 }
 
 static void
-cc_meta_add_input (const char *path, uint64_t size, uint64_t mtime,
+cc_meta_add_input (const char *path, uint64_t size,
+		   const struct cc_statid *id, uint32_t mhr_flags,
 		   const unsigned char hash[20])
 {
   if (cc_meta.input_count == cc_meta.input_cap)
@@ -222,8 +260,85 @@ cc_meta_add_input (const char *path, uint64_t size, uint64_t mtime,
   cc_input *in = &cc_meta.inputs[cc_meta.input_count++];
   in->path = xstrdup (path);
   in->size = size;
-  in->mtime = mtime;
+  in->id = *id;
+  in->mhr_flags = mhr_flags;
   memcpy (in->hash, hash, 20);
+}
+
+/* Second of the compile's start, for the stat-identity "too new" guard
+   below.  Set (once) in compile_cache_init_determinism (), which runs at the
+   very start of c_common_parse_file -- before the preprocessor reads any
+   header.  */
+static time_t cc_compile_start_time = 0;
+
+/* Capture PATH's full stat identity into *ID for a header record whose
+   hashed content was READ_SIZE bytes.  Returns CC_MHR_FLAG_HAS_STATID when
+   the identity can be TRUSTED to describe those hashed bytes, else 0 (with
+   *ID zeroed):
+
+     - the stat must succeed and report exactly READ_SIZE bytes (a differing
+       size means the file changed between cpp reading it and now, so the
+       identity describes different content than the hash);
+     - the file's mtime and ctime must predate this compile's start second
+       (ccache's bar): a file written during or after the compile started
+       could be rewritten again with an indistinguishable same-second stamp,
+       so its identity cannot vouch for its content yet.  The next store
+       refreshes it; until then a serve simply re-hashes that one file.  */
+static uint32_t
+cc_capture_statid (const char *path, uint64_t read_size,
+		   struct cc_statid *id)
+{
+  memset (id, 0, sizeof (*id));
+  struct stat stt;
+  if (stat (path, &stt) != 0)
+    return 0;
+  cc_statid_from_stat (&stt, id);
+  if (id->size != read_size)
+    {
+      memset (id, 0, sizeof (*id));
+      return 0;
+    }
+  if (cc_compile_start_time > 0
+      && ((time_t) id->mtime_s >= cc_compile_start_time
+	  || (time_t) id->ctime_s >= cc_compile_start_time))
+    {
+      memset (id, 0, sizeof (*id));
+      return 0;
+    }
+  return CC_MHR_FLAG_HAS_STATID;
+}
+
+/* Append one probe record (deep-copying every string) to the growable vec
+   *V/*N/*CAP.  Shared by the TU metadata (cc_meta.probes) and the auto-PCH
+   manifest writer's local collection.  */
+static void
+cc_probe_vec_add (cc_probe **v, unsigned *n, unsigned *cap,
+		  const char *name, unsigned flags, const char *resolved,
+		  const char *const *candidates, unsigned n_candidates)
+{
+  if (*n == *cap)
+    {
+      unsigned ncap = *cap ? *cap * 2 : 8;
+      *v = XRESIZEVEC (cc_probe, *v, ncap);
+      *cap = ncap;
+    }
+  cc_probe *p = &(*v)[(*n)++];
+  p->name = xstrdup (name);
+  p->resolved = resolved ? xstrdup (resolved) : NULL;
+  p->n_candidates = n_candidates;
+  p->candidates = n_candidates ? XNEWVEC (char *, n_candidates) : NULL;
+  for (unsigned k = 0; k < n_candidates; k++)
+    p->candidates[k] = xstrdup (candidates[k]);
+  p->flags = flags;
+}
+
+static void
+cc_meta_add_probe (const char *name, unsigned flags, const char *resolved,
+		   const char *const *candidates, unsigned n_candidates)
+{
+  cc_probe_vec_add (&cc_meta.probes, &cc_meta.probe_count,
+		    &cc_meta.probe_cap, name, flags, resolved, candidates,
+		    n_candidates);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -736,16 +851,50 @@ cc_hash_one_file (const char *path, const unsigned char *buffer,
      bytes) -- the closure is walked in the unchanged all_files order.  */
   cc_hash_component (st->ctx, CC_TAG_FILE_BODY, fh, 20);
 
-  /* Capture st_mtime for the manifest stat-shortcut (size+mtime match accepts
-     a header on a hit without re-reading it).  Best-effort: a failed stat
-     records mtime 0, which simply forces a content re-hash on the next hit.  */
-  uint64_t mtime = 0;
-  {
-    struct stat stt;
-    if (stat (path, &stt) == 0)
-      mtime = (uint64_t) stt.st_mtime;
-  }
-  cc_meta_add_input (path, (uint64_t) size, mtime, fh);
+  /* Capture the file's full stat identity for the manifest stat-shortcut (an
+     identity match accepts a header on a hit without re-reading it).
+     Best-effort: an untrusted identity (stat failure, changed size, too-new
+     stamps) just forces a content re-hash on the next hit.  */
+  struct cc_statid id;
+  uint32_t mflags = cc_capture_statid (path, (uint64_t) size, &id);
+  cc_meta_add_input (path, (uint64_t) size, &id, mflags, fh);
+  return true;			/* keep walking */
+}
+
+/* Fold one __has_include probe's RESULT into the key: the operand spelling
+   plus its output-affecting facts (form + found bit).  Deliberately NOT the
+   resolved path or the candidates -- paths would break the non-debug key's
+   build-tree independence, and only the boolean result (per spelling and
+   form) reaches the preprocessed tokens.  A flipped probe usually changes
+   the output WITHOUT changing the include closure (it just changes a
+   #define), so without this component the closure-content key would keep
+   serving the stale object -- and, a hit storing nothing, would never
+   refresh the manifest either.  */
+static void
+cc_hash_probe_result (struct sha1_ctx *ctx, const char *name, unsigned flags)
+{
+  unsigned char fb
+    = (unsigned char) (flags & (CPP_HI_PROBE_FOUND | CPP_HI_PROBE_BRACKET
+				| CPP_HI_PROBE_NEXT));
+  cc_hash_component (ctx, CC_TAG_HAS_INCLUDE, &fb, 1);
+  cc_hash_str (ctx, CC_TAG_HAS_INCLUDE, name);
+}
+
+/* cpp_has_include_probe_cb: fold one recorded probe into the TU key and
+   capture it in cc_meta.probes for the manifest store.  An unverifiable
+   probe still keys (its result affects the output) but flags the TU as
+   manifest-ineligible.  */
+static bool
+cc_collect_one_probe (const char *name, unsigned flags, const char *resolved,
+		      const char *const *candidates, unsigned n_candidates,
+		      void *user)
+{
+  struct sha1_ctx *ctx = (struct sha1_ctx *) user;
+
+  cc_hash_probe_result (ctx, name, flags);
+  cc_meta_add_probe (name, flags, resolved, candidates, n_candidates);
+  if (!(flags & CPP_HI_PROBE_VERIFIABLE))
+    cc_tu_has_unverifiable_probe = true;
   return true;			/* keep walking */
 }
 
@@ -768,13 +917,18 @@ cc_options_append (char **opts, const char *tok)
 
 /* Auto-PCH: fold the consumed .gch's recorded include closure (the gch
    manifest next to the -fauto-pch-ref stub) into the TU key and the inputs
-   table.  With a PCH loaded, libcpp never stacks the prelude headers, so the
-   cpp_foreach_included_file walk cannot see them -- without this merge the
-   stored manifest would validate a TU whose prelude headers changed and
-   serve a stale object.  The merged records use the digests captured when
-   the .gch was built, which the driver's probe re-validated against the
-   filesystem before injecting.  Returns false on any parse problem (the
-   caller must then distrust the key).  */
+   table, and its recorded __has_include probes into the key and
+   cc_meta.probes.  With a PCH loaded, libcpp never stacks the prelude
+   headers NOR re-evaluates their probes, so the cpp walks cannot see either
+   -- without this merge the stored manifest would validate a TU whose
+   prelude headers (or probe results) changed and serve a stale object.  The
+   merged records use the digests captured when the .gch was built, which
+   the driver's probe re-validated against the filesystem before injecting.
+   Returns false on any parse problem OR on a gch flagged
+   CC_MAN_EFLAG_UNVERIFIED_PROBES -- its probe results are not fully on
+   record, so no trustworthy key exists (the driver refuses to inject such a
+   PCH in the first place; this is the belt-and-braces).  The caller must
+   then distrust the key.  */
 static bool
 cc_merge_gch_manifest (struct sha1_ctx *ctx)
 {
@@ -798,47 +952,96 @@ cc_merge_gch_manifest (struct sha1_ctx *ctx)
   free (man_path);
 
   bool ok = false;
+  struct cc_man_entry ent;
   if (man
       && mlen >= CC_MANIFEST_HEADER_SIZE
       && memcmp (man + CC_MAN_OFF_MAGIC, CC_MANIFEST_MAGIC, CC_MAGIC_LEN) == 0
       && cc_get_u16 (man + CC_MAN_OFF_VERSION) == CC_MANIFEST_VERSION
-      && cc_get_u32 (man + CC_MAN_OFF_ENTRY_COUNT) == 1)
+      && cc_get_u32 (man + CC_MAN_OFF_ENTRY_COUNT) == 1
+      && cc_man_entry_parse (man, mlen,
+			     cc_get_u64 (man + CC_MAN_OFF_ENTRIES_OFF), &ent)
+      && ent.eflags == 0)
     {
-      uint64_t eoff = cc_get_u64 (man + CC_MAN_OFF_ENTRIES_OFF);
-      if (eoff + 32 <= mlen)
-	{
-	  uint32_t hc = cc_get_u32 (man + eoff + 28);
-	  uint64_t recs = eoff + 32;
-	  if (recs + (uint64_t) hc * CC_MAN_HDR_REC_SIZE <= mlen)
-	    {
-	      ok = true;
-	      for (uint32_t hi = 0; hi < hc && ok; hi++)
-		{
-		  const unsigned char *rec
-		    = man + recs + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
-		  uint32_t poff = cc_get_u32 (rec + CC_MHR_OFF_PATH);
-		  if ((uint64_t) poff + 4 > mlen)
-		    {
-		      ok = false;
-		      break;
-		    }
-		  uint32_t plen = cc_get_u32 (man + poff);
-		  if ((uint64_t) poff + 4 + plen + 1 > mlen)
-		    {
-		      ok = false;
-		      break;
-		    }
-		  const char *hpath = (const char *) (man + poff + 4);
-		  uint64_t sz = cc_get_u64 (rec + CC_MHR_OFF_SIZE);
-		  uint64_t mt = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
-		  const unsigned char *h = rec + CC_MHR_OFF_HASH;
+      ok = true;
 
-		  if (cc_paths_affect_output_p ())
-		    cc_hash_str (ctx, CC_TAG_FILE_PATH, hpath);
-		  cc_hash_component (ctx, CC_TAG_FILE_BODY, h, 20);
-		  cc_meta_add_input (hpath, sz, mt, h);
-		}
+      /* (a) The prelude's include closure.  */
+      for (uint32_t hi = 0; hi < ent.hdr_count && ok; hi++)
+	{
+	  const unsigned char *rec = man + ent.hdr_recs_off
+				     + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+	  const char *hpath
+	    = cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
+	  uint32_t mflags = cc_get_u32 (rec + CC_MHR_OFF_FLAGS);
+	  if (!hpath || (mflags & ~CC_MHR_FLAG_KNOWN_MASK))
+	    {
+	      ok = false;	/* unknown flag bits: future format */
+	      break;
 	    }
+	  uint64_t sz = cc_get_u64 (rec + CC_MHR_OFF_SIZE);
+	  struct cc_statid id;
+	  id.size = sz;
+	  id.mtime_s = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
+	  id.ctime_s = cc_get_u64 (rec + CC_MHR_OFF_CTIME);
+	  id.dev = cc_get_u64 (rec + CC_MHR_OFF_DEV);
+	  id.ino = cc_get_u64 (rec + CC_MHR_OFF_INO);
+	  id.mtime_ns = cc_get_u32 (rec + CC_MHR_OFF_MTIME_NSEC);
+	  id.ctime_ns = cc_get_u32 (rec + CC_MHR_OFF_CTIME_NSEC);
+	  const unsigned char *h = rec + CC_MHR_OFF_HASH;
+
+	  if (cc_paths_affect_output_p ())
+	    cc_hash_str (ctx, CC_TAG_FILE_PATH, hpath);
+	  cc_hash_component (ctx, CC_TAG_FILE_BODY, h, 20);
+	  cc_meta_add_input (hpath, sz, &id, mflags, h);
+	}
+
+      /* (b) The prelude's recorded probes: fold the results into the key
+	 and import the records so this TU's own manifest re-verifies them.
+	 Everything the gch recorded is verifiable (unverifiable probes set
+	 the entry flag rejected above).  */
+      uint64_t cur = ent.probe_recs_off;
+      for (uint32_t pi = 0; pi < ent.probe_count && ok; pi++)
+	{
+	  const unsigned char *rec = man + cur;
+	  uint32_t pflags = cc_get_u32 (rec + CC_MPR_OFF_FLAGS);
+	  uint32_t ncand = cc_get_u32 (rec + CC_MPR_OFF_NCAND);
+	  cur += CC_MAN_PROBE_REC_FIXED_SIZE + (uint64_t) ncand * 4;
+
+	  const char *name
+	    = cc_man_string (man, mlen, cc_get_u32 (rec + CC_MPR_OFF_NAME));
+	  const char *resolved = NULL;
+	  if (pflags & CC_MPR_FLAG_FOUND)
+	    resolved = cc_man_string (man, mlen,
+				      cc_get_u32 (rec + CC_MPR_OFF_RESOLVED));
+	  if (!name || (pflags & ~CC_MPR_FLAG_KNOWN_MASK)
+	      || ((pflags & CC_MPR_FLAG_FOUND) && !resolved))
+	    {
+	      ok = false;
+	      break;
+	    }
+
+	  unsigned flags = CPP_HI_PROBE_VERIFIABLE;
+	  if (pflags & CC_MPR_FLAG_FOUND)
+	    flags |= CPP_HI_PROBE_FOUND;
+	  if (pflags & CC_MPR_FLAG_BRACKET)
+	    flags |= CPP_HI_PROBE_BRACKET;
+
+	  const char **cands
+	    = ncand ? XNEWVEC (const char *, ncand) : NULL;
+	  for (uint32_t ci = 0; ci < ncand && ok; ci++)
+	    {
+	      cands[ci]
+		= cc_man_string (man, mlen,
+				 cc_get_u32 (rec + CC_MAN_PROBE_REC_FIXED_SIZE
+					     + ci * 4));
+	      if (!cands[ci])
+		ok = false;
+	    }
+	  if (ok)
+	    {
+	      cc_hash_probe_result (ctx, name, flags);
+	      cc_meta_add_probe (name, flags, resolved, cands, ncand);
+	    }
+	  free (cands);
 	}
     }
   free (man);
@@ -931,9 +1134,16 @@ cc_compute_key (cpp_reader *pfile)
   if (!cpp_foreach_included_file (pfile, cc_hash_one_file, &st))
     return false;		/* a file could not be re-read; don't trust key */
 
-  /* (3b) Auto-PCH: the consumed .gch replaced the prelude headers in the
-     walk above; commit their recorded identities from the gch manifest so
-     the key + manifest stay closure-complete.  */
+  /* (3b) Every evaluated __has_include probe's RESULT (a probe can flip the
+     output without changing the closure hashed above), captured into
+     cc_meta.probes for the manifest along the way.  */
+  cc_tu_has_unverifiable_probe = false;
+  cpp_foreach_has_include_probe (pfile, cc_collect_one_probe, &ctx);
+
+  /* (3c) Auto-PCH: the consumed .gch replaced the prelude headers in the
+     walk above (and pre-answered their probes); commit their recorded
+     identities from the gch manifest so the key + manifest stay
+     closure-complete.  */
   if (cc_pch_consumed_ours && !cc_merge_gch_manifest (&ctx))
     return false;
 
@@ -1086,6 +1296,14 @@ compile_cache_init_determinism (bool pch_active)
 {
   /* Record PCH state before any gating decision is cached.  */
   cc_pch_active = pch_active;
+
+  /* Anchor the stat-identity "too new" guard (cc_capture_statid) at the
+     compile's start, before the preprocessor reads any file.  Deliberately
+     ahead of the enabled_p gate: the auto-PCH gch store also captures
+     identities, and it runs in PCH-build compiles where the .o cache is
+     disabled.  */
+  if (cc_compile_start_time == 0)
+    cc_compile_start_time = time (NULL);
 
   if (!compile_cache_enabled_p ())
     return;
@@ -1516,9 +1734,12 @@ compile_cache_try_serve (cpp_reader *pfile)
       return false;
     }
 
-  /* Record whether the parse used __has_include so the store can decide
-     whether a manifest entry is sound for this TU (it isn't, if it did).  */
-  cc_tu_used_has_include = cpp_used_has_include (pfile);
+  /* Record whether the parse used __has_include_next: its result depends on
+     include-stack position, which no record can let the pre-parse serve
+     re-verify, so the store must skip the manifest for such a TU.  (Plain
+     __has_include is handled by the per-probe records collected in
+     cc_compute_key.)  */
+  cc_tu_used_has_include_next = cpp_used_has_include_next (pfile);
 
   if (!cc_compute_key (pfile))
     return false;		/* key untrustworthy -> behave as a miss */
@@ -1552,26 +1773,56 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
   if (!compile_cache_enabled_p ())
     return false;
 
-  /* Note on __has_include: a TU that probes __has_include / __has_include_next
-     cannot be soundly served from the manifest (such a probe never enters the
-     include closure, so the manifest cannot notice it flipping absent<->present
-     between runs).  The bit that records this (cpp_reader::used_has_include) is
-     only set DURING the parse, so it is not yet known here at pre-parse time.
-     The protection therefore lives on the STORE side: compile_cache_store ()
-     refuses to write a manifest for a TU that used __has_include, so no
-     manifest ever exists for such a TU and this lookup simply misses -> a full
-     compile re-resolves everything.  Safe by construction.  (void pfile.)  */
+  /* Dependency output.  A pre-parse hit skips preprocessing, so libcpp's
+     deps hold only the main file and the -MT/-MQ targets; on a hit below the
+     recorded closure is fed into the deps object (deps_add_dep) so
+     c_common_finish still writes a complete .d -- the -MD contract.  Forms
+     the records cannot reproduce decline the manifest serve instead (the
+     deep path recomputes exact deps): -MM/-MMD exclude system headers, which
+     the records do not distinguish; -MG (explicit opt-in) adds missing-file
+     entries; -fdeps-* (explicit opt-in) emits structured P1689 output.
+     deps.modules is deliberately NOT a decline condition: c-family
+     initialization defaults it to TRUE on every compile (c-opts.cc
+     c_common_init_options) -- it only means "IF module dependencies exist,
+     also list them" -- so treating it as a form signal would kill the
+     manifest for every ordinary -MD build, i.e. the entire ninja/cmake hot
+     path.  TUs that actually import modules are outside the cache's
+     supported territory regardless of dependency output (their .gcm inputs
+     are invisible to the include-closure walk).  */
+  class mkdeps *mdeps = NULL;
+  {
+    const cpp_options *copts = cpp_get_options (pfile);
+    if (copts->deps.style != DEPS_NONE
+	|| copts->deps.fdeps_format != FDEPS_FMT_NONE)
+      {
+	if (copts->deps.style == DEPS_USER
+	    || copts->deps.fdeps_format != FDEPS_FMT_NONE
+	    || copts->deps.missing_files)
+	  {
+	    cc_debug_line ("manifest-skip-deps-form", NULL);
+	    return false;
+	  }
+	mdeps = cpp_get_deps (pfile);
+      }
+  }
+
+  /* Note on __has_include: probes never enter the include closure, so the
+     header records alone cannot notice one flipping absent<->present between
+     runs.  Each manifest entry therefore carries the probe records its TU
+     evaluated (operand + result + the candidate paths the search proved
+     absent), and cc_man_entry_records_valid re-verifies them below alongside
+     the headers.  TUs whose probes cannot be re-verified from records
+     (__has_include_next, relative quote form, -remap, header maps) never get
+     a manifest -- compile_cache_store () skips them -- so this lookup simply
+     misses for those and a full compile re-resolves everything.  Safe by
+     construction.  (void pfile.)  */
   (void) pfile;
 
-  /* Optional airtight mode: GCC_COMPILE_CACHE_VERIFY=hash forces a full
-     content re-hash of every header on a hit instead of the size+mtime stat
-     shortcut.  Even this still skips parse/codegen/assemble.  */
-  bool verify_hash = false;
-  {
-    const char *v = getenv ("GCC_COMPILE_CACHE_VERIFY");
-    if (v && !strcmp (v, "hash"))
-      verify_hash = true;
-  }
+  /* Optional airtight mode: GCC_COMPILE_CACHE_VERIFY=hash (alias:
+     GCC_COMPILE_CACHE_PARANOID=1) forces a full content re-hash of every
+     header on a hit instead of the stat-identity shortcut.  Even this still
+     skips parse/codegen/assemble.  */
+  bool verify_hash = cc_verify_hash_env_p ();
 
   if (!cc_compute_manifest_key (src_path))
     return false;
@@ -1600,95 +1851,44 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
       return false;
     }
 
-  /* Walk each entry (candidate header set).  */
+  /* Walk each entry (candidate header set + its recorded probes),
+     re-validating with the SAME shared code the driver-level serve uses
+     (headers: stat shortcut else re-hash; probes: candidates still absent,
+     found paths still present).  */
   uint64_t cur = entries_off;
   for (uint32_t ei = 0; ei < entry_count; ei++)
     {
-      /* Entry fixed part: OK[20] warnings(4) werrors(4) header_count(4).  */
-      if (cur + 20 + 4 + 4 + 4 > mlen)
+      struct cc_man_entry ent;
+      if (!cc_man_entry_parse (man, mlen, cur, &ent))
 	break;			/* truncated manifest -> stop */
-      const unsigned char *ent = man + cur;
-      unsigned char ok_raw[20];
-      memcpy (ok_raw, ent + 0, 20);
-      uint32_t hdr_count = cc_get_u32 (ent + 28);
-      uint64_t recs_off = cur + 32;
-      uint64_t recs_len = (uint64_t) hdr_count * CC_MAN_HDR_REC_SIZE;
-      if (recs_off + recs_len > mlen)
-	break;			/* truncated -> stop */
 
-      /* Verify every header in this set resolves and matches.  */
-      bool all_match = true;
-      for (uint32_t hi = 0; hi < hdr_count && all_match; hi++)
+      if (ent.eflags == 0
+	  && cc_man_entry_records_valid (man, mlen, &ent, verify_hash))
 	{
-	  const unsigned char *rec = man + recs_off
-				     + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
-	  uint32_t path_off = cc_get_u32 (rec + CC_MHR_OFF_PATH);
-	  uint64_t want_size = cc_get_u64 (rec + CC_MHR_OFF_SIZE);
-	  uint64_t want_mtime = cc_get_u64 (rec + CC_MHR_OFF_MTIME);
-	  const unsigned char *want_hash = rec + CC_MHR_OFF_HASH;
-
-	  /* The path string lives in the string area (length-prefixed + NUL).
-	     Bounds-check before dereferencing.  */
-	  if (path_off + 4 > mlen)
-	    {
-	      all_match = false;
-	      break;
-	    }
-	  uint32_t plen = cc_get_u32 (man + path_off);
-	  if ((uint64_t) path_off + 4 + plen + 1 > mlen)
-	    {
-	      all_match = false;
-	      break;
-	    }
-	  const char *hpath = (const char *) (man + path_off + 4);
-
-	  struct stat stt;
-	  if (stat (hpath, &stt) != 0)
-	    {
-	      all_match = false;	/* header moved/deleted -> stale set */
-	      break;
-	    }
-
-	  /* Stat shortcut: size + mtime match accepts without reading, unless
-	     the airtight verify-hash mode is on.  */
-	  if (!verify_hash
-	      && (uint64_t) stt.st_size == want_size
-	      && (uint64_t) stt.st_mtime == want_mtime)
-	    continue;
-
-	  /* Otherwise read + content-hash and compare.  */
-	  size_t got_len = 0;
-	  unsigned char *body = cc_read_file (hpath, &got_len);
-	  if (!body || (uint64_t) got_len != want_size)
-	    {
-	      free (body);
-	      all_match = false;
-	      break;
-	    }
-	  unsigned char got_hash[20];
-	  struct sha1_ctx fctx;
-	  sha1_init_ctx (&fctx);
-	  if (got_len)
-	    sha1_process_bytes (body, got_len, &fctx);
-	  sha1_finish_ctx (&fctx, got_hash);
-	  free (body);
-	  if (memcmp (got_hash, want_hash, 20) != 0)
-	    {
-	      all_match = false;
-	      break;
-	    }
-	}
-
-      if (all_match)
-	{
-	  /* Every header matched.  Resolve the object under this set's OK and
+	  /* Every record matched.  Resolve the object under this set's OK and
 	     serve it -- but only if it carries no front-end diagnostics (we are
 	     about to skip the parse).  */
 	  char ok_hex[41];
-	  cc_hex (ok_raw, ok_hex);
+	  cc_hex (ent.ok_raw, ok_hex);
 	  if (cc_serve_from_bin (ok_hex, /*require_no_fe_diag=*/true,
 				 "manifest-hit"))
 	    {
+	      /* Complete the dependency info from the entry's records (the
+		 include closure).  The main file is already in the deps --
+		 libcpp added it when the main buffer was stacked -- so skip
+		 its record to avoid a duplicate.  */
+	      if (mdeps)
+		for (uint32_t hi = 0; hi < ent.hdr_count; hi++)
+		  {
+		    const unsigned char *rec
+		      = man + ent.hdr_recs_off
+			+ (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+		    const char *hpath
+		      = cc_man_string (man, mlen,
+				       cc_get_u32 (rec + CC_MHR_OFF_PATH));
+		    if (hpath && strcmp (hpath, src_path) != 0)
+		      deps_add_dep (mdeps, hpath);
+		  }
 	      free (man);
 	      return true;
 	    }
@@ -1696,7 +1896,7 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
 	     fall through to a real compile.  */
 	}
 
-      cur = recs_off + recs_len;
+      cur = ent.next_off;
     }
 
   free (man);
@@ -1760,6 +1960,28 @@ cc_blob_add_string (cc_blob *b, const char *s)
   unsigned char nul = 0;
   cc_blob_append (b, &nul, 1);
   return off;
+}
+
+/* Emit one v3 header record for IN into ENTRIES.  PATH_OFF_ABS is the
+   already-final absolute file offset of IN's path string.  Shared by the .o
+   manifest store and the auto-PCH gch manifest store so both write identical
+   record bytes.  */
+static void
+cc_emit_hdr_rec (cc_blob *entries, uint32_t path_off_abs, const cc_input *in)
+{
+  unsigned char nrec[CC_MAN_HDR_REC_SIZE];
+  memset (nrec, 0, sizeof (nrec));
+  cc_put_u32 (nrec + CC_MHR_OFF_PATH, path_off_abs);
+  cc_put_u32 (nrec + CC_MHR_OFF_FLAGS, in->mhr_flags);
+  cc_put_u64 (nrec + CC_MHR_OFF_SIZE, in->size);
+  cc_put_u64 (nrec + CC_MHR_OFF_MTIME, in->id.mtime_s);
+  cc_put_u64 (nrec + CC_MHR_OFF_CTIME, in->id.ctime_s);
+  cc_put_u64 (nrec + CC_MHR_OFF_DEV, in->id.dev);
+  cc_put_u64 (nrec + CC_MHR_OFF_INO, in->id.ino);
+  cc_put_u32 (nrec + CC_MHR_OFF_MTIME_NSEC, in->id.mtime_ns);
+  cc_put_u32 (nrec + CC_MHR_OFF_CTIME_NSEC, in->id.ctime_ns);
+  memcpy (nrec + CC_MHR_OFF_HASH, in->hash, 20);
+  cc_blob_append (entries, nrec, CC_MAN_HDR_REC_SIZE);
 }
 
 /* Write BYTES (LEN bytes) to PATH atomically (temp + rename), then make PATH
@@ -1858,26 +2080,39 @@ cc_write_compiler_id (void)
 }
 
 /* Append/refresh this TU's entry in the manifest object keyed by MK.  The
-   manifest lists, per include set, the object key OK and the headers that set
-   depended on (path + size + mtime + hash, from cc_meta.inputs).  Existing
-   entries with a DIFFERENT OK are preserved (the same source+flags can reach
-   different header sets via conditional includes / -I ordering); an entry with
-   the SAME OK is replaced (refreshes mtimes after a touch).  WARNINGS/WERRORS
-   are the object's stored counts (carried so a future manifest reader could
-   short-circuit; the authoritative copy is in the object header).  Atomic
-   publish.  No-op unless the manifest key is valid.  */
+   manifest lists, per include set, the object key OK, the headers that set
+   depended on (path + size + mtime + hash, from cc_meta.inputs), and the
+   __has_include probes the TU evaluated (operand + result + the candidate
+   paths the search proved absent, from cc_meta.probes).  Existing entries
+   with a DIFFERENT OK are preserved (the same source+flags can reach
+   different header sets via conditional includes / -I ordering); an entry
+   with the SAME OK is replaced (refreshes mtimes after a touch).
+   WARNINGS/WERRORS are the object's stored counts (carried so a future
+   manifest reader could short-circuit; the authoritative copy is in the
+   object header).  Atomic publish.  No-op unless the manifest key is valid,
+   and skipped entirely for TUs whose probes a pre-parse serve could not
+   re-verify (__has_include_next; unverifiable probe forms).  */
 static void
 cc_store_manifest (uint32_t warnings, uint32_t werrors)
 {
   if (!cc_manifest_key_valid)
     return;
 
-  /* A TU that probed __has_include / __has_include_next has an include closure
-     that is not a sound predictor for a pre-parse serve (a probed-but-not-
-     included header can appear without changing the closure).  Do NOT record a
-     manifest for it, so the fast-path never serves it; the object cache still
-     hits post-parse.  */
-  if (cc_tu_used_has_include)
+  /* __has_include_next resolves relative to the probing file's position on
+     the include stack, which no record lets a pre-parse serve re-run.  Do
+     NOT record a manifest (the post-parse object cache still applies).  */
+  if (cc_tu_used_has_include_next)
+    {
+      cc_debug_line ("manifest-skip-has-include-next", cc_manifest_key_hex);
+      return;
+    }
+
+  /* Likewise for any probe libcpp could not make re-verifiable from records
+     (relative quote form, -remap, header-map dirs) -- the status quo for
+     such TUs.  Plain angle probes (the ones every C++ TU makes via
+     bits/c++config.h) are recorded in the entry and re-verified at serve
+     time instead of disqualifying the TU.  */
+  if (cc_tu_has_unverifiable_probe)
     {
       cc_debug_line ("manifest-skip-has-include", cc_manifest_key_hex);
       return;
@@ -1895,117 +2130,220 @@ cc_store_manifest (uint32_t warnings, uint32_t werrors)
 		    && cc_get_u16 (old + CC_MAN_OFF_VERSION)
 			 == CC_MANIFEST_VERSION);
 
-  /* Build the new manifest: a fresh string area + entries blob.  We re-emit
-     preserved entries (rewriting their header paths into the new string area)
-     plus this TU's entry.  */
-  cc_blob strings = { NULL, 0, 0 };
-  cc_blob entries = { NULL, 0, 0 };
-  uint32_t entry_count = 0;
-
-  /* Helper lambda-style emit of one entry given OK + per-header arrays.  Done
-     inline (C++ here has no convenient closure over the blobs without a struct)
-     so we keep two code paths: preserved entries and the new entry.  */
-
-  /* (a) Preserve existing entries whose OK differs from ours.  */
+  /* Pass 1: pick the old entries to preserve (parseable, all strings
+     resolvable, OK differing from ours -- the fresh entry supersedes a same-
+     OK one) and size the whole entries section, so pass 2 can write every
+     string offset as its final ABSOLUTE file offset up front (the string
+     area starts right after the entries).  */
+  uint64_t keep_off[64];
+  unsigned keep_count = 0;
+  uint64_t entries_total = 0;
   if (old_valid)
     {
       uint32_t ocount = cc_get_u32 (old + CC_MAN_OFF_ENTRY_COUNT);
-      uint64_t ooff = cc_get_u64 (old + CC_MAN_OFF_ENTRIES_OFF);
-      uint64_t ocur = ooff;
-      for (uint32_t ei = 0; ei < ocount && ocur + 32 <= old_len; ei++)
+      uint64_t ocur = cc_get_u64 (old + CC_MAN_OFF_ENTRIES_OFF);
+      for (uint32_t ei = 0; ei < ocount; ei++)
 	{
-	  const unsigned char *ent = old + ocur;
-	  unsigned char ok_raw[20];
-	  memcpy (ok_raw, ent, 20);
-	  uint32_t ow = cc_get_u32 (ent + 20);
-	  uint32_t owe = cc_get_u32 (ent + 24);
-	  uint32_t hc = cc_get_u32 (ent + 28);
-	  uint64_t recs = ocur + 32;
-	  uint64_t recs_len = (uint64_t) hc * CC_MAN_HDR_REC_SIZE;
-	  if (recs + recs_len > old_len)
-	    break;
-	  /* Skip our own OK -- the fresh entry below supersedes it.  */
-	  if (memcmp (ok_raw, cc_key_raw, 20) == 0)
+	  struct cc_man_entry ent;
+	  if (!cc_man_entry_parse (old, old_len, ocur, &ent))
+	    break;		/* truncated -> drop the rest */
+	  uint64_t esize = ent.next_off - ocur;
+	  uint64_t eoff = ocur;
+	  ocur = ent.next_off;
+
+	  if (memcmp (ent.ok_raw, cc_key_raw, 20) == 0)
+	    continue;		/* superseded by the fresh entry below */
+	  if (keep_count == sizeof (keep_off) / sizeof (keep_off[0]))
+	    continue;		/* pathological entry pile-up: drop extras */
+
+	  /* Every string must resolve, or the entry is dropped whole (a
+	     truncated string area cannot be re-emitted faithfully).  */
+	  bool strings_ok = true;
+	  for (uint32_t hi = 0; hi < ent.hdr_count && strings_ok; hi++)
 	    {
-	      ocur = recs + recs_len;
-	      continue;
-	    }
-	  /* Re-emit this entry into the new blobs.  */
-	  unsigned char head[32];
-	  memcpy (head, ok_raw, 20);
-	  cc_put_u32 (head + 20, ow);
-	  cc_put_u32 (head + 24, owe);
-	  cc_put_u32 (head + 28, hc);
-	  cc_blob_append (&entries, head, 32);
-	  for (uint32_t hi = 0; hi < hc; hi++)
-	    {
-	      const unsigned char *rec = old + recs
+	      const unsigned char *rec = old + ent.hdr_recs_off
 					 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
-	      uint32_t opath = cc_get_u32 (rec + CC_MHR_OFF_PATH);
-	      const char *hpath = "";
-	      if ((uint64_t) opath + 4 <= old_len)
-		{
-		  uint32_t plen = cc_get_u32 (old + opath);
-		  if ((uint64_t) opath + 4 + plen + 1 <= old_len)
-		    hpath = (const char *) (old + opath + 4);
-		}
-	      uint32_t npath = cc_blob_add_string (&strings, hpath);
-	      unsigned char nrec[CC_MAN_HDR_REC_SIZE];
-	      cc_put_u32 (nrec + CC_MHR_OFF_PATH, npath);	/* rebased later */
-	      memcpy (nrec + CC_MHR_OFF_SIZE, rec + CC_MHR_OFF_SIZE, 8);
-	      memcpy (nrec + CC_MHR_OFF_MTIME, rec + CC_MHR_OFF_MTIME, 8);
-	      memcpy (nrec + CC_MHR_OFF_HASH, rec + CC_MHR_OFF_HASH, 20);
-	      cc_blob_append (&entries, nrec, CC_MAN_HDR_REC_SIZE);
+	      strings_ok = (cc_man_string (old, old_len,
+					   cc_get_u32 (rec + CC_MHR_OFF_PATH))
+			    != NULL);
 	    }
-	  entry_count++;
-	  ocur = recs + recs_len;
+	  uint64_t pcur = ent.probe_recs_off;
+	  for (uint32_t pi = 0; pi < ent.probe_count && strings_ok; pi++)
+	    {
+	      const unsigned char *rec = old + pcur;
+	      uint32_t pflags = cc_get_u32 (rec + CC_MPR_OFF_FLAGS);
+	      uint32_t ncand = cc_get_u32 (rec + CC_MPR_OFF_NCAND);
+	      pcur += CC_MAN_PROBE_REC_FIXED_SIZE + (uint64_t) ncand * 4;
+	      strings_ok = (cc_man_string (old, old_len,
+					   cc_get_u32 (rec + CC_MPR_OFF_NAME))
+			    != NULL);
+	      if (strings_ok && (pflags & CC_MPR_FLAG_FOUND))
+		strings_ok
+		  = (cc_man_string (old, old_len,
+				    cc_get_u32 (rec + CC_MPR_OFF_RESOLVED))
+		     != NULL);
+	      for (uint32_t ci = 0; ci < ncand && strings_ok; ci++)
+		strings_ok
+		  = (cc_man_string (old, old_len,
+				    cc_get_u32 (rec
+						+ CC_MAN_PROBE_REC_FIXED_SIZE
+						+ ci * 4))
+		     != NULL);
+	    }
+	  if (!strings_ok)
+	    continue;
+
+	  keep_off[keep_count++] = eoff;
+	  entries_total += esize;	/* re-emitted at identical size */
 	}
+    }
+  entries_total += CC_MAN_ENT_HEAD_SIZE
+		   + (uint64_t) cc_meta.input_count * CC_MAN_HDR_REC_SIZE;
+  for (unsigned i = 0; i < cc_meta.probe_count; i++)
+    entries_total += CC_MAN_PROBE_REC_FIXED_SIZE
+		     + (uint64_t) cc_meta.probes[i].n_candidates * 4;
+
+  uint64_t entries_off = CC_MANIFEST_HEADER_SIZE;
+  uint64_t string_area_off = entries_off + entries_total;
+  uint32_t entry_count = 0;
+
+  /* Pass 2: emit.  Strings land in the strings blob; the stored offsets are
+     string_area_off + the blob-relative offset, i.e. final.  */
+  cc_blob strings = { NULL, 0, 0 };
+  cc_blob entries = { NULL, 0, 0 };
+
+  /* (a) Preserved entries, re-emitted with their strings re-added.  */
+  for (unsigned ki = 0; ki < keep_count; ki++)
+    {
+      struct cc_man_entry ent;
+      /* Parsed successfully in pass 1; parse again for the offsets.  */
+      cc_man_entry_parse (old, old_len, keep_off[ki], &ent);
+
+      unsigned char head[CC_MAN_ENT_HEAD_SIZE];
+      memcpy (head + CC_MENT_OFF_OK, ent.ok_raw, 20);
+      cc_put_u32 (head + CC_MENT_OFF_WARNINGS, ent.warnings);
+      cc_put_u32 (head + CC_MENT_OFF_WERRORS, ent.werrors);
+      cc_put_u32 (head + CC_MENT_OFF_FLAGS, ent.eflags);
+      cc_put_u32 (head + CC_MENT_OFF_HDR_COUNT, ent.hdr_count);
+      cc_put_u32 (head + CC_MENT_OFF_PROBE_COUNT, ent.probe_count);
+      cc_blob_append (&entries, head, CC_MAN_ENT_HEAD_SIZE);
+
+      for (uint32_t hi = 0; hi < ent.hdr_count; hi++)
+	{
+	  const unsigned char *rec = old + ent.hdr_recs_off
+				     + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+	  const char *hpath
+	    = cc_man_string (old, old_len,
+			     cc_get_u32 (rec + CC_MHR_OFF_PATH));
+	  /* Copy the record verbatim (flags + size + stat identity + hash);
+	     only the path offset is buffer-relative and must be re-aimed at
+	     the new string area.  */
+	  unsigned char nrec[CC_MAN_HDR_REC_SIZE];
+	  memcpy (nrec, rec, CC_MAN_HDR_REC_SIZE);
+	  cc_put_u32 (nrec + CC_MHR_OFF_PATH,
+		      (uint32_t) string_area_off
+		      + cc_blob_add_string (&strings, hpath));
+	  cc_blob_append (&entries, nrec, CC_MAN_HDR_REC_SIZE);
+	}
+
+      uint64_t pcur = ent.probe_recs_off;
+      for (uint32_t pi = 0; pi < ent.probe_count; pi++)
+	{
+	  const unsigned char *rec = old + pcur;
+	  uint32_t pflags = cc_get_u32 (rec + CC_MPR_OFF_FLAGS);
+	  uint32_t ncand = cc_get_u32 (rec + CC_MPR_OFF_NCAND);
+	  pcur += CC_MAN_PROBE_REC_FIXED_SIZE + (uint64_t) ncand * 4;
+
+	  unsigned char fixed[CC_MAN_PROBE_REC_FIXED_SIZE];
+	  cc_put_u32 (fixed + CC_MPR_OFF_FLAGS, pflags);
+	  cc_put_u32 (fixed + CC_MPR_OFF_NAME,
+		      (uint32_t) string_area_off
+		      + cc_blob_add_string
+			  (&strings,
+			   cc_man_string (old, old_len,
+					  cc_get_u32 (rec
+						      + CC_MPR_OFF_NAME))));
+	  uint32_t nresolved = 0;
+	  if (pflags & CC_MPR_FLAG_FOUND)
+	    nresolved
+	      = (uint32_t) string_area_off
+		+ cc_blob_add_string
+		    (&strings,
+		     cc_man_string (old, old_len,
+				    cc_get_u32 (rec + CC_MPR_OFF_RESOLVED)));
+	  cc_put_u32 (fixed + CC_MPR_OFF_RESOLVED, nresolved);
+	  cc_put_u32 (fixed + CC_MPR_OFF_NCAND, ncand);
+	  cc_blob_append (&entries, fixed, CC_MAN_PROBE_REC_FIXED_SIZE);
+	  for (uint32_t ci = 0; ci < ncand; ci++)
+	    {
+	      const char *cand
+		= cc_man_string (old, old_len,
+				 cc_get_u32 (rec + CC_MAN_PROBE_REC_FIXED_SIZE
+					     + ci * 4));
+	      unsigned char co[4];
+	      cc_put_u32 (co, (uint32_t) string_area_off
+			      + cc_blob_add_string (&strings, cand));
+	      cc_blob_append (&entries, co, 4);
+	    }
+	}
+      entry_count++;
     }
   free (old);
 
-  /* (b) This TU's entry: OK + counts + the recorded include set.  */
+  /* (b) This TU's entry: OK + counts + the recorded include set + probes.  */
   {
-    unsigned char head[32];
-    memcpy (head, cc_key_raw, 20);
-    cc_put_u32 (head + 20, warnings);
-    cc_put_u32 (head + 24, werrors);
-    cc_put_u32 (head + 28, cc_meta.input_count);
-    cc_blob_append (&entries, head, 32);
+    unsigned char head[CC_MAN_ENT_HEAD_SIZE];
+    memcpy (head + CC_MENT_OFF_OK, cc_key_raw, 20);
+    cc_put_u32 (head + CC_MENT_OFF_WARNINGS, warnings);
+    cc_put_u32 (head + CC_MENT_OFF_WERRORS, werrors);
+    cc_put_u32 (head + CC_MENT_OFF_FLAGS, 0);
+    cc_put_u32 (head + CC_MENT_OFF_HDR_COUNT, cc_meta.input_count);
+    cc_put_u32 (head + CC_MENT_OFF_PROBE_COUNT, cc_meta.probe_count);
+    cc_blob_append (&entries, head, CC_MAN_ENT_HEAD_SIZE);
+
     for (unsigned i = 0; i < cc_meta.input_count; i++)
+      cc_emit_hdr_rec (&entries,
+		       (uint32_t) string_area_off
+		       + cc_blob_add_string (&strings,
+					     cc_meta.inputs[i].path),
+		       &cc_meta.inputs[i]);
+
+    for (unsigned i = 0; i < cc_meta.probe_count; i++)
       {
-	uint32_t npath = cc_blob_add_string (&strings, cc_meta.inputs[i].path);
-	unsigned char nrec[CC_MAN_HDR_REC_SIZE];
-	cc_put_u32 (nrec + CC_MHR_OFF_PATH, npath);		/* rebased later */
-	cc_put_u64 (nrec + CC_MHR_OFF_SIZE, cc_meta.inputs[i].size);
-	cc_put_u64 (nrec + CC_MHR_OFF_MTIME, cc_meta.inputs[i].mtime);
-	memcpy (nrec + CC_MHR_OFF_HASH, cc_meta.inputs[i].hash, 20);
-	cc_blob_append (&entries, nrec, CC_MAN_HDR_REC_SIZE);
+	const cc_probe *p = &cc_meta.probes[i];
+	uint32_t pflags = 0;
+	if (p->flags & CPP_HI_PROBE_FOUND)
+	  pflags |= CC_MPR_FLAG_FOUND;
+	if (p->flags & CPP_HI_PROBE_BRACKET)
+	  pflags |= CC_MPR_FLAG_BRACKET;
+
+	unsigned char fixed[CC_MAN_PROBE_REC_FIXED_SIZE];
+	cc_put_u32 (fixed + CC_MPR_OFF_FLAGS, pflags);
+	cc_put_u32 (fixed + CC_MPR_OFF_NAME,
+		    (uint32_t) string_area_off
+		    + cc_blob_add_string (&strings, p->name));
+	cc_put_u32 (fixed + CC_MPR_OFF_RESOLVED,
+		    p->resolved
+		    ? (uint32_t) string_area_off
+		      + cc_blob_add_string (&strings, p->resolved)
+		    : 0);
+	cc_put_u32 (fixed + CC_MPR_OFF_NCAND, p->n_candidates);
+	cc_blob_append (&entries, fixed, CC_MAN_PROBE_REC_FIXED_SIZE);
+	for (unsigned k = 0; k < p->n_candidates; k++)
+	  {
+	    unsigned char co[4];
+	    cc_put_u32 (co, (uint32_t) string_area_off
+			    + cc_blob_add_string (&strings,
+						  p->candidates[k]));
+	    cc_blob_append (&entries, co, 4);
+	  }
       }
     entry_count++;
   }
 
-  /* Layout: header -> entries -> string area.  Rebase every header record's
-     path offset (currently relative to the string area) to an absolute file
-     offset.  Walk the entries blob in lockstep with how we built it.  */
-  uint64_t entries_off = CC_MANIFEST_HEADER_SIZE;
-  uint64_t string_area_off = entries_off + entries.len;
-  {
-    uint64_t cur = 0;
-    for (uint32_t ei = 0; ei < entry_count; ei++)
-      {
-	uint32_t hc = cc_get_u32 (entries.data + cur + 28);
-	uint64_t recs = cur + 32;
-	for (uint32_t hi = 0; hi < hc; hi++)
-	  {
-	    unsigned char *rec = entries.data + recs
-				 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
-	    uint32_t rel = cc_get_u32 (rec + CC_MHR_OFF_PATH);
-	    cc_put_u32 (rec + CC_MHR_OFF_PATH,
-			rel + (uint32_t) string_area_off);
-	  }
-	cur = recs + (uint64_t) hc * CC_MAN_HDR_REC_SIZE;
-      }
-  }
+  /* Layout: header -> entries -> string area.  Pass 1 sized the entries
+     section, so the string offsets emitted above are already absolute.  */
+  gcc_checking_assert (entries.len == entries_total);
 
   unsigned char mhdr[CC_MANIFEST_HEADER_SIZE];
   memset (mhdr, 0, sizeof (mhdr));
@@ -2217,12 +2555,8 @@ cc_apch_collect_one (const char *path, const unsigned char *buffer,
       sha1_finish_ctx (&fctx, fh);
     }
 
-  uint64_t mtime = 0;
-  {
-    struct stat stt;
-    if (stat (path, &stt) == 0)
-      mtime = (uint64_t) stt.st_mtime;
-  }
+  struct cc_statid id;
+  uint32_t mflags = cc_capture_statid (path, (uint64_t) size, &id);
 
   if (st->n == st->cap)
     {
@@ -2233,19 +2567,48 @@ cc_apch_collect_one (const char *path, const unsigned char *buffer,
   cc_input *in = &st->v[st->n++];
   in->path = xstrdup (path);
   in->size = size;
-  in->mtime = mtime;
+  in->id = id;
+  in->mhr_flags = mflags;
   memcpy (in->hash, fh, 20);
+  return true;
+}
+
+/* Auto-PCH probe collection: the gch build's evaluated __has_include probes.
+   Verifiable ones are recorded in the manifest entry so the driver's probe
+   re-validates them before injecting the PCH; any unverifiable one instead
+   sets the entry's CC_MAN_EFLAG_UNVERIFIED_PROBES flag, which makes the
+   driver answer NEGATIVE (compile without the PCH -- the TU then evaluates
+   its probes itself) and the gch-merge distrust the key.  */
+struct cc_apch_probe_state
+{
+  cc_probe *v;
+  unsigned n, cap;
+  bool unverifiable;
+};
+
+static bool
+cc_apch_collect_probe (const char *name, unsigned flags, const char *resolved,
+		       const char *const *candidates, unsigned n_candidates,
+		       void *user)
+{
+  struct cc_apch_probe_state *st = (struct cc_apch_probe_state *) user;
+  if (!(flags & CPP_HI_PROBE_VERIFIABLE))
+    st->unverifiable = true;
+  else
+    cc_probe_vec_add (&st->v, &st->n, &st->cap, name, flags, resolved,
+		      candidates, n_candidates);
   return true;
 }
 
 /* Called from c_common_write_pch after the .gch was fully written.  When
    the driver requested it (-fauto-pch-store=PATH on this PCH build), write
-   the include closure this .gch baked in as a single-entry manifest (the
-   same on-disk format the .o cache's manifests use, so the driver validates
-   it with the same code) to PATH.  PATH is a driver-owned temp; the driver
-   renames it into the entry on success, so no atomicity is needed here.
-   Any failure leaves PATH absent/short, which the driver treats as a failed
-   generation (negative entry).  */
+   the include closure this .gch baked in -- plus the __has_include probes it
+   evaluated -- as a single-entry manifest (the same on-disk format the .o
+   cache's manifests use, so the driver validates it with the same code) to
+   PATH.  PATH is a driver-owned temp; the driver renames it into the entry
+   on success, so no atomicity is needed here.  Any failure leaves PATH
+   absent/short, which the driver treats as a failed generation (negative
+   entry).  */
 void
 compile_cache_auto_pch_store (cpp_reader *pfile)
 {
@@ -2259,37 +2622,77 @@ compile_cache_auto_pch_store (cpp_reader *pfile)
   st.cap = 0;
   st.oom_fail = false;
 
+  struct cc_apch_probe_state ps;
+  ps.v = NULL;
+  ps.n = 0;
+  ps.cap = 0;
+  ps.unverifiable = false;
+
   bool ok = cpp_foreach_included_file (pfile, cc_apch_collect_one, &st);
 
   if (ok)
     {
+      cpp_foreach_has_include_probe (pfile, cc_apch_collect_probe, &ps);
+
       cc_blob strings = { NULL, 0, 0 };
       cc_blob entries = { NULL, 0, 0 };
 
-      unsigned char head[32];
+      /* Size the (single) entry up front so string offsets are emitted
+	 absolute (the string area follows the entries section directly).  */
+      uint64_t entries_total
+	= CC_MAN_ENT_HEAD_SIZE + (uint64_t) st.n * CC_MAN_HDR_REC_SIZE;
+      for (unsigned i = 0; i < ps.n; i++)
+	entries_total += CC_MAN_PROBE_REC_FIXED_SIZE
+			 + (uint64_t) ps.v[i].n_candidates * 4;
+      uint64_t entries_off = CC_MANIFEST_HEADER_SIZE;
+      uint64_t string_area_off = entries_off + entries_total;
+
+      unsigned char head[CC_MAN_ENT_HEAD_SIZE];
       memset (head, 0, sizeof (head));	/* OK slot unused: 20 zero bytes */
-      cc_put_u32 (head + 28, st.n);
-      cc_blob_append (&entries, head, 32);
+      cc_put_u32 (head + CC_MENT_OFF_FLAGS,
+		  ps.unverifiable ? CC_MAN_EFLAG_UNVERIFIED_PROBES : 0);
+      cc_put_u32 (head + CC_MENT_OFF_HDR_COUNT, st.n);
+      cc_put_u32 (head + CC_MENT_OFF_PROBE_COUNT, ps.n);
+      cc_blob_append (&entries, head, CC_MAN_ENT_HEAD_SIZE);
+
       for (unsigned i = 0; i < st.n; i++)
+	cc_emit_hdr_rec (&entries,
+			 (uint32_t) string_area_off
+			 + cc_blob_add_string (&strings, st.v[i].path),
+			 &st.v[i]);
+
+      for (unsigned i = 0; i < ps.n; i++)
 	{
-	  uint32_t npath = cc_blob_add_string (&strings, st.v[i].path);
-	  unsigned char nrec[CC_MAN_HDR_REC_SIZE];
-	  cc_put_u32 (nrec + CC_MHR_OFF_PATH, npath);	/* rebased below */
-	  cc_put_u64 (nrec + CC_MHR_OFF_SIZE, st.v[i].size);
-	  cc_put_u64 (nrec + CC_MHR_OFF_MTIME, st.v[i].mtime);
-	  memcpy (nrec + CC_MHR_OFF_HASH, st.v[i].hash, 20);
-	  cc_blob_append (&entries, nrec, CC_MAN_HDR_REC_SIZE);
+	  const cc_probe *p = &ps.v[i];
+	  uint32_t pflags = 0;
+	  if (p->flags & CPP_HI_PROBE_FOUND)
+	    pflags |= CC_MPR_FLAG_FOUND;
+	  if (p->flags & CPP_HI_PROBE_BRACKET)
+	    pflags |= CC_MPR_FLAG_BRACKET;
+
+	  unsigned char fixed[CC_MAN_PROBE_REC_FIXED_SIZE];
+	  cc_put_u32 (fixed + CC_MPR_OFF_FLAGS, pflags);
+	  cc_put_u32 (fixed + CC_MPR_OFF_NAME,
+		      (uint32_t) string_area_off
+		      + cc_blob_add_string (&strings, p->name));
+	  cc_put_u32 (fixed + CC_MPR_OFF_RESOLVED,
+		      p->resolved
+		      ? (uint32_t) string_area_off
+			+ cc_blob_add_string (&strings, p->resolved)
+		      : 0);
+	  cc_put_u32 (fixed + CC_MPR_OFF_NCAND, p->n_candidates);
+	  cc_blob_append (&entries, fixed, CC_MAN_PROBE_REC_FIXED_SIZE);
+	  for (unsigned k = 0; k < p->n_candidates; k++)
+	    {
+	      unsigned char co[4];
+	      cc_put_u32 (co, (uint32_t) string_area_off
+			      + cc_blob_add_string (&strings,
+						    p->candidates[k]));
+	      cc_blob_append (&entries, co, 4);
+	    }
 	}
 
-      uint64_t entries_off = CC_MANIFEST_HEADER_SIZE;
-      uint64_t string_area_off = entries_off + entries.len;
-      for (unsigned i = 0; i < st.n; i++)
-	{
-	  unsigned char *rec = entries.data + 32
-			       + (uint64_t) i * CC_MAN_HDR_REC_SIZE;
-	  uint32_t rel = cc_get_u32 (rec + CC_MHR_OFF_PATH);
-	  cc_put_u32 (rec + CC_MHR_OFF_PATH, rel + (uint32_t) string_area_off);
-	}
+      gcc_checking_assert (entries.len == entries_total);
 
       unsigned char mhdr[CC_MANIFEST_HEADER_SIZE];
       memset (mhdr, 0, sizeof (mhdr));
@@ -2323,4 +2726,13 @@ compile_cache_auto_pch_store (cpp_reader *pfile)
   for (unsigned i = 0; i < st.n; i++)
     free (st.v[i].path);
   free (st.v);
+  for (unsigned i = 0; i < ps.n; i++)
+    {
+      free (ps.v[i].name);
+      free (ps.v[i].resolved);
+      for (unsigned k = 0; k < ps.v[i].n_candidates; k++)
+	free (ps.v[i].candidates[k]);
+      free (ps.v[i].candidates);
+    }
+  free (ps.v);
 }
