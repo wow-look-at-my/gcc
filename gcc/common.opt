@@ -2055,8 +2055,8 @@ Common RejectNegative Joined
 -finstrument-functions-exclude-file-list=filename,...	Do not instrument functions listed in files.
 
 fintegrated-as
-Common Var(flag_integrated_as) Init(1) RejectNegative
-Assemble in-process with the built-in assembler instead of invoking as.  This is always on: cc1plus folds the GNU assembler into the compiler so a compile-to-object is a single process; there is no fork to a separate as and no way to turn it off.
+Common Var(flag_integrated_as) Init(1)
+Assemble in-process with the built-in assembler instead of invoking as.  On by default when the embedded assembler (libgas) is linked into the compiler; a compile-to-object is then a single process.  -fno-integrated-as restores the classic pipeline (the compiler writes textual assembly and the driver runs the external as).  Compiles using the external assembler are ineligible for -fcompile-cache: both serving and storing are skipped (debug tag skip-no-integrated-as), trading speed for byte-level soundness since the cache stores in-process-assembled objects.
 
 fipa-cp
 Common Var(flag_ipa_cp) Optimization
@@ -3421,14 +3421,16 @@ Common Var(flag_verbose_asm)
 Add extra commentary to assembler output.
 
 ; Internal marker, set by the driver only, telling the compiler to emit
-; assembly to the output file and stop (i.e. the user asked for -S) rather
-; than assembling the result in-process into an object file.  cc1plus always
-; builds assembly into an in-memory buffer; at finalize it either writes that
-; buffer to the .s output (this flag set) or hands it to the integrated
-; assembler to produce the .o (this flag clear).  RejectDriver: users never
-; pass this; the driver emits it via %{S:...} in the object/compile path.
-; There is deliberately no -fno- opt-out: the in-process assembly fold is
-; unconditional and permanent.
+; assembly to the output file and stop (i.e. the user asked for -S, or the
+; driver selected the external-assembler pipeline) rather than assembling the
+; result in-process into an object file.  cc1plus always builds assembly into
+; an in-memory buffer; at finalize it either writes that buffer to the .s
+; output (this flag set) or hands it to the integrated assembler to produce
+; the .o (this flag clear).  RejectDriver: users never pass this; the driver
+; emits it via %{S:...} and via invoke_as's -fno-integrated-as arm.  The
+; compiler also folds !flag_integrated_as into this flag in process_options,
+; so a bare cc1plus run with -fno-integrated-as writes text to its -o just
+; like stock GCC did.
 fasm-output-only
 Common Var(flag_asm_output_only) RejectDriver
 Emit assembly and stop instead of assembling in-process (driver internal).

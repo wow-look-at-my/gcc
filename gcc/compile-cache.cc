@@ -752,13 +752,18 @@ compile_cache_enabled_p (void)
 
   /* 10. Stage 5 caches and serves the in-process-assembled OBJECT (.o), which
      only exists under -fintegrated-as (cc1plus produced the .o itself via
-     gas_assemble_buffer).  Without integrated-as there is no in-process .o to
-     cache, and the whole pre-parse serve premise ("the compiler already made
-     the object") does not hold -- so the cache disables itself rather than
-     fall back to the older .s behaviour.  asm_file_name == integ_obj_path in
-     that mode (the real .o), which is what we place on a hit.  */
+     gas_assemble_buffer).  With -fno-integrated-as (the restored external-as
+     pipeline, also auto-selected by the driver when -Wa,/-Xassembler options
+     are present) cc1plus emits only text and the external as's object is not
+     guaranteed byte-identical to an in-process-assembled one -- so such
+     compiles are ineligible for BOTH serve and store, by design: soundness
+     over speed.  The driver tier skips them for the same reason (its own
+     skip-no-integrated-as tag in driver_try_serve_from_cache).  */
   if (!flag_integrated_as)
-    return false;
+    {
+      cc_debug_line ("skip-no-integrated-as", NULL);
+      return false;
+    }
 
   cc_enabled = 1;
   return true;
