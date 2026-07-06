@@ -807,6 +807,15 @@ struct cc_closure_state
   struct sha1_ctx *ctx;
 };
 
+/* B2: the prefix maps active while cc_compute_key runs -- shared by the
+   closure-walk callback (cc_hash_one_file) and the auto-PCH gch merge
+   (cc_merge_gch_manifest), both of which hash file PATHS under -g and must
+   hash the same REWRITTEN strings DWARF will contain.  Populated/freed by
+   cc_compute_key; empty (count == 0, remap == identity) without -g or
+   without map options.  cc1 processes one TU per process, so file-scope
+   state is safe here (matches cc_meta et al.).  */
+static struct cc_prefix_maps cc_key_pm;
+
 /* Callback: fold one included file's path + content DIGEST into the TU key,
    and record its identity (path + size + per-file SHA-1) for the inputs table.
    Both the key and the object metadata are produced from this single walk.
@@ -833,9 +842,18 @@ cc_hash_one_file (const char *path, const unsigned char *buffer,
      produced bytes depend on it (under -g -- see cc_paths_affect_output_p).
      Dropping the path off the non-debug key is what makes an identical header
      reached via a differently named include tree hash the same.  The inputs
-     table below still records the real path for diagnostics either way.  */
+     table below still records the real path for diagnostics either way.
+     B2: DWARF contains the path AFTER the -f{file,debug}-prefix-map
+     rewrites, so the key hashes the mapped string (identity without maps;
+     this also closes the deep-tier hole where two differently-mapped
+     compiles of headers under a dropped prefix would otherwise collide).  */
   if (cc_paths_affect_output_p ())
-    cc_hash_str (st->ctx, CC_TAG_FILE_PATH, path);
+    {
+      char *mp = (cc_key_pm.count
+		  ? cc_pmaps_remap_alloc (&cc_key_pm, path) : NULL);
+      cc_hash_str (st->ctx, CC_TAG_FILE_PATH, mp ? mp : path);
+      free (mp);
+    }
 
   /* Per-file SHA-1 (also the inputs-table per-file hash).  Prefer the stored
      raw-bytes digest from libcpp (no re-read); otherwise hash the bytes we
@@ -995,7 +1013,13 @@ cc_merge_gch_manifest (struct sha1_ctx *ctx)
 	  const unsigned char *h = rec + CC_MHR_OFF_HASH;
 
 	  if (cc_paths_affect_output_p ())
-	    cc_hash_str (ctx, CC_TAG_FILE_PATH, hpath);
+	    {
+	      /* B2: hash the prefix-mapped path, like cc_hash_one_file.  */
+	      char *mp = (cc_key_pm.count
+			  ? cc_pmaps_remap_alloc (&cc_key_pm, hpath) : NULL);
+	      cc_hash_str (ctx, CC_TAG_FILE_PATH, mp ? mp : hpath);
+	      free (mp);
+	    }
 	  cc_hash_component (ctx, CC_TAG_FILE_BODY, h, 20);
 	  cc_meta_add_input (hpath, sz, &id, mflags, h);
 	}
@@ -1109,16 +1133,31 @@ cc_compute_key (cpp_reader *pfile)
      cc_paths_affect_output_p.  Leaving them out of the non-debug key is what
      lets the same source compiled from two different directories (different
      cwd, different -o) share one cache entry.  They are still recorded in the
-     object metadata (cc_meta.source / cc_meta.cwd) for diagnostics.  */
+     object metadata (cc_meta.source / cc_meta.cwd) for diagnostics -- RAW:
+     only the key hashes the B2 prefix-mapped strings (DWARF contains the
+     paths only after the user's -f{file,debug}-prefix-map rewrites; two
+     build dirs mapped to one canonical prefix therefore share the key AND
+     the bytes).  */
+  cc_pmaps_free (&cc_key_pm);	/* drop any stale per-TU state */
   if (cc_paths_affect_output_p ())
     {
-      cc_hash_str (&ctx, CC_TAG_MAIN_INPUT, main_input_filename);
-      cc_hash_str (&ctx, CC_TAG_CWD, cc_meta.cwd);
+      cc_pmaps_collect (&cc_key_pm, save_decoded_options,
+			save_decoded_options_count);
+      cc_pmaps_mark_dropped (&cc_key_pm, save_decoded_options_count,
+			     main_input_filename, cc_meta.cwd);
+      char *msrc = cc_pmaps_remap_alloc (&cc_key_pm, main_input_filename);
+      char *mcwd = cc_pmaps_remap_alloc (&cc_key_pm, cc_meta.cwd);
+      cc_hash_str (&ctx, CC_TAG_MAIN_INPUT, msrc);
+      cc_hash_str (&ctx, CC_TAG_CWD, mcwd);
+      free (msrc);
+      free (mcwd);
     }
 
   /* (4) Canonicalized codegen/ABI-relevant command-line options, in order.
      The same token set is recorded in the metadata "options" string (minus
-     -o / dump temp paths, which cc_option_affects_output_p already drops).  */
+     -o / dump temp paths, which cc_option_affects_output_p already drops;
+     the B2-dropped map options ARE still recorded there -- the metadata
+     describes the compile, the hash describes the output).  */
   for (unsigned i = 1; i < save_decoded_options_count; i++)
     {
       const cl_decoded_option *o = &save_decoded_options[i];
@@ -1126,7 +1165,8 @@ cc_compute_key (cpp_reader *pfile)
 	continue;
       for (size_t k = 0; k < o->canonical_option_num_elements; k++)
 	{
-	  cc_hash_str (&ctx, CC_TAG_OPT, o->canonical_option[k]);
+	  if (!cc_pmaps_opt_dropped_p (&cc_key_pm, i))
+	    cc_hash_str (&ctx, CC_TAG_OPT, o->canonical_option[k]);
 	  cc_options_append (&cc_meta.options, o->canonical_option[k]);
 	}
     }
@@ -1134,11 +1174,15 @@ cc_compute_key (cpp_reader *pfile)
     cc_meta.options = xstrdup ("");
 
   /* (3) The source closure: paths + exact bytes of every stacked file.  This
-     same walk fills the inputs table via cc_meta_add_input.  */
+     same walk fills the inputs table via cc_meta_add_input.  (Paths hash
+     prefix-mapped under -g via cc_key_pm; see cc_hash_one_file.)  */
   struct cc_closure_state st;
   st.ctx = &ctx;
   if (!cpp_foreach_included_file (pfile, cc_hash_one_file, &st))
-    return false;		/* a file could not be re-read; don't trust key */
+    {
+      cc_pmaps_free (&cc_key_pm);
+      return false;		/* a file could not be re-read; don't trust key */
+    }
 
   /* (3b) Every evaluated __has_include probe's RESULT (a probe can flip the
      output without changing the closure hashed above), captured into
@@ -1151,8 +1195,12 @@ cc_compute_key (cpp_reader *pfile)
      identities from the gch manifest so the key + manifest stay
      closure-complete.  */
   if (cc_pch_consumed_ours && !cc_merge_gch_manifest (&ctx))
-    return false;
+    {
+      cc_pmaps_free (&cc_key_pm);
+      return false;
+    }
 
+  cc_pmaps_free (&cc_key_pm);
   sha1_finish_ctx (&ctx, cc_key_raw);
   cc_hex (cc_key_raw, cc_key_hex);
   cc_key_valid = true;
@@ -1220,19 +1268,36 @@ cc_compute_manifest_key (const char *src_path)
   cc_hash_component (&ctx, CC_TAG_CHECKSUM, executable_checksum, 16);
   cc_hash_str (&ctx, CC_TAG_LANG, lang_hooks.name);
 
-  /* Under -g the source path + cwd bake into DWARF, so fold them in.  */
+  /* Under -g the source path + cwd bake into DWARF -- but only after the
+     user's -f{file,debug}-prefix-map rewrites, so hash the MAPPED strings
+     and drop the map options the mapping consumed (B2; identity + no drops
+     when no map matches).  MUST stay byte-for-byte parallel with the
+     driver's ccs_compute_manifest_key.  */
+  struct cc_prefix_maps pm;
+  memset (&pm, 0, sizeof (pm));
   if (cc_paths_affect_output_p ())
     {
-      cc_hash_str (&ctx, CC_TAG_MAIN_INPUT, src_path);
       const char *pwd = get_src_pwd ();
-      cc_hash_str (&ctx, CC_TAG_CWD, pwd ? pwd : "");
+      cc_pmaps_collect (&pm, save_decoded_options, save_decoded_options_count);
+      cc_pmaps_mark_dropped (&pm, save_decoded_options_count, src_path,
+			     pwd ? pwd : "");
+      char *msrc = cc_pmaps_remap_alloc (&pm, src_path);
+      char *mcwd = cc_pmaps_remap_alloc (&pm, pwd ? pwd : "");
+      cc_hash_str (&ctx, CC_TAG_MAIN_INPUT, msrc);
+      cc_hash_str (&ctx, CC_TAG_CWD, mcwd);
+      free (msrc);
+      free (mcwd);
     }
 
   /* (4) Output-affecting options + (anti-shadow) search-path VALUES.  Walked
-     in command-line order so option ordering is part of the key.  */
+     in command-line order so option ordering is part of the key.  Map
+     options whose effect is already captured by the mapped src/cwd above
+     are excluded (cc_pmaps_opt_dropped_p; never set without -g).  */
   for (unsigned i = 1; i < save_decoded_options_count; i++)
     {
       const cl_decoded_option *o = &save_decoded_options[i];
+      if (cc_pmaps_opt_dropped_p (&pm, i))
+	continue;
       bool affects = cc_option_affects_output_p (o);
       bool search = cc_option_is_search_path_p (o);
       if (!affects && !search)
@@ -1241,6 +1306,7 @@ cc_compute_manifest_key (const char *src_path)
 	cc_hash_str (&ctx, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT,
 		     o->canonical_option[k]);
     }
+  cc_pmaps_free (&pm);
 
   /* (S) The main source file's exact bytes -- the heart of MK.  Fingerprinted
      with the fast 128-bit cc_fast128 and folded into MK's SHA-1 (see the long

@@ -517,6 +517,170 @@ cc_option_is_search_path_p (const cl_decoded_option *decoded)
 }
 
 /* ------------------------------------------------------------------------ */
+/* B2: prefix-map-aware -g keys (see compile-cache-serve.h)                 */
+/* ------------------------------------------------------------------------ */
+
+void
+cc_pmaps_collect (struct cc_prefix_maps *pm, const cl_decoded_option *decoded,
+		  unsigned decoded_count)
+{
+  pm->ents = NULL;
+  pm->count = 0;
+  pm->dropped = NULL;
+  pm->dropped_n = 0;
+
+  unsigned cap = 0;
+  bool canon = false;		/* -fcanon-prefix-map is Init(0) */
+  for (unsigned i = 1; i < decoded_count; i++)
+    {
+      const cl_decoded_option *o = &decoded[i];
+      if (o->opt_index == OPT_fcanon_prefix_map)
+	{
+	  canon = (o->value != 0);
+	  continue;
+	}
+      if (o->opt_index != OPT_ffile_prefix_map_
+	  && o->opt_index != OPT_fdebug_prefix_map_)
+	continue;
+      const char *arg = o->arg;
+      const char *p = arg ? strrchr (arg, '=') : NULL;
+      if (!p)
+	continue;	/* malformed (cc1 errors); stays hashed raw */
+      if (pm->count == cap)
+	{
+	  cap = cap ? cap * 2 : 4;
+	  pm->ents = XRESIZEVEC (struct cc_pmap_ent, pm->ents, cap);
+	}
+      struct cc_pmap_ent *e = &pm->ents[pm->count++];
+      e->canonicalize = canon;
+      e->old_prefix = xstrndup (arg, p - arg);
+      e->old_len = (size_t) (p - arg);
+      if (e->canonicalize)
+	{
+	  char *realname = lrealpath (e->old_prefix);
+	  free (e->old_prefix);
+	  e->old_prefix = realname;
+	  e->old_len = strlen (realname);
+	}
+      e->new_prefix = xstrdup (p + 1);
+      e->new_len = strlen (e->new_prefix);
+      e->opt_i = i;
+    }
+}
+
+/* Does E's OLD prefix match FILENAME (per E's canonicalize rule)?  The
+   exact comparison remap_filename performs when it walks the list.  */
+static bool
+cc_pmap_ent_matches (const struct cc_pmap_ent *e, const char *filename)
+{
+  if (!filename)
+    return false;
+  if (!e->canonicalize)
+    return filename_ncmp (filename, e->old_prefix, e->old_len) == 0;
+  const char *realname;
+  bool realname_alloc = false;
+  if (lbasename (filename) == filename)
+    realname = filename;
+  else
+    {
+      realname = lrealpath (filename);
+      realname_alloc = true;
+    }
+  bool m = filename_ncmp (realname, e->old_prefix, e->old_len) == 0;
+  if (realname_alloc)
+    free (const_cast <char *> (realname));
+  return m;
+}
+
+void
+cc_pmaps_mark_dropped (struct cc_prefix_maps *pm, unsigned decoded_count,
+		       const char *src_path, const char *cwd)
+{
+  if (pm->count == 0)
+    return;
+  pm->dropped = XCNEWVEC (bool, decoded_count);
+  pm->dropped_n = decoded_count;
+  for (unsigned k = 0; k < pm->count; k++)
+    {
+      const struct cc_pmap_ent *e = &pm->ents[k];
+      if (cc_pmap_ent_matches (e, src_path) || cc_pmap_ent_matches (e, cwd))
+	pm->dropped[e->opt_i] = true;
+    }
+}
+
+char *
+cc_pmaps_remap_alloc (const struct cc_prefix_maps *pm, const char *filename)
+{
+  if (!filename)
+    return xstrdup ("");
+  const char *realname = NULL;
+  bool realname_alloc = false;
+  const struct cc_pmap_ent *hit = NULL;
+
+  /* Walk BACKWARDS: file-prefix-map.cc prepends each option, so its list
+     head -- the first match candidate -- is the LAST option given.  */
+  for (unsigned k = pm->count; k-- > 0;)
+    {
+      const struct cc_pmap_ent *e = &pm->ents[k];
+      if (e->canonicalize)
+	{
+	  if (realname == NULL)
+	    {
+	      if (lbasename (filename) == filename)
+		realname = filename;
+	      else
+		{
+		  realname = lrealpath (filename);
+		  realname_alloc = true;
+		}
+	    }
+	  if (filename_ncmp (realname, e->old_prefix, e->old_len) == 0)
+	    {
+	      hit = e;
+	      break;
+	    }
+	}
+      else if (filename_ncmp (filename, e->old_prefix, e->old_len) == 0)
+	{
+	  hit = e;
+	  break;
+	}
+    }
+
+  char *result;
+  if (!hit)
+    result = xstrdup (filename);
+  else
+    {
+      const char *name
+	= (hit->canonicalize ? realname : filename) + hit->old_len;
+      size_t name_len = strlen (name) + 1;
+      result = (char *) xmalloc (hit->new_len + name_len);
+      memcpy (result, hit->new_prefix, hit->new_len);
+      memcpy (result + hit->new_len, name, name_len);
+    }
+  if (realname_alloc)
+    free (const_cast <char *> (realname));
+  return result;
+}
+
+void
+cc_pmaps_free (struct cc_prefix_maps *pm)
+{
+  for (unsigned k = 0; k < pm->count; k++)
+    {
+      free (pm->ents[k].old_prefix);
+      free (pm->ents[k].new_prefix);
+    }
+  free (pm->ents);
+  free (pm->dropped);
+  pm->ents = NULL;
+  pm->count = 0;
+  pm->dropped = NULL;
+  pm->dropped_n = 0;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Manifest key (MK) computation -- the function both sides MUST share       */
 /* ------------------------------------------------------------------------ */
 
@@ -557,18 +721,35 @@ ccs_compute_manifest_key (const cc_serve_ctx *ctx, const char *src_path,
   ccs_hash_component (&ctx_sha, CC_TAG_CHECKSUM, ctx->checksum, 16);
   ccs_hash_str (&ctx_sha, CC_TAG_LANG, ctx->lang_name);
 
-  /* Under -g the source path + cwd bake into DWARF.  */
+  /* Under -g the source path + cwd bake into DWARF -- but only after the
+     user's -f{file,debug}-prefix-map rewrites, so hash the MAPPED strings
+     and drop the map options the mapping consumed (B2; identity + no drops
+     when no map matches).  MUST stay byte-for-byte parallel with cc1plus's
+     cc_compute_manifest_key.  */
+  struct cc_prefix_maps pm;
+  memset (&pm, 0, sizeof (pm));
   if (ctx->paths_affect_output)
     {
-      ccs_hash_str (&ctx_sha, CC_TAG_MAIN_INPUT, src_path);
-      ccs_hash_str (&ctx_sha, CC_TAG_CWD, ctx->cwd ? ctx->cwd : "");
+      cc_pmaps_collect (&pm, ctx->decoded, ctx->decoded_count);
+      cc_pmaps_mark_dropped (&pm, ctx->decoded_count, src_path,
+			     ctx->cwd ? ctx->cwd : "");
+      char *msrc = cc_pmaps_remap_alloc (&pm, src_path);
+      char *mcwd = cc_pmaps_remap_alloc (&pm, ctx->cwd ? ctx->cwd : "");
+      ccs_hash_str (&ctx_sha, CC_TAG_MAIN_INPUT, msrc);
+      ccs_hash_str (&ctx_sha, CC_TAG_CWD, mcwd);
+      free (msrc);
+      free (mcwd);
     }
 
   /* (4) Output-affecting options + (anti-shadow) search-path VALUES, in
-     command-line order.  decoded[0] is the program-name slot; skip it.  */
+     command-line order.  decoded[0] is the program-name slot; skip it.
+     Map options whose effect is already captured by the mapped src/cwd
+     above are excluded (cc_pmaps_opt_dropped_p; never set without -g).  */
   for (unsigned i = 1; i < ctx->decoded_count; i++)
     {
       const cl_decoded_option *o = &ctx->decoded[i];
+      if (cc_pmaps_opt_dropped_p (&pm, i))
+	continue;
       bool affects = cc_option_affects_output_p (o);
       bool search = cc_option_is_search_path_p (o);
       if (!affects && !search)
@@ -577,6 +758,7 @@ ccs_compute_manifest_key (const cc_serve_ctx *ctx, const char *src_path,
 	ccs_hash_str (&ctx_sha, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT,
 		      o->canonical_option[k]);
     }
+  cc_pmaps_free (&pm);
 
   /* (S) The main source file's exact bytes.  Fingerprinted with the fast
      128-bit hash (cc_fast128) and the fingerprint folded into MK's SHA-1, so
