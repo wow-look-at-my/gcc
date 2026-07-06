@@ -24,6 +24,11 @@ on:
         type: boolean
         required: false
         default: false
+      run_corpus:
+        description: 'Run the corpus validation matrix (openssl/zlib-ng/sqlite/fmt/llama.cpp: cache off/cold/warm byte-identity)'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -230,6 +235,17 @@ jobs:
           "$RUNNER_TEMP/dist-smoke/gcc-dist/bin/g++" -O2 "$RUNNER_TEMP/dist-smoke/t.cpp" -o "$RUNNER_TEMP/dist-smoke/t"
           "$RUNNER_TEMP/dist-smoke/t"
           "$RUNNER_TEMP/dist-smoke/gcc-dist/bin/g++" --version | head -1
+
+      # The dist is also a GHA artifact so same-run jobs (corpus) consume the
+      # exact shipping compiler without depending on the buildhost publish
+      # below (which is continue-on-error and may legitimately be skipped by
+      # a registry blip).
+      - name: Upload installed dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcc-dist
+          path: gcc-dist.tar.zst
+          retention-days: 1
 
       # Durable publish: push the installed dist to buildhost (pazer.build,
       # the org package registry) so every branch's compiler outlives the
@@ -836,6 +852,79 @@ jobs:
           name: testsuite-sums-${{ matrix.shard }}
           path: ${{ runner.temp }}/sums/
           retention-days: 30
+
+  # Corpus validation: prove the dist compiler is a drop-in on real projects.
+  # Each matrix leg builds one pinned upstream project three times with the
+  # shipping gcc-dist -- cache OFF, cache ON cold, cache ON warm in a fresh
+  # build dir -- and asserts the builds succeed, quick tests pass (off +
+  # warm, i.e. cache-served objects link and run), warm objects are
+  # byte-identical to cold, and the warm build genuinely served from the
+  # cache (GCC_COMPILE_CACHE_DEBUG hit-line floor per project; llama.cpp's
+  # RelWithDebInfo leg builds with -ffile-prefix-map=<builddir>=. and needs
+  # >= 300 cross-directory manifest hits, exercising the B2 prefix-mapped
+  # -g keys). Same triggers as `testsuite` (multi-hour-adjacent cost), with
+  # its own dispatch input so either gate can run alone.
+  corpus:
+    needs: build
+    runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/develop-matt/v14') ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_corpus)
+    # Legs are timeboxed; openssl and llama.cpp get more room because each
+    # runs three full builds of a non-trivial project on 4 vcpus.
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: openssl
+            timeout: 45
+          - project: zlib-ng
+            timeout: 30
+          - project: sqlite
+            timeout: 30
+          - project: fmt
+            timeout: 30
+          - project: llama.cpp
+            timeout: 45
+    steps:
+      # Only .github is needed (the corpus driver); skip the ~1 GiB GCC tree.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      # ninja for the cmake projects; gmp/mpfr/mpc/isl are cc1's own runtime
+      # deps. cmake, perl, unzip and git are preinstalled on ubuntu-latest.
+      - name: Install corpus dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgmp-dev libmpfr-dev libmpc-dev libisl-dev
+
+      - name: Download installed dist
+        uses: actions/download-artifact@v4
+        with:
+          name: gcc-dist
+
+      - name: Extract dist
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          tar -C "$RUNNER_TEMP/dist" --zstd -xf gcc-dist.tar.zst
+          "$RUNNER_TEMP/dist/gcc-dist/bin/gcc" --version | head -1
+
+      - name: Corpus validation (${{ matrix.project }})
+        env:
+          GCC_DIST: ${{ runner.temp }}/dist/gcc-dist
+        run: node "$GITHUB_WORKSPACE/.github/scripts/ci-corpus.mjs" "${{ matrix.project }}"
+
+      # Debug evidence on failure: per-phase stderr (cache debug lines) and
+      # the cold/warm object-hash manifests.
+      - name: Upload corpus logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-logs-${{ matrix.project }}
+          path: ${{ runner.temp }}/corpus/${{ matrix.project }}/logs/
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # GCC-testsuite regression gate -- overview in .github/TESTSUITE.md.
