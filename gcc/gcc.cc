@@ -1343,12 +1343,26 @@ ASM_COMPRESS_DEBUG_SPEC
 #define INVOKE_AS_EXTERNAL \
 "%{!S:-fasm-output-only -o %|.s |\n as %(asm_debug) %(asm_options) %m.s %A }"
 #endif
+#ifdef HAVE_LIBGAS
 static const char *invoke_as =
 "%{!fwpa*:\
    %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
    %{fno-integrated-as:" INVOKE_AS_EXTERNAL "}\
    %{!fno-integrated-as:%{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}}\
   }";
+#else
+/* Built without libgas (HAVE_LIBGAS unset -- not a combined tree, or a
+   target the embedded assembler does not support): the external pipeline is
+   the only pipeline, regardless of any -fintegrated-as on the command line
+   (which cc1 then rejects with a sorry; the spec must still route the
+   compile through `as` so the error is the compiler's, not a cascade of
+   missing-object failures).  */
+static const char *invoke_as =
+"%{!fwpa*:\
+   %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
+   " INVOKE_AS_EXTERNAL "\
+  }";
+#endif
 
 /* Some compilers have limits on line lengths, and the multilib_select
    and/or multilib_matches strings can be very long, so we build them at
@@ -5070,6 +5084,7 @@ process_command (unsigned int decoded_options_count,
 		       "%<-Wa,%>/%<-Xassembler%> options cannot be passed to "
 		       "the integrated assembler; remove %<-fintegrated-as%> "
 		       "or the assembler options");
+#ifdef HAVE_LIBGAS
 	else if (explicit_ias == -1)
 	  {
 	    save_switch ("-fno-integrated-as", 0, NULL,
@@ -5080,7 +5095,9 @@ process_command (unsigned int decoded_options_count,
 		       "external assembler for this invocation "
 		       "(compile cache disabled)\n");
 	  }
-	/* explicit_ias == 0: the user already chose the external path.  */
+#endif
+	/* explicit_ias == 0 (or no libgas, where the external pipeline is
+	   the only pipeline): the external path is already selected.  */
       }
   }
 
@@ -6010,7 +6027,11 @@ driver_try_serve_from_cache (void)
   const char *cache_dir = NULL;
   const char *src_path = NULL;
   const char *out_path = NULL;
+#ifdef HAVE_LIBGAS
   bool integrated_as = true;
+#else
+  bool integrated_as = false;	/* no libgas: never an in-process object */
+#endif
   bool disqualify = false;
   bool saw_g = false;
 

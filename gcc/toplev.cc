@@ -96,7 +96,9 @@ along with GCC; see the file COPYING3.  If not see
 
 #include "selftest.h"
 
+#ifdef HAVE_LIBGAS
 #include "gas-embed.h"		/* for -fintegrated-as (gas_assemble_buffer) */
+#endif
 
 #ifdef HAVE_isl
 #include <isl/version.h>
@@ -1291,6 +1293,22 @@ process_options ()
   if (flag_short_enums == 2)
     flag_short_enums = targetm.default_short_enums ();
 
+#ifndef HAVE_LIBGAS
+  /* Built without the embedded assembler (not a combined tree, or a target
+     libgas does not support): the integrated assembler cannot run at all.
+     An explicit -fintegrated-as is a loud error; the silent default flips
+     to the classic external-as pipeline (the driver's invoke_as made the
+     same compile-time choice, so it already routed this compile through
+     `as`).  */
+  if (flag_integrated_as)
+    {
+      if (global_options_set.x_flag_integrated_as)
+	sorry ("%<-fintegrated-as%> is not supported by this configuration "
+	       "of the compiler (built without libgas)");
+      flag_integrated_as = 0;
+    }
+#endif
+
   /* -fno-integrated-as: skip the in-process assembler and emit textual
      assembly to the output file instead, exactly like -S / the PCH specs do
      via -fasm-output-only -- reuse that internal flag so init_asm_output /
@@ -2096,6 +2114,7 @@ finalize ()
 	    }
 	  else if (!seen_error ())
 	    {
+#ifdef HAVE_LIBGAS
 	      /* Compile-to-object: assemble the buffered text in-process,
 		 writing the object straight to asm_file_name (the .o path the
 		 driver handed us).  gas_assemble_buffer is the libgas entry
@@ -2108,6 +2127,12 @@ finalize ()
 		fatal_error (input_location,
 			     "integrated assembler failed on %qs (code %d)",
 			     asm_file_name, rc);
+#else
+	      /* Unreachable: without libgas, process_options forced
+		 !flag_integrated_as and therefore flag_asm_output_only, so
+		 a real object request never lands in this branch.  */
+	      gcc_unreachable ();
+#endif
 	    }
 
 	  free (asm_mem_buf);
