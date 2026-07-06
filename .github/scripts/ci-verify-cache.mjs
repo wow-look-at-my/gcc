@@ -959,6 +959,543 @@ function compilePch(driver, src, obj, cacheDir, extra) {
     'check 14 OK: PCH objects deterministic across caches + identical to manual -x c++-header PCH\n');
 }
 
+// ---- checks 15-18: __has_include probes in the manifest fast path ---------
+// A TU that evaluates __has_include used to be disqualified from the manifest
+// ("manifest-skip-has-include") -- which was every real C++ TU, because
+// libstdc++'s bits/c++config.h probes <pstl/pstl_config.h> and <tbb/tbb.h>.
+// Probes are now RECORDED in the manifest entry (operand + result + the
+// candidate paths the search proved absent) and re-verified at serve time,
+// and their results fold into the object key. These checks pin:
+//   15. a real std-header C++ TU stores a manifest and gets a pre-parse
+//       manifest-hit on the warm compile;
+//   16. a NEGATIVE probe (header absent) does not serve stale after the
+//       probed header APPEARS -- full recompile, new key, new behavior;
+//   17. a POSITIVE probe does not serve stale after the header is DELETED
+//       (and the multi-entry manifest serves the matching original state);
+//   18. the carve-outs still disqualify: __has_include_next
+//       ("manifest-skip-has-include-next") and relative quote-form probes
+//       ("manifest-skip-has-include"), while the deep post-parse cache still
+//       hits for them.
+
+// ---- 15. C++ std-header TU: manifest stored + pre-parse manifest-hit ------
+{
+  // The in-tree xg++ has no default C++ include path; point it at the
+  // build-tree libstdc++ headers (and the in-srcdir libsupc++), like a
+  // build-tree caller would.
+  function findLibstdcxxIncludes(root) {
+    let incs = [];
+    try {
+      incs = fs.globSync(path.join(root, '*', 'libstdc++-v3', 'include'));
+    } catch {
+      incs = [];
+    }
+    if (incs.length === 0) {
+      // Node without fs.globSync: scan one level of build subdirs.
+      let ents = [];
+      try {
+        ents = fs.readdirSync(root, { withFileTypes: true });
+      } catch {
+        ents = [];
+      }
+      for (const e of ents) {
+        if (!e.isDirectory()) continue;
+        const p = path.join(root, e.name, 'libstdc++-v3', 'include');
+        if (fs.existsSync(p)) incs.push(p);
+      }
+    }
+    for (const inc of incs) {
+      let ents = [];
+      try {
+        ents = fs.readdirSync(inc, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of ents) {
+        if (e.isDirectory() &&
+            fs.existsSync(path.join(inc, e.name, 'bits', 'c++config.h'))) {
+          return { inc, tgtInc: path.join(inc, e.name) };
+        }
+      }
+    }
+    return null;
+  }
+  function findSrcdir(root) {
+    let mk;
+    try {
+      mk = fs.readFileSync(path.join(root, 'Makefile'), 'utf8');
+    } catch {
+      return null;
+    }
+    const m = mk.match(/^srcdir\s*=\s*(.+)\s*$/m);
+    return m ? path.resolve(root, m[1].trim()) : null;
+  }
+  const hdrs = findLibstdcxxIncludes(buildDir);
+  if (!hdrs) fail('check 15: could not locate build-tree libstdc++ headers under ' + buildDir);
+  const srcdir = findSrcdir(buildDir);
+  const supDir = srcdir ? path.join(srcdir, 'libstdc++-v3', 'libsupc++') : null;
+  const XI = ['-nostdinc++', '-I' + hdrs.tgtInc, '-I' + hdrs.inc]
+    .concat(supDir && fs.existsSync(supDir) ? ['-I' + supDir] : []);
+
+  const dir = path.join(work, 'probe-std');
+  fs.mkdirSync(dir);
+  const src = path.join(dir, 'stdtu.cpp');
+  fs.writeFileSync(
+    src,
+    '#include <string>\n' +
+    'int main(){ std::string s("hello"); return (int) s.size(); }\n'
+  );
+  const cache = path.join(dir, 'cache');
+  const o1 = path.join(dir, 's1.o');
+  const o2 = path.join(dir, 's2.o');
+
+  const r1 = compile(XGPP, src, o1, cache, XI);
+  if (/compile-cache: manifest-skip-has-include/.test(r1.stderr)) {
+    fail('check 15: std-header TU still disqualified from the manifest ' +
+         '(manifest-skip-has-include)\n' + r1.stderr);
+  }
+  if (!/compile-cache: manifest-store /.test(r1.stderr)) {
+    fail('check 15: expected a manifest-store on the cold std-header compile\n' + r1.stderr);
+  }
+  const r2 = compile(XGPP, src, o2, cache, XI);
+  if (!/compile-cache: manifest-hit /.test(r2.stderr)) {
+    fail('check 15: expected a pre-parse manifest-hit on the warm std-header compile\n' + r2.stderr);
+  }
+  if (Buffer.compare(readObj(o1), readObj(o2)) !== 0) {
+    fail('check 15: manifest-served std-header object is not byte-identical');
+  }
+  process.stdout.write(
+    'check 15 OK: std-header C++ TU stores a manifest and manifest-hits warm, byte-identical\n');
+}
+
+// ---- 16+17. probe soundness: header appears / disappears ------------------
+{
+  const dir = path.join(work, 'probe-flip');
+  const idir = path.join(dir, 'inc');
+  fs.mkdirSync(idir, { recursive: true });
+  const src = path.join(dir, 'p.c');
+  // Deliberately NO #include of the probed header: its appearance then flips
+  // the probe result WITHOUT changing the include closure, which is exactly
+  // the case a closure-only key cannot see -- without the probe-result key
+  // component, r3 below would be a stale deep "hit".
+  fs.writeFileSync(
+    src,
+    '#if __has_include(<maybe_probe.h>)\n' +
+    '#define PROBE_VAL 42\n' +
+    '#else\n' +
+    '#define PROBE_VAL 1\n' +
+    '#endif\n' +
+    'int main(void){ return PROBE_VAL; }\n'
+  );
+  const cache = path.join(dir, 'cache');
+  const XI = ['-I' + idir];
+  const o = (n) => path.join(dir, 'p' + n + '.o');
+
+  // Cold: negative probe recorded, manifest stored.
+  const r1 = compile(XGCC, src, o(1), cache, XI);
+  if (!/compile-cache: manifest-store /.test(r1.stderr)) {
+    fail('check 16: expected manifest-store on the cold negative-probe compile\n' + r1.stderr);
+  }
+  const key1 = keyFor(r1.keys, 'miss');
+  // Warm: pre-parse manifest serve.
+  const r2 = compile(XGCC, src, o(2), cache, XI);
+  if (!/compile-cache: manifest-hit /.test(r2.stderr)) {
+    fail('check 16: expected manifest-hit on the warm negative-probe compile\n' + r2.stderr);
+  }
+  // The probed header APPEARS: serving the old object would be stale.
+  writeHeader(path.join(idir, 'maybe_probe.h'), '#define PROBE_VAL 42\n');
+  const r3 = compile(XGCC, src, o(3), cache, XI);
+  if (/compile-cache: manifest-hit /.test(r3.stderr)) {
+    fail('check 16: STALE manifest-hit after the probed header appeared\n' + r3.stderr);
+  }
+  const key3 = keyFor(r3.keys, 'miss');
+  if (!key3) fail('check 16: expected a full recompile (miss) after the probed header appeared\n' + r3.stderr);
+  if (key3 === key1) {
+    fail('check 16: object key unchanged although the probe result flipped ' +
+         '(probe results must fold into the key)');
+  }
+  const exe = path.join(dir, 'p.out');
+  let code = linkAndRun(XGCC, o(3), exe);
+  if (code !== 42) fail('check 16: post-appearance program returned ' + code + ', expected 42');
+  process.stdout.write(
+    'check 16 OK: negative probe invalidates when the header appears (no stale serve; new key; runs 42)\n');
+
+  // Warm again with the header present (positive-probe entry now cached).
+  const r4 = compile(XGCC, src, o(4), cache, XI);
+  if (!/compile-cache: manifest-hit /.test(r4.stderr)) {
+    fail('check 17: expected manifest-hit on the warm positive-probe compile\n' + r4.stderr);
+  }
+  // The probed header DISAPPEARS: the positive entry must not serve; the
+  // ORIGINAL negative entry is valid again and legitimately serves the
+  // original object (multi-entry manifest round-trip).
+  fs.rmSync(path.join(idir, 'maybe_probe.h'));
+  const r5 = compile(XGCC, src, o(5), cache, XI);
+  const hit5 = keyFor(r5.keys, 'hit');
+  if (!hit5 || hit5 !== key1) {
+    fail('check 17: after deleting the probed header, expected the ORIGINAL ' +
+         'entry (' + key1 + ') to serve; got ' + hit5 + '\n' + r5.stderr);
+  }
+  if (Buffer.compare(readObj(o(5)), readObj(o(1))) !== 0) {
+    fail('check 17: round-trip object differs from the original');
+  }
+  code = linkAndRun(XGCC, o(5), exe);
+  if (code !== 1) fail('check 17: post-deletion program returned ' + code + ', expected 1');
+  process.stdout.write(
+    'check 17 OK: positive probe invalidates when the header disappears; original entry serves again\n');
+}
+
+// ---- 18. carve-outs: __has_include_next / quote form still disqualify -----
+{
+  const dir = path.join(work, 'probe-skip');
+  const dA = path.join(dir, 'a');
+  const dB = path.join(dir, 'b');
+  fs.mkdirSync(dA, { recursive: true });
+  fs.mkdirSync(dB, { recursive: true });
+  fs.writeFileSync(
+    path.join(dA, 'x_next.h'),
+    '#if __has_include_next(<x_next.h>)\n#define HAVE_NEXT 1\n#else\n#define HAVE_NEXT 0\n#endif\n'
+  );
+  fs.writeFileSync(path.join(dB, 'x_next.h'), '#define UNUSED_B 1\n');
+  const srcNext = path.join(dir, 'n.c');
+  fs.writeFileSync(srcNext, '#include <x_next.h>\nint main(void){ return HAVE_NEXT; }\n');
+  const cache = path.join(dir, 'cache');
+
+  const rn1 = compile(XGCC, srcNext, path.join(dir, 'n1.o'), cache,
+                      ['-I' + dA, '-I' + dB]);
+  if (!/compile-cache: manifest-skip-has-include-next /.test(rn1.stderr)) {
+    fail('check 18: expected manifest-skip-has-include-next for a __has_include_next TU\n' + rn1.stderr);
+  }
+  if (/compile-cache: manifest-store /.test(rn1.stderr)) {
+    fail('check 18: __has_include_next TU must not store a manifest\n' + rn1.stderr);
+  }
+  const rn2 = compile(XGCC, srcNext, path.join(dir, 'n2.o'), cache,
+                      ['-I' + dA, '-I' + dB]);
+  if (/compile-cache: manifest-hit /.test(rn2.stderr)) {
+    fail('check 18: __has_include_next TU must not manifest-hit\n' + rn2.stderr);
+  }
+  if (!keyFor(rn2.keys, 'hit')) {
+    fail('check 18: __has_include_next TU should still deep-hit post-parse\n' + rn2.stderr);
+  }
+
+  // Relative quote-form probe: VERIFIABLE from records (the candidates are
+  // pre-joined at probe time against the exact chain cpp walked, probing
+  // file's directory included), so it stores a manifest and serves.  glibc's
+  // own bits/statx.h / bits/unistd_ext.h probe "linux/stat.h" /
+  // "linux/close_range.h", so this decides whether every POSIX-touching TU
+  // manifest-serves or none of them do.  Full appear/disappear lifecycle in
+  // check 19.
+  fs.writeFileSync(path.join(dir, 'qprobe.h'), '#define HAVE_Q 1\n');
+  const srcQ = path.join(dir, 'q.c');
+  fs.writeFileSync(
+    srcQ,
+    '#if __has_include("qprobe.h")\n#define QV 3\n#else\n#define QV 0\n#endif\n' +
+    'int main(void){ return QV; }\n'
+  );
+  const rq = compile(XGCC, srcQ, path.join(dir, 'q1.o'), cache);
+  if (!/compile-cache: manifest-store /.test(rq.stderr)) {
+    fail('check 18: quote-form probe TU must store a manifest now\n' + rq.stderr);
+  }
+  const rq2 = compile(XGCC, srcQ, path.join(dir, 'q2.o'), cache);
+  if (!/compile-cache: manifest-hit /.test(rq2.stderr)) {
+    fail('check 18: quote-form probe TU must manifest-hit warm\n' + rq2.stderr);
+  }
+  process.stdout.write(
+    'check 18 OK: __has_include_next still skips the manifest; quote-form probes store and serve\n');
+}
+
+// Synchronous sleep (seconds, fractional ok) for the timestamp-sensitive
+// checks below: the store only trusts a file's stat identity when its
+// stamps predate the compile's start second (the "too new" guard), so a
+// just-written header must rest for over a second before the storing
+// compile for the stat shortcut to engage at all.
+function sleepSecs(s) {
+  spawnSync('sleep', [String(s)]);
+}
+
+// ---- 19. quote-form probe lifecycle: flip by appearance, heal by removal --
+// A NOT-FOUND quote probe ("qf_probe.h" absent everywhere) must flip the TU
+// when a file appears at the probe's first candidate -- the SOURCE'S OWN
+// DIRECTORY, the part of the quote chain no search-path option describes --
+// and the original entry must serve again once the file is removed
+// (multi-entry manifest).  Functional proof via exit codes, like checks
+// 16/17 do for the angle forms.
+{
+  const dir = path.join(work, 'quote-flip');
+  fs.mkdirSync(dir, { recursive: true });
+  const src = path.join(dir, 'qf.c');
+  fs.writeFileSync(
+    src,
+    '#if __has_include("qf_probe.h")\n#define QV 3\n#else\n#define QV 0\n#endif\n' +
+    'int main(void){ return QV; }\n'
+  );
+  const cache = path.join(dir, 'cache');
+  const exe = path.join(dir, 'qf');
+  const o = (n) => path.join(dir, 'qf' + n + '.o');
+
+  const r1 = compile(XGCC, src, o(1), cache);
+  if (!/compile-cache: manifest-store /.test(r1.stderr)) {
+    fail('check 19: expected manifest-store for the not-found quote probe TU\n' + r1.stderr);
+  }
+  let code = linkAndRun(XGCC, o(1), exe);
+  if (code !== 0) fail('check 19: initial program returned ' + code + ', expected 0');
+
+  const r2 = compile(XGCC, src, o(2), cache);
+  if (!/compile-cache: manifest-hit /.test(r2.stderr)) {
+    fail('check 19: expected manifest-hit while the probe file is absent\n' + r2.stderr);
+  }
+
+  // The probed file APPEARS next to the source: the recorded candidate
+  // exists now, so the entry must be rejected (no stale 0-return serve) and
+  // the recompile must see QV=3.
+  writeHeader(path.join(dir, 'qf_probe.h'), '/* appeared */\n');
+  const r3 = compile(XGCC, src, o(3), cache);
+  if (/compile-cache: manifest-hit /.test(r3.stderr)) {
+    fail('check 19: stale manifest-hit after the quoted probe file appeared\n' + r3.stderr);
+  }
+  code = linkAndRun(XGCC, o(3), exe);
+  if (code !== 3) fail('check 19: post-appearance program returned ' + code + ', expected 3');
+
+  // Removal restores the original state: the first entry must serve again.
+  fs.rmSync(path.join(dir, 'qf_probe.h'));
+  const r4 = compile(XGCC, src, o(4), cache);
+  if (!/compile-cache: manifest-hit /.test(r4.stderr)) {
+    fail('check 19: expected manifest-hit again after the probe file was removed\n' + r4.stderr);
+  }
+  code = linkAndRun(XGCC, o(4), exe);
+  if (code !== 0) fail('check 19: post-removal program returned ' + code + ', expected 0');
+
+  process.stdout.write(
+    'check 19 OK: quote-form probe flips on appearance in the source dir and heals on removal\n');
+}
+
+// ---- 20. stat identity: same-size rewrite with ns-exact restored mtime ----
+// The manifest stat shortcut must NOT accept a header whose content changed
+// even when the rewrite preserves the size AND restores the mtime to the
+// exact nanosecond (touch -r): st_ctime necessarily advances, the identity
+// mismatch forces the content re-hash, and the changed hash rejects the
+// entry.  This is precisely the rewrite the old size+mtime-seconds shortcut
+// could not see.
+{
+  const dir = path.join(work, 'statid');
+  fs.mkdirSync(dir, { recursive: true });
+  const hdr = path.join(dir, 'sh.h');
+  const src = path.join(dir, 's.c');
+  const stamp = path.join(dir, 'stamp');
+  fs.writeFileSync(hdr, '#define SVAL 42\n');
+  fs.writeFileSync(
+    src, '#include "sh.h"\nint main(void){ return SVAL; }\n');
+  const cache = path.join(dir, 'cache');
+  const exe = path.join(dir, 's');
+  const o = (n) => path.join(dir, 's' + n + '.o');
+
+  // Let the header come to rest so the store trusts its stat identity (the
+  // "too new" guard compares its stamps against the compile's start second).
+  sleepSecs(1.3);
+
+  const r1 = compile(XGCC, src, o(1), cache, ['-I' + dir]);
+  if (!/compile-cache: manifest-store /.test(r1.stderr)) {
+    fail('check 20: expected manifest-store on the cold compile\n' + r1.stderr);
+  }
+  let code = linkAndRun(XGCC, o(1), exe);
+  if (code !== 42) fail('check 20: initial program returned ' + code + ', expected 42');
+
+  // Sanity: the shortcut itself hits while nothing changed.
+  const r2 = compile(XGCC, src, o(2), cache, ['-I' + dir]);
+  if (!/compile-cache: manifest-hit /.test(r2.stderr)) {
+    fail('check 20: expected manifest-hit before the rewrite\n' + r2.stderr);
+  }
+
+  // Capture sh.h's full-resolution timestamps on a stamp file, rewrite the
+  // header SAME-SIZE with different content, then restore the timestamps
+  // ns-exactly from the stamp.  Size, mtime (s+ns), dev, ino all match the
+  // record afterwards; only ctime differs.
+  let tr = spawnSync('touch', ['-r', hdr, stamp], { encoding: 'utf8' });
+  if (tr.status !== 0) fail('check 20: touch -r (capture) failed: ' + (tr.stderr || ''));
+  fs.writeFileSync(hdr, '#define SVAL 43\n');   // same byte count as 42
+  tr = spawnSync('touch', ['-r', stamp, hdr], { encoding: 'utf8' });
+  if (tr.status !== 0) fail('check 20: touch -r (restore) failed: ' + (tr.stderr || ''));
+  const stNew = fs.statSync(hdr, { bigint: true });
+
+  const r3 = compile(XGCC, src, o(3), cache, ['-I' + dir]);
+  if (/compile-cache: manifest-hit /.test(r3.stderr)) {
+    fail('check 20: STALE manifest-hit after a same-size mtime-restored rewrite\n' +
+         'header stat: mtimeNs=' + String(stNew.mtimeNs) +
+         ' ctimeNs=' + String(stNew.ctimeNs) + '\n' + r3.stderr);
+  }
+  code = linkAndRun(XGCC, o(3), exe);
+  if (code !== 43) fail('check 20: post-rewrite program returned ' + code + ', expected 43 (stale 42 served?)');
+
+  process.stdout.write(
+    'check 20 OK: same-size content rewrite with ns-exact restored mtime is caught (ctime mismatch -> re-hash -> stale)\n');
+}
+
+// ---- 21. GCC_COMPILE_CACHE_PARANOID=1 forces the re-hash path -------------
+// The paranoid mode must still serve (correct hits survive full content
+// verification) -- it just never takes the stat shortcut.  Serve parity is
+// asserted via the debug tag, byte-identical objects, and program behavior.
+{
+  const dir = path.join(work, 'paranoid');
+  fs.mkdirSync(dir, { recursive: true });
+  const hdr = path.join(dir, 'ph.h');
+  const src = path.join(dir, 'p.c');
+  fs.writeFileSync(hdr, '#define PVAL 7\n');
+  fs.writeFileSync(src, '#include "ph.h"\nint main(void){ return PVAL; }\n');
+  const cache = path.join(dir, 'cache');
+  const exe = path.join(dir, 'p');
+  const o = (n) => path.join(dir, 'p' + n + '.o');
+
+  const r1 = compile(XGCC, src, o(1), cache, ['-I' + dir]);
+  if (!/compile-cache: manifest-store /.test(r1.stderr)) {
+    fail('check 21: expected manifest-store on the cold compile\n' + r1.stderr);
+  }
+
+  const paranoidEnv = { ...debugEnv, GCC_COMPILE_CACHE_PARANOID: '1' };
+  const res = spawnSync(
+    XGCC,
+    ['-O2', '-c', src, '-o', o(2), '-I' + dir,
+      '-fcompile-cache=' + cache, '-fintegrated-as', B],
+    { env: paranoidEnv, encoding: 'utf8' });
+  if (res.status !== 0) fail('check 21: paranoid compile failed\n' + (res.stderr || ''));
+  if (!/compile-cache: manifest-hit /.test(res.stderr || '')) {
+    fail('check 21: expected manifest-hit under GCC_COMPILE_CACHE_PARANOID=1\n' + (res.stderr || ''));
+  }
+  if (!readObj(o(1)).equals(readObj(o(2)))) {
+    fail('check 21: paranoid hit produced different object bytes');
+  }
+  const code = linkAndRun(XGCC, o(2), exe);
+  if (code !== 7) fail('check 21: paranoid-served program returned ' + code + ', expected 7');
+
+  process.stdout.write(
+    'check 21 OK: PARANOID=1 (forced content re-hash) still serves byte-identical objects\n');
+}
+
+// ---- 22. dependency files on manifest hits (-MD contract) -----------------
+// A served hit must leave the SAME dependency information a real compile
+// leaves: (a) driver-tier hit (-MD -MT -MF present) synthesizes the .d from
+// the manifest records; (b) -MD without an explicit -MT (the driver spec
+// then adds -MQ <output> to the cc1 line; whichever tier serves must leave
+// the complete file); (c) -MMD (user-only deps) must not be served from the
+// manifest at all -- the records cannot distinguish system headers -- and
+// falls to the deep path, which writes exact deps.  Before this fix a
+// driver-tier hit wrote NOTHING, silently erasing ninja's recorded header
+// dependencies for that object (deps = gcc treats a missing depfile as
+// empty).
+{
+  const dir = path.join(work, 'depsynth');
+  fs.mkdirSync(dir, { recursive: true });
+  const hdr = path.join(dir, 'dh.h');
+  const src = path.join(dir, 'd.c');
+  fs.writeFileSync(hdr, '#define DV 5\n');
+  fs.writeFileSync(src, '#include "dh.h"\n#include <stdint.h>\nint main(void){ return DV; }\n');
+  const cache = path.join(dir, 'cache');
+  const o = (n) => path.join(dir, 'd' + n + '.o');
+  const d = (n) => path.join(dir, 'd' + n + '.d');
+
+  // Parse a make depfile into its sorted SET of prerequisites.  Duplicates
+  // collapse: make/ninja ignore multiplicity, and the manifest legitimately
+  // records the same path twice when cpp reached it via two search anchors
+  // (e.g. the preincluded stdc-predef.h).
+  const depSet = (p) => {
+    const txt = fs.readFileSync(p, 'utf8');
+    const ci = txt.indexOf(':');
+    const body = ci >= 0 ? txt.slice(ci + 1) : txt;
+    return [...new Set(
+      body
+        .replace(/\\\n/g, ' ')
+        .split(/\s+/)
+        .filter((s) => s && !s.endsWith(':'))
+    )].sort().join('\n');
+  };
+
+  // NOTE: the M-family option values are EXCLUDED from the keys (they shape
+  // only the .d side channel, regenerated from the live command line on
+  // every serve).  The pairs below still repeat the identical command line
+  // and delete the .d in between -- the point under test is that the hit
+  // RECREATES the file, not cross-flag key sharing (check 20/21 cover key
+  // behavior).
+
+  // (a) driver-tier form: -MD -MT -MF all explicit.
+  const argsA = ['-I' + dir, '-MD', '-MT', 'fixed-target.o', '-MF', d(1)];
+  const r1 = compile(XGCC, src, o(1), cache, argsA);
+  if (!/compile-cache: manifest-store /.test(r1.stderr)) {
+    fail('check 22: expected manifest-store on the cold -MD compile\n' + r1.stderr);
+  }
+  const realSetA = depSet(d(1));
+  fs.rmSync(d(1));
+  const r2 = compile(XGCC, src, o(1), cache, argsA);
+  if (!/compile-cache: manifest-hit /.test(r2.stderr)) {
+    fail('check 22: expected manifest-hit on the warm -MD compile\n' + r2.stderr);
+  }
+  if (!fs.existsSync(d(1))) {
+    fail('check 22: manifest hit left NO dependency file (the -MD contract)\n' + r2.stderr);
+  }
+  if (realSetA !== depSet(d(1))) {
+    fail('check 22: hit-synthesized deps differ from the real compile\n--- real ---\n' +
+         realSetA + '\n--- synthesized ---\n' + depSet(d(1)));
+  }
+
+  // (b) -MD without -MT (the driver spec adds -MQ <output> to the cc1 line;
+  // the serving tier must still leave the complete file).  Because the
+  // M-family options are excluded from the keys, this DIFFERENT dependency
+  // spelling must hit entry (a) directly -- cross-flag key sharing -- and
+  // still synthesize its own .d.
+  const argsB = ['-I' + dir, '-MD', '-MF', d(2)];
+  const r3 = compile(XGCC, src, o(2), cache, argsB);
+  if (!/compile-cache: manifest-hit /.test(r3.stderr)) {
+    fail('check 22: expected a manifest-hit for -MD without -MT (M-opts are unkeyed)\n' + r3.stderr);
+  }
+  if (!fs.existsSync(d(2))) {
+    fail('check 22: -MD without -MT left no dependency file on a hit');
+  }
+  if (realSetA !== depSet(d(2))) {
+    fail('check 22: -MD-without-MT deps differ from the real compile\n--- real ---\n' +
+         realSetA + '\n--- got ---\n' + depSet(d(2)));
+  }
+  const realSetB = depSet(d(2));
+  fs.rmSync(d(2));
+  const r4 = compile(XGCC, src, o(2), cache, argsB);
+  if (!/compile-cache: manifest-hit /.test(r4.stderr)) {
+    fail('check 22: expected a manifest-hit on the repeat -MD-no-MT compile\n' + r4.stderr);
+  }
+  if (!fs.existsSync(d(2))) {
+    fail('check 22: repeat hit did not recreate the deleted .d');
+  }
+  if (realSetB !== depSet(d(2))) {
+    fail('check 22: recreated deps differ\n--- before ---\n' +
+         realSetB + '\n--- after ---\n' + depSet(d(2)));
+  }
+
+  // (c) -MMD: never served from the manifest (the records carry no
+  // system-header bit, and such TUs do not even store one -- the guard
+  // precedes the key computation).  The deep object path still works:
+  // cold stores, warm deep-hits, and cpp itself writes exact user-only
+  // deps both times.
+  const argsC = ['-I' + dir, '-MMD', '-MF', d(3)];
+  const r5 = compile(XGCC, src, o(3), cache, argsC);
+  if (!/compile-cache: manifest-skip-deps-form /.test(r5.stderr)) {
+    fail('check 22: expected manifest-skip-deps-form for -MMD\n' + r5.stderr);
+  }
+  if (/compile-cache: manifest-(hit|store) /.test(r5.stderr)) {
+    fail('check 22: -MMD must neither serve nor store a manifest\n' + r5.stderr);
+  }
+  fs.rmSync(d(3));
+  const r6 = compile(XGCC, src, o(3), cache, argsC);
+  if (/compile-cache: manifest-hit /.test(r6.stderr)) {
+    fail('check 22: -MMD must not be served from the manifest\n' + r6.stderr);
+  }
+  if (!keyFor(r6.keys, 'hit')) {
+    fail('check 22: -MMD warm compile should deep-hit\n' + r6.stderr);
+  }
+  if (!fs.existsSync(d(3))) {
+    fail('check 22: -MMD deep path left no dependency file');
+  }
+  if (/stdint\.h/.test(fs.readFileSync(d(3), 'utf8'))) {
+    fail('check 22: -MMD deps must exclude system headers\n' + fs.readFileSync(d(3), 'utf8'));
+  }
+
+  process.stdout.write(
+    'check 22 OK: hits honor -MD (explicit-MT and spec-MQ forms, equal dep sets); -MMD declines to the deep path\n');
+}
+
 // ---- cleanup + success ---------------------------------------------------
 try {
   fs.rmSync(work, { recursive: true, force: true });

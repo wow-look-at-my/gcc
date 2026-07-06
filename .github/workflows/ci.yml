@@ -18,6 +18,10 @@ on:
 permissions:
   contents: read
   actions: write
+  # Mint short-lived GHA OIDC tokens: the "Publish to buildhost" steps in
+  # `build` and `package-pgo` authenticate to pazer.build with one instead
+  # of a static secret (the project auto-provisions server-side).
+  id-token: write
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -165,6 +169,137 @@ jobs:
           name: gccbuild
           path: gccbuild.tar.gz
           retention-days: 1
+
+      # Small "installed dist" for the buildhost publish below. The published
+      # artifact MUST stay well under ~100 MiB: pazer.build's only ingress is
+      # a Cloudflare Tunnel, and Cloudflare's edge caps a request body at
+      # ~100 MiB (a bigger single PUT draws an instant 413 at the edge;
+      # buildhost has no chunked artifact upload). The ~1 GiB build-tree
+      # tarball above therefore cannot be published -- this stripped DESTDIR
+      # install (~38 MiB tar.zst, ~193 MiB unpacked) is what goes to the
+      # registry. It is relocatable: gcc-dist/bin/{gcc,g++} compile, link and
+      # run C/C++ from any extraction path with no -B/-I flags (cc1plus,
+      # headers and libstdc++ resolve relative to the driver); the trailing
+      # smoke test re-proves that from the packed bits on every run.
+      - name: Package installed dist (fits buildhost upload cap)
+        run: |
+          WORK="$RUNNER_TEMP/dist"
+          rm -rf "$WORK"
+          make -C "$RUNNER_TEMP/gccbuild" -j2 install-gcc install-target-libgcc install-target-libstdc++-v3 \
+            DESTDIR="$WORK" MAKEINFO=true
+          # configured --prefix is /usr/local; rename the installed prefix
+          mv "$WORK/usr/local" "$WORK/gcc-dist"
+          cd "$WORK/gcc-dist"
+          # trim what a consumer never needs (keep c++ headers, libgcc, crt, specs)
+          rm -rf share/man share/info share/doc
+          rm -rf libexec/gcc/x86_64-pc-linux-gnu/*/install-tools lib/gcc/x86_64-pc-linux-gnu/*/install-tools
+          find . -name '*.la' -delete
+          # strip(1) replaces inodes, which would break the driver hardlink
+          # groups (gcc/g++/c++/x86_64-pc-linux-gnu-* share inodes): record
+          # the groups, strip one path per inode, then restore the links.
+          find . -type f -links +1 -printf '%i %p\n' | sort -n > "$WORK/hardlinks.txt"
+          find . -type f -exec file {} + | grep -E 'ELF.*(executable|shared object)' | cut -d: -f1 > "$WORK/elf.txt"
+          while read -r f; do printf '%s %s\n' "$(stat -c %i "$f")" "$f"; done < "$WORK/elf.txt" \
+            | awk '!seen[$1]++ { $1=""; sub(/^ /,""); print }' > "$WORK/striplist.txt"
+          xargs -a "$WORK/striplist.txt" strip --strip-unneeded
+          awk '{ if ($1 in first) print first[$1] "\t" $2; else first[$1]=$2 }' "$WORK/hardlinks.txt" \
+            | while IFS=$'\t' read -r src dst; do ln -f "$src" "$dst"; done
+          # static libs / crt objects: --strip-debug only (--strip-unneeded would gut them)
+          find . -type f \( -name '*.a' -o -name 'crt*.o' \) -exec strip --strip-debug {} +
+          du -sh "$WORK/gcc-dist"
+          tar -C "$WORK" -cf - gcc-dist | zstd -19 --long=27 -T0 -o "$GITHUB_WORKSPACE/gcc-dist.tar.zst"
+          ls -l "$GITHUB_WORKSPACE/gcc-dist.tar.zst"
+          # smoke test the packed dist from a fresh path before publishing it
+          mkdir -p "$RUNNER_TEMP/dist-smoke"
+          tar -C "$RUNNER_TEMP/dist-smoke" --zstd -xf "$GITHUB_WORKSPACE/gcc-dist.tar.zst"
+          cat > "$RUNNER_TEMP/dist-smoke/t.cpp" <<'EOF'
+          #include <vector>
+          #include <iostream>
+          int main() { std::vector<int> v{1,2,3}; int s=0; for (int x : v) s+=x; std::cout << s << "\n"; }
+          EOF
+          "$RUNNER_TEMP/dist-smoke/gcc-dist/bin/g++" -O2 "$RUNNER_TEMP/dist-smoke/t.cpp" -o "$RUNNER_TEMP/dist-smoke/t"
+          "$RUNNER_TEMP/dist-smoke/t"
+          "$RUNNER_TEMP/dist-smoke/gcc-dist/bin/g++" --version | head -1
+
+      # Durable publish: push the installed dist to buildhost (pazer.build,
+      # the org package registry) so every branch's compiler outlives the
+      # 1-day GHA artifact and stays downloadable per branch:
+      #   https://dl.pazer.build/gcc?branch=<branch>&os=linux&arch=amd64
+      # (serves gcc-dist.tar.zst; extract and run gcc-dist/bin/g++ directly).
+      # Auth is the job's GHA OIDC token (audience = the server URL; needs the
+      # workflow-level `id-token: write`); the project auto-provisions on the
+      # first publish. Same REST sequence as the org's buildhost-publish
+      # action: create release (recording git branch + commit) -> upload
+      # artifact (kind=archive -- the payload is a tarball, not a bare
+      # binary; the token rides in a curl config file so it stays off argv)
+      # -> publish release.
+      #
+      # The upload is the ~38 MiB stripped dist from the step above, NOT the
+      # ~1 GiB build-tree tarball: Cloudflare's edge 413s request bodies over
+      # ~100 MiB (see that step's comment), so the published artifact must
+      # stay under the cap. continue-on-error stays regardless: a registry
+      # blip must never fail `build` and skip the benchmark job; the GHA
+      # artifact above is the fallback.
+      - name: Publish to buildhost
+        continue-on-error: true
+        uses: wow-look-at-my/actions@typescript#latest
+        with:
+          script: |
+            const server = "https://pazer.build";
+            const project = "gcc";
+            const tarball = "gcc-dist.tar.zst";
+
+            try {
+              // getIDToken also registers the JWT as a masked secret.
+              const token = await core.getIDToken(server);
+
+              // Retry transient edge errors (5xx, or an empty-body CDN 404
+              // during a buildhost rolling deploy) with backoff, like the org
+              // buildhost-publish action, so a brief deploy window cannot
+              // waste a ~40-minute build.
+              const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+              const api = async (method: string, urlPath: string, body?: string) => {
+                const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+                if (body !== undefined) headers["Content-Type"] = "application/json";
+                for (let attempt = 1; ; attempt++) {
+                  try {
+                    const resp = await fetch(`${server}${urlPath}`, { method, headers, body });
+                    const text = await resp.text();
+                    const transient = resp.status >= 500 || (resp.status === 404 && text.trim() === "");
+                    if (attempt === 5 || !transient) return { status: resp.status, text };
+                    core.warning(`${method} ${urlPath} -> HTTP ${resp.status} (transient, attempt ${attempt}/5)`);
+                  } catch (e) {
+                    if (attempt === 5) throw e;
+                    core.warning(`${method} ${urlPath} -> ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
+                  }
+                  await sleep(1000 * 2 ** (attempt - 1));
+                }
+              };
+
+              const create = await api("POST", `/api/v1/projects/${project}/releases`,
+                JSON.stringify({ git_branch: github.ref_name, git_commit: github.sha }));
+              if (create.status !== 201) throw new Error(`create release failed (HTTP ${create.status}): ${create.text}`);
+              const version: string = JSON.parse(create.text).version;
+              core.info(`Created release ${project}/${version}`);
+
+              const cfg = path.join(os.tmpdir(), "buildhost-auth-cfg");
+              fs.writeFileSync(cfg, `header = "Authorization: Bearer ${token}"\n`, { mode: 0o600 });
+              const uploadURL = `${server}/api/v1/projects/${project}/releases/${version}/artifacts/linux/amd64?kind=archive`;
+              await $`curl -sS --fail-with-body --retry 4 -X PUT -K ${cfg} -H ${`X-Artifact-Filename: ${tarball}`} --data-binary ${`@${tarball}`} ${uploadURL}`;
+
+              const pub = await api("POST", `/api/v1/projects/${project}/releases/${version}/publish`);
+              if (pub.status !== 200) throw new Error(`publish failed (HTTP ${pub.status}): ${pub.text}`);
+              core.info(`Published ${project}/${version} -> https://dl.pazer.build/${project}?branch=${github.ref_name}&os=linux&arch=amd64`);
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              core.warning(
+                `buildhost publish FAILED -- this build was NOT published to ` +
+                `https://dl.pazer.build/${project}?branch=${github.ref_name}. The dist tarball is ` +
+                `~38 MiB (under Cloudflare's ~100 MiB edge body cap), so this is a transient ` +
+                `registry/network failure, not the old oversized-PUT 413. The gccbuild GHA ` +
+                `artifact (1-day retention) is unaffected; downstream jobs continue.`);
+              core.setFailed(`buildhost publish failed (non-blocking, continue-on-error): ${msg}`);
+            }
 
   # PGO-built release package: instrumented build -> deterministic training
   # workload (contrib/perf-train) -> profile-use rebuild. Measured ~-8% cc1plus
@@ -330,6 +465,115 @@ jobs:
           name: gccbuild-pgo
           path: gccbuild-pgo.tar.gz
           retention-days: 7
+
+      # Same installed-dist packaging as the `build` job (see the comments
+      # there): the buildhost artifact must stay under Cloudflare's ~100 MiB
+      # edge body cap, so the ~1 GiB build tree is not publishable and this
+      # stripped ~38 MiB dist is. The tree was mv'd to $RUNNER_TEMP/gccbuild
+      # by "Package PGO compiler" above, so the same commands apply.
+      - name: Package installed dist (fits buildhost upload cap)
+        run: |
+          WORK="$RUNNER_TEMP/dist"
+          rm -rf "$WORK"
+          make -C "$RUNNER_TEMP/gccbuild" -j2 install-gcc install-target-libgcc install-target-libstdc++-v3 \
+            DESTDIR="$WORK" MAKEINFO=true
+          # configured --prefix is /usr/local; rename the installed prefix
+          mv "$WORK/usr/local" "$WORK/gcc-dist"
+          cd "$WORK/gcc-dist"
+          # trim what a consumer never needs (keep c++ headers, libgcc, crt, specs)
+          rm -rf share/man share/info share/doc
+          rm -rf libexec/gcc/x86_64-pc-linux-gnu/*/install-tools lib/gcc/x86_64-pc-linux-gnu/*/install-tools
+          find . -name '*.la' -delete
+          # strip(1) replaces inodes, which would break the driver hardlink
+          # groups (gcc/g++/c++/x86_64-pc-linux-gnu-* share inodes): record
+          # the groups, strip one path per inode, then restore the links.
+          find . -type f -links +1 -printf '%i %p\n' | sort -n > "$WORK/hardlinks.txt"
+          find . -type f -exec file {} + | grep -E 'ELF.*(executable|shared object)' | cut -d: -f1 > "$WORK/elf.txt"
+          while read -r f; do printf '%s %s\n' "$(stat -c %i "$f")" "$f"; done < "$WORK/elf.txt" \
+            | awk '!seen[$1]++ { $1=""; sub(/^ /,""); print }' > "$WORK/striplist.txt"
+          xargs -a "$WORK/striplist.txt" strip --strip-unneeded
+          awk '{ if ($1 in first) print first[$1] "\t" $2; else first[$1]=$2 }' "$WORK/hardlinks.txt" \
+            | while IFS=$'\t' read -r src dst; do ln -f "$src" "$dst"; done
+          # static libs / crt objects: --strip-debug only (--strip-unneeded would gut them)
+          find . -type f \( -name '*.a' -o -name 'crt*.o' \) -exec strip --strip-debug {} +
+          du -sh "$WORK/gcc-dist"
+          tar -C "$WORK" -cf - gcc-dist | zstd -19 --long=27 -T0 -o "$GITHUB_WORKSPACE/gcc-dist-pgo.tar.zst"
+          ls -l "$GITHUB_WORKSPACE/gcc-dist-pgo.tar.zst"
+          # smoke test the packed dist from a fresh path before publishing it
+          mkdir -p "$RUNNER_TEMP/dist-smoke"
+          tar -C "$RUNNER_TEMP/dist-smoke" --zstd -xf "$GITHUB_WORKSPACE/gcc-dist-pgo.tar.zst"
+          cat > "$RUNNER_TEMP/dist-smoke/t.cpp" <<'EOF'
+          #include <vector>
+          #include <iostream>
+          int main() { std::vector<int> v{1,2,3}; int s=0; for (int x : v) s+=x; std::cout << s << "\n"; }
+          EOF
+          "$RUNNER_TEMP/dist-smoke/gcc-dist/bin/g++" -O2 "$RUNNER_TEMP/dist-smoke/t.cpp" -o "$RUNNER_TEMP/dist-smoke/t"
+          "$RUNNER_TEMP/dist-smoke/t"
+          "$RUNNER_TEMP/dist-smoke/gcc-dist/bin/g++" --version | head -1
+
+      # Durable publish, same as the `build` job (see the comments there) --
+      # but to project gcc/pgo: the repo's OIDC grant covers its own
+      # namespace only ("gcc" and "gcc/<...>"), so the PGO package nests
+      # under gcc rather than a sibling "gcc-pgo" the token could not create.
+      #   https://dl.pazer.build/gcc/pgo?branch=develop-matt/v14&os=linux&arch=amd64
+      # Uploads the ~38 MiB dist from the step above (under Cloudflare's
+      # ~100 MiB edge body cap). continue-on-error stays: a registry blip
+      # must not fail package-pgo; the gccbuild-pgo GHA artifact remains.
+      - name: Publish PGO build to buildhost
+        continue-on-error: true
+        uses: wow-look-at-my/actions@typescript#latest
+        with:
+          script: |
+            const server = "https://pazer.build";
+            const project = "gcc/pgo";
+            const tarball = "gcc-dist-pgo.tar.zst";
+
+            try {
+              const token = await core.getIDToken(server);
+
+              const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+              const api = async (method: string, urlPath: string, body?: string) => {
+                const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
+                if (body !== undefined) headers["Content-Type"] = "application/json";
+                for (let attempt = 1; ; attempt++) {
+                  try {
+                    const resp = await fetch(`${server}${urlPath}`, { method, headers, body });
+                    const text = await resp.text();
+                    const transient = resp.status >= 500 || (resp.status === 404 && text.trim() === "");
+                    if (attempt === 5 || !transient) return { status: resp.status, text };
+                    core.warning(`${method} ${urlPath} -> HTTP ${resp.status} (transient, attempt ${attempt}/5)`);
+                  } catch (e) {
+                    if (attempt === 5) throw e;
+                    core.warning(`${method} ${urlPath} -> ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
+                  }
+                  await sleep(1000 * 2 ** (attempt - 1));
+                }
+              };
+
+              const create = await api("POST", `/api/v1/projects/${project}/releases`,
+                JSON.stringify({ git_branch: github.ref_name, git_commit: github.sha }));
+              if (create.status !== 201) throw new Error(`create release failed (HTTP ${create.status}): ${create.text}`);
+              const version: string = JSON.parse(create.text).version;
+              core.info(`Created release ${project}/${version}`);
+
+              const cfg = path.join(os.tmpdir(), "buildhost-auth-cfg");
+              fs.writeFileSync(cfg, `header = "Authorization: Bearer ${token}"\n`, { mode: 0o600 });
+              const uploadURL = `${server}/api/v1/projects/${project}/releases/${version}/artifacts/linux/amd64?kind=archive`;
+              await $`curl -sS --fail-with-body --retry 4 -X PUT -K ${cfg} -H ${`X-Artifact-Filename: ${tarball}`} --data-binary ${`@${tarball}`} ${uploadURL}`;
+
+              const pub = await api("POST", `/api/v1/projects/${project}/releases/${version}/publish`);
+              if (pub.status !== 200) throw new Error(`publish failed (HTTP ${pub.status}): ${pub.text}`);
+              core.info(`Published ${project}/${version} -> https://dl.pazer.build/${project}?branch=${github.ref_name}&os=linux&arch=amd64`);
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              core.warning(
+                `buildhost publish FAILED -- this PGO build was NOT published to ` +
+                `https://dl.pazer.build/${project}?branch=${github.ref_name}. The dist tarball is ` +
+                `~38 MiB (under Cloudflare's ~100 MiB edge body cap), so this is a transient ` +
+                `registry/network failure, not the old oversized-PUT 413. The gccbuild-pgo GHA ` +
+                `artifact (7-day retention) is unaffected.`);
+              core.setFailed(`buildhost publish failed (non-blocking, continue-on-error): ${msg}`);
+            }
 
   benchmark:
     needs: build
