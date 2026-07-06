@@ -1,0 +1,14 @@
+# Known-benign GCC testsuite differences vs the vanilla fork-point baseline.
+#
+# Consulted by .github/scripts/testsuite-diff.mjs before failing the
+# `testsuite` CI job -- see .github/TESTSUITE.md for the workflow.
+#
+# One entry per line; '#' comments and blank lines are ignored.
+#   <test text>            waives the test text in every .sum file
+#   <sum>:<test text>      waives it in one .sum only, e.g.
+#       g++.sum:g++.dg/opt/pr12345.C  -std=c++17 (test for excess errors)
+# The text must match the .sum line after "FAIL: "/"XPASS: " exactly
+# (surrounding whitespace trimmed). Keep every entry annotated with a
+# comment explaining WHY the difference is benign.
+#
+# (intentionally empty)
