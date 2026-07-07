@@ -1330,9 +1330,11 @@ ASM_COMPRESS_DEBUG_SPEC
    %{fno-integrated-as:...} matchers get last-one-wins semantics for free.
    The driver also auto-selects this arm (by injecting -fno-integrated-as in
    process_command) whenever -Wa,/-Xassembler options are present, because
-   the in-process assembler cannot take options -- see the audit block
-   there.  Such compiles are compile-cache-ineligible on both the serve and
-   store sides (tag: skip-no-integrated-as).
+   the in-process assembler cannot take options; likewise for -save-temps*
+   (which promises the intermediate .s on disk) and -gsplit-dwarf (whose
+   .dwo extraction is ASM_FINAL_SPEC's objcopy pass after the as step) --
+   see the audit block there.  Such compiles are compile-cache-ineligible on
+   both the serve and store sides (tag: skip-no-integrated-as).
 
    The compare-debug dump-opt hook is kept ahead of both arms because it
    rewrites cc1's own -o dump naming and must still run.  */
@@ -5073,13 +5075,35 @@ process_command (unsigned int decoded_options_count,
 	  have_asm_options = true;
 	  break;
 	}
-    if (have_asm_options)
+
+    /* Options whose promised artifacts only the external-assembler pipeline
+       produces.  -save-temps (any flavor: plain, =cwd, =obj) promises the
+       intermediate .s on disk, but the integrated assembler has no textual
+       assembly stage to save.  -gsplit-dwarf relies on ASM_FINAL_SPEC's
+       objcopy --extract-dwo/--strip-dwo pass over the assembler's object,
+       which only runs after a real `as` step.  Auto-select the external
+       pipeline for these exactly like the assembler-options audit above so
+       both behave as stock GCC did.  */
+    const char *ext_as_opt = NULL;
+    if (save_temps_flag != SAVE_TEMPS_NONE)
+      ext_as_opt = "-save-temps";
+    else
+      {
+	int split_dwarf = 0;	/* last -g[no-]split-dwarf wins */
+	for (unsigned int oi = 1; oi < decoded_options_count; oi++)
+	  if (decoded_options[oi].opt_index == OPT_gsplit_dwarf)
+	    split_dwarf = (decoded_options[oi].value != 0);
+	if (split_dwarf)
+	  ext_as_opt = "-gsplit-dwarf";
+      }
+
+    if (have_asm_options || ext_as_opt)
       {
 	int explicit_ias = -1;	/* last explicit -f[no-]integrated-as */
 	for (unsigned int oi = 1; oi < decoded_options_count; oi++)
 	  if (decoded_options[oi].opt_index == OPT_fintegrated_as)
 	    explicit_ias = (decoded_options[oi].value != 0);
-	if (explicit_ias == 1)
+	if (have_asm_options && explicit_ias == 1)
 	  fatal_error (input_location,
 		       "%<-Wa,%>/%<-Xassembler%> options cannot be passed to "
 		       "the integrated assembler; remove %<-fintegrated-as%> "
@@ -5090,14 +5114,27 @@ process_command (unsigned int decoded_options_count,
 	    save_switch ("-fno-integrated-as", 0, NULL,
 			 /*validated=*/true, /*known=*/true);
 	    if (verbose_flag || env.get ("GCC_COMPILE_CACHE_DEBUG"))
-	      fnotice (stderr,
-		       "note: -Wa,/-Xassembler options present: using the "
-		       "external assembler for this invocation "
-		       "(compile cache disabled)\n");
+	      {
+		if (have_asm_options)
+		  fnotice (stderr,
+			   "note: -Wa,/-Xassembler options present: using the "
+			   "external assembler for this invocation "
+			   "(compile cache disabled)\n");
+		else
+		  fnotice (stderr,
+			   "note: %s: using the external assembler for this "
+			   "invocation (compile cache disabled)\n",
+			   ext_as_opt);
+	      }
 	  }
 #endif
 	/* explicit_ias == 0 (or no libgas, where the external pipeline is
-	   the only pipeline): the external path is already selected.  */
+	   the only pipeline): the external path is already selected.
+	   An explicit -fintegrated-as alongside -save-temps/-gsplit-dwarf
+	   keeps the integrated assembler (the user chose it knowingly);
+	   there is then no .s to save and no as-stage objcopy to split the
+	   DWARF -- only the -Wa,/-Xassembler combination, which would DROP
+	   user options, is a hard error.  */
       }
   }
 
@@ -8491,6 +8528,27 @@ check_live_switch (int switchnum, int prefix_length)
 	    && (switches[switchnum].live_cond & SWITCH_FALSE) == 0
 	    && (switches[switchnum].live_cond & SWITCH_IGNORE_PERMANENTLY)
 	       == 0);
+
+  /* -o: cc1 -- unlike the external as and ld, both of which take the last
+     of several -o options -- rejects a duplicate -o outright ("output
+     filename specified twice"), and the integrated-assembler compile hands
+     %W{o*} straight to cc1 (see invoke_as).  Give -o last-one-wins
+     semantics in the driver itself, mirroring what as/ld did with the full
+     list; process_command's output_file already resolves the same way.
+     This must precede the one-letter-prefix bailout below, which would
+     otherwise keep every -o live for {o*} matches.  */
+  if (name[0] == 'o' && name[1] == '\0')
+    {
+      for (i = switchnum + 1; i < n_switches; i++)
+	if (switches[i].part1[0] == 'o' && switches[i].part1[1] == '\0')
+	  {
+	    switches[switchnum].validated = true;
+	    switches[switchnum].live_cond = SWITCH_FALSE;
+	    return 0;
+	  }
+      switches[switchnum].live_cond |= SWITCH_LIVE;
+      return 1;
+    }
 
   /* In the common case of {<at-most-one-letter>*}, a negating
      switch would always match, so ignore that case.  We will just
