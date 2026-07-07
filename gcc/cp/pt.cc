@@ -10136,44 +10136,6 @@ lookup_template_class (tree d1, tree arglist, tree in_decl, tree context,
 	    return cur;
 	}
 
-      /* Before coercing the arguments, probe the specialization table
-	 with the raw (uncoerced) ARGLIST.  Coercion of an already-seen
-	 argument list is pure re-computation: when its result would be
-	 template_args_equal to a registered specialization's (always
-	 coerced) arguments, the raw arguments compare equal to them as
-	 well -- comp_template_args ignores exactly the differences
-	 coercion introduces when the argument count and structure are
-	 unchanged, and any other change (default args filled in,
-	 argument packs formed) changes the TREE_VEC shape and makes
-	 this probe miss, falling through to the normal path.  A hit
-	 returns the same entry the post-coercion lookup below would
-	 have returned, skipping the redundant coercion.  Comparing raw
-	 arguments against coerced ones is already done by the
-	 current-class-scope shortcut above.
-
-	 The probe is confined to lookups that cannot take the
-	 entering-scope early return below, which must keep consulting
-	 the coerced arguments; those self-referential lookups are rare
-	 and cheap anyway.  A miss costs one extra hash+find; a hit
-	 saves re-coercing (re-converting) the arguments of every
-	 repeated use of an already-registered specialization.  Like
-	 the post-coercion hit below, a hit here defers constraint
-	 checking to the first (registering) lookup.  */
-      if (PRIMARY_TEMPLATE_P (gen_tmpl)
-	  && arglist != error_mark_node
-	  && !entering_scope
-	  && !currently_open_class (template_type))
-	{
-	  elt.tmpl = gen_tmpl;
-	  elt.args = arglist;
-	  elt.spec = NULL_TREE;
-	  hash = spec_hasher::hash (&elt);
-	  entry = type_specializations->find_with_hash (&elt, hash);
-
-	  if (entry)
-	    return entry->spec;
-	}
-
       /* Calculate the BOUND_ARGS.  These will be the args that are
 	 actually tsubst'd into the definition to create the
 	 instantiation.  */
