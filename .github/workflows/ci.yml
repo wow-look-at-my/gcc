@@ -675,8 +675,12 @@ jobs:
       - name: Benchmark in-compiler cache
         run: node "$GITHUB_WORKSPACE/.github/scripts/ci-bench-cache.mjs" "$RUNNER_TEMP/gccbuild"
 
-      # Exercise the persisted cache so the post-run actions/cache save captures
-      # populated entries that a later run on this ref can reuse.
+      # Persistence smoke test: exercises cache save/restore plumbing across
+      # runs (~2 s). Entries can never be reused across commits -- the cache
+      # key embeds the freshly built compiler binary's identity, so a later
+      # run's compiler always misses. That is expected content-addressing
+      # behavior, not a warm-cache accelerator; the block stays for the
+      # restore/save coverage, not for speed.
       - name: Warm persisted compile cache
         run: |
           mkdir -p "$GCC_CC_DIR"
