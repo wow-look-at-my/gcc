@@ -184,18 +184,37 @@ function fetchSource() {
     run('fetch', ['unzip', '-q', '-o', zip, '-d', work]);
     fs.renameSync(path.join(work, pin.dir), srcDir);
   }
-  // b9891's webui defaults kit.version to Date.now(), making the generated
-  // ui.cpp nondeterministic across builds -- pin it so byte-identity is
-  // testable (same class as SOURCE_DATE_EPOCH for openssl).
-  if (project === 'llama.cpp') {
-    const cfg = path.join(srcDir, 'tools', 'ui', 'svelte.config.js');
-    const s = fs.readFileSync(cfg, 'utf8');
-    if (!/\bversion\s*:/.test(s)) {
-      const p = s.replace(/(\bkit:\s*\{)/, `$1\n\t\tversion: { name: 'corpus' },`);
-      if (p === s) fail('could not pin SvelteKit version in tools/ui/svelte.config.js');
-      fs.writeFileSync(cfg, p);
-    }
-  }
+}
+
+// llama.cpp only: build the SvelteKit webui ONCE, into the source tree.
+//
+// llama-server embeds the webui as a generated ui.cpp. By default every
+// build dir runs its own `npm run build` (scripts/ui-assets.cmake priority
+// 2), but Vite/Rollup chunk content-hashes are NOT reproducible across
+// separate builds -- chunking and hashing vary with module-graph iteration
+// order, and the hash names feed back into the emitted bundle -- even with
+// SvelteKit's kit.version pinned (an earlier fix pinned it to stop
+// kit.version defaulting to Date.now(); the chunk hashes still differed).
+// Three independent webui builds therefore embed three DIFFERENT ui.cpp
+// files, and the cold/warm byte-identity assertion fails on ui.cpp.o
+// through no fault of the compiler (it correctly misses on changed input).
+//
+// So make the embed deterministic BY CONSTRUCTION: pre-build the webui once
+// into tools/ui/dist. That is ui-assets.cmake's priority 1 ("pre-built
+// assets supplied by the user", checked before the npm and HF-download
+// paths; `npm run build` without LLAMA_UI_OUT_DIR targets ./dist exactly
+// for this flow), so all three build dirs embed the SAME bytes --
+// tools/ui/embed.cpp output depends only on asset contents (sorted names,
+// data, FNV etag), and the gzip pre-compression step is deterministic for a
+// fixed input file. Bonus: the webui pipeline runs once instead of 3x.
+function prebuildWebui() {
+  const uiDir = path.join(srcDir, 'tools', 'ui');
+  if (fs.existsSync(path.join(uiDir, 'dist', 'index.html'))) return;
+  run('webui', ['npm', 'ci', '--no-audit', '--no-fund'], { cwd: uiDir, quietStdout: true });
+  run('webui', ['npm', 'run', 'build'], { cwd: uiDir, quietStdout: true });
+  if (!fs.existsSync(path.join(uiDir, 'dist', 'index.html')))
+    fail('webui pre-build produced no tools/ui/dist/index.html');
+  process.stdout.write('[webui] built once into tools/ui/dist (shared by off/cold/warm)\n');
 }
 
 // Extra compile flags for a build in DIR with/without the cache. llama.cpp
@@ -328,6 +347,7 @@ int main(void) {
 
 run('setup', [...splitCmd(CC), '--version'], { quietStdout: true });
 fetchSource();
+if (project === 'llama.cpp') prebuildWebui();
 fs.mkdirSync(cacheDir, { recursive: true });
 
 const phases = [
