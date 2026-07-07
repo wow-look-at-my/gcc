@@ -40,7 +40,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Dispatch runs (multi-hour testsuite/corpus validation) must survive
+  # pr-minder base-sync pushes; push runs still cancel each other.
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
   # Persisted compile-cache directory, shared across runs via actions/cache.

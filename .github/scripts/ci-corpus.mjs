@@ -84,9 +84,12 @@ function childEnv(extra = {}) {
   return { ...process.env, CC, CXX, SOURCE_DATE_EPOCH: '1719792000', ...extra };
 }
 
-// Run a command; stdout streams through, stderr is appended to the phase log
-// (so cache-debug lines are countable afterwards). Fails hard on nonzero
-// exit unless allowFail.
+// Run a command; stdout streams through unless quietStdout pipes it. stderr
+// -- and piped stdout too -- is appended to the phase log so cache-debug
+// lines are countable afterwards: ninja relays each edge's captured output
+// (including the compiler's stderr `compile-cache:` lines) on its OWN
+// stdout, so a quiet build's hit/store lines only exist in r.stdout. Fails
+// hard on nonzero exit unless allowFail.
 function run(phase, argv, { cwd, env, input, allowFail = false, quietStdout = false } = {}) {
   const logFile = path.join(logDir, `${phase}.stderr.log`);
   const r = spawnSync(argv[0], argv.slice(1), {
@@ -94,7 +97,9 @@ function run(phase, argv, { cwd, env, input, allowFail = false, quietStdout = fa
     stdio: [input === undefined ? 'ignore' : 'pipe', quietStdout ? 'pipe' : 'inherit', 'pipe'],
     maxBuffer: 512 * 1024 * 1024, encoding: 'utf8',
   });
-  fs.appendFileSync(logFile, `\n### ${argv.join(' ')} (exit ${r.status})\n${r.stderr || ''}`);
+  fs.appendFileSync(logFile,
+    `\n### ${argv.join(' ')} (exit ${r.status})\n${r.stderr || ''}` +
+    (r.stdout ? `\n### stdout\n${r.stdout}` : ''));
   if (r.error) fail(`${argv[0]}: ${r.error.message}`);
   if (r.status !== 0 && !allowFail) {
     const tail = (r.stderr || '').split('\n').slice(-100).join('\n');
@@ -204,11 +209,15 @@ function build(phase, dir, cache) {
   switch (project) {
     case 'openssl':
       // Small config: static-only, no tests/docs. Unrecognized dash-args are
-      // appended to CFLAGS by Configure. linux-x86_64 passes no -Wa, options
-      // (those exist only for s390/sparc/darwin targets), so the integrated
-      // assembler -- and with it the cache -- stays engaged.
+      // appended to CFLAGS by Configure. no-asm matters: when asm is enabled
+      // Configure appends -Wa,--noexecstack to the compile flags, and any
+      // -Wa, option triggers the fork's external-as fallback, which disables
+      // the compile cache by design -- so the leg would silently validate
+      // nothing. no-asm keeps every TU on the integrated assembler and thus
+      // cache-covered. (Follow-up idea: teach libgas to accept --noexecstack
+      // so asm-enabled openssl builds become cacheable too.)
       run(phase, ['perl', path.join(srcDir, 'Configure'), 'linux-x86_64',
-                  'no-shared', 'no-tests', 'no-docs', ...flags],
+                  'no-asm', 'no-shared', 'no-tests', 'no-docs', ...flags],
           { cwd: dir, env, quietStdout: true });
       run(phase, ['make', '-s', `-j${nproc}`], { cwd: dir, env, quietStdout: true });
       break;
@@ -287,7 +296,10 @@ int main(void) {
       break;
     }
     case 'fmt':
-      run(phase, ['ctest', '--test-dir', dir, '--output-on-failure', '--timeout', '120', '-j', nproc],
+      // --no-tests=error: a misconfigured build discovering zero tests must
+      // fail the leg, not vacuously pass it.
+      run(phase, ['ctest', '--test-dir', dir, '--no-tests=error',
+                  '--output-on-failure', '--timeout', '120', '-j', nproc],
           { quietStdout: true });
       process.stdout.write(`[${phase}] fmt ctest suite ok\n`);
       break;
