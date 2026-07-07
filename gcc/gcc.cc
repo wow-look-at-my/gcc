@@ -1310,25 +1310,61 @@ static const char *asm_options =
 ASM_COMPRESS_DEBUG_SPEC
 "%a %Y %{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}";
 
-/* Integrated assembler: cc1plus assembles in-process via libgas, so there is
-   no separate `as` stage.  This spec therefore emits no ` | as` pipeline at
-   all -- the compile-to-object is a single process.  The object's -o name is
-   handed to cc1plus HERE (the %{!S:...%O} arm below, the same construct stock
-   GCC's asm_options handed to `as`), NOT in cc1_options: only the specs that
-   actually compile to an object reference %(invoke_as), while the PCH specs
-   (@c-header / @c++-header et al.) supply their own `-o %g.s` plus
-   --output-pch and must NOT receive a second -o (cc1 rejects a duplicate
-   with "output filename specified twice").  The compare-debug dump-opt hook
-   is kept because it rewrites cc1's own -o dump naming and must still run.
-   This fold is unconditional and permanent: there is no -fno- form and no
-   fork-`as` fallback for a compile.  (Hand-written .s inputs still use `as`;
-   that is a separate spec, see the assembler_spec/@assembler path, and is
-   left alone.)  */
+/* Integrated assembler: by default (-fintegrated-as, Init(1)) cc1plus
+   assembles in-process via libgas, so there is no separate `as` stage -- the
+   compile-to-object is a single process.  The object's -o name is then
+   handed to cc1plus HERE (the %{!fno-integrated-as:...%O} arm below, the
+   same construct stock GCC's asm_options handed to `as`), NOT in
+   cc1_options: only the specs that actually compile to an object reference
+   %(invoke_as), while the PCH specs (@c-header / @c++-header et al.) supply
+   their own `-o %g.s` plus --output-pch and must NOT receive a second -o
+   (cc1 rejects a duplicate with "output filename specified twice").
+
+   With -fno-integrated-as the classic two-process pipeline runs instead:
+   cc1plus writes textual assembly to a temporary .s (-fasm-output-only, the
+   same exemption -S and the PCH specs use; %| honors -pipe) and the
+   external `as` produces the real object -- %(asm_options) carries the
+   object -o exactly as in stock GCC's invoke_as and as the @assembler spec
+   still does for hand-written .s inputs.  check_live_switch() marks the
+   earlier of a -fintegrated-as/-fno-integrated-as pair dead, so the
+   %{fno-integrated-as:...} matchers get last-one-wins semantics for free.
+   The driver also auto-selects this arm (by injecting -fno-integrated-as in
+   process_command) whenever -Wa,/-Xassembler options are present, because
+   the in-process assembler cannot take options; likewise for -save-temps*
+   (which promises the intermediate .s on disk) and -gsplit-dwarf (whose
+   .dwo extraction is ASM_FINAL_SPEC's objcopy pass after the as step) --
+   see the audit block there.  Such compiles are compile-cache-ineligible on
+   both the serve and store sides (tag: skip-no-integrated-as).
+
+   The compare-debug dump-opt hook is kept ahead of both arms because it
+   rewrites cc1's own -o dump naming and must still run.  */
+#ifdef AS_NEEDS_DASH_FOR_PIPED_INPUT
+#define INVOKE_AS_EXTERNAL \
+"%{!S:-fasm-output-only -o %|.s |\n as %(asm_debug) %(asm_options) %|.s %A }"
+#else
+#define INVOKE_AS_EXTERNAL \
+"%{!S:-fasm-output-only -o %|.s |\n as %(asm_debug) %(asm_options) %m.s %A }"
+#endif
+#ifdef HAVE_LIBGAS
 static const char *invoke_as =
 "%{!fwpa*:\
    %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
-   %{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}\
+   %{fno-integrated-as:" INVOKE_AS_EXTERNAL "}\
+   %{!fno-integrated-as:%{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}}\
   }";
+#else
+/* Built without libgas (HAVE_LIBGAS unset -- not a combined tree, or a
+   target the embedded assembler does not support): the external pipeline is
+   the only pipeline, regardless of any -fintegrated-as on the command line
+   (which cc1 then rejects with a sorry; the spec must still route the
+   compile through `as` so the error is the compiler's, not a cascade of
+   missing-object failures).  */
+static const char *invoke_as =
+"%{!fwpa*:\
+   %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
+   " INVOKE_AS_EXTERNAL "\
+  }";
+#endif
 
 /* Some compilers have limits on line lengths, and the multilib_select
    and/or multilib_matches strings can be very long, so we build them at
@@ -5008,6 +5044,100 @@ process_command (unsigned int decoded_options_count,
 			   CL_DRIVER, &handlers, global_dc);
     }
 
+  /* Audit -Wa,/-Xassembler options (A2).  They are consumed only by the
+     external assembler's %Y substitution in %(asm_options), but the default
+     compile-to-object pipeline has no external assembler: cc1plus assembles
+     in-process via libgas, whose entry point (gas_assemble_buffer) accepts
+     no options -- so on a .c/.cc -> .o compile they used to be dropped
+     SILENTLY.  Never drop them: when any non-empty assembler option is
+     present (an empty -Wa, contributes nothing, matching stock %Y), either
+
+       - the user explicitly forced -fintegrated-as: refuse loudly (the
+	 integrated assembler cannot honor the options; mirrors clang's
+	 unsupported -Wa handling), or
+
+       - otherwise auto-select the external-assembler pipeline for this
+	 whole invocation by injecting -fno-integrated-as: invoke_as's
+	 fallback arm then runs `as` with %Y as stock GCC did, cc1 sees the
+	 flag via %{f*}, and the compile cache skips serve+store
+	 (skip-no-integrated-as).  Noted under -v / GCC_COMPILE_CACHE_DEBUG.
+
+     Hand-written .s/.S inputs always went through the @assembler specs and
+     honor %Y either way; the injected flag is unused by them.  */
+  if (!print_help_list && !print_version && !print_subprocess_help)
+  {
+    /* (--help/--version/--target-help add their own assembler options and
+       run no compile; leave those informational flows alone.)  */
+    bool have_asm_options = false;
+    for (unsigned int ai = 0; ai < assembler_options.length (); ai++)
+      if (assembler_options[ai] && assembler_options[ai][0] != '\0')
+	{
+	  have_asm_options = true;
+	  break;
+	}
+
+    /* Options whose promised artifacts only the external-assembler pipeline
+       produces.  -save-temps (any flavor: plain, =cwd, =obj) promises the
+       intermediate .s on disk, but the integrated assembler has no textual
+       assembly stage to save.  -gsplit-dwarf relies on ASM_FINAL_SPEC's
+       objcopy --extract-dwo/--strip-dwo pass over the assembler's object,
+       which only runs after a real `as` step.  Auto-select the external
+       pipeline for these exactly like the assembler-options audit above so
+       both behave as stock GCC did.  */
+    const char *ext_as_opt = NULL;
+    if (save_temps_flag != SAVE_TEMPS_NONE)
+      ext_as_opt = "-save-temps";
+    else
+      {
+	int split_dwarf = 0;	/* last -g[no-]split-dwarf wins */
+	for (unsigned int oi = 1; oi < decoded_options_count; oi++)
+	  if (decoded_options[oi].opt_index == OPT_gsplit_dwarf)
+	    split_dwarf = (decoded_options[oi].value != 0);
+	if (split_dwarf)
+	  ext_as_opt = "-gsplit-dwarf";
+      }
+
+    if (have_asm_options || ext_as_opt)
+      {
+	int explicit_ias = -1;	/* last explicit -f[no-]integrated-as */
+	for (unsigned int oi = 1; oi < decoded_options_count; oi++)
+	  if (decoded_options[oi].opt_index == OPT_fintegrated_as)
+	    explicit_ias = (decoded_options[oi].value != 0);
+	if (have_asm_options && explicit_ias == 1)
+	  fatal_error (input_location,
+		       "%<-Wa,%>/%<-Xassembler%> options cannot be passed to "
+		       "the integrated assembler; remove %<-fintegrated-as%> "
+		       "or the assembler options");
+#ifdef HAVE_LIBGAS
+	else if (explicit_ias == -1)
+	  {
+	    save_switch ("-fno-integrated-as", 0, NULL,
+			 /*validated=*/true, /*known=*/true);
+	    if (verbose_flag || env.get ("GCC_COMPILE_CACHE_DEBUG"))
+	      {
+		if (have_asm_options)
+		  fnotice (stderr,
+			   "note: -Wa,/-Xassembler options present: using the "
+			   "external assembler for this invocation "
+			   "(compile cache disabled)\n");
+		else
+		  fnotice (stderr,
+			   "note: %s: using the external assembler for this "
+			   "invocation (compile cache disabled)\n",
+			   ext_as_opt);
+	      }
+	  }
+#endif
+	/* explicit_ias == 0 (or no libgas, where the external pipeline is
+	   the only pipeline): the external path is already selected.
+	   An explicit -fintegrated-as alongside -save-temps/-gsplit-dwarf
+	   keeps the integrated assembler (the user chose it knowingly);
+	   there is then no .s to save and no as-stage objcopy to split the
+	   DWARF -- only the -Wa,/-Xassembler combination, which would DROP
+	   user options, is a hard error.  */
+      }
+  }
+
   /* If the user didn't specify any, default to all configured offload
      targets.  */
   if (ENABLE_OFFLOADING && offload_targets == NULL)
@@ -5923,15 +6053,22 @@ driver_try_serve_from_cache (void)
   free (argv);
 
   /* Scan for: the cache dir, integrated-as state, disqualifying modes, the
-     source file, and the output object.  The integrated assembler is always
-     on (common.opt: fintegrated-as Init(1) RejectNegative), and the driver no
-     longer puts -fintegrated-as on the cc1 command line, so default this true;
-     the OPT_fintegrated_as case below only ever re-affirms it (a negated form
-     is rejected at decode and cannot reach here).  */
+     source file, and the output object.  The integrated assembler is the
+     default (common.opt: fintegrated-as Init(1)) and the driver does not put
+     -fintegrated-as on the cc1 command line unless the user did, so default
+     this true; an explicit -fno-integrated-as (restored A1 escape hatch, and
+     auto-injected when -Wa,/-Xassembler options are present) reaches here
+     via %{f*} and flips it off, which makes the compile cache-ineligible for
+     the driver tier below (cc1plus's own gating check #10 skips its serve
+     and store tiers for the same reason).  */
   const char *cache_dir = NULL;
   const char *src_path = NULL;
   const char *out_path = NULL;
+#ifdef HAVE_LIBGAS
   bool integrated_as = true;
+#else
+  bool integrated_as = false;	/* no libgas: never an in-process object */
+#endif
   bool disqualify = false;
   bool saw_g = false;
 
@@ -5963,7 +6100,7 @@ driver_try_serve_from_cache (void)
 	  cache_dir = o->arg;
 	  break;
 	case OPT_fintegrated_as:
-	  integrated_as = (o->value != 0);	/* always 1; negation rejected */
+	  integrated_as = (o->value != 0);
 	  break;
 	case OPT_o:
 	  out_path = o->arg;
@@ -6026,6 +6163,23 @@ driver_try_serve_from_cache (void)
       deps_path = deps_mf ? deps_mf : deps_md_file;
       if (deps_unsupported || !deps_md || !deps_path || deps_tgt_count == 0)
 	disqualify = true;
+    }
+
+  /* External-assembler compiles are cache-ineligible by design (soundness
+     over speed: the cache stores in-process-assembled objects, and the
+     external as's output is not guaranteed byte-identical to them).  Say so
+     under the debug env, mirroring cc1plus's tag.  NOTE: with the current
+     invoke_as, a -fno-integrated-as compile is a two-command `cc1 | as`
+     pipeline whose cc1 command executes from do_spec_1's '\n' break, which
+     has no serve hook -- so in practice cc1's own skip-no-integrated-as tag
+     (gating check #10) is the one that prints; this branch is defensive for
+     any future spec layout that routes such a command through the do_spec
+     end-of-spec path below.  */
+  if (cache_dir && cache_dir[0] && !integrated_as && driver_cc_debug_p ())
+    {
+      fprintf (stderr, "compile-cache: skip-no-integrated-as - %s\n",
+	       out_path ? out_path : "-");
+      fflush (stderr);
     }
 
   bool served = false;
@@ -8374,6 +8528,27 @@ check_live_switch (int switchnum, int prefix_length)
 	    && (switches[switchnum].live_cond & SWITCH_FALSE) == 0
 	    && (switches[switchnum].live_cond & SWITCH_IGNORE_PERMANENTLY)
 	       == 0);
+
+  /* -o: cc1 -- unlike the external as and ld, both of which take the last
+     of several -o options -- rejects a duplicate -o outright ("output
+     filename specified twice"), and the integrated-assembler compile hands
+     %W{o*} straight to cc1 (see invoke_as).  Give -o last-one-wins
+     semantics in the driver itself, mirroring what as/ld did with the full
+     list; process_command's output_file already resolves the same way.
+     This must precede the one-letter-prefix bailout below, which would
+     otherwise keep every -o live for {o*} matches.  */
+  if (name[0] == 'o' && name[1] == '\0')
+    {
+      for (i = switchnum + 1; i < n_switches; i++)
+	if (switches[i].part1[0] == 'o' && switches[i].part1[1] == '\0')
+	  {
+	    switches[switchnum].validated = true;
+	    switches[switchnum].live_cond = SWITCH_FALSE;
+	    return 0;
+	  }
+      switches[switchnum].live_cond |= SWITCH_LIVE;
+      return 1;
+    }
 
   /* In the common case of {<at-most-one-letter>*}, a negating
      switch would always match, so ignore that case.  We will just

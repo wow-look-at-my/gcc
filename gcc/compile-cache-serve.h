@@ -142,6 +142,76 @@ struct cc_serve_ctx
   bool deps_phony;			/* -MP: phony target per header */
 };
 
+/* ---- B2: prefix-map-aware -g keys (shared by ALL key computations) ---- */
+
+/* Under -g the main source path and cwd (and, in the object key, every
+   closure path) bake into DWARF -- but only AFTER the user's
+   -ffile-prefix-map/-fdebug-prefix-map rewrites, so the keys hash the
+   REWRITTEN strings.  These helpers replicate gcc/file-prefix-map.cc's
+   semantics exactly (last '=' split, prepended list = last matching option
+   wins, per-entry -fcanon-prefix-map state captured in command-line order,
+   lrealpath/lbasename canonicalization, plain filename_ncmp prefix match)
+   from a decoded-option array, with no compiler globals -- so the driver
+   and cc1plus compute identical mappings from the identical cc1 argv.
+   Only the DWARF-relevant lists participate (-ffile-prefix-map +
+   -fdebug-prefix-map); -fmacro-prefix-map/-fprofile-prefix-map options
+   remain hashed raw like any other output-affecting option.
+
+   A map option whose OLD prefix matches the raw source path or cwd is
+   excluded ("dropped") from the option hash: its output effect on those
+   strings is captured by hashing the mapped strings themselves, which is
+   what lets two build dirs that map themselves to one canonical prefix
+   share keys.  Map options that match neither stay hashed raw
+   (conservative: they may rewrite other DWARF paths).  With no maps, every
+   mapping is the identity and nothing is dropped -- the hashed material is
+   exactly the pre-B2 bytes.  */
+
+struct cc_pmap_ent
+{
+  char *old_prefix;
+  size_t old_len;
+  char *new_prefix;
+  size_t new_len;
+  bool canonicalize;		/* -fcanon-prefix-map state at this option */
+  unsigned opt_i;		/* index into the decoded-option array */
+};
+
+struct cc_prefix_maps
+{
+  struct cc_pmap_ent *ents;	/* command-line order; consult BACKWARDS
+				   (mirrors file-prefix-map.cc's prepend) */
+  unsigned count;
+  bool *dropped;		/* per decoded-option index; may be NULL */
+  unsigned dropped_n;
+};
+
+/* Build PM from DECODED[1..COUNT-1].  PM must be zero-initialized or
+   freshly cc_pmaps_free'd.  Cheap when no map options are present
+   (pm->count stays 0 and every other helper is a near no-op).  */
+extern void cc_pmaps_collect (struct cc_prefix_maps *pm,
+			      const cl_decoded_option *decoded,
+			      unsigned decoded_count);
+
+/* Mark for exclusion every collected map option whose OLD prefix matches
+   SRC_PATH or CWD (per that entry's canonicalize rule).  */
+extern void cc_pmaps_mark_dropped (struct cc_prefix_maps *pm,
+				   unsigned decoded_count,
+				   const char *src_path, const char *cwd);
+
+/* Apply PM to FILENAME exactly like file-prefix-map.cc's remap_filename;
+   always returns a freshly xmalloc'd string (identity copy when no entry
+   matches).  */
+extern char *cc_pmaps_remap_alloc (const struct cc_prefix_maps *pm,
+				   const char *filename);
+
+static inline bool
+cc_pmaps_opt_dropped_p (const struct cc_prefix_maps *pm, unsigned opt_i)
+{
+  return pm->dropped != NULL && opt_i < pm->dropped_n && pm->dropped[opt_i];
+}
+
+extern void cc_pmaps_free (struct cc_prefix_maps *pm);
+
 /* ---- Shared manifest-entry access (one interpreter for the v2 bytes) ---- */
 
 /* Parsed byte locations of one manifest entry (v3 layout: 40-byte head,
@@ -179,6 +249,15 @@ extern const char *cc_man_string (const unsigned char *man, size_t mlen,
    instead of the stat-identity shortcut.  One definition (in the serve
    unit) so the driver and cc1plus honor identical spellings.  */
 extern bool cc_verify_hash_env_p (void);
+
+/* Eviction support (GCC_COMPILE_CACHE_MAX_SIZE): best-effort "last used"
+   bump -- set PATH's atime+mtime to now iff its mtime is older than one
+   hour.  Eviction ranks entries by mtime (atime is unreliable under
+   noatime), so every serve tier calls this on the entries it consumed; the
+   1h threshold keeps a hot entry from dirtying its inode on every hit.
+   Never fails loudly (a shared read-only cache simply doesn't bump).  One
+   definition so the driver and cc1plus tiers apply the identical policy.  */
+extern void cc_touch_entry (const char *path);
 
 /* Re-validate ENT against the filesystem: every header record must still
    resolve (full stat-identity shortcut, else content re-hash; VERIFY_HASH

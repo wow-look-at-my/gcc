@@ -23,7 +23,10 @@ cache hits replay the object, skipping only the back end): 156.8 s wall / 437 s 
 llama.cpp vs ccache's 73.6 s / 112 s, whose direct mode does serve these TUs.
 
 For the record, MK = schema version + domain tag + optional `GCC_COMPILE_CACHE_SALT` +
-compiler checksum + lang name + (only under `-g`: main source path + cwd) +
+compiler checksum + lang name + (only under `-g`: main source path + cwd, since schema
+v8 hashed AFTER applying the user's `-ffile-prefix-map`/`-fdebug-prefix-map` rewrites,
+with map options that matched those strings excluded from the option walk -- so build
+dirs mapped to one canonical prefix share keys) +
 output-affecting options + search-path option **values** (`-I` etc., anti-shadowing) +
 main source bytes (`ccs_compute_manifest_key`, `gcc/compile-cache-serve.cc:272`; twin
 `cc_compute_manifest_key`, `compile-cache.cc:858`). In the llama.cpp benchmark none of

@@ -14,6 +14,11 @@
 #      boolean input reset_cache=true (handled inside .github/workflows/ci.yml,
 #      not by this script).
 #
+# A full reset is rarely needed for SIZE anymore: set
+# GCC_COMPILE_CACHE_MAX_SIZE=N[K|M|G|T] and stores evict least-recently-used
+# entries per 2-hex shard automatically, ccache-style (serve hits refresh an
+# entry's mtime; unset or 0 keeps the unbounded behavior).
+#
 # This helper performs method 1 or 2 locally.
 #
 # Usage:

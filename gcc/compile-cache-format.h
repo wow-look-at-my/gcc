@@ -265,8 +265,22 @@ enum cc_tag
    from -o, so keying them made the key vary with the output path even
    though the object bytes do not.  The classifier change alters key
    material, so the bump keeps old and new binaries from half-sharing a
-   cache.  */
-#define CC_KEY_SCHEMA_VERSION 7u
+   cache.
+   Bumped 7 -> 8: prefix-map-aware -g keys (B2).  Under -g the main source
+   path, the cwd, and (object key only) every closure path are hashed AFTER
+   applying the user's -ffile-prefix-map/-fdebug-prefix-map rewrites
+   (replicating gcc/file-prefix-map.cc's semantics; shared helpers in
+   compile-cache-serve.cc keep the driver and cc1plus twins identical), and
+   map options whose OLD prefix matches the raw source path or cwd are
+   excluded from the option walk -- their entire effect on those hashed
+   strings is the mapping itself, so two build directories that map
+   themselves to one canonical prefix (-ffile-prefix-map=$PWD=.) share keys
+   and, since their DWARF is rewritten identically by construction, the
+   cached bytes.  Map options matching neither string stay hashed raw
+   (conservative: they may rewrite OTHER paths inside DWARF).  With no map
+   options the hashed material is byte-identical to v7, but the version
+   bump keeps old and new binaries from half-sharing a cache.  */
+#define CC_KEY_SCHEMA_VERSION 8u
 
 /* Little-endian store helpers.  */
 static inline void
