@@ -8,7 +8,10 @@
 > clang-parity) selects the classic textual `cc1 | as` pipeline per
 > invocation, the driver auto-selects it when `-Wa,`/`-Xassembler` options
 > are present (the in-process `gas_assemble_buffer()` takes no options, and
-> they are never dropped silently), and trees built WITHOUT libgas
+> they are never dropped silently), when any `-save-temps` flavor is active
+> (the promised intermediate `.s` only exists on the textual pipeline), or
+> when `-gsplit-dwarf` is active (the `.dwo` split is `ASM_FINAL_SPEC`'s
+> objcopy pass after the external `as` step), and trees built WITHOUT libgas
 > (`HAVE_LIBGAS` unset -- any non-combined tree or unsupported target)
 > default off and build working two-process compilers.  External-assembler
 > compiles are compile-cache-ineligible both ways (`skip-no-integrated-as`).
