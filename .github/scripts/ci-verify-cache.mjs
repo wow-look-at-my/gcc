@@ -1827,6 +1827,165 @@ function sleepSecs(s) {
     'no-map cross-dir still misses; unrelated-map difference still keys apart\n');
 }
 
+// ---- check 27: -save-temps / -gsplit-dwarf auto-fallback ------------------
+// Both options promise artifacts only the external-as pipeline produces
+// (-save-temps the on-disk .s/.i, -gsplit-dwarf the objcopy-extracted .dwo),
+// so the driver must auto-inject -fno-integrated-as for them: the artifacts
+// must exist, the fallback note must name the trigger, the compile must be
+// cache-skipped (skip-no-integrated-as) in both directions, and the object
+// must stay byte-identical to the integrated one.  An EXPLICIT
+// -fintegrated-as wins (no fallback, no error -- unlike -Wa nothing the
+// user passed is dropped).
+{
+  const dir = path.join(work, 'c27');
+  fs.mkdirSync(dir);
+  const src = path.join(dir, 'st.c');
+  fs.writeFileSync(src, 'int st_f(int x) { return x - 9; }\n');
+  const cache = path.join(dir, 'cache');
+  fs.mkdirSync(cache);
+  const objI = path.join(dir, 'st-int.o');
+
+  // Control: integrated compile stores.
+  let r = compile(XGCC, src, objI, cache);
+  if (!keyFor(r.keys, 'store'))
+    fail('check 27: integrated control compile did not store\n' + r.stderr);
+
+  // (a) -save-temps on the WARM cache: fallback note, .i/.s on disk,
+  // skip tag, no serve/store, byte-identical object.
+  const objS = path.join(dir, 'st-save.o');
+  r = spawnSync(XGCC, ['-O2', '-c', src, '-o', objS,
+                       '-fcompile-cache=' + cache, '-save-temps', B],
+                { cwd: dir, env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0) fail('check 27: -save-temps compile failed\n' + r.stderr);
+  if (!/note: -save-temps: using the external assembler/.test(r.stderr))
+    fail('check 27: missing -save-temps fallback note\n' + r.stderr);
+  // -save-temps names the kept temps after the output: -o st-save.o
+  // keeps st-save.i / st-save.s (see gcc.misc-tests/outputs.exp
+  // "obj savetmp named0").
+  for (const t of ['st-save.i', 'st-save.s'])
+    if (!fs.existsSync(path.join(dir, t)))
+      fail('check 27: -save-temps did not keep ' + t);
+  if (!/skip-no-integrated-as/.test(r.stderr))
+    fail('check 27: -save-temps compile not tagged skip\n' + r.stderr);
+  if (/compile-cache: (store|hit|manifest-hit) /.test(r.stderr))
+    fail('check 27: -save-temps must neither store nor serve\n' + r.stderr);
+  if (!readObj(objS).equals(readObj(objI)))
+    fail('check 27: -save-temps object differs from the integrated one');
+
+  // (b) -gsplit-dwarf: fallback note names it; ASM_FINAL_SPEC's objcopy
+  // pass leaves the .dwo beside the object and strips the .o.
+  const objD = path.join(dir, 'st-dwo.o');
+  r = spawnSync(XGCC, ['-O2', '-g', '-gsplit-dwarf', '-c', src, '-o', objD,
+                       '-fcompile-cache=' + cache, B],
+                { cwd: dir, env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0) fail('check 27: -gsplit-dwarf compile failed\n' + r.stderr);
+  if (!/note: -gsplit-dwarf: using the external assembler/.test(r.stderr))
+    fail('check 27: missing -gsplit-dwarf fallback note\n' + r.stderr);
+  const dwo = path.join(dir, 'st-dwo.dwo');
+  if (!fs.existsSync(dwo))
+    fail('check 27: -gsplit-dwarf produced no .dwo');
+  if (!readObj(dwo).includes('.debug_info.dwo'))
+    fail('check 27: .dwo lacks the .debug_info.dwo section');
+  if (readObj(objD).includes('.debug_info.dwo'))
+    fail('check 27: .o still carries .debug_info.dwo (objcopy --strip-dwo ' +
+         'did not run)');
+  if (!/skip-no-integrated-as/.test(r.stderr))
+    fail('check 27: -gsplit-dwarf compile not tagged skip\n' + r.stderr);
+
+  // (c) explicit -fintegrated-as + -save-temps: the user's choice wins --
+  // no fallback (and no .s: the in-process assembler has none to save).
+  const d2 = path.join(dir, 'explicit');
+  fs.mkdirSync(d2);
+  const objX = path.join(d2, 'st-x.o');
+  r = spawnSync(XGCC, ['-O2', '-c', src, '-o', objX,
+                       '-save-temps', '-fintegrated-as', B],
+                { cwd: d2, env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0)
+    fail('check 27: -fintegrated-as -save-temps must not error\n' + r.stderr);
+  if (/using the external assembler/.test(r.stderr))
+    fail('check 27: explicit -fintegrated-as must suppress the fallback\n'
+         + r.stderr);
+  if (fs.existsSync(path.join(d2, 'st-x.s')))
+    fail('check 27: explicit integrated compile unexpectedly wrote a .s');
+
+  process.stdout.write(
+    'check 27 OK: -save-temps keeps .i/.s and -gsplit-dwarf splits the .dwo ' +
+    'via the external-as fallback (noted, cache-skipped); explicit ' +
+    '-fintegrated-as wins\n');
+}
+
+// ---- check 28: duplicate -o is last-one-wins ------------------------------
+// The integrated arm hands %W{o*} to cc1, which rejects a duplicate -o
+// ("output filename specified twice") -- the external as and ld just took
+// the last one.  The driver now kills the earlier -o (check_live_switch),
+// so a duplicate -o compiles cleanly, writes ONLY the last name, stays
+// integrated and cache-eligible, and the link path behaves the same.
+{
+  const dir = path.join(work, 'c28');
+  fs.mkdirSync(dir);
+  const src = path.join(dir, 'oo.c');
+  fs.writeFileSync(src, 'int main(void) { return 42; }\n');
+  const cache = path.join(dir, 'cache');
+  fs.mkdirSync(cache);
+  const dead = path.join(dir, 'dead.o');
+  const live = path.join(dir, 'live.o');
+
+  // (a) -c with two -o: last wins, first never created, still a normal
+  // integrated miss+store.
+  let r = spawnSync(XGCC, ['-O2', '-c', src, '-o', dead, '-o', live,
+                           '-fcompile-cache=' + cache, B],
+                    { cwd: dir, env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0)
+    fail('check 28: duplicate -o compile failed\n' + r.stderr);
+  if (!fs.existsSync(live)) fail('check 28: last -o was not written');
+  if (fs.existsSync(dead)) fail('check 28: earlier (dead) -o was written');
+  if (!/compile-cache: store /.test(r.stderr))
+    fail('check 28: duplicate -o compile must stay cache-eligible\n'
+         + r.stderr);
+
+  // (b) warm repeat serves, byte-identical to a plain single -o compile.
+  r = spawnSync(XGCC, ['-O2', '-c', src, '-o', dead, '-o', live,
+                       '-fcompile-cache=' + cache, B],
+                { cwd: dir, env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0 || !/compile-cache: (manifest-hit|hit) /.test(r.stderr))
+    fail('check 28: warm duplicate -o compile did not serve\n' + r.stderr);
+  const single = path.join(dir, 'single.o');
+  r = spawnSync(XGCC, ['-O2', '-c', src, '-o', single, B],
+                { cwd: dir, env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0) fail('check 28: single -o compile failed\n' + r.stderr);
+  if (!readObj(live).equals(readObj(single)))
+    fail('check 28: duplicate -o object differs from single -o object');
+
+  // (c) the PR shape that used to error: a dump flag plus -o /dev/null
+  // before the real -c -o.
+  const outO = path.join(dir, 'devnull-shape.o');
+  r = spawnSync(XGCC, ['-fdump-ipa-clones', '-o', '/dev/null', '-c',
+                       '-o', outO, src, B],
+                { cwd: dir, env: debugEnv, encoding: 'utf8' });
+  if (r.status !== 0)
+    fail('check 28: -fdump-ipa-clones -o /dev/null -c -o out.o errored\n'
+         + r.stderr);
+  if (!fs.existsSync(outO))
+    fail('check 28: devnull-dump shape did not write the real -o');
+
+  // (d) link path: ld saw the full list before and took the last; with the
+  // dedup it still produces exactly the last name.
+  const deadExe = path.join(dir, 'dead.exe');
+  const liveExe = path.join(dir, 'live.exe');
+  r = spawnSync(XGCC, [live, '-o', deadExe, '-o', liveExe, B],
+                { cwd: dir, encoding: 'utf8' });
+  if (r.status !== 0) fail('check 28: duplicate -o link failed\n' + r.stderr);
+  if (!fs.existsSync(liveExe) || fs.existsSync(deadExe))
+    fail('check 28: link must write only the last -o');
+  const run = spawnSync(liveExe, [], { encoding: 'utf8' });
+  if (run.status !== 42)
+    fail('check 28: linked program returned ' + run.status + ', wanted 42');
+
+  process.stdout.write(
+    'check 28 OK: duplicate -o compiles clean (last wins, first absent), ' +
+    'stays integrated + cached, devnull-dump shape ok, link dedups too\n');
+}
+
 // ---- cleanup + success ---------------------------------------------------
 try {
   fs.rmSync(work, { recursive: true, force: true });
