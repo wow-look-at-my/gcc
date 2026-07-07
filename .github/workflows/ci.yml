@@ -39,10 +39,13 @@ permissions:
   id-token: write
 
 concurrency:
-  group: ci-${{ github.ref }}
-  # Dispatch runs (multi-hour testsuite/corpus validation) must survive
-  # pr-minder base-sync pushes; push runs still cancel each other.
-  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+  # Dispatch (validation) runs get their own concurrency group so pr-minder
+  # base-sync pushes can never cancel a multi-hour testsuite/corpus run;
+  # within each group newer runs still cancel older ones. Accepted trade-off:
+  # one push run and one dispatch run may execute concurrently (benign:
+  # buildhost publishes auto-increment; actions/cache last-save-wins).
+  group: ci-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
 
 env:
   # Persisted compile-cache directory, shared across runs via actions/cache.
