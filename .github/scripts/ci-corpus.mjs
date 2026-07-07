@@ -184,6 +184,18 @@ function fetchSource() {
     run('fetch', ['unzip', '-q', '-o', zip, '-d', work]);
     fs.renameSync(path.join(work, pin.dir), srcDir);
   }
+  // b9891's webui defaults kit.version to Date.now(), making the generated
+  // ui.cpp nondeterministic across builds -- pin it so byte-identity is
+  // testable (same class as SOURCE_DATE_EPOCH for openssl).
+  if (project === 'llama.cpp') {
+    const cfg = path.join(srcDir, 'tools', 'ui', 'svelte.config.js');
+    const s = fs.readFileSync(cfg, 'utf8');
+    if (!/\bversion\s*:/.test(s)) {
+      const p = s.replace(/(\bkit:\s*\{)/, `$1\n\t\tversion: { name: 'corpus' },`);
+      if (p === s) fail('could not pin SvelteKit version in tools/ui/svelte.config.js');
+      fs.writeFileSync(cfg, p);
+    }
+  }
 }
 
 // Extra compile flags for a build in DIR with/without the cache. llama.cpp

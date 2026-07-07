@@ -81,3 +81,15 @@ be pruned.
   serve" from "deterministic recompile"; a floor shortfall means the serve
   path regressed. Failure evidence (per-phase cache-debug logs, object-hash
   manifests) lands in the `corpus-logs-<project>` artifact.
+
+## Follow-ups surfaced by corpus validation
+
+- libgas should accept the ubiquitous benign `-Wa,--noexecstack` (fold it
+  into the cache key) so openssl-class builds retain caching. Today any
+  `-Wa,` option takes the sound external-as fallback and the build loses
+  the cache entirely (the corpus openssl leg works around this with
+  `no-asm`).
+- Perf-only: the driver-twin and cc1-twin manifest keys diverge for some
+  TUs once an auto-PCH `.gch` exists -- the cc1 twin still serves and
+  byte-identity holds, but the driver fast path is defeated. Investigate
+  folding the gch record into the driver-side key.
