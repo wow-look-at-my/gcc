@@ -728,36 +728,52 @@ jobs:
       # Fetch the published baseline FIRST: if none exists yet the job fails
       # in seconds with the fix, instead of after a 3h testsuite run.
       # Anonymous download -- dl.pazer.build serves this org's projects
-      # publicly (verified against the gcc dist); latest version, no branch
-      # filter (the baseline is a property of the fork point, not a branch).
+      # publicly (verified against the gcc dist). Candidates are tried in
+      # order -- current ref branch, release branch, bare latest -- because
+      # testsuite-baseline-publish tags releases with git_branch =
+      # github.ref_name and a bare "latest" resolves against the buildhost
+      # project's default branch. A 404 falls through to the next candidate
+      # (the baseline is a property of the fork point, so any published copy
+      # is acceptable); the step only fails once every candidate 404s.
       - name: Download testsuite baseline
         uses: wow-look-at-my/actions@typescript#latest
         with:
           script: |
-            const url = "https://dl.pazer.build/gcc/testsuite-baseline?os=linux&arch=amd64";
+            // Latest with no filter resolves against the buildhost project's DEFAULT
+            // branch, which need not be the branch that published the baseline
+            // (testsuite-baseline-publish sets git_branch = github.ref_name). Try the
+            // current branch first, then the release branch, then bare latest.
+            const base = "https://dl.pazer.build/gcc/testsuite-baseline";
+            const qs = "os=linux&arch=amd64";
+            const candidates = [
+              `${base}?branch=${encodeURIComponent(github.ref_name)}&${qs}`,
+              `${base}?branch=${encodeURIComponent("develop-matt/v14")}&${qs}`,
+              `${base}?${qs}`,
+            ];
             const dest = path.join(process.env.RUNNER_TEMP!, "testsuite-baseline.tar.gz");
             const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-            for (let attempt = 1; ; attempt++) {
-              try {
-                const resp = await fetch(url);
-                if (resp.status === 404) {
-                  core.setFailed(
-                    `no testsuite baseline published yet (HTTP 404 from ${url}) -- ` +
-                    `dispatch this workflow once with build_baseline=true to generate it ` +
-                    `(see .github/TESTSUITE.md), then re-run.`);
+            for (const url of candidates) {
+              for (let attempt = 1; ; attempt++) {
+                try {
+                  const resp = await fetch(url);
+                  if (resp.status === 404) break; // this candidate has no baseline
+                  if (resp.status !== 200) throw new Error(`HTTP ${resp.status}`);
+                  const buf = Buffer.from(await resp.arrayBuffer());
+                  fs.writeFileSync(dest, buf);
+                  core.info(`downloaded ${buf.length} bytes from ${url} -> ${dest}`);
                   return;
+                } catch (e) {
+                  if (attempt === 5) throw e;
+                  core.warning(`baseline download: ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
+                  await sleep(1000 * 2 ** (attempt - 1));
                 }
-                if (resp.status !== 200) throw new Error(`HTTP ${resp.status}`);
-                const buf = Buffer.from(await resp.arrayBuffer());
-                fs.writeFileSync(dest, buf);
-                core.info(`downloaded ${buf.length} bytes -> ${dest}`);
-                return;
-              } catch (e) {
-                if (attempt === 5) throw e;
-                core.warning(`baseline download: ${e instanceof Error ? e.message : String(e)} (attempt ${attempt}/5)`);
-                await sleep(1000 * 2 ** (attempt - 1));
               }
+              core.warning(`no baseline at ${url} (HTTP 404)`);
             }
+            core.setFailed(
+              `no testsuite baseline published yet (HTTP 404 from all of: ${candidates.join(", ")}) -- ` +
+              `dispatch this workflow once with build_baseline=true to generate it ` +
+              `(see .github/TESTSUITE.md), then re-run.`);
 
       - name: Unpack testsuite baseline
         run: |

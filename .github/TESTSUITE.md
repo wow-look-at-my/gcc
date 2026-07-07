@@ -41,9 +41,10 @@ gh workflow run ci.yml -R wow-look-at-my/gcc --ref <branch> -f build_baseline=tr
 ```
 
 Result: `https://dl.pazer.build/gcc/testsuite-baseline?os=linux&arch=amd64`
-(anonymous download; the gate always takes the latest published version,
-regardless of branch -- the baseline is a property of the fork point, not of
-a branch). Regenerate when:
+(anonymous download; the publish tags the release with the publishing
+branch, so the gate tries the current ref's branch first, then
+`develop-matt/v14`, then bare latest -- the baseline is a property of the
+fork point, so any published copy is acceptable). Regenerate when:
 
 - the fork rebases onto a new upstream commit (update the fork-point sha in
   `ci.yml` and here first), or
