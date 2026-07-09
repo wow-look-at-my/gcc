@@ -98,6 +98,15 @@ jobs:
         with:
           sparse-checkout: .github
 
+      # All 30 cells write their first in-flight record to the same wiki
+      # repo, and a fully synchronized fan-out start can outlast the action's
+      # 8-attempt push-retry budget for the unluckiest writers (observed:
+      # 4/30 legs of run 29024061808 exhausted retries on exactly this
+      # step). Stagger the first writes ~7 s apart so the herd never forms;
+      # the action's retry loop absorbs the residual collisions.
+      - name: Stagger first write
+        run: sleep $(( ${{ strategy.job-index }} * 7 ))
+
       - name: Mark cell in-flight
         uses: wow-look-at-my/profiling-results-matrix@v1
         with:
