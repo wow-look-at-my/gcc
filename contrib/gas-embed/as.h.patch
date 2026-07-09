@@ -1,0 +1,23 @@
+--- a/as.h	2024-01-29 00:00:00.000000000 +0000
++++ b/as.h	2026-06-28 06:07:51.496412145 +0000
+@@ -53,6 +53,7 @@
+ 
+ #include <errno.h>
+ #include <stdarg.h>
++#include <setjmp.h>
+ 
+ #include "getopt.h"
+ /* The first getopt value for machine-independent long options.
+@@ -477,6 +478,12 @@
+ void   signal_init (void);
+ int    had_errors (void);
+ int    had_warnings (void);
++
++/* cc1plus embed mode: when gas_in_embed is non-zero, as_fatal/as_abort
++   longjmp to gas_fatal_jmp instead of xexit-ing the process.  Both are
++   defined in messages.c.  */
++extern jmp_buf gas_fatal_jmp;
++extern int gas_in_embed;
+ void   as_warn_value_out_of_range (const char *, offsetT, offsetT, offsetT,
+ 				   const char *, unsigned);
+ void   as_bad_value_out_of_range (const char *, offsetT, offsetT, offsetT,

@@ -1,6 +1,6 @@
 // Set implementation -*- C++ -*-
 
-// Copyright (C) 2001-2022 Free Software Foundation, Inc.
+// Copyright (C) 2001-2024 Free Software Foundation, Inc.
 //
 // This file is part of the GNU ISO C++ Library.  This library is free
 // software; you can redistribute it and/or modify it under the
@@ -74,6 +74,8 @@ _GLIBCXX_BEGIN_NAMESPACE_CONTAINER
    *  retrieved in logarithmic time.
    *
    *  @ingroup associative_containers
+   *  @headerfile set
+   *  @since C++98
    *
    *  @tparam _Key  Type of key objects.
    *  @tparam _Compare  Comparison function object type, defaults to less<_Key>.
@@ -152,7 +154,7 @@ _GLIBCXX_BEGIN_NAMESPACE_CONTAINER
       typedef typename _Rep_type::difference_type	 difference_type;
       ///@}
 
-#if __cplusplus > 201402L
+#ifdef __glibcxx_node_extract // >= C++17
       using node_type = typename _Rep_type::node_type;
       using insert_return_type = typename _Rep_type::insert_return_type;
 #endif
@@ -579,7 +581,7 @@ _GLIBCXX_BEGIN_NAMESPACE_CONTAINER
       { this->insert(__l.begin(), __l.end()); }
 #endif
 
-#if __cplusplus > 201402L
+#ifdef __glibcxx_node_extract // >= C++17
       /// Extract a node.
       node_type
       extract(const_iterator __pos)

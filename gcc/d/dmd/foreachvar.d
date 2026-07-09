@@ -1,7 +1,7 @@
 /**
  * Utility to visit every variable in an expression.
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/foreachvar.d, _foreachvar.d)
@@ -15,7 +15,6 @@ import core.stdc.stdio;
 import core.stdc.stdlib;
 import core.stdc.string;
 
-import dmd.apply;
 import dmd.arraytypes;
 import dmd.astenums;
 import dmd.attrib;
@@ -33,9 +32,10 @@ import dmd.identifier;
 import dmd.init;
 import dmd.initsem;
 import dmd.mtype;
+import dmd.postordervisitor;
 import dmd.printast;
 import dmd.root.array;
-import dmd.root.rootobject;
+import dmd.rootobject;
 import dmd.statement;
 import dmd.tokens;
 import dmd.visitor;
@@ -56,7 +56,7 @@ void foreachVar(Expression e, void delegate(VarDeclaration) dgVar)
         alias visit = typeof(super).visit;
         extern (D) void delegate(VarDeclaration) dgVar;
 
-        extern (D) this(void delegate(VarDeclaration) dgVar)
+        extern (D) this(void delegate(VarDeclaration) dgVar) scope @safe
         {
             this.dgVar = dgVar;
         }
@@ -75,19 +75,7 @@ void foreachVar(Expression e, void delegate(VarDeclaration) dgVar)
             if (!v)
                 return;
             if (TupleDeclaration td = v.toAlias().isTupleDeclaration())
-            {
-                if (!td.objects)
-                    return;
-                foreach (o; *td.objects)
-                {
-                    Expression ex = isExpression(o);
-                    DsymbolExp s = ex ? ex.isDsymbolExp() : null;
-                    assert(s);
-                    VarDeclaration v2 = s.s.isVarDeclaration();
-                    assert(v2);
-                    dgVar(v2);
-                }
-            }
+                td.foreachVar((s) { dgVar(s.isVarDeclaration()); });
             else
                 dgVar(v);
             Dsymbol s = v.toAlias();
@@ -311,7 +299,7 @@ void foreachExpAndVar(Statement s,
             case STMT.Conditional:
             case STMT.While:
             case STMT.Forwarding:
-            case STMT.Compile:
+            case STMT.Mixin:
             case STMT.Peel:
             case STMT.Synchronized:
                 assert(0);              // should have been rewritten

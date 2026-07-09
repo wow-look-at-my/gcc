@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 B o d y                                  --
 --                                                                          --
---           Copyright (C) 1992-2022, Free Software Foundation, Inc.        --
+--           Copyright (C) 1992-2024, Free Software Foundation, Inc.        --
 --                                                                          --
 -- GNAT is free software;  you can  redistribute it  and/or modify it under --
 -- terms of the  GNU General Public License as published  by the Free Soft- --
@@ -55,9 +55,13 @@ is
       if V then
          S (1 .. 4) := "TRUE";
          P := 4;
+         pragma Assert
+           (System.Val_Spec.First_Non_Space_Ghost (S, S'First, S'Last) = 1);
       else
          S (1 .. 5) := "FALSE";
          P := 5;
+         pragma Assert
+           (System.Val_Spec.First_Non_Space_Ghost (S, S'First, S'Last) = 1);
       end if;
    end Image_Boolean;
 

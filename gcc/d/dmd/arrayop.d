@@ -3,7 +3,7 @@
  *
  * Specification: $(LINK2 https://dlang.org/spec/arrays.html#array-operations, Array Operations)
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/arrayop.d, _arrayop.d)
@@ -19,16 +19,16 @@ import dmd.astenums;
 import dmd.declaration;
 import dmd.dscope;
 import dmd.dsymbol;
+import dmd.errors;
 import dmd.expression;
 import dmd.expressionsem;
-import dmd.func;
-import dmd.globals;
+import dmd.funcsem;
 import dmd.hdrgen;
 import dmd.id;
 import dmd.identifier;
+import dmd.location;
 import dmd.mtype;
 import dmd.common.outbuffer;
-import dmd.statement;
 import dmd.tokens;
 import dmd.visitor;
 
@@ -93,7 +93,7 @@ bool checkNonAssignmentArrayOp(Expression e, bool suggestion = false)
         const(char)* s = "";
         if (suggestion)
             s = " (possible missing [])";
-        e.error("array operation `%s` without destination memory not allowed%s", e.toChars(), s);
+        error(e.loc, "array operation `%s` without destination memory not allowed%s", e.toChars(), s);
         return true;
     }
     return false;
@@ -111,8 +111,8 @@ bool checkNonAssignmentArrayOp(Expression e, bool suggestion = false)
  * evaluation order as the actual array operations have no
  * side-effect.
  * References:
- * https://github.com/dlang/druntime/blob/master/src/object.d#L3944
- * https://github.com/dlang/druntime/blob/master/src/core/internal/array/operations.d
+ * https://github.com/dlang/dmd/blob/cdfadf8a18f474e6a1b8352af2541efe3e3467cc/druntime/src/object.d#L4694
+ * https://github.com/dlang/dmd/blob/master/druntime/src/core/internal/array/operations.d
  */
 Expression arrayOp(BinExp e, Scope* sc)
 {
@@ -122,15 +122,14 @@ Expression arrayOp(BinExp e, Scope* sc)
     Type tbn = tb.nextOf().toBasetype();
     if (tbn.ty == Tvoid)
     {
-        e.error("cannot perform array operations on `void[]` arrays");
+        error(e.loc, "cannot perform array operations on `void[]` arrays");
         return ErrorExp.get();
     }
     if (!isArrayOpValid(e))
         return arrayOpInvalidError(e);
 
     auto tiargs = new Objects();
-    auto args = new Expressions();
-    buildArrayOp(sc, e, tiargs, args);
+    auto args = buildArrayOp(sc, e, tiargs);
 
     import dmd.dtemplate : TemplateDeclaration;
     __gshared TemplateDeclaration arrayOp;
@@ -149,7 +148,7 @@ Expression arrayOp(BinExp e, Scope* sc)
             ObjectNotFound(idArrayOp);   // fatal error
     }
 
-    auto fd = resolveFuncCall(e.loc, sc, arrayOp, tiargs, null, args, FuncResolveFlag.standard);
+    auto fd = resolveFuncCall(e.loc, sc, arrayOp, tiargs, null, ArgumentList(args), FuncResolveFlag.standard);
     if (!fd || fd.errors)
         return ErrorExp.get();
     return new CallExp(e.loc, new VarExp(e.loc, fd, false), args).expressionSemantic(sc);
@@ -166,14 +165,14 @@ Expression arrayOp(BinAssignExp e, Scope* sc)
 
     if (tn && (!tn.isMutable() || !tn.isAssignable()))
     {
-        e.error("slice `%s` is not mutable", e.e1.toChars());
+        error(e.loc, "slice `%s` is not mutable", e.e1.toChars());
         if (e.op == EXP.addAssign)
             checkPossibleAddCatError!(AddAssignExp, CatAssignExp)(e.isAddAssignExp);
         return ErrorExp.get();
     }
     if (e.e1.op == EXP.arrayLiteral)
     {
-        return e.e1.modifiableLvalue(sc, e.e1);
+        return e.e1.modifiableLvalue(sc);
     }
 
     return arrayOp(e.isBinExp(), sc);
@@ -184,7 +183,7 @@ Expression arrayOp(BinAssignExp e, Scope* sc)
  * using reverse polish notation (RPN) to encode order of operations.
  * Encode operations as string arguments, using a "u" prefix for unary operations.
  */
-private void buildArrayOp(Scope* sc, Expression e, Objects* tiargs, Expressions* args)
+private Expressions* buildArrayOp(Scope* sc, Expression e, Objects* tiargs)
 {
     extern (C++) final class BuildArrayOpVisitor : Visitor
     {
@@ -194,11 +193,11 @@ private void buildArrayOp(Scope* sc, Expression e, Objects* tiargs, Expressions*
         Expressions* args;
 
     public:
-        extern (D) this(Scope* sc, Objects* tiargs, Expressions* args)
+        extern (D) this(Scope* sc, Objects* tiargs) scope @safe
         {
             this.sc = sc;
             this.tiargs = tiargs;
-            this.args = args;
+            this.args = new Expressions();
         }
 
         override void visit(Expression e)
@@ -252,8 +251,9 @@ private void buildArrayOp(Scope* sc, Expression e, Objects* tiargs, Expressions*
         }
     }
 
-    scope v = new BuildArrayOpVisitor(sc, tiargs, args);
+    scope v = new BuildArrayOpVisitor(sc, tiargs);
     e.accept(v);
+    return v.args;
 }
 
 /***********************************************
@@ -275,7 +275,7 @@ bool isArrayOpImplicitCast(TypeDArray tfrom, TypeDArray tto)
 /***********************************************
  * Test if expression is a unary array op.
  */
-bool isUnaArrayOp(EXP op)
+bool isUnaArrayOp(EXP op) @safe
 {
     switch (op)
     {
@@ -291,7 +291,7 @@ bool isUnaArrayOp(EXP op)
 /***********************************************
  * Test if expression is a binary array op.
  */
-bool isBinArrayOp(EXP op)
+bool isBinArrayOp(EXP op) @safe
 {
     switch (op)
     {
@@ -314,7 +314,7 @@ bool isBinArrayOp(EXP op)
 /***********************************************
  * Test if expression is a binary assignment array op.
  */
-bool isBinAssignArrayOp(EXP op)
+bool isBinAssignArrayOp(EXP op) @safe
 {
     switch (op)
     {
@@ -371,7 +371,7 @@ bool isArrayOpOperand(Expression e)
 
 ErrorExp arrayOpInvalidError(Expression e)
 {
-    e.error("invalid array operation `%s` (possible missing [])", e.toChars());
+    error(e.loc, "invalid array operation `%s` (possible missing [])", e.toChars());
     if (e.op == EXP.add)
         checkPossibleAddCatError!(AddExp, CatExp)(e.isAddExp());
     else if (e.op == EXP.addAssign)
@@ -384,5 +384,5 @@ private void checkPossibleAddCatError(AddT, CatT)(AddT ae)
     if (!ae.e2.type || ae.e2.type.ty != Tarray || !ae.e2.type.implicitConvTo(ae.e1.type))
         return;
     CatT ce = new CatT(ae.loc, ae.e1, ae.e2);
-    ae.errorSupplemental("did you mean to concatenate (`%s`) instead ?", ce.toChars());
+    errorSupplemental(ae.loc, "did you mean to concatenate (`%s`) instead ?", ce.toChars());
 }

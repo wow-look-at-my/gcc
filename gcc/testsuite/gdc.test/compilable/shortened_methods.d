@@ -1,4 +1,4 @@
-// REQUIRED_ARGS: -preview=shortenedMethods
+// N.B. Shortened methods are no longer under a preview flag
 class A {
     int _x = 34;
     // short syntax works in all contexts
@@ -27,7 +27,12 @@ string test() => "hello"; // works at any scope
 static assert(test() == "hello"); // works normally
 static assert(is(typeof(&test) == string function())); // same normal type
 
+struct S(T) {}
+
 void func() {
     int a;
     int nested() => a; // and at nested scopes too
+
+    // Issue 24088 - https://issues.dlang.org/show_bug.cgi?id=24088
+    S!int f() => S!int();
 }

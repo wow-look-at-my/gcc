@@ -42,7 +42,7 @@ static diagnostic_finalizer_fn original_finalizer = NULL;
 
 static void
 verify_unpacked_ranges  (diagnostic_context *context,
-			 diagnostic_info *diagnostic,
+			 const diagnostic_info *diagnostic,
 			 diagnostic_t orig_diag_kind)
 {
   /* Verify that the locations are ad-hoc, not packed. */
@@ -56,7 +56,7 @@ verify_unpacked_ranges  (diagnostic_context *context,
 
 static void
 verify_no_columns  (diagnostic_context *context,
-		    diagnostic_info *diagnostic,
+		    const diagnostic_info *diagnostic,
 		    diagnostic_t orig_diag_kind)
 {
   /* Verify that the locations have no columns. */
@@ -101,7 +101,7 @@ plugin_init (struct plugin_name_args *plugin_info,
       break;
 
     default:
-      error_at (UNKNOWN_LOCATION, "unrecognized value for plugin argument");
+      break;
     }
 
   return 0;

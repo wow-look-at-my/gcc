@@ -2,7 +2,7 @@
    by the C-based front ends.  The structure of gimplified, or
    language-independent, trees is dictated by the grammar described in this
    file.
-   Copyright (C) 2002-2022 Free Software Foundation, Inc.
+   Copyright (C) 2002-2024 Free Software Foundation, Inc.
    Lowering of expressions contributed by Sebastian Pop <s.pop@laposte.net>
    Re-written to support lowering of whole function trees, documentation
    and miscellaneous cleanups by Diego Novillo <dnovillo@redhat.com>
@@ -40,6 +40,9 @@ along with GCC; see the file COPYING3.  If not see
 #include "dumpfile.h"
 #include "c-ubsan.h"
 #include "tree-nested.h"
+#include "context.h"
+#include "tree-pass.h"
+#include "internal-fn.h"
 
 /*  The gimplification pass converts the language-dependent trees
     (ld-trees) emitted by the parser into language-independent trees
@@ -105,6 +108,18 @@ ubsan_walk_array_refs_r (tree *tp, int *walk_subtrees, void *data)
     }
   else if (TREE_CODE (*tp) == ARRAY_REF)
     ubsan_maybe_instrument_array_ref (tp, false);
+  else if (TREE_CODE (*tp) == MODIFY_EXPR)
+    {
+      /* Since r7-1900, we gimplify RHS before LHS.  Consider
+	   a[b] |= c;
+	 wherein we can have a single shared tree a[b] in both LHS and RHS.
+	 If we only instrument the LHS and the access is invalid, the program
+	 could crash before emitting a UBSan error.  So instrument the RHS
+	 first.  */
+      *walk_subtrees = 0;
+      walk_tree (&TREE_OPERAND (*tp, 1), ubsan_walk_array_refs_r, pset, pset);
+      walk_tree (&TREE_OPERAND (*tp, 0), ubsan_walk_array_refs_r, pset, pset);
+    }
   return NULL_TREE;
 }
 
@@ -210,21 +225,30 @@ expr_loc_or_loc (const_tree expr, location_t or_loc)
    controlled by the loop.  INCR is the increment expression of a for-loop,
    or NULL_TREE.  COND_IS_FIRST indicates whether the condition is
    evaluated before the loop body as in while and for loops, or after the
-   loop body as in do-while loops.  */
+   loop body as in do-while loops.  COND_PREP and COND_CLEANUP are used
+   for C++ for/while loops with variable declaration as condition.  COND_PREP
+   is a BIND_EXPR with the declaration and initialization of the condition
+   variable, into which COND, BODY, continue label if needed and INCR if
+   non-NULL should be appended, and COND_CLEANUP is number of nested
+   CLEANUP_STMT -> TRY_FINALLY_EXPR statements at the end.  If non-NULL,
+   COND, BODY, continue label if needed and INCR if non-NULL should be
+   appended to the body of the COND_CLEANUP's nested TRY_FINALLY_EXPR.  */
 
 static void
 genericize_c_loop (tree *stmt_p, location_t start_locus, tree cond, tree body,
-		   tree incr, bool cond_is_first, int *walk_subtrees,
-		   void *data, walk_tree_fn func, walk_tree_lh lh)
+		   tree incr, tree cond_prep, tree cond_cleanup,
+		   bool cond_is_first, int *walk_subtrees, void *data,
+		   walk_tree_fn func, walk_tree_lh lh)
 {
   tree blab, clab;
   tree entry = NULL, exit = NULL, t;
-  tree stmt_list = NULL;
+  tree stmt_list = NULL, outer_stmt_list = NULL_TREE, *stmt_list_p = NULL;
   location_t cond_locus = expr_loc_or_loc (cond, start_locus);
   location_t incr_locus = expr_loc_or_loc (incr, start_locus);
 
   protected_set_expr_location_if_unset (incr, start_locus);
 
+  walk_tree_1 (&cond_prep, func, data, NULL, lh);
   walk_tree_1 (&cond, func, data, NULL, lh);
   walk_tree_1 (&incr, func, data, NULL, lh);
 
@@ -234,9 +258,54 @@ genericize_c_loop (tree *stmt_p, location_t start_locus, tree cond, tree body,
   walk_tree_1 (&body, func, data, NULL, lh);
   *walk_subtrees = 0;
 
-  /* If condition is zero don't generate a loop construct.  */
-  if (cond && integer_zerop (cond))
+  if (cond_prep)
     {
+      /* The C++ cases of
+	 while (A x = 42) body;
+	 for (; A x = 42; expr) body;
+	 This should be expanded into:
+
+	 top:
+	 COND_PREP
+
+	 with either
+
+	 if (COND); else break;
+	 BODY;
+	 cont:
+	 EXPR;
+	 goto top;
+
+	 appended into COND_PREP body or body of some TRY_FINALLY_EXPRs
+	 at the end of COND_PREP.  */
+      gcc_assert (cond_is_first && TREE_CODE (cond_prep) == BIND_EXPR);
+      tree top = build1 (LABEL_EXPR, void_type_node,
+			 create_artificial_label (start_locus));
+      exit = build1 (GOTO_EXPR, void_type_node, LABEL_EXPR_LABEL (top));
+      append_to_statement_list (top, &outer_stmt_list);
+      append_to_statement_list (cond_prep, &outer_stmt_list);
+      stmt_list_p = &BIND_EXPR_BODY (cond_prep);
+      if (cond_cleanup)
+	for (unsigned depth = tree_to_uhwi (cond_cleanup); depth; --depth)
+	  {
+	    t = tsi_stmt (tsi_last (*stmt_list_p));
+	    gcc_assert (TREE_CODE (t) == TRY_FINALLY_EXPR);
+	    stmt_list_p = &TREE_OPERAND (t, 0);
+	  }
+      stmt_list = *stmt_list_p;
+      *stmt_list_p = NULL_TREE;
+      tree after_cond = create_artificial_label (cond_locus);
+      tree goto_after_cond = build1 (GOTO_EXPR, void_type_node, after_cond);
+      t = build1 (GOTO_EXPR, void_type_node, get_bc_label (bc_break));
+      t = fold_build3_loc (cond_locus, COND_EXPR, void_type_node, cond,
+			   goto_after_cond, t);
+      append_to_statement_list (t, &stmt_list);
+      t = build1 (LABEL_EXPR, void_type_node, after_cond);
+      append_to_statement_list (t, &stmt_list);
+    }
+  else if (cond && integer_zerop (cond))
+    {
+      /* If condition is zero don't generate a loop construct.  */
       if (cond_is_first)
 	{
 	  t = build1_loc (start_locus, GOTO_EXPR, void_type_node,
@@ -292,6 +361,27 @@ genericize_c_loop (tree *stmt_p, location_t start_locus, tree cond, tree body,
     }
 
   append_to_statement_list (body, &stmt_list);
+  if (c_dialect_cxx ()
+      && stmt_list
+      && TREE_CODE (stmt_list) == STATEMENT_LIST)
+    {
+      tree_stmt_iterator tsi = tsi_last (stmt_list);
+      if (!tsi_end_p (tsi))
+	{
+	  tree t = *tsi;
+	  while (TREE_CODE (t) == CLEANUP_POINT_EXPR
+		 || TREE_CODE (t) == EXPR_STMT
+		 || CONVERT_EXPR_CODE_P (TREE_CODE (t)))
+	    t = TREE_OPERAND (t, 0);
+	  /* For C++, if iteration statement body ends with fallthrough
+	     statement, mark it such that we diagnose it even if next
+	     statement would be labeled statement with case/default label.  */
+	  if (TREE_CODE (t) == CALL_EXPR
+	      && !CALL_EXPR_FN (t)
+	      && CALL_EXPR_IFN (t) == IFN_FALLTHROUGH)
+	    TREE_NOTHROW (t) = 1;
+	}
+    }
   finish_bc_block (&stmt_list, bc_continue, clab);
   if (incr)
     {
@@ -312,6 +402,11 @@ genericize_c_loop (tree *stmt_p, location_t start_locus, tree cond, tree body,
       append_to_statement_list (d, &stmt_list);
     }
   append_to_statement_list (exit, &stmt_list);
+  if (stmt_list_p)
+    {
+      *stmt_list_p = stmt_list;
+      stmt_list = outer_stmt_list;
+    }
   finish_bc_block (&stmt_list, bc_break, blab);
   if (!stmt_list)
     stmt_list = build_empty_stmt (start_locus);
@@ -337,8 +432,9 @@ genericize_for_stmt (tree *stmt_p, int *walk_subtrees, void *data,
     }
 
   genericize_c_loop (&loop, EXPR_LOCATION (stmt), FOR_COND (stmt),
-		     FOR_BODY (stmt), FOR_EXPR (stmt), 1, walk_subtrees,
-		     data, func, lh);
+		     FOR_BODY (stmt), FOR_EXPR (stmt),
+		     FOR_COND_PREP (stmt), FOR_COND_CLEANUP (stmt), 1,
+		     walk_subtrees, data, func, lh);
   append_to_statement_list (loop, &expr);
   if (expr == NULL_TREE)
     expr = loop;
@@ -353,8 +449,9 @@ genericize_while_stmt (tree *stmt_p, int *walk_subtrees, void *data,
 {
   tree stmt = *stmt_p;
   genericize_c_loop (stmt_p, EXPR_LOCATION (stmt), WHILE_COND (stmt),
-		     WHILE_BODY (stmt), NULL_TREE, 1, walk_subtrees,
-		     data, func, lh);
+		     WHILE_BODY (stmt), NULL_TREE,
+		     WHILE_COND_PREP (stmt), WHILE_COND_CLEANUP (stmt), 1,
+		     walk_subtrees, data, func, lh);
 }
 
 /* Genericize a DO_STMT node *STMT_P.  */
@@ -365,8 +462,8 @@ genericize_do_stmt (tree *stmt_p, int *walk_subtrees, void *data,
 {
   tree stmt = *stmt_p;
   genericize_c_loop (stmt_p, EXPR_LOCATION (stmt), DO_COND (stmt),
-		     DO_BODY (stmt), NULL_TREE, 0, walk_subtrees,
-		     data, func, lh);
+		     DO_BODY (stmt), NULL_TREE,
+		     NULL_TREE, NULL_TREE, 0, walk_subtrees, data, func, lh);
 }
 
 /* Genericize a SWITCH_STMT node *STMT_P by turning it into a SWITCH_EXPR.  */
@@ -510,12 +607,15 @@ c_genericize_control_stmt (tree *stmt_p, int *walk_subtrees, void *data,
 	     STATEMENT_LIST wouldn't be present at all the resulting
 	     expression wouldn't have TREE_SIDE_EFFECTS set, so make sure
 	     to clear it even on the STATEMENT_LIST in such cases.  */
+	  hash_set<tree> *pset = (c_dialect_cxx ()
+				  ? nullptr
+				  : static_cast<hash_set<tree> *>(data));
 	  for (i = tsi_start (stmt); !tsi_end_p (i); tsi_next (&i))
 	    {
 	      tree t = tsi_stmt (i);
 	      if (TREE_CODE (t) != DEBUG_BEGIN_STMT && nondebug_stmts < 2)
 		nondebug_stmts++;
-	      walk_tree_1 (tsi_stmt_ptr (i), func, data, NULL, lh);
+	      walk_tree_1 (tsi_stmt_ptr (i), func, data, pset, lh);
 	      if (TREE_CODE (t) != DEBUG_BEGIN_STMT
 		  && (nondebug_stmts > 1 || TREE_SIDE_EFFECTS (tsi_stmt (i))))
 		clear_side_effects = false;
@@ -552,6 +652,7 @@ c_genericize_control_r (tree *stmt_p, int *walk_subtrees, void *data)
 void
 c_genericize (tree fndecl)
 {
+  dump_file_info *dfi;
   FILE *dump_orig;
   dump_flags_t local_dump_flags;
   struct cgraph_node *cgn;
@@ -570,8 +671,9 @@ c_genericize (tree fndecl)
       bc_state_t save_state;
       push_cfun (DECL_STRUCT_FUNCTION (fndecl));
       save_bc_state (&save_state);
-      walk_tree (&DECL_SAVED_TREE (fndecl), c_genericize_control_r,
-		 NULL, NULL);
+      hash_set<tree> pset;
+      walk_tree (&DECL_SAVED_TREE (fndecl), c_genericize_control_r, &pset,
+		 &pset);
       restore_bc_state (&save_state);
       pop_cfun ();
     }
@@ -581,7 +683,9 @@ c_genericize (tree fndecl)
 				  do_warn_duplicated_branches_r, NULL);
 
   /* Dump the C-specific tree IR.  */
-  dump_orig = get_dump_info (TDI_original, &local_dump_flags);
+  dfi = g->get_dumps ()->get_dump_file_info (TDI_original);
+  dump_orig = dfi->pstream;
+  local_dump_flags = dfi->pflags;
   if (dump_orig)
     {
       fprintf (dump_orig, "\n;; Function %s",
@@ -666,6 +770,14 @@ c_build_bind_expr (location_t loc, tree block, tree body)
   return bind;
 }
 
+/* Helper for c_gimplify_expr: test if target supports fma-like FN.  */
+
+static bool
+fma_supported_p (enum internal_fn fn, tree type)
+{
+  return direct_internal_fn_supported_p (fn, type, OPTIMIZE_FOR_BOTH);
+}
+
 /* Gimplification of expression trees.  */
 
 /* Do C-specific gimplification on *EXPR_P.  PRE_P and POST_P are as in
@@ -704,18 +816,6 @@ c_gimplify_expr (tree *expr_p, gimple_seq *pre_p ATTRIBUTE_UNUSED,
 	break;
       }
 
-    case DECL_EXPR:
-      /* This is handled mostly by gimplify.cc, but we have to deal with
-	 not warning about int x = x; as it is a GCC extension to turn off
-	 this warning but only if warn_init_self is zero.  */
-      if (VAR_P (DECL_EXPR_DECL (*expr_p))
-	  && !DECL_EXTERNAL (DECL_EXPR_DECL (*expr_p))
-	  && !TREE_STATIC (DECL_EXPR_DECL (*expr_p))
-	  && (DECL_INITIAL (DECL_EXPR_DECL (*expr_p)) == DECL_EXPR_DECL (*expr_p))
-	  && !warn_init_self)
-	suppress_warning (DECL_EXPR_DECL (*expr_p), OPT_Winit_self);
-      break;
-
     case PREINCREMENT_EXPR:
     case PREDECREMENT_EXPR:
     case POSTINCREMENT_EXPR:
@@ -727,6 +827,104 @@ c_gimplify_expr (tree *expr_p, gimple_seq *pre_p ATTRIBUTE_UNUSED,
 	    if (!TYPE_OVERFLOW_WRAPS (type))
 	      type = unsigned_type_for (type);
 	    return gimplify_self_mod_expr (expr_p, pre_p, post_p, 1, type);
+	  }
+	break;
+      }
+
+    case PLUS_EXPR:
+    case MINUS_EXPR:
+      {
+	tree type = TREE_TYPE (*expr_p);
+	/* For -ffp-contract=on we need to attempt FMA contraction only
+	   during initial gimplification.  Late contraction across statement
+	   boundaries would violate language semantics.  */
+	if (SCALAR_FLOAT_TYPE_P (type)
+	    && flag_fp_contract_mode == FP_CONTRACT_ON
+	    && cfun && !(cfun->curr_properties & PROP_gimple_any)
+	    && fma_supported_p (IFN_FMA, type))
+	  {
+	    bool neg_mul = false, neg_add = code == MINUS_EXPR;
+
+	    tree *op0_p = &TREE_OPERAND (*expr_p, 0);
+	    tree *op1_p = &TREE_OPERAND (*expr_p, 1);
+
+	    /* Look for ±(x * y) ± z, swapping operands if necessary.  */
+	    if (TREE_CODE (*op0_p) == NEGATE_EXPR
+		&& TREE_CODE (TREE_OPERAND (*op0_p, 0)) == MULT_EXPR)
+	      /* '*EXPR_P' is '-(x * y) ± z'.  This is fine.  */;
+	    else if (TREE_CODE (*op0_p) != MULT_EXPR)
+	      {
+		std::swap (op0_p, op1_p);
+		std::swap (neg_mul, neg_add);
+	      }
+	    if (TREE_CODE (*op0_p) == NEGATE_EXPR)
+	      {
+		op0_p = &TREE_OPERAND (*op0_p, 0);
+		neg_mul = !neg_mul;
+	      }
+	    if (TREE_CODE (*op0_p) != MULT_EXPR)
+	      break;
+	    auto_vec<tree, 3> ops (3);
+	    ops.quick_push (TREE_OPERAND (*op0_p, 0));
+	    ops.quick_push (TREE_OPERAND (*op0_p, 1));
+	    ops.quick_push (*op1_p);
+
+	    enum internal_fn ifn = IFN_FMA;
+	    if (neg_mul)
+	      {
+		if (fma_supported_p (IFN_FNMA, type))
+		  ifn = IFN_FNMA;
+		else
+		  ops[0] = build1 (NEGATE_EXPR, type, ops[0]);
+	      }
+	    if (neg_add)
+	      {
+		enum internal_fn ifn2 = ifn == IFN_FMA ? IFN_FMS : IFN_FNMS;
+		if (fma_supported_p (ifn2, type))
+		  ifn = ifn2;
+		else
+		  ops[2] = build1 (NEGATE_EXPR, type, ops[2]);
+	      }
+	    /* Avoid gimplify_arg: it emits all side effects into *PRE_P.  */
+	    for (auto &&op : ops)
+	      if (gimplify_expr (&op, pre_p, post_p, is_gimple_val, fb_rvalue)
+		  == GS_ERROR)
+		return GS_ERROR;
+
+	    gcall *call = gimple_build_call_internal_vec (ifn, ops);
+	    gimple_seq_add_stmt_without_update (pre_p, call);
+	    *expr_p = create_tmp_var (type);
+	    gimple_call_set_lhs (call, *expr_p);
+	    return GS_ALL_DONE;
+	  }
+	break;
+      }
+
+    case CALL_EXPR:
+      {
+	tree fndecl = get_callee_fndecl (*expr_p);
+	if (fndecl
+	    && fndecl_built_in_p (fndecl, BUILT_IN_CLZG, BUILT_IN_CTZG)
+	    && call_expr_nargs (*expr_p) == 2
+	    && TREE_CODE (CALL_EXPR_ARG (*expr_p, 1)) != INTEGER_CST)
+	  {
+	    tree a = CALL_EXPR_ARG (*expr_p, 0);
+	    if (gimplify_expr (&a, pre_p, post_p, is_gimple_val, fb_rvalue)
+		== GS_ERROR)
+	      return GS_ERROR;
+	    tree b = CALL_EXPR_ARG (*expr_p, 1);
+	    if (gimplify_expr (&b, pre_p, post_p, is_gimple_val, fb_rvalue)
+		== GS_ERROR)
+	      return GS_ERROR;
+	    tree c = build_call_expr_loc (EXPR_LOCATION (*expr_p),
+					  fndecl, 1, a);
+	    *expr_p = build3_loc (EXPR_LOCATION (*expr_p), COND_EXPR,
+				  integer_type_node,
+				  build2_loc (EXPR_LOCATION (*expr_p),
+					      NE_EXPR, boolean_type_node, a,
+					      build_zero_cst (TREE_TYPE (a))),
+				  c, b);
+	    return GS_OK;
 	  }
 	break;
       }

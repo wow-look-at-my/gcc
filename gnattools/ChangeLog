@@ -1,3 +1,30 @@
+2026-06-26  Release Manager
+
+	* GCC 14.4.0 released.
+
+2025-05-23  Release Manager
+
+	* GCC 14.3.0 released.
+
+2024-08-01  Release Manager
+
+	* GCC 14.2.0 released.
+
+2024-05-07  Release Manager
+
+	* GCC 14.1.0 released.
+
+2023-04-25  Eric Botcazou  <ebotcazou@adacore.com>
+
+	* configure.ac (TOOLS_TARGET_PAIRS): Remove obsolete settings.
+	(EXTRA_GNATTOOLS): Likewise.
+	* configure: Regenerate.
+
+2022-08-31  Martin Liska  <mliska@suse.cz>
+
+	* configure.ac: Remove deprecated ports.
+	* configure: Regenerate.
+
 2021-10-22  Eric Gallager  <egallager@gcc.gnu.org>
 
 	PR other/102663
@@ -327,7 +354,7 @@
 	* configure: Regenerate.
 	* New directory, cloned from libada.
 
-Copyright 2004-2018 Free Software Foundation, Inc.
+Copyright 2004-2024 Free Software Foundation, Inc.
 
 This ChangeLog is free software; the Free Software Foundation gives
 unlimited permission to copy, distribute, and modify it.

@@ -3,7 +3,7 @@
  *
  * Specification: $(LINK2 https://dlang.org/spec/function.html#function-safety, Function Safety)
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/safe.d, _safe.d)
@@ -26,7 +26,8 @@ import dmd.identifier;
 import dmd.mtype;
 import dmd.target;
 import dmd.tokens;
-
+import dmd.typesem : hasPointers, arrayOf;
+import dmd.func : setUnsafe, setUnsafePreview;
 
 /*************************************************************
  * Check for unsafe access in @safe code:
@@ -51,10 +52,23 @@ bool checkUnsafeAccess(Scope* sc, Expression e, bool readonly, bool printmsg)
     DotVarExp dve = cast(DotVarExp)e;
     if (VarDeclaration v = dve.var.isVarDeclaration())
     {
-        if (sc.intypeof || !sc.func || !sc.func.isSafeBypassingInference())
+        if (!sc.func)
             return false;
-        auto ad = v.toParent2().isAggregateDeclaration();
+        auto ad = v.isMember2();
         if (!ad)
+            return false;
+
+        import dmd.globals : global;
+        if (v.isSystem())
+        {
+            if (sc.setUnsafePreview(global.params.systemVariables, !printmsg, e.loc,
+                "cannot access `@system` field `%s.%s` in `@safe` code", ad, v))
+                return true;
+        }
+
+        // This branch shouldn't be here, but unfortunately calling `ad.determineSize`
+        // breaks code with circular reference errors. Specifically, test23589.d fails
+        if (ad.sizeok != Sizeok.done && !sc.func.isSafeBypassingInference())
             return false;
 
         // needed to set v.overlapped and v.overlapUnsafe
@@ -64,23 +78,36 @@ bool checkUnsafeAccess(Scope* sc, Expression e, bool readonly, bool printmsg)
         const hasPointers = v.type.hasPointers();
         if (hasPointers)
         {
-            if (v.overlapped && sc.func.setUnsafe())
+            if (v.overlapped)
             {
-                if (printmsg)
-                    e.error("field `%s.%s` cannot access pointers in `@safe` code that overlap other fields",
-                        ad.toChars(), v.toChars());
-                return true;
+                if (sc.func.isSafeBypassingInference() && sc.setUnsafe(!printmsg, e.loc,
+                    "field `%s.%s` cannot access pointers in `@safe` code that overlap other fields", ad, v))
+                {
+                    return true;
+                }
+                else
+                {
+                    import dmd.globals : FeatureState;
+                    // @@@DEPRECATED_2.116@@@
+                    // https://issues.dlang.org/show_bug.cgi?id=20655
+                    // Inferring `@system` because of union access breaks code,
+                    // so make it a deprecation safety violation as of 2.106
+                    // To turn into an error, remove `isSafeBypassingInference` check in the
+                    // above if statement and remove the else branch
+                    sc.setUnsafePreview(FeatureState.default_, !printmsg, e.loc,
+                        "field `%s.%s` cannot access pointers in `@safe` code that overlap other fields", ad, v);
+                }
             }
         }
 
         if (v.type.hasInvariant())
         {
-            if (v.overlapped && sc.func.setUnsafe())
+            if (v.overlapped)
             {
-                if (printmsg)
-                    e.error("field `%s.%s` cannot access structs with invariants in `@safe` code that overlap other fields",
-                        ad.toChars(), v.toChars());
-                return true;
+                if (sc.setUnsafe(!printmsg, e.loc,
+                    "field `%s.%s` cannot access structs with invariants in `@safe` code that overlap other fields",
+                    ad, v))
+                    return true;
             }
         }
 
@@ -90,22 +117,22 @@ bool checkUnsafeAccess(Scope* sc, Expression e, bool readonly, bool printmsg)
         if (hasPointers && v.type.toBasetype().ty != Tstruct)
         {
             if ((!ad.type.alignment.isDefault() && ad.type.alignment.get() < target.ptrsize ||
-                 (v.offset & (target.ptrsize - 1))) &&
-                sc.func.setUnsafe())
+                 (v.offset & (target.ptrsize - 1))))
             {
-                if (printmsg)
-                    e.error("field `%s.%s` cannot modify misaligned pointers in `@safe` code",
-                        ad.toChars(), v.toChars());
-                return true;
+                if (sc.setUnsafe(!printmsg, e.loc,
+                    "field `%s.%s` cannot modify misaligned pointers in `@safe` code", ad, v))
+                    return true;
             }
         }
 
-        if (v.overlapUnsafe && sc.func.setUnsafe())
+        if (v.overlapUnsafe)
         {
-             if (printmsg)
-                 e.error("field `%s.%s` cannot modify fields in `@safe` code that overlap fields with other storage classes",
-                    ad.toChars(), v.toChars());
-             return true;
+            if (sc.setUnsafe(!printmsg, e.loc,
+                "field `%s.%s` cannot modify fields in `@safe` code that overlap fields with other storage classes",
+                ad, v))
+            {
+                return true;
+            }
         }
     }
     return false;
@@ -212,17 +239,12 @@ bool isSafeCast(Expression e, Type tfrom, Type tto)
  */
 bool checkUnsafeDotExp(Scope* sc, Expression e, Identifier id, int flag)
 {
-    if (!(flag & DotExpFlag.noDeref) && // this use is attempting a dereference
-        sc.func &&                      // inside a function
-        !sc.intypeof &&                 // allow unsafe code in typeof expressions
-        !(sc.flags & SCOPE.debug_) &&   // allow unsafe code in debug statements
-        sc.func.setUnsafe())            // infer this function to be unsafe
+    if (!(flag & DotExpFlag.noDeref)) // this use is attempting a dereference
     {
         if (id == Id.ptr)
-            e.error("`%s.ptr` cannot be used in `@safe` code, use `&%s[0]` instead", e.toChars(), e.toChars());
+            return sc.setUnsafe(false, e.loc, "`%s.ptr` cannot be used in `@safe` code, use `&%s[0]` instead", e, e);
         else
-            e.error("`%s.%s` cannot be used in `@safe` code", e.toChars(), id.toChars());
-        return true;
+            return sc.setUnsafe(false, e.loc, "`%s.%s` cannot be used in `@safe` code", e, id);
     }
     return false;
 }

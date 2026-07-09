@@ -1,5 +1,5 @@
 /* expr.cc -- Lower D frontend expressions to GCC trees.
-   Copyright (C) 2015-2022 Free Software Foundation, Inc.
+   Copyright (C) 2015-2024 Free Software Foundation, Inc.
 
 GCC is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -204,6 +204,22 @@ binop_assignment (tree_code code, Expression *e1, Expression *e2)
   return compound_expr (lexpr, expr);
 }
 
+/* Compile the function literal body.  */
+
+static void
+build_lambda_tree (FuncLiteralDeclaration *fld, Type *type = NULL)
+{
+  /* This check is for lambda's, remove `vthis' as function isn't nested.  */
+  if (fld->tok == TOK::reserved && (type == NULL || type->ty == TY::Tpointer))
+    {
+      fld->tok = TOK::function_;
+      fld->vthis = NULL;
+    }
+
+  /* Compile the function literal body.  */
+  build_decl_tree (fld);
+}
+
 /* Implements the visitor interface to build the GCC trees of all Expression
    AST classes emitted from the D Front-end.
    All visit methods accept one parameter E, which holds the frontend AST
@@ -234,7 +250,7 @@ public:
   /* Visitor interfaces, each Expression class should have
      overridden the default.  */
 
-  void visit (Expression *)
+  void visit (Expression *) final override
   {
     gcc_unreachable ();
   }
@@ -243,7 +259,7 @@ public:
      expression is void, then the resulting type is void.  Otherwise
      they are implicitly converted to a common type.  */
 
-  void visit (CondExp *e)
+  void visit (CondExp *e) final override
   {
     tree cond = convert_for_condition (build_expr (e->econd),
 				       e->econd->type);
@@ -263,7 +279,7 @@ public:
      usual conversions to bring them to a common type before comparison.
      The result type is bool.  */
 
-  void visit (IdentityExp *e)
+  void visit (IdentityExp *e) final override
   {
     tree_code code = (e->op == EXP::identity) ? EQ_EXPR : NE_EXPR;
     Type *tb1 = e->e1->type->toBasetype ();
@@ -313,6 +329,31 @@ public:
 
 	this->result_ = build_struct_comparison (code, ts->sym, t1, t2);
       }
+    else if (tb1->ty == TY::Tvector && tb2->ty == TY::Tvector)
+      {
+	/* For vectors, identity is defined as all values being equal.  */
+	tree t1 = build_expr (e->e1);
+	tree t2 = build_expr (e->e2);
+	tree mask = build_boolop (code, t1, t2);
+
+	/* To reinterpret the vector comparison as a boolean expression, bitcast
+	   the bitmask result and generate an additional integer comparison.  */
+	opt_scalar_int_mode mode =
+	  int_mode_for_mode (TYPE_MODE (TREE_TYPE (mask)));
+	gcc_assert (mode.exists ());
+
+	tree type = lang_hooks.types.type_for_mode (mode.require (), 1);
+	if (type == NULL_TREE)
+	  type = make_unsigned_type (GET_MODE_BITSIZE (mode.require ()));
+
+	/* In `t1 is t2', all mask bits must be set for vectors to be equal.
+	   Otherwise any bit set is enough for vectors to be not-equal.  */
+	tree mask_eq = (code == EQ_EXPR)
+	  ? build_all_ones_cst (type) : build_zero_cst (type);
+
+	this->result_ = build_boolop (code, mask_eq,
+				      build_vconvert (type, mask));
+      }
     else
       {
 	/* For operands of other types, identity is defined as being the
@@ -328,7 +369,7 @@ public:
      equality or inequality.  Operands go through the usual conversions to bring
      them to a common type before comparison.  The result type is bool.  */
 
-  void visit (EqualExp *e)
+  void visit (EqualExp *e) final override
   {
     Type *tb1 = e->e1->type->toBasetype ();
     Type *tb2 = e->e2->type->toBasetype ();
@@ -423,11 +464,11 @@ public:
 	else
 	  {
 	    /* Use _adEq2() to compare each element.  */
-	    Type *t1array = t1elem->arrayOf ();
+	    Type *t1array = dmd::arrayOf (t1elem);
 	    tree result = build_libcall (LIBCALL_ADEQ2, e->type, 3,
 					 d_array_convert (e->e1),
 					 d_array_convert (e->e2),
-					 build_typeinfo (e->loc, t1array));
+					 build_typeinfo (e, t1array));
 
 	    if (e->op == EXP::notEqual)
 	      result = build1 (TRUTH_NOT_EXPR, build_ctype (e->type), result);
@@ -450,7 +491,7 @@ public:
       {
 	/* Use _aaEqual() for associative arrays.  */
 	tree result = build_libcall (LIBCALL_AAEQUAL, e->type, 3,
-				     build_typeinfo (e->loc, tb1),
+				     build_typeinfo (e, tb1),
 				     build_expr (e->e1),
 				     build_expr (e->e2));
 
@@ -475,7 +516,7 @@ public:
      exists in an associative array.  The result is a pointer to the
      element, or null if false.  */
 
-  void visit (InExp *e)
+  void visit (InExp *e) final override
   {
     Type *tb2 = e->e2->type->toBasetype ();
     Type *tkey = tb2->isTypeAArray ()->index->toBasetype ();
@@ -484,13 +525,13 @@ public:
     /* Build a call to _aaInX().  */
     this->result_ = build_libcall (LIBCALL_AAINX, e->type, 3,
 				   build_expr (e->e2),
-				   build_typeinfo (e->loc, tkey),
+				   build_typeinfo (e, tkey),
 				   build_address (key));
   }
 
   /* Build a relational expression.  The result type is bool.  */
 
-  void visit (CmpExp *e)
+  void visit (CmpExp *e) final override
   {
     Type *tb1 = e->e1->type->toBasetype ();
     Type *tb2 = e->e2->type->toBasetype ();
@@ -539,7 +580,7 @@ public:
      expression is void, then the resulting type is void.  Otherwise the
      result is bool.  */
 
-  void visit (LogicalExp *e)
+  void visit (LogicalExp *e) final override
   {
     tree_code code = (e->op == EXP::andAnd) ? TRUTH_ANDIF_EXPR : TRUTH_ORIF_EXPR;
 
@@ -571,7 +612,7 @@ public:
   /* Build a binary operand expression.  Operands go through usual arithmetic
      conversions to bring them to a common type before evaluating.  */
 
-  void visit (BinExp *e)
+  void visit (BinExp *e) final override
   {
     tree_code code;
 
@@ -666,86 +707,30 @@ public:
      same type, producing a dynamic array with the result.  If one operand
      is an element type, that element is converted to an array of length 1.  */
 
-  void visit (CatExp *e)
+  void visit (CatExp *e) final override
   {
-    Type *tb1 = e->e1->type->toBasetype ();
-    Type *tb2 = e->e2->type->toBasetype ();
-    Type *etype;
-
-    if (tb1->ty == TY::Tarray || tb1->ty == TY::Tsarray)
-      etype = tb1->nextOf ();
-    else
-      etype = tb2->nextOf ();
-
-    tree result;
-
-    if (e->e1->op == EXP::concatenate)
+    /* This error is only emitted during the code generation pass because
+       concatentation is allowed in CTFE.  */
+    if (!global.params.useGC)
       {
-	/* Flatten multiple concatenations to an array.
-	   So the expression ((a ~ b) ~ c) becomes [a, b, c]  */
-	int ndims = 2;
-
-	for (Expression *ex = e->e1; ex->op == EXP::concatenate;)
-	  {
-	    if (ex->op == EXP::concatenate)
-	      {
-		ex = ex->isCatExp ()->e1;
-		ndims++;
-	      }
-	  }
-
-	/* Store all concatenation args to a temporary byte[][ndims] array.  */
-	Type *targselem = Type::tint8->arrayOf ();
-	tree var = build_local_temp (make_array_type (targselem, ndims));
-
-	/* Loop through each concatenation from right to left.  */
-	vec <constructor_elt, va_gc> *elms = NULL;
-	CatExp *ce = e;
-	int dim = ndims - 1;
-
-	for (Expression *oe = ce->e2; oe != NULL;
-	     (ce->e1->op != EXP::concatenate
-	      ? (oe = ce->e1)
-	      : (ce = ce->e1->isCatExp (), oe = ce->e2)))
-	  {
-	    tree arg = d_array_convert (etype, oe);
-	    tree index = size_int (dim);
-	    CONSTRUCTOR_APPEND_ELT (elms, index, d_save_expr (arg));
-
-	    /* Finished pushing all arrays.  */
-	    if (oe == ce->e1)
-	      break;
-
-	    dim -= 1;
-	  }
-
-	/* Check there is no logic bug in constructing byte[][] of arrays.  */
-	gcc_assert (dim == 0);
-	tree init = build_constructor (TREE_TYPE (var), elms);
-	var = compound_expr (modify_expr (var, init), var);
-
-	tree arrs = d_array_value (build_ctype (targselem->arrayOf ()),
-				   size_int (ndims), build_address (var));
-
-	result = build_libcall (LIBCALL_ARRAYCATNTX, e->type, 2,
-				build_typeinfo (e->loc, e->type), arrs);
-      }
-    else
-      {
-	/* Handle single concatenation (a ~ b).  */
-	result = build_libcall (LIBCALL_ARRAYCATT, e->type, 3,
-				build_typeinfo (e->loc, e->type),
-				d_array_convert (etype, e->e1),
-				d_array_convert (etype, e->e2));
+	error_at (make_location_t (e->loc),
+		  "array concatenation of expression %qs requires the GC and "
+		  "cannot be used with %<-fno-druntime%>", e->toChars ());
+	this->result_ = error_mark_node;
+	return;
       }
 
-    this->result_ = result;
+    /* All concat expressions should have been rewritten to `_d_arraycatnTX` in
+       the semantic phase.  */
+    gcc_assert (e->lowering);
+
+    this->result_ = build_expr (e->lowering);
   }
 
   /* Build an assignment operator expression.  The right operand is implicitly
      converted to the type of the left operand, and assigned to it.  */
 
-  void visit (BinAssignExp *e)
+  void visit (BinAssignExp *e) final override
   {
     tree_code code;
     Expression *e1b = e->e1;
@@ -818,93 +803,66 @@ public:
   /* Build a concat assignment expression.  The right operand is appended
      to the left operand.  */
 
-  void visit (CatAssignExp *e)
+  void visit (CatAssignExp *e) final override
   {
+    if (!global.params.useGC)
+      {
+	error_at (make_location_t (e->loc),
+		  "appending to array in %qs requires the GC and cannot be "
+		  "used with %<-fno-druntime%>", e->toChars ());
+	this->result_ = error_mark_node;
+	return;
+      }
+
     Type *tb1 = e->e1->type->toBasetype ();
     Type *tb2 = e->e2->type->toBasetype ();
-    Type *etype = tb1->nextOf ()->toBasetype ();
 
-    /* Save the address of `e1', so it can be evaluated first.
-       As all D run-time library functions for concat assignments update `e1'
-       in-place and then return its value, the saved address can also be used as
-       the result of this expression as well.  */
-    tree lhs = build_expr (e->e1);
-    tree lexpr = stabilize_expr (&lhs);
-    tree ptr = d_save_expr (build_address (lhs));
-    tree result = NULL_TREE;
-
-    if (tb1->ty == TY::Tarray && tb2->ty == TY::Tdchar
-	&& (etype->ty == TY::Tchar || etype->ty == TY::Twchar))
+    if (e->op == EXP::concatenateDcharAssign)
       {
 	/* Append a dchar to a char[] or wchar[]:
 	   The assignment is handled by the D run-time library, so only
 	   need to call `_d_arrayappend[cw]d(&e1, e2)'  */
+	Type *etype = tb1->nextOf ()->toBasetype ();
+
+	/* Save the address of `e1', so it can be evaluated first.
+	   As all D run-time library functions for concat assignments update
+	   `e1' in-place and then return its value, the saved address can also
+	   be used as the result of this expression as well.  */
+	tree lhs = build_expr (e->e1);
+	tree lexpr = stabilize_expr (&lhs);
+	tree ptr = d_save_expr (build_address (lhs));
+	tree result = NULL_TREE;
+
+	gcc_assert (tb1->ty == TY::Tarray && tb2->ty == TY::Tdchar
+		    && (etype->ty == TY::Tchar || etype->ty == TY::Twchar));
+
 	libcall_fn libcall = (etype->ty == TY::Tchar)
 	  ? LIBCALL_ARRAYAPPENDCD : LIBCALL_ARRAYAPPENDWD;
 
 	result = build_libcall (libcall, e->type, 2,
 				ptr, build_expr (e->e2));
+
+	/* Construct in order: ptr = &e1, _d_arrayappend(ptr, e2), *ptr;  */
+	result = compound_expr (compound_expr (lexpr, ptr), result);
+	this->result_ = compound_expr (result, build_deref (ptr));
       }
     else
       {
+	gcc_assert (e->op == EXP::concatenateAssign
+		    || e->op == EXP::concatenateElemAssign);
 	gcc_assert (tb1->ty == TY::Tarray || tb2->ty == TY::Tsarray);
+	/* Appending an element or array to another array has already been
+	   handled by the front-end.  */
+	gcc_assert (e->lowering);
 
-	if ((tb2->ty == TY::Tarray || tb2->ty == TY::Tsarray)
-	    && same_type_p (etype, tb2->nextOf ()->toBasetype ()))
-	  {
-	    /* Append an array to another array:
-	       The assignment is handled by the D run-time library, so only
-	       need to call `_d_arrayappendT(ti, &e1, e2)'  */
-	    result = build_libcall (LIBCALL_ARRAYAPPENDT, e->type, 3,
-				    build_typeinfo (e->loc, e->type),
-				    ptr, d_array_convert (e->e2));
-	  }
-	else if (same_type_p (etype, tb2))
-	  {
-	    /* Append an element to an array:
-	       The assignment is generated inline, so need to handle temporaries
-	       here, and ensure that they are evaluated in the correct order.
-
-	       The generated code should end up being equivalent to:
-		    _d_arrayappendcTX(ti, &e1, 1)[e1.length - 1] = e2
-	     */
-	    tree callexp = build_libcall (LIBCALL_ARRAYAPPENDCTX, e->type, 3,
-					  build_typeinfo (e->loc, e->type),
-					  ptr, size_one_node);
-	    callexp = d_save_expr (callexp);
-
-	    /* Assign e2 to last element.  */
-	    tree offexp = d_array_length (callexp);
-	    offexp = build2 (MINUS_EXPR, TREE_TYPE (offexp),
-			     offexp, size_one_node);
-
-	    tree ptrexp = d_array_ptr (callexp);
-	    ptrexp = void_okay_p (ptrexp);
-	    ptrexp = build_array_index (ptrexp, offexp);
-
-	    /* Evaluate expression before appending.  */
-	    tree rhs = build_expr (e->e2);
-	    tree rexpr = stabilize_expr (&rhs);
-
-	    if (TREE_CODE (rhs) == CALL_EXPR)
-	      rhs = force_target_expr (rhs);
-
-	    result = modify_expr (build_deref (ptrexp), rhs);
-	    result = compound_expr (rexpr, result);
-	  }
-	else
-	  gcc_unreachable ();
+	this->result_ = build_expr (e->lowering);
       }
-
-    /* Construct in order: ptr = &e1, _d_arrayappend(ptr, e2), *ptr;  */
-    result = compound_expr (compound_expr (lexpr, ptr), result);
-    this->result_ = compound_expr (result, build_deref (ptr));
   }
 
   /* Build an assignment expression.  The right operand is implicitly
      converted to the type of the left operand, and assigned to it.  */
 
-  void visit (AssignExp *e)
+  void visit (AssignExp *e) final override
   {
     /* First, handle special assignment semantics.  */
 
@@ -914,6 +872,17 @@ public:
 	/* This case should have been rewritten to `_d_arraysetlengthT` in the
 	   semantic phase.  */
 	gcc_unreachable ();
+      }
+
+    /* Look for exp = noreturn;  */
+    if (e->e2->type->isTypeNoreturn ())
+      {
+	/* If the RHS is a `noreturn' expression, there is no point generating
+	   any code for the assignment, just evaluate side effects.  */
+	tree t1 = build_expr (e->e1);
+	tree t2 = build_expr (e->e2);
+	this->result_ = compound_expr (t1, t2);
+	return;
       }
 
     /* Look for array[] = n;  */
@@ -940,21 +909,12 @@ public:
 
 	    if ((postblit || destructor) && e->op != EXP::blit)
 	      {
-		/* Need to call postblit/destructor as part of assignment.
-		   Construction has already been handled by the front-end.  */
-		gcc_assert (e->op != EXP::construct);
-
-		/* So we can call postblits on const/immutable objects.  */
-		Type *tm = etype->unSharedOf ()->mutableOf ();
-		tree ti = build_typeinfo (e->loc, tm);
-
-		/* Generate: _d_arraysetassign (t1.ptr, &t2, t1.length, ti);  */
-		result = build_libcall (LIBCALL_ARRAYSETASSIGN, Type::tvoid, 4,
-					d_array_ptr (t1),
-					build_address (t2),
-					d_array_length (t1), ti);
+		/* This case should have been rewritten to `_d_arraysetassign`
+		   in the semantic phase.  */
+		gcc_unreachable ();
 	      }
-	    else if (integer_zerop (t2))
+
+	    if (integer_zerop (t2))
 	      {
 		tree size = size_mult_expr (d_array_length (t1),
 					    size_int (etype->size ()));
@@ -1018,11 +978,9 @@ public:
 	    else if ((postblit || destructor)
 		     && e->op != EXP::blit && e->op != EXP::construct)
 	      {
-		/* Generate: _d_arrayassign(ti, from, to);  */
-		this->result_ = build_libcall (LIBCALL_ARRAYASSIGN, e->type, 3,
-					       build_typeinfo (e->loc, etype),
-					       d_array_convert (e->e2),
-					       d_array_convert (e->e1));
+		/* Assigning to a non-trivially copyable array has already been
+		   handled by the front-end.  */
+		gcc_unreachable ();
 	      }
 	    else
 	      {
@@ -1046,8 +1004,7 @@ public:
 	Declaration *decl = e->e1->isVarExp ()->var;
 	if (decl->storage_class & (STCout | STCref))
 	  {
-	    tree t2 = convert_for_assignment (build_expr (e->e2),
-					      e->e2->type, e->e1->type);
+	    tree t2 = convert_for_assignment (e->e2, e->e1->type);
 	    tree t1 = build_expr (e->e1);
 	    /* Want reference to lhs, not indirect ref.  */
 	    t1 = TREE_OPERAND (t1, 0);
@@ -1067,8 +1024,7 @@ public:
     if (tb1->ty == TY::Tstruct)
       {
 	tree t1 = build_expr (e->e1);
-	tree t2 = convert_for_assignment (build_expr (e->e2, false, true),
-					  e->e2->type, e->e1->type);
+	tree t2 = convert_for_assignment (e->e2, e->e1->type, true);
 	StructDeclaration *sd = tb1->isTypeStruct ()->sym;
 
 	/* Look for struct = 0.  */
@@ -1142,12 +1098,12 @@ public:
 	   this assignment should call dtors on old assigned elements.  */
 	if ((!postblit && !destructor)
 	    || (e->op == EXP::construct && e->e2->op == EXP::arrayLiteral)
+	    || (e->op == EXP::construct && e->e2->op == EXP::call)
 	    || (e->op == EXP::construct && !lvalue && postblit)
 	    || (e->op == EXP::blit || e->e1->type->size () == 0))
 	  {
 	    tree t1 = build_expr (e->e1);
-	    tree t2 = convert_for_assignment (build_expr (e->e2),
-					      e->e2->type, e->e1->type);
+	    tree t2 = convert_for_assignment (e->e2, e->e1->type);
 
 	    this->result_ = build_assign (modifycode, t1, t2);
 	    return;
@@ -1156,40 +1112,26 @@ public:
 	/* All other kinds of lvalue or rvalue static array assignment.
 	   Array construction has already been handled by the front-end.  */
 	gcc_assert (e->op != EXP::construct);
-
-	/* Generate: _d_arrayassign_l()
-		 or: _d_arrayassign_r()  */
-	libcall_fn libcall = (lvalue)
-	  ? LIBCALL_ARRAYASSIGN_L : LIBCALL_ARRAYASSIGN_R;
-	tree elembuf = build_local_temp (build_ctype (etype));
-	Type *arrtype = (e->type->ty == TY::Tsarray)
-	  ? etype->arrayOf () : e->type;
-	tree result = build_libcall (libcall, arrtype, 4,
-				     build_typeinfo (e->loc, etype),
-				     d_array_convert (e->e2),
-				     d_array_convert (e->e1),
-				     build_address (elembuf));
-
-	/* Cast the libcall result back to a static array.  */
-	if (e->type->ty == TY::Tsarray)
-	  result = indirect_ref (build_ctype (e->type),
-				 d_array_ptr (result));
-
-	this->result_ = result;
-	return;
+	gcc_unreachable ();
       }
 
     /* Simple assignment.  */
     tree t1 = build_expr (e->e1);
-    tree t2 = convert_for_assignment (build_expr (e->e2),
-				      e->e2->type, e->e1->type);
+    tree t2 = convert_for_assignment (e->e2, e->e1->type);
 
     this->result_ = build_assign (modifycode, t1, t2);
   }
 
+  /* Build an assignment expression that has been lowered in the front-end.  */
+
+  void visit (LoweredAssignExp *e) final override
+  {
+    this->result_ = build_expr (e->lowering);
+  }
+
   /* Build a throw expression.  */
 
-  void visit (ThrowExp *e)
+  void visit (ThrowExp *e) final override
   {
     tree arg = build_expr_dtor (e->e1);
     this->result_ = build_libcall (LIBCALL_THROW, Type::tvoid, 1, arg);
@@ -1197,7 +1139,7 @@ public:
 
   /* Build a postfix expression.  */
 
-  void visit (PostExp *e)
+  void visit (PostExp *e) final override
   {
     tree result;
 
@@ -1220,7 +1162,7 @@ public:
 
   /* Build an index expression.  */
 
-  void visit (IndexExp *e)
+  void visit (IndexExp *e) final override
   {
     Type *tb1 = e->e1->type->toBasetype ();
 
@@ -1236,17 +1178,17 @@ public:
 	  {
 	    libcall = LIBCALL_AAGETY;
 	    ptr = build_address (build_expr (e->e1));
-	    tinfo = build_typeinfo (e->loc, tb1->unSharedOf ()->mutableOf ());
+	    tinfo = build_typeinfo (e, dmd::mutableOf (dmd::unSharedOf (tb1)));
 	  }
 	else
 	  {
 	    libcall = LIBCALL_AAGETRVALUEX;
 	    ptr = build_expr (e->e1);
-	    tinfo = build_typeinfo (e->loc, tkey);
+	    tinfo = build_typeinfo (e, tkey);
 	  }
 
 	/* Index the associative array.  */
-	tree result = build_libcall (libcall, e->type->pointerTo (), 4,
+	tree result = build_libcall (libcall, dmd::pointerTo (e->type), 4,
 				     ptr, tinfo,
 				     size_int (tb1->nextOf ()->size ()),
 				     build_address (key));
@@ -1265,9 +1207,8 @@ public:
       }
     else
       {
-	/* Get the data pointer and length for static and dynamic arrays.  */
+	/* Get the array and length for static and dynamic arrays.  */
 	tree array = d_save_expr (build_expr (e->e1));
-	tree ptr = convert_expr (array, tb1, tb1->nextOf ()->pointerTo ());
 
 	tree length = NULL_TREE;
 	if (tb1->ty != TY::Tpointer)
@@ -1288,16 +1229,42 @@ public:
 	if (tb1->ty != TY::Tpointer)
 	  index = build_bounds_index_condition (e, index, length);
 
-	/* Index the .ptr.  */
-	ptr = void_okay_p (ptr);
-	this->result_ = indirect_ref (TREE_TYPE (TREE_TYPE (ptr)),
-				      build_array_index (ptr, index));
+	/* Convert vectors to their underlying array type.  */
+	if (VECTOR_TYPE_P (TREE_TYPE (array)))
+	  {
+	    tree array_type =
+	      build_array_type_nelts (TREE_TYPE (TREE_TYPE (array)),
+				      TYPE_VECTOR_SUBPARTS (TREE_TYPE (array)));
+	    d_mark_addressable (array, false);
+	    array = build1 (VIEW_CONVERT_EXPR, array_type, array);
+	  }
+
+	if (TREE_CODE (TREE_TYPE (array)) == ARRAY_TYPE)
+	  {
+	    /* Generate `array[index]'.  When the index is non-constant, we must
+	       mark the array as addressable because we'll need to do pointer
+	       arithmetic on its address.  */
+	    if (TREE_CODE (index) != INTEGER_CST)
+	      d_mark_addressable (array);
+
+	    this->result_ = build4 (ARRAY_REF, TREE_TYPE (TREE_TYPE (array)),
+				    array, index, NULL_TREE, NULL_TREE);
+	  }
+	else
+	  {
+	    /* Generate `array.ptr[index]'.  */
+	    tree ptr = convert_expr (array, tb1,
+				     dmd::pointerTo (tb1->nextOf ()));
+	    ptr = void_okay_p (ptr);
+	    this->result_ = indirect_ref (TREE_TYPE (TREE_TYPE (ptr)),
+					  build_pointer_index (ptr, index));
+	  }
       }
   }
 
   /* Build a comma expression.  The type is the type of the right operand.  */
 
-  void visit (CommaExp *e)
+  void visit (CommaExp *e) final override
   {
     tree t1 = build_expr (e->e1);
     tree t2 = build_expr (e->e2);
@@ -1309,7 +1276,7 @@ public:
   /* Build an array length expression.  Returns the number of elements
      in the array.  The result is of type size_t.  */
 
-  void visit (ArrayLengthExp *e)
+  void visit (ArrayLengthExp *e) final override
   {
     if (e->e1->type->toBasetype ()->ty == TY::Tarray)
       this->result_ = d_array_length (build_expr (e->e1));
@@ -1324,7 +1291,7 @@ public:
   /* Build a delegate pointer expression.  This will return the frame
      pointer value as a type void*.  */
 
-  void visit (DelegatePtrExp *e)
+  void visit (DelegatePtrExp *e) final override
   {
     tree t1 = build_expr (e->e1);
     this->result_ = delegate_object (t1);
@@ -1333,7 +1300,7 @@ public:
   /* Build a delegate function pointer expression.  This will return the
      function pointer value as a function type.  */
 
-  void visit (DelegateFuncptrExp *e)
+  void visit (DelegateFuncptrExp *e) final override
   {
     tree t1 = build_expr (e->e1);
     this->result_ = delegate_method (t1);
@@ -1341,7 +1308,7 @@ public:
 
   /* Build a slice expression.  */
 
-  void visit (SliceExp *e)
+  void visit (SliceExp *e) final override
   {
     Type *tb = e->type->toBasetype ();
     Type *tb1 = e->e1->type->toBasetype ();
@@ -1362,7 +1329,7 @@ public:
 
     /* Get the data pointer and length for static and dynamic arrays.  */
     tree array = d_save_expr (build_expr (e->e1));
-    tree ptr = convert_expr (array, tb1, tb1->nextOf ()->pointerTo ());
+    tree ptr = convert_expr (array, tb1, dmd::pointerTo (tb1->nextOf ()));
     tree length = NULL_TREE;
 
     /* Our array is already a SAVE_EXPR if necessary, so we don't make length
@@ -1390,7 +1357,7 @@ public:
     if (!integer_zerop (lwr_tree))
       {
 	tree ptrtype = TREE_TYPE (ptr);
-	ptr = build_array_index (void_okay_p (ptr), lwr_tree);
+	ptr = build_pointer_index (void_okay_p (ptr), lwr_tree);
 	ptr = build_nop (ptrtype, ptr);
       }
 
@@ -1414,7 +1381,7 @@ public:
   /* Build a cast expression, which converts the given unary expression to the
      type of result.  */
 
-  void visit (CastExp *e)
+  void visit (CastExp *e) final override
   {
     Type *ebtype = e->e1->type->toBasetype ();
     Type *tbtype = e->to->toBasetype ();
@@ -1429,7 +1396,7 @@ public:
 
   /* Build a delete expression.  */
 
-  void visit (DeleteExp *e)
+  void visit (DeleteExp *e) final override
   {
     tree t1 = build_expr (e->e1);
     Type *tb1 = e->e1->type->toBasetype ();
@@ -1459,7 +1426,7 @@ public:
   /* Build a remove expression, which removes a particular key from an
      associative array.  */
 
-  void visit (RemoveExp *e)
+  void visit (RemoveExp *e) final override
   {
     /* Check that the array is actually an associative array.  */
     if (e->e1->type->toBasetype ()->ty == TY::Taarray)
@@ -1470,7 +1437,7 @@ public:
 
 	this->result_ = build_libcall (LIBCALL_AADELX, Type::tbool, 3,
 				       build_expr (e->e1),
-				       build_typeinfo (e->loc, tkey),
+				       build_typeinfo (e, tkey),
 				       build_address (index));
       }
     else
@@ -1482,7 +1449,7 @@ public:
 
   /* Build an unary not expression.  */
 
-  void visit (NotExp *e)
+  void visit (NotExp *e) final override
   {
     tree result = convert_for_condition (build_expr (e->e1), e->e1->type);
     /* Need to convert to boolean type or this will fail.  */
@@ -1495,7 +1462,7 @@ public:
      complemented.  Note: unlike in C, the usual integral promotions
      are not performed prior to the complement operation.  */
 
-  void visit (ComExp *e)
+  void visit (ComExp *e) final override
   {
     TY ty1 = e->e1->type->toBasetype ()->ty;
     gcc_assert (ty1 != TY::Tarray && ty1 != TY::Tsarray);
@@ -1506,7 +1473,7 @@ public:
 
   /* Build an unary negation expression.  */
 
-  void visit (NegExp *e)
+  void visit (NegExp *e) final override
   {
     TY ty1 = e->e1->type->toBasetype ()->ty;
     gcc_assert (ty1 != TY::Tarray && ty1 != TY::Tsarray);
@@ -1527,10 +1494,10 @@ public:
 
   /* Build a pointer index expression.  */
 
-  void visit (PtrExp *e)
+  void visit (PtrExp *e) final override
   {
     Type *tnext = NULL;
-    size_t offset;
+    dinteger_t offset;
     tree result;
 
     if (e->e1->op == EXP::add)
@@ -1590,7 +1557,7 @@ public:
 
   /* Build an unary address expression.  */
 
-  void visit (AddrExp *e)
+  void visit (AddrExp *e) final override
   {
     tree type = build_ctype (e->type);
     tree exp;
@@ -1624,7 +1591,7 @@ public:
 
   /* Build a function call expression.  */
 
-  void visit (CallExp *e)
+  void visit (CallExp *e) final override
   {
     Type *tb = e->e1->type->toBasetype ();
     Expression *e1b = e->e1;
@@ -1776,6 +1743,12 @@ public:
        build the call expression.  */
     tree exp = d_build_call (tf, callee, object, e->arguments);
 
+    /* Record whether the call expression has no side effects, so we can check
+       for an unused return value later.  */
+    if (TREE_CODE (exp) == CALL_EXPR && CALL_EXPR_FN (exp) != NULL_TREE
+	&& call_side_effect_free_p (e->f, e->e1->type))
+      CALL_EXPR_WARN_IF_UNUSED (exp) = 1;
+
     if (returnvalue != NULL_TREE)
       exp = compound_expr (exp, returnvalue);
 
@@ -1806,7 +1779,7 @@ public:
 
   /* Build a delegate expression.  */
 
-  void visit (DelegateExp *e)
+  void visit (DelegateExp *e) final override
   {
     if (e->func->semanticRun == PASS::semantic3done)
       {
@@ -1870,7 +1843,7 @@ public:
 
   /* Build a type component expression.  */
 
-  void visit (DotTypeExp *e)
+  void visit (DotTypeExp *e) final override
   {
     /* Just a pass through to underlying expression.  */
     this->result_ = build_expr (e->e1);
@@ -1878,7 +1851,7 @@ public:
 
   /* Build a component reference expression.  */
 
-  void visit (DotVarExp *e)
+  void visit (DotVarExp *e) final override
   {
     VarDeclaration *vd = e->var->isVarDeclaration ();
 
@@ -1900,7 +1873,7 @@ public:
 	       underlying is really a complex type.  */
 	    if (e->e1->type->ty == TY::Tenum
 		&& e->e1->type->isTypeEnum ()->sym->isSpecial ())
-	      object = build_vconvert (build_ctype (tb), object);
+	      object = underlying_complex_expr (build_ctype (tb), object);
 
 	    this->result_ = component_ref (object, get_symbol_decl (vd));
 	  }
@@ -1916,7 +1889,7 @@ public:
   /* Build an assert expression, used to declare conditions that must hold at
      that a given point in the program.  */
 
-  void visit (AssertExp *e)
+  void visit (AssertExp *e) final override
   {
     Type *tb1 = e->e1->type->toBasetype ();
     tree arg = build_expr (e->e1);
@@ -2001,7 +1974,7 @@ public:
 
   /* Build a declaration expression.  */
 
-  void visit (DeclarationExp *e)
+  void visit (DeclarationExp *e) final override
   {
     /* Compile the declaration.  */
     push_stmt_list ();
@@ -2020,11 +1993,11 @@ public:
   /* Build a typeid expression.  Returns an instance of class TypeInfo
      corresponding to.  */
 
-  void visit (TypeidExp *e)
+  void visit (TypeidExp *e) final override
   {
-    if (Type *tid = isType (e->obj))
+    if (Type *tid = dmd::isType (e->obj))
       {
-	tree ti = build_typeinfo (e->loc, tid);
+	tree ti = build_typeinfo (e, tid);
 
 	/* If the typeinfo is at an offset.  */
 	if (tid->vtinfo->offset)
@@ -2032,7 +2005,7 @@ public:
 
 	this->result_ = build_nop (build_ctype (e->type), ti);
       }
-    else if (Expression *tid = isExpression (e->obj))
+    else if (Expression *tid = dmd::isExpression (e->obj))
       {
 	Type *type = tid->type->toBasetype ();
 	assert (type->ty == TY::Tclass);
@@ -2054,41 +2027,36 @@ public:
 
   /* Build a function/lambda expression.  */
 
-  void visit (FuncExp *e)
+  void visit (FuncExp *e) final override
   {
-    Type *ftype = e->type->toBasetype ();
+    /* Compile the declaration.  */
+    build_lambda_tree (e->fd, e->type->toBasetype ());
 
-    /* This check is for lambda's, remove `vthis' as function isn't nested.  */
-    if (e->fd->tok == TOK::reserved && ftype->ty == TY::Tpointer)
+    tree func = build_address (get_symbol_decl (e->fd));
+    Type *tb = e->type->toBasetype ();
+
+    /* If a delegate is expected, the literal will be inferred as a delegate
+       even if it accesses no variables from an enclosing function.  */
+    if (tb->ty == TY::Tdelegate)
       {
-	e->fd->tok = TOK::function_;
-	e->fd->vthis = NULL;
-      }
-
-    /* Compile the function literal body.  */
-    build_decl_tree (e->fd);
-
-    /* If nested, this will be a trampoline.  */
-    if (e->fd->isNested ())
-      {
-	tree func = build_address (get_symbol_decl (e->fd));
-	tree object;
-
-	if (this->constp_)
+	/* Static delegate variables have no context pointer.  */
+	if (this->constp_ || !e->fd->isNested ())
 	  {
-	    /* Static delegate variables have no context pointer.  */
-	    object = null_pointer_node;
-	    this->result_ = build_method_call (func, object, e->fd->type);
+	    this->result_ = build_method_call (func, null_pointer_node,
+					       e->fd->type);
 	    TREE_CONSTANT (this->result_) = 1;
 	  }
 	else
 	  {
-	    object = get_frame_for_symbol (e->fd);
+	    gcc_assert (e->fd->isNested ());
+	    tree object = get_frame_for_symbol (e->fd);
 	    this->result_ = build_method_call (func, object, e->fd->type);
 	  }
       }
     else
       {
+	/* The function literal is a function pointer.  */
+	gcc_assert (tb->ty == TY::Tpointer);
 	this->result_ = build_nop (build_ctype (e->type),
 				   build_address (get_symbol_decl (e->fd)));
       }
@@ -2096,7 +2064,7 @@ public:
 
   /* Build a halt expression.  */
 
-  void visit (HaltExp *)
+  void visit (HaltExp *) final override
   {
     /* Should we use trap() or abort()?  */
     tree ttrap = builtin_decl_explicit (BUILT_IN_TRAP);
@@ -2105,12 +2073,19 @@ public:
 
   /* Build a symbol pointer offset expression.  */
 
-  void visit (SymOffExp *e)
+  void visit (SymOffExp *e) final override
   {
     /* Build the address and offset of the symbol.  */
-    size_t soffset = e->isSymOffExp ()->offset;
+    dinteger_t soffset = e->isSymOffExp ()->offset;
     tree result = get_decl_tree (e->var);
     TREE_USED (result) = 1;
+
+    if (e->var->isFuncDeclaration ())
+      result = maybe_reject_intrinsic (result);
+
+    /* Emit lambdas, same as is done in FuncExp.  */
+    if (FuncLiteralDeclaration *fld = e->var->isFuncLiteralDeclaration ())
+      build_lambda_tree (fld);
 
     if (declaration_reference_p (e->var))
       gcc_assert (POINTER_TYPE_P (TREE_TYPE (result)));
@@ -2131,7 +2106,7 @@ public:
 
   /* Build a variable expression.  */
 
-  void visit (VarExp *e)
+  void visit (VarExp *e) final override
   {
     if (e->var->needThis ())
       {
@@ -2146,19 +2121,9 @@ public:
 	return;
       }
 
-    /* This check is same as is done in FuncExp for lambdas.  */
-    FuncLiteralDeclaration *fld = e->var->isFuncLiteralDeclaration ();
-    if (fld != NULL)
-      {
-	if (fld->tok == TOK::reserved)
-	  {
-	    fld->tok = TOK::function_;
-	    fld->vthis = NULL;
-	  }
-
-	/* Compiler the function literal body.  */
-	build_decl_tree (fld);
-      }
+    /* Emit lambdas, same as is done in FuncExp.  */
+    if (FuncLiteralDeclaration *fld = e->var->isFuncLiteralDeclaration ())
+      build_lambda_tree (fld);
 
     if (this->constp_)
       {
@@ -2176,7 +2141,8 @@ public:
 	    else
 	      {
 		var->inuse++;
-		init = build_expr (initializerToExpression (var->_init), true);
+		Expression *vinit = dmd::initializerToExpression (var->_init);
+		init = build_expr (vinit, true);
 		var->inuse--;
 	      }
 	  }
@@ -2210,7 +2176,8 @@ public:
 	      {
 		/* Generate a slice for non-zero initialized aggregates,
 		   otherwise create an empty array.  */
-		gcc_assert (e->type == Type::tvoid->arrayOf ()->constOf ());
+		gcc_assert (e->type->nextOf ()->isConst ()
+			    && e->type->nextOf ()->ty == TY::Tvoid);
 
 		tree type = build_ctype (e->type);
 		tree length = size_int (sd->dsym->structsize);
@@ -2235,7 +2202,7 @@ public:
 
   /* Build a this variable expression.  */
 
-  void visit (ThisExp *e)
+  void visit (ThisExp *e) final override
   {
     FuncDeclaration *fd = d_function_chain ? d_function_chain->function : NULL;
     tree result = NULL_TREE;
@@ -2257,7 +2224,7 @@ public:
   /* Build a new expression, which allocates memory either on the garbage
      collected heap or by using a class or struct specific allocator.  */
 
-  void visit (NewExp *e)
+  void visit (NewExp *e) final override
   {
     Type *tb = e->type->toBasetype ();
     tree result;
@@ -2278,16 +2245,21 @@ public:
 	       storage class, then the instance is allocated on the stack
 	       rather than the heap or using the class specific allocator.  */
 	    tree var = build_local_temp (TREE_TYPE (type));
+	    SET_DECL_ALIGN (var, cd->alignsize * BITS_PER_UNIT);
+	    DECL_USER_ALIGN (var) = 1;
 	    new_call = build_nop (type, build_address (var));
 	    setup_exp = modify_expr (var, aggregate_initializer_decl (cd));
+	  }
+	else if (global.params.ehnogc && e->thrownew)
+	  {
+	    /* Allocating a `@nogc' Exception with `_d_newThrowable' has already
+	       been handled by the front-end.  */
+	    gcc_unreachable ();
 	  }
 	else
 	  {
 	    /* Generate: _d_newclass()  */
-	    tree arg = build_address (get_classinfo_decl (cd));
-	    libcall_fn libcall = (global.params.ehnogc && e->thrownew)
-	      ? LIBCALL_NEWTHROW : LIBCALL_NEWCLASS;
-	    new_call = build_libcall (libcall, tb, 1, arg);
+	    new_call = build_expr (e->lowering);
 	  }
 
 	/* Set the context pointer for nested classes.  */
@@ -2355,11 +2327,12 @@ public:
 	    return;
 	  }
 
+	/* This case should have been rewritten to `_d_newitemT' during the
+	   semantic phase.  */
+	gcc_assert (e->lowering);
+
 	/* Generate: _d_newitemT()  */
-	libcall_fn libcall = htype->isZeroInit ()
-	  ? LIBCALL_NEWITEMT : LIBCALL_NEWITEMIT;
-	tree arg = build_typeinfo (e->loc, e->newtype);
-	new_call = build_libcall (libcall, tb, 1, arg);
+	new_call = build_expr (e->lowering);
 
 	if (e->member || !e->arguments)
 	  {
@@ -2393,7 +2366,12 @@ public:
 		new_call = d_save_expr (new_call);
 		se->type = sd->type;
 		se->sym = new_call;
-		result = compound_expr (build_expr (se), new_call);
+
+		/* Setting `se->sym' would mean that the result of the
+		   constructed struct literal expression is `*(new_call)'.
+		   Strip off the indirect reference, as we don't mean to
+		   compute the value yet.  */
+		result = build_address (build_expr (se));
 	      }
 	    else
 	      result = new_call;
@@ -2405,66 +2383,11 @@ public:
     else if (tb->ty == TY::Tarray)
       {
 	/* Allocating memory for a new D array.  */
-	tb = e->newtype->toBasetype ();
-	TypeDArray *tarray = tb->isTypeDArray ();
-
 	gcc_assert (e->arguments && e->arguments->length >= 1);
 
-	if (e->arguments->length == 1)
-	  {
-	    /* Single dimension array allocations.  */
-	    Expression *arg = (*e->arguments)[0];
-
-	    if (tarray->next->size () == 0)
-	      {
-		/* Array element size is unknown.  */
-		this->result_ = d_array_value (build_ctype (e->type),
-					       size_int (0), null_pointer_node);
-		return;
-	      }
-
-	    libcall_fn libcall = tarray->next->isZeroInit ()
-	      ? LIBCALL_NEWARRAYT : LIBCALL_NEWARRAYIT;
-	    result = build_libcall (libcall, tb, 2,
-				    build_typeinfo (e->loc, e->type),
-				    build_expr (arg));
-	  }
-	else
-	  {
-	    /* Multidimensional array allocations.  */
-	    tree tarray = make_array_type (Type::tsize_t, e->arguments->length);
-	    tree var = build_local_temp (tarray);
-	    vec <constructor_elt, va_gc> *elms = NULL;
-
-	    /* Get the base element type for the array, generating the
-	       initializer for the dims parameter along the way.  */
-	    Type *telem = e->newtype->toBasetype ();
-	    for (size_t i = 0; i < e->arguments->length; i++)
-	      {
-		Expression *arg = (*e->arguments)[i];
-		CONSTRUCTOR_APPEND_ELT (elms, size_int (i), build_expr (arg));
-
-		gcc_assert (telem->ty == TY::Tarray);
-		telem = telem->toBasetype ()->nextOf ();
-		gcc_assert (telem);
-	      }
-
-	    /* Initialize the temporary.  */
-	    tree init = modify_expr (var, build_constructor (tarray, elms));
-	    var = compound_expr (init, var);
-
-	    /* Generate: _d_newarraymTX(ti, dims)
-		     or: _d_newarraymiTX(ti, dims)  */
-	    libcall_fn libcall = telem->isZeroInit ()
-	      ? LIBCALL_NEWARRAYMTX : LIBCALL_NEWARRAYMITX;
-
-	    tree tinfo = build_typeinfo (e->loc, e->type);
-	    tree dims = d_array_value (build_ctype (Type::tsize_t->arrayOf ()),
-				       size_int (e->arguments->length),
-				       build_address (var));
-
-	    result = build_libcall (libcall, tb, 2, tinfo, dims);
-	  }
+	/* Array allocations have already been handled by the front-end.  */
+	gcc_assert (e->lowering != NULL);
+	result = build_expr (e->lowering);
 
 	if (e->argprefix)
 	  result = compound_expr (build_expr (e->argprefix), result);
@@ -2482,11 +2405,12 @@ public:
 	    return;
 	  }
 
-	libcall_fn libcall = tpointer->next->isZeroInit (e->loc)
-	  ? LIBCALL_NEWITEMT : LIBCALL_NEWITEMIT;
+	/* This case should have been rewritten to `_d_newitemT' during the
+	   semantic phase.  */
+	gcc_assert (e->lowering);
 
-	tree arg = build_typeinfo (e->loc, e->newtype);
-	result = build_libcall (libcall, tb, 1, arg);
+	/* Generate: _d_newitemT()  */
+	result = build_expr (e->lowering);
 
 	if (e->arguments && e->arguments->length == 1)
 	  {
@@ -2499,6 +2423,20 @@ public:
 	if (e->argprefix)
 	  result = compound_expr (build_expr (e->argprefix), result);
       }
+    else if (tb->ty == TY::Taarray)
+      {
+	/* Allocating memory for a new associative array.  */
+	tree arg = build_typeinfo (e, e->newtype);
+	tree mem = build_libcall (LIBCALL_AANEW, Type::tvoidptr, 1, arg);
+
+	/* Return an associative array pointed to by MEM.  */
+	tree aatype = build_ctype (tb);
+	vec <constructor_elt, va_gc> *ce = NULL;
+	CONSTRUCTOR_APPEND_ELT (ce, TYPE_FIELDS (aatype), mem);
+
+	result = build_nop (build_ctype (e->type),
+			    build_constructor (aatype, ce));
+      }
     else
       gcc_unreachable ();
 
@@ -2507,7 +2445,7 @@ public:
 
   /* Build an integer literal.  */
 
-  void visit (IntegerExp *e)
+  void visit (IntegerExp *e) final override
   {
     tree ctype = build_ctype (e->type->toBasetype ());
     this->result_ = build_integer_cst (e->value, ctype);
@@ -2515,14 +2453,14 @@ public:
 
   /* Build a floating-point literal.  */
 
-  void visit (RealExp *e)
+  void visit (RealExp *e) final override
   {
     this->result_ = build_float_cst (e->value, e->type->toBasetype ());
   }
 
   /* Build a complex literal.  */
 
-  void visit (ComplexExp *e)
+  void visit (ComplexExp *e) final override
   {
     Type *tnext;
 
@@ -2552,7 +2490,7 @@ public:
   /* Build a string literal, all strings are null terminated except for
      static arrays.  */
 
-  void visit (StringExp *e)
+  void visit (StringExp *e) final override
   {
     Type *tb = e->type->toBasetype ();
     tree type = build_ctype (e->type);
@@ -2566,26 +2504,38 @@ public:
 
 	for (size_t i = 0; i < e->len; i++)
 	  {
-	    tree value = build_integer_cst (e->getCodeUnit (i), etype);
+	    tree value = build_integer_cst (e->getIndex (i), etype);
 	    CONSTRUCTOR_APPEND_ELT (elms, size_int (i), value);
 	  }
 
 	tree ctor = build_constructor (type, elms);
 	TREE_CONSTANT (ctor) = 1;
 	this->result_ = ctor;
+	return;
       }
     else
       {
-	/* Copy the string contents to a null terminated string.  */
+	/* Copy the string contents to a null terminated STRING_CST.  */
 	dinteger_t length = (e->len * e->sz);
-	char *string = XALLOCAVEC (char, length + 1);
+	char *string = XALLOCAVEC (char, length + e->sz);
+	memset (string, 0, length + e->sz);
 	if (length > 0)
 	  memcpy (string, e->string, length);
-	string[length] = '\0';
 
 	/* String value and type includes the null terminator.  */
-	tree value = build_string (length, string);
-	TREE_TYPE (value) = make_array_type (tb->nextOf (), length + 1);
+	tree value = build_string (length + e->sz, string);
+	if (e->sz <= 4)
+	  TREE_TYPE (value) = make_array_type (tb->nextOf (), length + 1);
+	else
+	  {
+	    /* Hexadecimal literal strings with an 8-byte character type are
+	       just an alternative way to store an array of `ulong'.
+	       Treat it as if it were a `uint[]' array instead.  */
+	    dinteger_t resize = e->sz / 4;
+	    TREE_TYPE (value) = make_array_type (Type::tuns32,
+						 (length * resize) + resize);
+	  }
+
 	value = build_address (value);
 
 	if (tb->ty == TY::Tarray)
@@ -2599,7 +2549,7 @@ public:
   /* Build a tuple literal.  Just an argument list that may have
      side effects that need evaluation.  */
 
-  void visit (TupleExp *e)
+  void visit (TupleExp *e) final override
   {
     tree result = NULL_TREE;
 
@@ -2622,13 +2572,13 @@ public:
      be the type of the array element, and all elements are implicitly
      converted to that type.  */
 
-  void visit (ArrayLiteralExp *e)
+  void visit (ArrayLiteralExp *e) final override
   {
     Type *tb = e->type->toBasetype ();
 
     /* Implicitly convert void[n] to ubyte[n].  */
     if (tb->ty == TY::Tsarray && tb->nextOf ()->toBasetype ()->ty == TY::Tvoid)
-      tb = Type::tuns8->sarrayOf (tb->isTypeSArray ()->dim->toUInteger ());
+      tb = dmd::sarrayOf (Type::tuns8, tb->isTypeSArray ()->dim->toUInteger ());
 
     gcc_assert (tb->ty == TY::Tarray || tb->ty == TY::Tsarray
 		|| tb->ty == TY::Tpointer);
@@ -2697,6 +2647,10 @@ public:
 	    if (tb->ty == TY::Tarray)
 	      ctor = d_array_value (type, size_int (e->elements->length), ctor);
 
+	    /* Immutable literals can be placed in rodata.  */
+	    if (tb->isImmutable ())
+	      TREE_READONLY (decl) = 1;
+
 	    d_pushdecl (decl);
 	    rest_of_decl_compilation (decl, 1, 0);
 	  }
@@ -2725,12 +2679,21 @@ public:
 
 	this->result_ = compound_expr (saved_elems, d_convert (type, ctor));
       }
+    else if (e->onstack)
+      {
+	/* Array literal for a `scope' dynamic array.  */
+	gcc_assert (tb->ty == TY::Tarray);
+	ctor = force_target_expr (ctor);
+	ctor = d_array_value (type, size_int (e->elements->length),
+			      build_address (ctor));
+	this->result_ = compound_expr (saved_elems, ctor);
+      }
     else
       {
 	/* Allocate space on the memory managed heap.  */
 	tree mem = build_libcall (LIBCALL_ARRAYLITERALTX,
-				  etype->pointerTo (), 2,
-				  build_typeinfo (e->loc, etype->arrayOf ()),
+				  dmd::pointerTo (etype), 2,
+				  build_typeinfo (e, dmd::arrayOf (etype)),
 				  size_int (e->elements->length));
 	mem = d_save_expr (mem);
 
@@ -2754,10 +2717,18 @@ public:
      taken to be the key type, and common type of all values the value type.
      All keys and values are then implicitly converted as needed.  */
 
-  void visit (AssocArrayLiteralExp *e)
+  void visit (AssocArrayLiteralExp *e) final override
   {
+    if (this->constp_ && e->lowering != NULL)
+      {
+	/* When an associative array literal gets lowered, it's converted into a
+	   struct literal suitable for static initialization.  */
+	this->result_ = build_expr (e->lowering, this->constp_, true);
+	return ;
+      }
+
     /* Want the mutable type for typeinfo reference.  */
-    Type *tb = e->type->toBasetype ()->mutableOf ();
+    Type *tb = dmd::mutableOf (e->type->toBasetype ());
 
     /* Handle empty assoc array literals.  */
     TypeAArray *ta = tb->isTypeAArray ();
@@ -2769,25 +2740,25 @@ public:
 
     /* Build an expression that assigns all expressions in KEYS
        to a constructor.  */
-    tree akeys = build_array_from_exprs (ta->index->sarrayOf (e->keys->length),
-					 e->keys, this->constp_);
+    Type *tkarray = dmd::sarrayOf (ta->index, e->keys->length);
+    tree akeys = build_array_from_exprs (tkarray, e->keys, this->constp_);
     tree init = stabilize_expr (&akeys);
 
     /* Do the same with all expressions in VALUES.  */
-    tree avals = build_array_from_exprs (ta->next->sarrayOf (e->values->length),
-					 e->values, this->constp_);
+    Type *tvarray = dmd::sarrayOf (ta->next, e->values->length);
+    tree avals = build_array_from_exprs (tvarray, e->values, this->constp_);
     init = compound_expr (init, stabilize_expr (&avals));
 
     /* Generate: _d_assocarrayliteralTX (ti, keys, vals);  */
-    tree keys = d_array_value (build_ctype (ta->index->arrayOf ()),
+    tree keys = d_array_value (build_ctype (dmd::arrayOf (ta->index)),
 			       size_int (e->keys->length),
 			       build_address (akeys));
-    tree vals = d_array_value (build_ctype (ta->next->arrayOf ()),
+    tree vals = d_array_value (build_ctype (dmd::arrayOf (ta->next)),
 			       size_int (e->values->length),
 			       build_address (avals));
 
     tree mem = build_libcall (LIBCALL_ASSOCARRAYLITERALTX, Type::tvoidptr, 3,
-			      build_typeinfo (e->loc, ta), keys, vals);
+			      build_typeinfo (e, ta), keys, vals);
 
     /* Return an associative array pointed to by MEM.  */
     tree aatype = build_ctype (ta);
@@ -2801,7 +2772,7 @@ public:
 
   /* Build a struct literal.  */
 
-  void visit (StructLiteralExp *e)
+  void visit (StructLiteralExp *e) final override
   {
     /* Handle empty struct literals.  */
     if (e->elements == NULL || e->sd->fields.length == 0)
@@ -2812,7 +2783,7 @@ public:
 
     /* Building sinit trees are delayed until after frontend semantic
        processing has complete.  Build the static initializer now.  */
-    if (e->useStaticInit && !this->constp_)
+    if (e->useStaticInit && !this->constp_ && !e->sd->isCsymbol ())
       {
 	tree init = aggregate_initializer_decl (e->sd);
 
@@ -2923,23 +2894,22 @@ public:
 
   /* Build a null literal.  */
 
-  void visit (NullExp *e)
+  void visit (NullExp *e) final override
   {
     this->result_ = build_typeof_null_value (e->type);
   }
 
   /* Build a vector literal.  */
 
-  void visit (VectorExp *e)
+  void visit (VectorExp *e) final override
   {
-    tree type = build_ctype (e->type);
-
     /* First handle array literal expressions.  */
     if (e->e1->op == EXP::arrayLiteral)
       {
 	ArrayLiteralExp *ale = e->e1->isArrayLiteralExp ();
 	vec <constructor_elt, va_gc> *elms = NULL;
 	bool constant_p = true;
+	tree type = build_ctype (e->type);
 
 	vec_safe_reserve (elms, ale->elements->length);
 	for (size_t i = 0; i < ale->elements->length; i++)
@@ -2959,9 +2929,16 @@ public:
 	else
 	  this->result_ = build_constructor (type, elms);
       }
+    else if (e->e1->type->toBasetype ()->ty == TY::Tsarray)
+      {
+	/* Build a vector representation from a static array.  */
+	this->result_ = convert_expr (build_expr (e->e1, this->constp_),
+				      e->e1->type, e->type);
+      }
     else
       {
 	/* Build constructor from single value.  */
+	tree type = build_ctype (e->type);
 	tree value = d_convert (TREE_TYPE (type),
 				build_expr (e->e1, this->constp_, true));
 	this->result_ = build_vector_from_val (type, value);
@@ -2970,7 +2947,7 @@ public:
 
   /* Build a static array representation of a vector expression.  */
 
-  void visit (VectorArrayExp *e)
+  void visit (VectorArrayExp *e) final override
   {
     this->result_ = convert_expr (build_expr (e->e1, this->constp_, true),
 				  e->e1->type, e->type);
@@ -2978,7 +2955,7 @@ public:
 
   /* Build a static class literal, return its reference.  */
 
-  void visit (ClassReferenceExp *e)
+  void visit (ClassReferenceExp *e) final override
   {
     /* The result of build_new_class_expr is a RECORD_TYPE, we want
        the reference.  */
@@ -3008,7 +2985,7 @@ public:
 
   /* Build an uninitialized value, generated from void initializers.  */
 
-  void visit (VoidInitExp *e)
+  void visit (VoidInitExp *e) final override
   {
     /* The front-end only generates these for the initializer of globals.
        Represent `void' as zeroes, regardless of the type's default value.  */
@@ -3019,14 +2996,14 @@ public:
   /* These expressions are mainly just a placeholders in the frontend.
      We shouldn't see them here.  */
 
-  void visit (ScopeExp *e)
+  void visit (ScopeExp *e) final override
   {
     error_at (make_location_t (e->loc), "%qs is not an expression",
 	      e->toChars ());
     this->result_ = error_mark_node;
   }
 
-  void visit (TypeExp *e)
+  void visit (TypeExp *e) final override
   {
     error_at (make_location_t (e->loc), "type %qs is not an expression",
 	      e->toChars ());

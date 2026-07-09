@@ -1,0 +1,10 @@
+--- a/input-file.h	2024-01-29 00:00:00.000000000 +0000
++++ b/input-file.h	2026-06-28 06:07:11.088413069 +0000
+@@ -63,3 +63,7 @@
+ void input_file_end (void);
+ void input_file_open (const char *filename, int pre);
+ void input_file_pop (char *arg);
++
++/* Register an in-memory assembly buffer as the input source (cc1plus embed
++   mode).  Call before input_file_open / read_a_source_file.  */
++void input_file_set_buffer (const char *buf, size_t len);

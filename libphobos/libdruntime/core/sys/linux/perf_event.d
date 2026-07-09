@@ -9,7 +9,6 @@ module core.sys.linux.perf_event;
 version (linux)  : extern (C):
 @nogc:
 nothrow:
-@system:
 
 import core.sys.posix.sys.ioctl;
 import core.sys.posix.unistd;
@@ -76,6 +75,10 @@ else version (RISCV_Any)
 else version (SPARC_Any)
 {
         enum __NR_perf_event_open = 327;
+}
+else version (LoongArch64)
+{
+        enum __NR_perf_event_open = 241;
 }
 else
 {

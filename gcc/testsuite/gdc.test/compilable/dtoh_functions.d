@@ -8,9 +8,9 @@ TEST_OUTPUT:
 #pragma once
 
 #include <assert.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <math.h>
 
 #ifdef CUSTOM_D_ARRAY_TYPE
 #define _d_dynamicArray CUSTOM_D_ARRAY_TYPE
@@ -45,10 +45,10 @@ struct S final
     int32_t get(int32_t , int32_t );
     static int32_t get();
     static const int32_t staticVar;
-    void useVars(int32_t pi = i, int32_t psv = staticVar);
+    void useVars(int32_t pi = i, int32_t psv = S::staticVar);
     struct Nested final
     {
-        void useStaticVar(int32_t i = staticVar);
+        void useStaticVar(int32_t i = S::staticVar);
         Nested()
         {
         }
@@ -78,6 +78,8 @@ extern int32_t baz4(int32_t x = 42);
 extern size_t baz5(size_t x = 42);
 
 extern size_t& bazRef(size_t& x);
+
+extern size_t bazOut(size_t& x);
 
 enum class E : int64_t
 {
@@ -157,7 +159,7 @@ extern int32_t(*f)(int32_t );
 
 extern void special(int32_t a = ptr->i, int32_t b = ptr->get(1, 2), int32_t j = (*f)(1));
 
-extern void variadic(int32_t _param_0, ...);
+extern void variadic(int32_t __param_0_, ...);
 ---
 +/
 
@@ -215,6 +217,11 @@ extern (C++) size_t baz5(size_t x = 42)
 }
 
 extern (C++) ref size_t bazRef(return ref size_t x)
+{
+    return x;
+}
+
+extern (C++) size_t bazOut(out size_t x)
 {
     return x;
 }

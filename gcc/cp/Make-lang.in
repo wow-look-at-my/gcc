@@ -1,5 +1,5 @@
 # Top level -*- makefile -*- fragment for GNU C++.
-#   Copyright (C) 1994-2022 Free Software Foundation, Inc.
+#   Copyright (C) 1994-2024 Free Software Foundation, Inc.
 
 #This file is part of GCC.
 
@@ -39,7 +39,7 @@ CXX_INSTALL_NAME := $(shell echo c++|sed '$(program_transform_name)')
 GXX_INSTALL_NAME := $(shell echo g++|sed '$(program_transform_name)')
 CXX_TARGET_INSTALL_NAME := $(target_noncanonical)-$(shell echo c++|sed '$(program_transform_name)')
 GXX_TARGET_INSTALL_NAME := $(target_noncanonical)-$(shell echo g++|sed '$(program_transform_name)')
-CP_PLUGIN_HEADERS := cp-tree.h cxx-pretty-print.h name-lookup.h type-utils.h operators.def
+CP_PLUGIN_HEADERS := cp-tree.h cxx-pretty-print.h name-lookup.h type-utils.h operators.def cp-trait.def contracts.h
 
 #
 # Define the names for selecting c++ in LANGUAGES.
@@ -55,16 +55,25 @@ c++.serial = cc1plus$(exeext)
 CFLAGS-cp/g++spec.o += $(DRIVER_DEFINES)
 
 CFLAGS-cp/module.o += -DHOST_MACHINE=\"$(host)\" \
-	-DTARGET_MACHINE=\"$(target)\"
+	-DTARGET_MACHINE=\"$(target)\" $(ZLIBINC)
 
 # In non-release builds, use a date-related module version.
 ifneq ($(DEVPHASE_c),)
-# Some date's don't grok 'r', if so, simply use today's
-# date (don't bootstrap at midnight).
-MODULE_VERSION := $(shell date -r $(srcdir)/cp/module.cc '+%y%m%d-%H%M' \
-  2>/dev/null || date '+%y%m%d-0000' 2>/dev/null || echo 0)
-
-CFLAGS-cp/module.o += -DMODULE_VERSION='($(subst -,,$(MODULE_VERSION))U)'
+# Some date's don't grok 'r', if so, simply use today's date,
+# but use date from previous stage if bootstrapping to avoid breaking
+# bootstraps across midnight.
+s-cp-module-version: $(srcdir)/cp/module.cc
+	MODULE_VERSION=`if date -r $(srcdir)/cp/module.cc '+%y%m%d%H%MU' \
+			  2>/dev/null; then :; \
+			elif test ../prev-gcc/s-cp-module-version -nt \
+			       $(srcdir)/cp/module.cc; then \
+			  cat ../prev-gcc/s-cp-module-version; \
+			else \
+			  date '+%y%m%d0000U' 2>/dev/null; \
+			fi`; \
+	echo $${MODULE_VERSION} > s-cp-module-version
+cp/module.o: s-cp-module-version
+CFLAGS-cp/module.o += -DMODULE_VERSION='$(shell cat s-cp-module-version)'
 endif
 
 # Create the compiler driver for g++.
@@ -81,7 +90,7 @@ g++-cross$(exeext): xg++$(exeext)
 
 # The compiler itself.
 # Shared with C front end:
-CXX_C_OBJS = attribs.o incpath.o \
+CXX_C_OBJS = attribs.o \
 	$(C_COMMON_OBJS) $(CXX_TARGET_OBJS)
 
 # Language-specific object files for C++ and Objective C++.
@@ -89,7 +98,7 @@ CXX_AND_OBJCXX_OBJS = \
 	cp/call.o cp/class.o cp/constexpr.o cp/constraint.o \
 	cp/coroutines.o cp/cp-gimplify.o \
 	cp/cp-objcp-common.o cp/cp-ubsan.o \
-	cp/cvt.o cp/cxx-pretty-print.o \
+	cp/cvt.o cp/contracts.o cp/cxx-pretty-print.o \
 	cp/decl.o cp/decl2.o cp/dump.o \
 	cp/error.o cp/except.o cp/expr.o \
 	cp/friend.o cp/init.o \
@@ -131,11 +140,57 @@ cc1plus-checksum.cc : build/genchecksum$(build_exeext) checksum-options \
 	  $(srcdir)/../move-if-change cc1plus-checksum.cc.tmp cc1plus-checksum.cc; \
 	fi
 
-cc1plus$(exeext): $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(LIBDEPS) $(c++.prev)
+# -fintegrated-as: the built-in assembler (gas/embed.c) is shipped in libgas.a
+# alongside libbfd/libopcodes/libsframe, all built in the combined tree.  They
+# are linked ONLY into cc1plus (not added to OBJS/BACKEND).  The four archives
+# plus libiberty have mutual dependencies, so they are wrapped in a linker
+# --start-group to make resolution order-independent.  Paths are relative to
+# the gcc build subdir (CWD of this rule): ../gas, ../bfd/.libs, etc. are the
+# sibling combined-tree build dirs; libgas.a is built by
+# contrib/gas-embed/build-libgas.sh into the top of the build tree (../libgas.a).
+GAS_BUILD = ..
+# HAVE_LIBGAS gate (see gcc/Makefile.in): only link the embedded-assembler
+# archives when the combined-tree build actually produced libgas.a.  On a
+# tree without binutils GAS_LIBS/GAS_DEPS collapse to empty and cc1plus
+# links as a plain two-process compiler (toplev.o was compiled without
+# HAVE_LIBGAS by the same read-time snapshot, so it references no gas
+# symbol).  ifeq/wildcard is evaluated when this makefile is read -- the
+# same snapshot as gcc/Makefile.in's LIBGAS_DEFINE.
+ifneq ($(wildcard $(GAS_BUILD)/libgas.a),)
+GAS_LIBS = -Wl,--start-group \
+	   $(GAS_BUILD)/libgas.a \
+	   $(GAS_BUILD)/bfd/.libs/libbfd.a \
+	   $(GAS_BUILD)/opcodes/libopcodes.a \
+	   $(GAS_BUILD)/libsframe/.libs/libsframe.a \
+	   ../libiberty/libiberty.a \
+	   -Wl,--end-group $(ZLIB) $(ZSTD_LIB)
+GAS_DEPS = $(GAS_BUILD)/libgas.a
+else
+GAS_LIBS =
+GAS_DEPS =
+endif
+
+# Optional fast thread-caching malloc for the compiler proper (measured -5%
+# wall vs glibc malloc on a large template-heavy C++ TU, -3% on a mid-size
+# STL TU; jemalloc/mimalloc gave about half that).  Static archive, so the
+# installed binaries gain no runtime .so dependency.  Gracefully optional,
+# mirroring GAS_LIBS' make-level wiring: $(CC) -print-file-name prints an
+# absolute path when the library exists in the toolchain's search dirs and
+# echoes the bare name back when it does not, so a build host without
+# gperftools (libgoogle-perftools-dev on Debian/Ubuntu) still builds plain.
+# Placed after every other archive so tcmalloc's malloc/free win symbol
+# resolution over libc's.
+# -lpthread: tcmalloc_minimal references pthread symbols; on glibc >= 2.34
+# they live in libc (libpthread is a stub, so the extra -l is harmless), on
+# older hosts the explicit library is required.
+TCMALLOC_A := $(shell $(CC) -print-file-name=libtcmalloc_minimal.a)
+TCMALLOC_LIBS := $(if $(findstring /,$(TCMALLOC_A)),$(TCMALLOC_A) -lpthread)
+
+cc1plus$(exeext): $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(LIBDEPS) $(GAS_DEPS) $(c++.prev)
 	@$(call LINK_PROGRESS,$(INDEX.c++),start)
 	+$(LLINKER) $(ALL_LINKERFLAGS) $(LDFLAGS) -o $@ \
 	      $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(NETLIBS) \
-		$(LIBS) $(BACKENDLIBS)
+		$(LIBS) $(BACKENDLIBS) $(GAS_LIBS) $(TCMALLOC_LIBS)
 	@$(call LINK_PROGRESS,$(INDEX.c++),end)
 
 ifeq ($(ENABLE_MAINTAINER_RULES), true)
@@ -153,10 +208,59 @@ endif
 	gperf -o -C -E -k '1-6,$$' -j1 -D -N 'libc_name_p' -L C++ \
 		$(srcdir)/cp/cfns.gperf --output-file $(srcdir)/cp/cfns.h
 
-cc1plus.fda: ../stage1-gcc/cc1plus$(exeext) ../prev-gcc/$(PERF_DATA)
-	$(CREATE_GCOV) -binary ../stage1-gcc/cc1plus$(exeext) -gcov cc1plus.fda -profile ../prev-gcc/$(PERF_DATA) -gcov_version 1
+# We always need the dependency on the .gperf file because it itself is generated.
+ifeq ($(ENABLE_MAINTAINER_RULES), true)
+$(srcdir)/cp/std-name-hint.h: $(srcdir)/cp/std-name-hint.gperf
+else
+$(srcdir)/cp/std-name-hint.h: | $(srcdir)/cp/std-name-hint.gperf
+endif
+	gperf -o -C -E -k '1,2,7,11,$$' -D -N find -L C++ \
+		$(srcdir)/cp/std-name-hint.gperf --output-file $(srcdir)/cp/std-name-hint.h
 
-#
+# The std-name-hint.gperf file itself is generated from a general
+# C++ API description.
+ifeq ($(ENABLE_MAINTAINER_RULES), true)
+$(srcdir)/cp/std-name-hint.gperf: $(srcdir)/cp/gen-cxxapi-file.py $(srcdir)/cp/cxxapi-data.csv
+else
+$(srcdir)/cp/std-name-hint.gperf:
+endif
+	python3 $(srcdir)/cp/gen-cxxapi-file.py hints $(srcdir)/cp/cxxapi-data.csv > $@
+ifneq ($(ENABLE_MAINTAINER_RULES), true)
+.SECONDARY: $(srcdir)/cp/std-name-hint.gperf
+endif
+
+# This is the file that depends on the generated header file.
+cp/name-lookup.o: $(srcdir)/cp/std-name-hint.h
+
+components_in_prev = "bfd opcodes binutils fixincludes gas gcc gmp mpfr mpc isl gold intl ld libbacktrace libcpp libcody libdecnumber libiberty libiberty-linker-plugin libiconv zlib lto-plugin libctf libsframe"
+components_in_prev_target = "libstdc++-v3 libsanitizer libvtv libgcc libbacktrace libphobos zlib libgomp libatomic"
+
+cc1plus.fda: create_fdas_for_cc1plus
+	$(PROFILE_MERGER) $(shell ls -ha cc1plus_*.fda) --output_file cc1plus.fda -gcov_version 2
+
+create_fdas_for_cc1plus: ../stage1-gcc/cc1plus$(exeext) ../prev-gcc/$(PERF_DATA)
+	for component_in_prev in "$(components_in_prev)"; do \
+	  perf_path=../prev-$$component_in_prev/$(PERF_DATA); \
+	  echo "Perf path:"; \
+	  echo $$perf_path; \
+	  if [ -f $$perf_path ]; then \
+	    profile_name=cc1plus_$$component_in_prev.fda; \
+	    $(CREATE_GCOV) -binary ../stage1-gcc/cc1plus$(exeext) -gcov $$profile_name -profile $$perf_path -gcov_version 2; \
+	  fi; \
+	done;
+
+	for component_in_prev_target in "$(components_in_prev_target)"; do \
+	  perf_path=../prev-$(TARGET_SUBDIR)/$$component_in_prev_target/$(PERF_DATA); \
+	  echo "Perf path:"; \
+	  echo $$perf_path; \
+	  if [ -f $$perf_path ]; then \
+	    profile_name=cc1plus_$$component_in_prev_target.fda; \
+	    $(CREATE_GCOV) -binary ../prev-gcc/cc1plus$(exeext) -gcov $$profile_name -profile $$perf_path -gcov_version 2; \
+	  fi; \
+	done;
+
+	$(STAMP) $@
+#
 # Build hooks:
 
 c++.all.cross: g++-cross$(exeext)
@@ -174,7 +278,7 @@ c++.srcinfo:
 c++.srcextra:
 
 c++.tags: force
-	cd $(srcdir)/cp; $(ETAGS) -o TAGS.sub *.c *.cc *.h --language=none \
+	cd $(srcdir)/cp; $(ETAGS) -o TAGS.sub *.cc *.h --language=none \
 	  --regex='/DEFTREECODE [(]\([A-Z_]+\)/\1/' cp-tree.def; \
 	$(ETAGS) --include TAGS.sub --include ../TAGS.sub
 
@@ -302,7 +406,7 @@ c++.mostlyclean:
 	-rm -f doc/g++.1
 	-rm -f cp/*$(objext)
 	-rm -f cp/*$(coverageexts)
-	-rm -f xg++$(exeext) g++-cross$(exeext) cc1plus$(exeext) cc1plus.fda
+	-rm -f xg++$(exeext) g++-cross$(exeext) cc1plus$(exeext) cc1plus*.fda
 c++.clean:
 c++.distclean:
 	-rm -f cp/config.status cp/Makefile

@@ -1,7 +1,7 @@
 /**
  * Semantic analysis for cast-expressions.
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/dcast.d, _dcast.d)
@@ -20,30 +20,33 @@ import dmd.arraytypes;
 import dmd.astenums;
 import dmd.dclass;
 import dmd.declaration;
+import dmd.dinterpret;
 import dmd.dscope;
 import dmd.dstruct;
 import dmd.dsymbol;
+import dmd.dsymbolsem;
 import dmd.errors;
 import dmd.escape;
 import dmd.expression;
 import dmd.expressionsem;
 import dmd.func;
+import dmd.funcsem;
 import dmd.globals;
 import dmd.hdrgen;
+import dmd.location;
 import dmd.impcnvtab;
-import dmd.id;
 import dmd.importc;
 import dmd.init;
 import dmd.intrange;
 import dmd.mtype;
 import dmd.opover;
+import dmd.optimize;
 import dmd.root.ctfloat;
 import dmd.common.outbuffer;
 import dmd.root.rmem;
 import dmd.root.utf;
 import dmd.tokens;
 import dmd.typesem;
-import dmd.visitor;
 
 enum LOG = false;
 
@@ -66,10 +69,15 @@ Expression implicitCastTo(Expression e, Scope* sc, Type t)
 {
     Expression visit(Expression e)
     {
-        //printf("Expression.implicitCastTo(%s of type %s) => %s\n", e.toChars(), e.type.toChars(), t.toChars());
-
+        // printf("Expression.implicitCastTo(%s of type %s) => %s\n", e.toChars(), e.type.toChars(), t.toChars());
         if (const match = (sc && sc.flags & SCOPE.Cfile) ? e.cimplicitConvTo(t) : e.implicitConvTo(t))
         {
+            // no need for an extra cast when matching is exact
+
+            if (match == MATCH.convert && e.type.isTypeNoreturn() && e.op != EXP.type)
+            {
+                return specialNoreturnCast(e, t);
+            }
             if (match == MATCH.constant && (e.type.constConv(t) || !e.isLvalue() && e.type.equivalent(t)))
             {
                 /* Do not emit CastExp for const conversions and
@@ -83,6 +91,8 @@ Expression implicitCastTo(Expression e, Scope* sc, Type t)
             auto ad = isAggregate(e.type);
             if (ad && ad.aliasthis)
             {
+                if (!ad.type || ad.type.isTypeError())
+                    return e;
                 auto ts = ad.type.isTypeStruct();
                 const adMatch = ts
                     ? ts.implicitConvToWithoutAliasThis(t)
@@ -129,7 +139,7 @@ Expression implicitCastTo(Expression e, Scope* sc, Type t)
         {
             if (!t.deco)
             {
-                e.error("forward reference to type `%s`", t.toChars());
+                error(e.loc, "forward reference to type `%s`", t.toChars());
             }
             else
             {
@@ -137,7 +147,7 @@ Expression implicitCastTo(Expression e, Scope* sc, Type t)
                 //type = type.typeSemantic(loc, sc);
                 //printf("type %s t %s\n", type.deco, t.deco);
                 auto ts = toAutoQualChars(e.type, t);
-                e.error("cannot implicitly convert expression `%s` of type `%s` to `%s`",
+                error(e.loc, "cannot implicitly convert expression `%s` of type `%s` to `%s`",
                     e.toChars(), ts[0], ts[1]);
             }
         }
@@ -165,7 +175,7 @@ Expression implicitCastTo(Expression e, Scope* sc, Type t)
     {
         //printf("FuncExp::implicitCastTo type = %p %s, t = %s\n", e.type, e.type ? e.type.toChars() : NULL, t.toChars());
         FuncExp fe;
-        if (e.matchType(t, sc, &fe) > MATCH.nomatch)
+        if (e.matchType(t, sc, &fe, global.errorSink) > MATCH.nomatch)
         {
             return fe;
         }
@@ -192,7 +202,7 @@ Expression implicitCastTo(Expression e, Scope* sc, Type t)
             {
                 Type tb = t.toBasetype();
                 Type tx = (tb.ty == Tsarray)
-                    ? tb.nextOf().sarrayOf(ale.elements ? ale.elements.dim : 0)
+                    ? tb.nextOf().sarrayOf(ale.elements ? ale.elements.length : 0)
                     : tb.nextOf().arrayOf();
                 se.e1 = ale.implicitCastTo(sc, tx);
             }
@@ -238,7 +248,7 @@ MATCH implicitConvTo(Expression e, Type t)
             return MATCH.nomatch;
         if (!e.type)
         {
-            e.error("`%s` is not an expression", e.toChars());
+            error(e.loc, "`%s` is not an expression", e.toChars());
             e.type = Type.terror;
         }
 
@@ -325,6 +335,45 @@ MATCH implicitConvTo(Expression e, Type t)
         }
 
         return MATCH.nomatch;
+    }
+
+    // Apply mod bits to each function parameter,
+    // and see if we can convert the function argument to the modded type
+    static bool parametersModMatch(Expressions* args, TypeFunction tf, MOD mod)
+    {
+        const size_t nparams = tf.parameterList.length;
+        const size_t j = tf.isDstyleVariadic(); // if TypeInfoArray was prepended
+        foreach (const i; j .. args.length)
+        {
+            Expression earg = (*args)[i];
+            Type targ = earg.type.toBasetype();
+            static if (LOG)
+            {
+                printf("[%d] earg: %s, targ: %s\n", cast(int)i, earg.toChars(), targ.toChars());
+            }
+            if (i - j < nparams)
+            {
+                Parameter fparam = tf.parameterList[i - j];
+                if (fparam.isLazy())
+                    return false; // not sure what to do with this
+                Type tparam = fparam.type;
+                if (!tparam)
+                    continue;
+                if (fparam.isReference())
+                {
+                    if (targ.constConv(tparam.castMod(mod)) == MATCH.nomatch)
+                        return false;
+                    continue;
+                }
+            }
+            static if (LOG)
+            {
+                printf("[%d] earg: %s, targm: %s\n", cast(int)i, earg.toChars(), targ.addMod(mod).toChars());
+            }
+            if (implicitMod(earg, targ, mod) == MATCH.nomatch)
+                return false;
+        }
+        return true;
     }
 
     MATCH visitAdd(AddExp e)
@@ -580,7 +629,7 @@ MATCH implicitConvTo(Expression e, Type t)
 
         TY tyn = e.type.nextOf().ty;
 
-        if (!tyn.isSomeChar)
+        if (!tyn.isSomeChar && !e.hexString)
             return visit(e);
 
         switch (t.ty)
@@ -654,6 +703,11 @@ MATCH implicitConvTo(Expression e, Type t)
                     return MATCH.nomatch;
                 m = MATCH.constant;
             }
+            if (e.hexString && tn.isintegral && (tn.size == e.sz || (!e.committed && (e.len % tn.size) == 0)))
+            {
+                m = MATCH.convert;
+                return m;
+            }
             if (!e.committed)
             {
                 switch (tn.ty)
@@ -710,12 +764,12 @@ MATCH implicitConvTo(Expression e, Type t)
 
             if (auto tsa = tb.isTypeSArray())
             {
-                if (e.elements.dim != tsa.dim.toInteger())
+                if (e.elements.length != tsa.dim.toInteger())
                     result = MATCH.nomatch;
             }
 
             Type telement = tb.nextOf();
-            if (!e.elements.dim)
+            if (!e.elements.length)
             {
                 if (typen.ty != Tvoid)
                     result = typen.implicitConvTo(telement);
@@ -728,7 +782,7 @@ MATCH implicitConvTo(Expression e, Type t)
                     if (m < result)
                         result = m;
                 }
-                for (size_t i = 0; i < e.elements.dim; i++)
+                for (size_t i = 0; i < e.elements.length; i++)
                 {
                     Expression el = (*e.elements)[i];
                     if (result == MATCH.nomatch)
@@ -746,14 +800,14 @@ MATCH implicitConvTo(Expression e, Type t)
 
             return result;
         }
-        else if (tb.ty == Tvector && (typeb.ty == Tarray || typeb.ty == Tsarray))
-        {
+        else if (tb.ty == Tvector && (typeb.ty == Tarray || typeb.ty == Tsarray || typeb.ty == Tpointer))
+        {   // Tpointer because ImportC eagerly converts Tsarray to Tpointer
             result = MATCH.exact;
             // Convert array literal to vector type
             TypeVector tv = tb.isTypeVector();
             TypeSArray tbase = tv.basetype.isTypeSArray();
             assert(tbase);
-            const edim = e.elements.dim;
+            const edim = e.elements.length;
             const tbasedim = tbase.dim.toInteger();
             if (edim > tbasedim)
             {
@@ -824,9 +878,8 @@ MATCH implicitConvTo(Expression e, Type t)
          * convert to immutable
          */
         if (e.f &&
-            // lots of legacy code breaks with the following purity check
-            (global.params.useDIP1000 != FeatureState.enabled || e.f.isPure() >= PURE.const_) &&
-             e.f.isReturnIsolated() // check isReturnIsolated last, because it is potentially expensive.
+            (!global.params.fixImmutableConv || e.f.isPure() >= PURE.const_) &&
+            e.f.isReturnIsolated() // check isReturnIsolated last, because it is potentially expensive.
            )
         {
             result = e.type.immutableOf().implicitConvTo(t);
@@ -895,9 +948,6 @@ MATCH implicitConvTo(Expression e, Type t)
         /* Apply mod bits to each function parameter,
          * and see if we can convert the function argument to the modded type
          */
-
-        size_t nparams = tf.parameterList.length;
-        size_t j = tf.isDstyleVariadic(); // if TypeInfoArray was prepended
         if (auto dve = e.e1.isDotVarExp())
         {
             /* Treat 'this' as just another function argument
@@ -906,36 +956,9 @@ MATCH implicitConvTo(Expression e, Type t)
             if (targ.constConv(targ.castMod(mod)) == MATCH.nomatch)
                 return result;
         }
-        foreach (const i; j .. e.arguments.dim)
-        {
-            Expression earg = (*e.arguments)[i];
-            Type targ = earg.type.toBasetype();
-            static if (LOG)
-            {
-                printf("[%d] earg: %s, targ: %s\n", cast(int)i, earg.toChars(), targ.toChars());
-            }
-            if (i - j < nparams)
-            {
-                Parameter fparam = tf.parameterList[i - j];
-                if (fparam.storageClass & STC.lazy_)
-                    return result; // not sure what to do with this
-                Type tparam = fparam.type;
-                if (!tparam)
-                    continue;
-                if (fparam.isReference())
-                {
-                    if (targ.constConv(tparam.castMod(mod)) == MATCH.nomatch)
-                        return result;
-                    continue;
-                }
-            }
-            static if (LOG)
-            {
-                printf("[%d] earg: %s, targm: %s\n", cast(int)i, earg.toChars(), targ.addMod(mod).toChars());
-            }
-            if (implicitMod(earg, targ, mod) == MATCH.nomatch)
-                return result;
-        }
+
+        if (!parametersModMatch(e.arguments, tf, mod))
+            return result;
 
         /* Success
          */
@@ -1058,7 +1081,7 @@ MATCH implicitConvTo(Expression e, Type t)
     MATCH visitFunc(FuncExp e)
     {
         //printf("FuncExp::implicitConvTo type = %p %s, t = %s\n", e.type, e.type ? e.type.toChars() : NULL, t.toChars());
-        MATCH m = e.matchType(t, null, null, 1);
+        MATCH m = e.matchType(t, null, null, global.errorSinkNull);
         if (m > MATCH.nomatch)
         {
             return m;
@@ -1107,9 +1130,14 @@ MATCH implicitConvTo(Expression e, Type t)
 
     MATCH visitCond(CondExp e)
     {
-        auto result = visit(e);
-        if (result != MATCH.nomatch)
-            return result;
+        e.econd = e.econd.optimize(WANTvalue);
+        const opt = e.econd.toBool();
+        if (opt.isPresent())
+        {
+            auto result = visit(e);
+            if (result != MATCH.nomatch)
+                return result;
+        }
 
         MATCH m1 = e.e1.implicitConvTo(t);
         MATCH m2 = e.e2.implicitConvTo(t);
@@ -1202,47 +1230,16 @@ MATCH implicitConvTo(Expression e, Type t)
             if (tf.purity == PURE.impure)
                 return MATCH.nomatch; // impure
 
+            // Allow a conversion to immutable type, or
+            // conversions of mutable types between thread-local and shared.
             if (e.type.immutableOf().implicitConvTo(t) < MATCH.constant && e.type.addMod(MODFlags.shared_).implicitConvTo(t) < MATCH.constant && e.type.implicitConvTo(t.addMod(MODFlags.shared_)) < MATCH.constant)
             {
                 return MATCH.nomatch;
             }
-            // Allow a conversion to immutable type, or
-            // conversions of mutable types between thread-local and shared.
 
-            Expressions* args = e.arguments;
-
-            size_t nparams = tf.parameterList.length;
-            // if TypeInfoArray was prepended
-            size_t j = tf.isDstyleVariadic();
-            for (size_t i = j; i < e.arguments.dim; ++i)
+            if (!parametersModMatch(e.arguments, tf, mod))
             {
-                Expression earg = (*args)[i];
-                Type targ = earg.type.toBasetype();
-                static if (LOG)
-                {
-                    printf("[%d] earg: %s, targ: %s\n", cast(int)i, earg.toChars(), targ.toChars());
-                }
-                if (i - j < nparams)
-                {
-                    Parameter fparam = tf.parameterList[i - j];
-                    if (fparam.storageClass & STC.lazy_)
-                        return MATCH.nomatch; // not sure what to do with this
-                    Type tparam = fparam.type;
-                    if (!tparam)
-                        continue;
-                    if (fparam.isReference())
-                    {
-                        if (targ.constConv(tparam.castMod(mod)) == MATCH.nomatch)
-                            return MATCH.nomatch;
-                        continue;
-                    }
-                }
-                static if (LOG)
-                {
-                    printf("[%d] earg: %s, targm: %s\n", cast(int)i, earg.toChars(), targ.addMod(mod).toChars());
-                }
-                if (implicitMod(earg, targ, mod) == MATCH.nomatch)
-                    return MATCH.nomatch;
+                return MATCH.nomatch;
             }
         }
 
@@ -1251,7 +1248,7 @@ MATCH implicitConvTo(Expression e, Type t)
          */
         if (!e.member && e.arguments)
         {
-            for (size_t i = 0; i < e.arguments.dim; ++i)
+            for (size_t i = 0; i < e.arguments.length; ++i)
             {
                 Expression earg = (*e.arguments)[i];
                 if (!earg) // https://issues.dlang.org/show_bug.cgi?id=14853
@@ -1302,7 +1299,7 @@ MATCH implicitConvTo(Expression e, Type t)
                 {
                     extern (C++) static bool convertible(Expression e, ClassDeclaration cd, MOD mod)
                     {
-                        for (size_t i = 0; i < cd.fields.dim; i++)
+                        for (size_t i = 0; i < cd.fields.length; i++)
                         {
                             VarDeclaration v = cd.fields[i];
                             Initializer _init = v._init;
@@ -1488,6 +1485,10 @@ MATCH cimplicitConvTo(Expression e, Type t)
 
     if (tb.equals(typeb))
         return MATCH.exact;
+
+    if (tb.isTypeVector() || typeb.isTypeVector())
+        return implicitConvTo(e, t);    // permissive checking doesn't apply to vectors
+
     if ((typeb.isintegral() || typeb.isfloating()) &&
         (tb.isintegral() || tb.isfloating()))
         return MATCH.convert;
@@ -1533,6 +1534,8 @@ Type toStaticArrayType(SliceExp e)
  */
 Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
 {
+    //printf("castTo(e: %s from: %s to: %s\n", e.toChars(), e.type.toChars(), t.toChars());
+
     Expression visit(Expression e)
     {
         //printf("Expression::castTo(this=%s, t=%s)\n", e.toChars(), t.toChars());
@@ -1543,6 +1546,10 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
         if (e.type.equals(t))
         {
             return e;
+        }
+        if (e.type.isTypeNoreturn() && e.op != EXP.type)
+        {
+            return specialNoreturnCast(e, t);
         }
         if (auto ve = e.isVarExp())
         {
@@ -1626,6 +1633,13 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
         }
         else if (tob.ty == Tvector && t1b.ty != Tvector)
         {
+            if (t1b.ty == Tsarray)
+            {
+                // Casting static array to vector with same size, e.g. `cast(int4) int[4]`
+                if (t1b.size(e.loc) != tob.size(e.loc))
+                    goto Lfail;
+                return new VectorExp(e.loc, e, tob).expressionSemantic(sc);
+            }
             //printf("test1 e = %s, e.type = %s, tob = %s\n", e.toChars(), e.type.toChars(), tob.toChars());
             TypeVector tv = tob.isTypeVector();
             Expression result = new CastExp(e.loc, e, tv.elementType());
@@ -1677,7 +1691,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 goto Lok;
 
             auto ts = toAutoQualChars(e.type, t);
-            e.error("cannot cast expression `%s` of type `%s` to `%s` because of different sizes",
+            error(e.loc, "cannot cast expression `%s` of type `%s` to `%s` because of different sizes",
                 e.toChars(), ts[0], ts[1]);
             return ErrorExp.get();
         }
@@ -1695,14 +1709,6 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
             {
                 // T[n] sa;
                 // cast(U[])sa; // ==> cast(U[])sa[];
-                if (global.params.useDIP1000 == FeatureState.enabled)
-                {
-                    if (auto v = expToVariable(e))
-                    {
-                        if (e.type.hasPointers() && !checkAddressVar(sc, e, v))
-                            goto Lfail;
-                    }
-                }
                 const fsize = t1b.nextOf().size();
                 const tsize = tob.nextOf().size();
                 if (fsize == SIZE_INVALID || tsize == SIZE_INVALID)
@@ -1714,7 +1720,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                     const dim = t1b.isTypeSArray().dim.toInteger();
                     if (tsize == 0 || (dim * fsize) % tsize != 0)
                     {
-                        e.error("cannot cast expression `%s` of type `%s` to `%s` since sizes don't line up",
+                        error(e.loc, "cannot cast expression `%s` of type `%s` to `%s` since sizes don't line up",
                                 e.toChars(), e.type.toChars(), t.toChars());
                         return ErrorExp.get();
                     }
@@ -1757,7 +1763,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 // void delegate() dg;
                 // cast(U*)dg; // ==> cast(U*)dg.ptr;
                 // Note that it happens even when U is a Tfunction!
-                e.deprecation("casting from %s to %s is deprecated", e.type.toChars(), t.toChars());
+                deprecation(e.loc, "casting from %s to %s is deprecated", e.type.toChars(), t.toChars());
                 goto Lok;
             }
             goto Lfail;
@@ -1775,7 +1781,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 if (result)
                     return result;
             }
-            e.error("cannot cast expression `%s` of type `%s` to `%s`", e.toChars(), e.type.toChars(), t.toChars());
+            error(e.loc, "cannot cast expression `%s` of type `%s` to `%s`", e.toChars(), e.type.toChars(), t.toChars());
             return ErrorExp.get();
         }
 
@@ -1844,7 +1850,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
         if (!e.committed && t.ty == Tpointer && t.nextOf().ty == Tvoid &&
             (!sc || !(sc.flags & SCOPE.Cfile)))
         {
-            e.error("cannot convert string literal to `void*`");
+            error(e.loc, "cannot convert string literal to `void*`");
             return ErrorExp.get();
         }
 
@@ -1860,7 +1866,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
         if (!e.committed)
         {
             se = e.copy().isStringExp();
-            se.committed = 1;
+            se.committed = true;
             copied = 1;
         }
 
@@ -1871,6 +1877,19 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
 
         Type tb = t.toBasetype();
         Type typeb = e.type.toBasetype();
+
+        if (e.hexString && !e.committed)
+        {
+            const szx = cast(ubyte) tb.nextOf().size();
+            if (szx != se.sz && (e.len % szx) == 0)
+            {
+                import dmd.utils: arrayCastBigEndian;
+                const data = e.peekData();
+                se.setData(arrayCastBigEndian(data, szx).ptr, data.length / szx, szx);
+                se.type = t;
+                return se;
+            }
+        }
 
         //printf("\ttype = %s\n", e.type.toChars());
         if (tb.ty == Tdelegate && typeb.ty != Tdelegate)
@@ -1902,7 +1921,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
             assert(szx <= 255);
             se.sz = cast(ubyte)szx;
             se.len = cast(size_t)tb.isTypeSArray().dim.toInteger();
-            se.committed = 1;
+            se.committed = true;
             se.type = t;
 
             /* If larger than source, pad with zeros.
@@ -1982,7 +2001,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 {
                     dchar c;
                     if (const s = utf_decodeChar(se.peekString(), u, c))
-                        e.error("%.*s", cast(int)s.length, s.ptr);
+                        error(e.loc, "%.*s", cast(int)s.length, s.ptr);
                     else
                         buffer.writeUTF16(c);
                 }
@@ -1995,7 +2014,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 {
                     dchar c;
                     if (const s = utf_decodeChar(se.peekString(), u, c))
-                        e.error("%.*s", cast(int)s.length, s.ptr);
+                        error(e.loc, "%.*s", cast(int)s.length, s.ptr);
                     buffer.write4(c);
                     newlen++;
                 }
@@ -2007,7 +2026,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 {
                     dchar c;
                     if (const s = utf_decodeWchar(se.peekWstring(), u, c))
-                        e.error("%.*s", cast(int)s.length, s.ptr);
+                        error(e.loc, "%.*s", cast(int)s.length, s.ptr);
                     else
                         buffer.writeUTF8(c);
                 }
@@ -2020,7 +2039,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 {
                     dchar c;
                     if (const s = utf_decodeWchar(se.peekWstring(), u, c))
-                        e.error("%.*s", cast(int)s.length, s.ptr);
+                        error(e.loc, "%.*s", cast(int)s.length, s.ptr);
                     buffer.write4(c);
                     newlen++;
                 }
@@ -2032,7 +2051,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 {
                     uint c = se.peekDstring()[u];
                     if (!utf_isValidDchar(c))
-                        e.error("invalid UCS-32 char \\U%08x", c);
+                        error(e.loc, "invalid UCS-32 char \\U%08x", c);
                     else
                         buffer.writeUTF8(c);
                     newlen++;
@@ -2046,7 +2065,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 {
                     uint c = se.peekDstring()[u];
                     if (!utf_isValidDchar(c))
-                        e.error("invalid UCS-32 char \\U%08x", c);
+                        error(e.loc, "invalid UCS-32 char \\U%08x", c);
                     else
                         buffer.writeUTF16(c);
                     newlen++;
@@ -2127,7 +2146,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
         {
             OverExp eo = e.e1.isOverExp();
             FuncDeclaration f = null;
-            for (size_t i = 0; i < eo.vars.a.dim; i++)
+            for (size_t i = 0; i < eo.vars.a.length; i++)
             {
                 auto s = eo.vars.a[i];
                 auto f2 = s.isFuncDeclaration();
@@ -2177,7 +2196,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
 
         if (auto f = isFuncAddress(e))
         {
-            if (f.checkForwardRef(e.loc))
+            if (checkForwardRef(f, e.loc))
             {
                 return ErrorExp.get();
             }
@@ -2203,7 +2222,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
         TupleExp te = e.copy().isTupleExp();
         te.e0 = e.e0 ? e.e0.copy() : null;
         te.exps = e.exps.copy();
-        for (size_t i = 0; i < te.exps.dim; i++)
+        for (size_t i = 0; i < te.exps.length; i++)
         {
             Expression ex = (*te.exps)[i];
             ex = ex.castTo(sc, totuple ? (*totuple.arguments)[i].type : t);
@@ -2236,7 +2255,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
         ArrayLiteralExp ae = e;
 
         Type tb = t.toBasetype();
-        if (tb.ty == Tarray && global.params.useDIP1000 == FeatureState.enabled)
+        if (tb.ty == Tarray)
         {
             if (checkArrayLiteralEscape(sc, ae, false))
             {
@@ -2265,7 +2284,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
             {
                 if (auto tsa = tb.isTypeSArray())
                 {
-                    if (e.elements.dim != tsa.dim.toInteger())
+                    if (e.elements.length != tsa.dim.toInteger())
                         goto L1;
                 }
 
@@ -2273,7 +2292,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 if (e.basis)
                     ae.basis = e.basis.castTo(sc, tb.nextOf());
                 ae.elements = e.elements.copy();
-                for (size_t i = 0; i < e.elements.dim; i++)
+                for (size_t i = 0; i < e.elements.length; i++)
                 {
                     Expression ex = (*e.elements)[i];
                     if (!ex)
@@ -2294,13 +2313,14 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 ae.type = tp;
             }
         }
-        else if (tb.ty == Tvector && (typeb.ty == Tarray || typeb.ty == Tsarray))
+        else if (tb.ty == Tvector && (typeb.ty == Tarray || typeb.ty == Tsarray || typeb.ty == Tpointer))
         {
             // Convert array literal to vector type
+            // The Tpointer case comes from C eagerly converting Tsarray to Tpointer
             TypeVector tv = tb.isTypeVector();
             TypeSArray tbase = tv.basetype.isTypeSArray();
             assert(tbase.ty == Tsarray);
-            const edim = e.elements.dim;
+            const edim = e.elements.length;
             const tbasedim = tbase.dim.toInteger();
             if (edim > tbasedim)
                 goto L1;
@@ -2348,8 +2368,8 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
             AssocArrayLiteralExp ae = e.copy().isAssocArrayLiteralExp();
             ae.keys = e.keys.copy();
             ae.values = e.values.copy();
-            assert(e.keys.dim == e.values.dim);
-            for (size_t i = 0; i < e.keys.dim; i++)
+            assert(e.keys.length == e.values.length);
+            for (size_t i = 0; i < e.keys.length; i++)
             {
                 Expression ex = (*e.values)[i];
                 ex = ex.castTo(sc, tb.nextOf());
@@ -2406,7 +2426,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                     }
                     else if (f.needThis())
                     {
-                        e.error("no `this` to create delegate for `%s`", f.toChars());
+                        error(e.loc, "no `this` to create delegate for `%s`", f.toChars());
                         return ErrorExp.get();
                     }
                     else if (f.isNested())
@@ -2416,7 +2436,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                     }
                     else
                     {
-                        e.error("cannot cast from function pointer to delegate");
+                        error(e.loc, "cannot cast from function pointer to delegate");
                         return ErrorExp.get();
                     }
                 }
@@ -2432,7 +2452,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
 
         if (auto f = isFuncAddress(e))
         {
-            if (f.checkForwardRef(e.loc))
+            if (checkForwardRef(f, e.loc))
             {
                 return ErrorExp.get();
             }
@@ -2457,7 +2477,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
             int offset;
             e.func.tookAddressOf++;
             if (e.func.tintro && e.func.tintro.nextOf().isBaseOf(e.func.type.nextOf(), &offset) && offset)
-                e.error("%s", msg.ptr);
+                error(e.loc, "%s", msg.ptr);
             auto result = e.copy();
             result.type = t;
             return result;
@@ -2473,7 +2493,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                 {
                     int offset;
                     if (f.tintro && f.tintro.nextOf().isBaseOf(f.type.nextOf(), &offset) && offset)
-                        e.error("%s", msg.ptr);
+                        error(e.loc, "%s", msg.ptr);
                     if (f != e.func)    // if address not already marked as taken
                         f.tookAddressOf++;
                     auto result = new DelegateExp(e.loc, e.e1, f, false, e.vthis2);
@@ -2481,13 +2501,13 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
                     return result;
                 }
                 if (e.func.tintro)
-                    e.error("%s", msg.ptr);
+                    error(e.loc, "%s", msg.ptr);
             }
         }
 
         if (auto f = isFuncAddress(e))
         {
-            if (f.checkForwardRef(e.loc))
+            if (checkForwardRef(f, e.loc))
             {
                 return ErrorExp.get();
             }
@@ -2500,7 +2520,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
     {
         //printf("FuncExp::castTo type = %s, t = %s\n", e.type.toChars(), t.toChars());
         FuncExp fe;
-        if (e.matchType(t, sc, &fe, 1) > MATCH.nomatch)
+        if (e.matchType(t, sc, &fe, global.errorSinkNull) > MATCH.nomatch)
         {
             return fe;
         }
@@ -2565,7 +2585,12 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
 
         // Handle the cast from Tarray to Tsarray with CT-known slicing
 
-        TypeSArray tsa = toStaticArrayType(e).isTypeSArray();
+        TypeSArray tsa;
+        {
+            Type t = toStaticArrayType(e);
+            tsa = t ? t.isTypeSArray() : null;
+        }
+
         if (tsa && tsa.size(e.loc) == tb.size(e.loc))
         {
             /* Match if the sarray sizes are equal:
@@ -2605,7 +2630,7 @@ Expression castTo(Expression e, Scope* sc, Type t, Type att = null)
             }
         }
         auto ts = toAutoQualChars(tsa ? tsa : e.type, t);
-        e.error("cannot cast expression `%s` of type `%s` to `%s`",
+        error(e.loc, "cannot cast expression `%s` of type `%s` to `%s`",
             e.toChars(), ts[0], ts[1]);
         return ErrorExp.get();
     }
@@ -2663,7 +2688,7 @@ Expression inferType(Expression e, Type t, int flag = 0)
             Type tn = tb.nextOf();
             if (ale.basis)
                 ale.basis = inferType(ale.basis, tn, flag);
-            for (size_t i = 0; i < ale.elements.dim; i++)
+            for (size_t i = 0; i < ale.elements.length; i++)
             {
                 if (Expression e = (*ale.elements)[i])
                 {
@@ -2682,7 +2707,7 @@ Expression inferType(Expression e, Type t, int flag = 0)
         {
             Type ti = taa.index;
             Type tv = taa.nextOf();
-            for (size_t i = 0; i < aale.keys.dim; i++)
+            for (size_t i = 0; i < aale.keys.length; i++)
             {
                 if (Expression e = (*aale.keys)[i])
                 {
@@ -2690,7 +2715,7 @@ Expression inferType(Expression e, Type t, int flag = 0)
                     (*aale.keys)[i] = e;
                 }
             }
-            for (size_t i = 0; i < aale.values.dim; i++)
+            for (size_t i = 0; i < aale.values.length; i++)
             {
                 if (Expression e = (*aale.values)[i])
                 {
@@ -2776,17 +2801,14 @@ Expression scaleFactor(BinExp be, Scope* sc)
     else
         assert(0);
 
-    if (sc.func && !sc.intypeof)
+
+    eoff = eoff.optimize(WANTvalue);
+    if (eoff.op == EXP.int64 && eoff.toInteger() == 0)
     {
-        eoff = eoff.optimize(WANTvalue);
-        if (eoff.op == EXP.int64 && eoff.toInteger() == 0)
-        {
-        }
-        else if (sc.func.setUnsafe())
-        {
-            be.error("pointer arithmetic not allowed in @safe functions");
-            return ErrorExp.get();
-        }
+    }
+    else if (sc.setUnsafe(false, be.loc, "pointer arithmetic not allowed in @safe functions"))
+    {
+        return ErrorExp.get();
     }
 
     return be;
@@ -2801,7 +2823,7 @@ Expression scaleFactor(BinExp be, Scope* sc)
  */
 private bool isVoidArrayLiteral(Expression e, Type other)
 {
-    while (e.op == EXP.arrayLiteral && e.type.ty == Tarray && (e.isArrayLiteralExp().elements.dim == 1))
+    while (e.op == EXP.arrayLiteral && e.type.ty == Tarray && (e.isArrayLiteralExp().elements.length == 1))
     {
         auto ale = e.isArrayLiteralExp();
         e = ale[0];
@@ -2813,7 +2835,7 @@ private bool isVoidArrayLiteral(Expression e, Type other)
     if (other.ty != Tsarray && other.ty != Tarray)
         return false;
     Type t = e.type;
-    return (e.op == EXP.arrayLiteral && t.ty == Tarray && t.nextOf().ty == Tvoid && e.isArrayLiteralExp().elements.dim == 0);
+    return (e.op == EXP.arrayLiteral && t.ty == Tarray && t.nextOf().ty == Tvoid && e.isArrayLiteralExp().elements.length == 0);
 }
 
 /**
@@ -2833,7 +2855,7 @@ private bool isVoidArrayLiteral(Expression e, Type other)
  */
 Type typeMerge(Scope* sc, EXP op, ref Expression pe1, ref Expression pe2)
 {
-    //printf("typeMerge() %s op %s\n", e1.toChars(), e2.toChars());
+    //printf("typeMerge() %s op %s\n", pe1.toChars(), pe2.toChars());
 
     Expression e1 = pe1;
     Expression e2 = pe2;
@@ -2931,6 +2953,7 @@ Type typeMerge(Scope* sc, EXP op, ref Expression pe1, ref Expression pe2)
         ubyte mod = MODmerge(t1.mod, t2.mod);
         t1 = t1.castMod(mod);
         t2 = t2.castMod(mod);
+        return Lret(t1);
     }
 
 Lagain:
@@ -2954,6 +2977,9 @@ Lagain:
 
         t1 = Type.basic[ty1];
         t2 = Type.basic[ty2];
+
+        if (!(t1 && t2))
+            return null;
         e1 = e1.castTo(sc, t1);
         e2 = e2.castTo(sc, t2);
         return Lret(Type.basic[ty]);
@@ -2983,10 +3009,10 @@ Lagain:
             return Lret(t);
 
         if (t1n.ty == Tvoid) // pointers to void are always compatible
-            return Lret(t2);
+            return Lret(t1);
 
         if (t2n.ty == Tvoid)
-            return Lret(t);
+            return Lret(t2);
 
         if (t1.implicitConvTo(t2))
             return convert(e1, t2);
@@ -3146,6 +3172,9 @@ Lagain:
         goto Lagain;
     }
 
+LmergeClassTypes:
+    /* Merge different type modifiers on classes
+     */
     if (t1.ty == Tclass && t2.ty == Tclass)
     {
         if (t1.mod != t2.mod)
@@ -3214,8 +3243,22 @@ Lagain:
 
             if (t1.ty == Tclass && t2.ty == Tclass)
             {
+                /* t1 cannot be converted to t2, and vice versa
+                 */
                 TypeClass tc1 = t1.isTypeClass();
                 TypeClass tc2 = t2.isTypeClass();
+
+                //if (tc1.sym.interfaces.length || tc2.sym.interfaces.length)
+                if (tc1.sym.isInterfaceDeclaration() ||
+                    tc2.sym.isInterfaceDeclaration())
+                {
+                    ClassDeclaration cd = findClassCommonRoot(tc1.sym, tc2.sym);
+                    if (!cd)
+                        return null;    // no common root
+                    t1 = cd.type.castMod(t1.mod);
+                    t2 = cd.type.castMod(t2.mod);
+                    goto LmergeClassTypes;   // deal with mod differences
+                }
 
                 /* Pick 'tightest' type
                  */
@@ -3232,6 +3275,7 @@ Lagain:
                     t2 = cd2.type;
                 else
                     return null;
+                goto LmergeClassTypes;
             }
             else if (t1.ty == Tstruct && t1.isTypeStruct().sym.aliasthis)
             {
@@ -3563,6 +3607,71 @@ LmodCompare:
     return null;
 }
 
+/**********************************
+ * Find common root that both cd1 and cd2 can be implicitly converted to.
+ * Params:
+ *      cd1 = first class
+ *      cd2 = second class
+ * Returns:
+ *      common base that both can implicitly convert to, null if none or
+ *      multiple matches
+ */
+private
+ClassDeclaration findClassCommonRoot(ClassDeclaration cd1, ClassDeclaration cd2)
+{
+    enum log = false;
+    if (log) printf("findClassCommonRoot(%s, %s)\n", cd1.toChars(), cd2.toChars());
+    /* accumulate results in this */
+    static struct Root
+    {
+        ClassDeclaration cd;
+        bool error;
+
+        /* merge cd into results */
+        void accumulate(ClassDeclaration cd)
+        {
+            if (log) printf(" accumulate(r.cd: %s r.error: %d cd: %s)\n", this.cd ? this.cd.toChars() : "null", error, cd ? cd.toChars() : null);
+            if (this.cd is cd)
+            {
+            }
+            else if (!this.cd)
+                this.cd = cd;
+            else
+                error = true;
+        }
+    }
+
+    /* Find common root of cd1 and cd2. Accumulate results in r. depth is nesting level */
+    void findCommonRoot(ClassDeclaration cd1, ClassDeclaration cd2, ref Root r)
+    {
+        if (log) printf("findCommonRoot(cd1: %s cd2: %s)\n", cd1.toChars(), cd2.toChars());
+        /* Warning: quadratic time function
+         */
+        if (cd1 is cd2)
+        {
+            r.accumulate(cd1);
+            return;
+        }
+
+        foreach (b1; (*cd1.baseclasses)[])
+        {
+            if (b1.sym != r.cd)
+                findCommonRoot(cd2, b1.sym, r);
+        }
+        foreach (b2; (*cd2.baseclasses)[])
+        {
+            if (b2.sym != r.cd)
+                findCommonRoot(cd1, b2.sym, r);
+        }
+    }
+
+    Root r;
+    findCommonRoot(cd1, cd2, r);
+    if (!r.cd || r.error)
+        return null;        // no common root
+    return r.cd;
+}
+
 /************************************
  * Bring leaves to common type.
  * Returns:
@@ -3618,7 +3727,7 @@ Expression integralPromotions(Expression e, Scope* sc)
     switch (e.type.toBasetype().ty)
     {
     case Tvoid:
-        e.error("void has no value");
+        error(e.loc, "void has no value");
         return ErrorExp.get();
 
     case Tint8:
@@ -3667,7 +3776,7 @@ void fix16997(Scope* sc, UnaExp ue)
             case Tchar:
             case Twchar:
             case Tdchar:
-                ue.deprecation("integral promotion not done for `%s`, remove '-revert=intpromote' switch or `%scast(int)(%s)`",
+                deprecation(ue.loc, "integral promotion not done for `%s`, remove '-revert=intpromote' switch or `%scast(int)(%s)`",
                     ue.toChars(), EXPtoString(ue.op).ptr, ue.e1.toChars());
                 break;
 
@@ -3683,7 +3792,7 @@ void fix16997(Scope* sc, UnaExp ue)
  * This is to enable comparing things like an immutable
  * array with a mutable one.
  */
-extern (C++) bool arrayTypeCompatibleWithoutCasting(Type t1, Type t2)
+extern (D) bool arrayTypeCompatibleWithoutCasting(Type t1, Type t2)
 {
     t1 = t1.toBasetype();
     t2 = t2.toBasetype();
@@ -3883,4 +3992,22 @@ IntRange getIntRange(Expression e)
         case EXP.tilde              : return visitCom(e.isComExp());
         case EXP.negate             : return visitNeg(e.isNegExp());
     }
+}
+/**
+ * A helper function to "cast" from expressions of type noreturn to
+ * any other type - noreturn is implicitly convertible to any other type.
+ * However, the dmd backend does not like a naive cast from a noreturn expression
+ * (particularly an `assert(0)`) so this function generates:
+ *
+ * `(assert(0), value)` instead of `cast(to)(assert(0))`.
+ *
+ * `value` is currently `to.init` however it cannot be read so could be made simpler.
+ * Params:
+ *   toBeCasted = Expression of type noreturn to cast
+ *   to = Type to cast the expression to.
+ * Returns: A CommaExp, upon any failure ErrorExp will be returned.
+ */
+Expression specialNoreturnCast(Expression toBeCasted, Type to)
+{
+    return Expression.combine(toBeCasted, to.defaultInitLiteral(toBeCasted.loc));
 }

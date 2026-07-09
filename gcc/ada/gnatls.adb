@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 B o d y                                  --
 --                                                                          --
---          Copyright (C) 1992-2022, Free Software Foundation, Inc.         --
+--          Copyright (C) 1992-2024, Free Software Foundation, Inc.         --
 --                                                                          --
 -- GNAT is free software;  you can  redistribute it  and/or modify it under --
 -- terms of the  GNU General Public License as published  by the Free Soft- --
@@ -44,6 +44,7 @@ with Snames;
 with Stringt;
 with Switch;      use Switch;
 with Types;       use Types;
+with Uintp;
 
 with GNAT.Case_Util;            use GNAT.Case_Util;
 with GNAT.Command_Line;         use GNAT.Command_Line;
@@ -188,7 +189,6 @@ procedure Gnatls is
    --  Print usage message
 
    procedure Output_License_Information;
-   pragma No_Return (Output_License_Information);
    --  Output license statement, and if not found, output reference to COPYING
 
    function Image (Restriction : Restriction_Id) return String;
@@ -318,7 +318,6 @@ procedure Gnatls is
       Write_Eol;
       Error_Msg ("wrong ALI format, can't find dependency line for $ in {");
       Exit_Program (E_Fatal);
-      return No_Sdep_Id;
    end Corresponding_Sdep_Entry;
 
    -------------------------
@@ -894,8 +893,6 @@ procedure Gnatls is
                      & " for license terms.");
             Write_Eol;
       end case;
-
-      Exit_Program (E_Success);
    end Output_License_Information;
 
    -------------------
@@ -1417,7 +1414,7 @@ procedure Gnatls is
          First := 3;
          loop
             while First <= Name_Len
-              and then (Name_Buffer (First) = Path_Separator)
+              and then Name_Buffer (First) = Path_Separator
             loop
                First := First + 1;
             end loop;
@@ -2023,6 +2020,7 @@ begin
    --  Initialize standard packages
 
    Csets.Initialize;
+   Uintp.Initialize;
    Snames.Initialize;
    Stringt.Initialize;
 
@@ -2049,7 +2047,6 @@ begin
    if License then
       if Arg_Count = 2 then
          Output_License_Information;
-         Exit_Program (E_Success);
 
       else
          Set_Standard_Error;
@@ -2173,7 +2170,7 @@ begin
             First := Prj_Path'First;
             loop
                while First <= Prj_Path'Last
-                 and then (Prj_Path (First) = Path_Separator)
+                 and then Prj_Path (First) = Path_Separator
                loop
                   First := First + 1;
                end loop;

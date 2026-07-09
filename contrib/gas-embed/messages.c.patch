@@ -1,0 +1,35 @@
+--- a/messages.c	2024-01-29 00:00:00.000000000 +0000
++++ b/messages.c	2026-06-28 06:07:29.240412654 +0000
+@@ -20,6 +20,14 @@
+ #include "as.h"
+ #include <limits.h>
+ #include <signal.h>
++#include <setjmp.h>
++
++/* When embedded in cc1plus (gas_in_embed != 0), as_fatal / as_abort must not
++   kill the host process.  Instead they longjmp back to a landing pad set up by
++   gas_assemble_buffer.  In standalone gas (gas_in_embed == 0) they xexit as
++   before, preserving exact standalone behaviour.  */
++jmp_buf gas_fatal_jmp;
++int gas_in_embed = 0;
+ 
+ /* If the system doesn't provide strsignal, we get it defined in
+    libiberty but no declaration is supplied.  Because, reasons. */
+@@ -332,6 +340,8 @@
+      thinking that a file was created and hence does not need rebuilding.  */
+   if (out_file_name != NULL)
+     unlink_if_ordinary (out_file_name);
++  if (gas_in_embed)
++    longjmp (gas_fatal_jmp, 1);
+   xexit (EXIT_FAILURE);
+ }
+ 
+@@ -354,6 +364,8 @@
+ 
+   fprintf (stderr, _("Please report this bug.\n"));
+ 
++  if (gas_in_embed)
++    longjmp (gas_fatal_jmp, 1);
+   xexit (EXIT_FAILURE);
+ }
+ 

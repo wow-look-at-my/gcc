@@ -89,22 +89,21 @@ private template createAccessors(
     }
     else
     {
-        enum ulong
-            maskAllElse = ((~0uL) >> (64 - len)) << offset,
-            signBitCheck = 1uL << (len - 1);
+        enum ulong maskAllElse = ((~0uL) >> (64 - len)) << offset;
+        enum TSize = 8 * T.sizeof;
+        enum SignShift = TSize - len;
 
         static if (T.min < 0)
         {
             enum long minVal = -(1uL << (len - 1));
             enum ulong maxVal = (1uL << (len - 1)) - 1;
-            alias UT = Unsigned!(T);
-            enum UT extendSign = cast(UT)~((~0uL) >> (64 - len));
+            enum RightShiftOp = ">>=";
         }
         else
         {
             enum ulong minVal = 0;
             enum ulong maxVal = (~0uL) >> (64 - len);
-            enum extendSign = 0;
+            enum RightShiftOp = ">>>=";
         }
 
         static if (is(T == bool))
@@ -121,15 +120,11 @@ private template createAccessors(
         else
         {
             // getter
-            enum createAccessors = "@property "~T.stringof~" "~name~"() @safe pure nothrow @nogc const { auto result = "
-                ~"("~store~" & "
-                ~ myToString(maskAllElse) ~ ") >>"
-                ~ myToString(offset) ~ ";"
-                ~ (T.min < 0
-                   ? "if (result >= " ~ myToString(signBitCheck)
-                   ~ ") result |= " ~ myToString(extendSign) ~ ";"
-                   : "")
-                ~ " return cast("~T.stringof~") result;}\n"
+            enum createAccessors = "@property "~T.stringof~" "~name~"() @safe pure nothrow @nogc const {"
+                ~ "auto result = cast("~T.stringof~") (" ~ store ~ " >>" ~ myToString(offset) ~ ");"
+                ~ "result <<= " ~ myToString(SignShift) ~ ";"
+                ~ "result " ~ RightShiftOp ~ myToString(SignShift) ~ ";"
+                ~ " return result;}\n"
             // setter
                 ~"@property void "~name~"("~T.stringof~" v) @safe pure nothrow @nogc { "
                 ~"assert(v >= "~name~`_min, "Value is smaller than the minimum value of bitfield '`~name~`'"); `
@@ -268,9 +263,9 @@ Implementation_details: `Bitfields` are internally stored in an
 `ubyte`, `ushort`, `uint` or `ulong` depending on the number of bits
 used. The bits are filled in the order given by the parameters,
 starting with the lowest significant bit. The name of the (private)
-variable used for saving the `bitfield` is created by a prefix `_bf`
-and concatenating all of the variable names, each preceded by an
-underscore.
+variable used for saving the `bitfield` is created by concatenating
+all of the variable names, each preceded by an underscore, and
+a suffix `_bf`.
 
 Params: T = A list of template parameters divided into chunks of 3
             items. Each chunk consists (in this order) of a type, a
@@ -284,10 +279,8 @@ See_Also: $(REF BitFlags, std,typecons)
 */
 string bitfields(T...)()
 {
-    import std.conv : to;
-
     static assert(T.length % 3 == 0,
-                  "Wrong number of arguments (" ~ to!string(T.length) ~ "): Must be a multiple of 3");
+                  "Wrong number of arguments (" ~ T.length.stringof ~ "): Must be a multiple of 3");
 
     static foreach (i, ARG; T)
     {
@@ -784,48 +777,6 @@ if (is(T == class))
     static assert(!__traits(compiles, bar(s)));
 }
 
-/**
-   Allows manipulating the fraction, exponent, and sign parts of a
-   `float` separately. The definition is:
-
-----
-struct FloatRep
-{
-    union
-    {
-        float value;
-        mixin(bitfields!(
-                  uint,  "fraction", 23,
-                  ubyte, "exponent",  8,
-                  bool,  "sign",      1));
-    }
-    enum uint bias = 127, fractionBits = 23, exponentBits = 8, signBits = 1;
-}
-----
-*/
-alias FloatRep = FloatingPointRepresentation!float;
-
-/**
-   Allows manipulating the fraction, exponent, and sign parts of a
-   `double` separately. The definition is:
-
-----
-struct DoubleRep
-{
-    union
-    {
-        double value;
-        mixin(bitfields!(
-                  ulong,   "fraction", 52,
-                  ushort,  "exponent", 11,
-                  bool,    "sign",      1));
-    }
-    enum uint bias = 1023, signBits = 1, fractionBits = 52, exponentBits = 11;
-}
-----
-*/
-alias DoubleRep = FloatingPointRepresentation!double;
-
 private struct FloatingPointRepresentation(T)
 {
     static if (is(T == float))
@@ -850,6 +801,27 @@ private struct FloatingPointRepresentation(T)
                   bool,  "sign",     signBits));
     }
 }
+
+/**
+   Allows manipulating the fraction, exponent, and sign parts of a
+   `float` separately. The definition is:
+
+----
+struct FloatRep
+{
+    union
+    {
+        float value;
+        mixin(bitfields!(
+                  uint,  "fraction", 23,
+                  ubyte, "exponent",  8,
+                  bool,  "sign",      1));
+    }
+    enum uint bias = 127, fractionBits = 23, exponentBits = 8, signBits = 1;
+}
+----
+*/
+alias FloatRep = FloatingPointRepresentation!float;
 
 ///
 @safe unittest
@@ -898,6 +870,27 @@ private struct FloatingPointRepresentation(T)
     assert(rep.exponent == 125);
     assert(rep.sign);
 }
+
+/**
+   Allows manipulating the fraction, exponent, and sign parts of a
+   `double` separately. The definition is:
+
+----
+struct DoubleRep
+{
+    union
+    {
+        double value;
+        mixin(bitfields!(
+                  ulong,   "fraction", 52,
+                  ushort,  "exponent", 11,
+                  bool,    "sign",      1));
+    }
+    enum uint bias = 1023, signBits = 1, fractionBits = 52, exponentBits = 11;
+}
+----
+*/
+alias DoubleRep = FloatingPointRepresentation!double;
 
 ///
 @safe unittest
@@ -986,17 +979,17 @@ private:
     size_t* _ptr;
     enum bitsPerSizeT = size_t.sizeof * 8;
 
-    @property size_t fullWords() const @nogc pure nothrow
+    @property size_t fullWords() const scope @safe @nogc pure nothrow
     {
         return _len / bitsPerSizeT;
     }
     // Number of bits after the last full word
-    @property size_t endBits() const @nogc pure nothrow
+    @property size_t endBits() const scope @safe @nogc pure nothrow
     {
         return _len % bitsPerSizeT;
     }
     // Bit mask to extract the bits after the last full word
-    @property size_t endMask() const @nogc pure nothrow
+    @property size_t endMask() const scope @safe @nogc pure nothrow
     {
         return (size_t(1) << endBits) - 1;
     }
@@ -1418,9 +1411,9 @@ public:
     /**
       Flips a single bit, specified by `pos`
      */
-    void flip(size_t i) @nogc pure nothrow
+    void flip(size_t pos) @nogc pure nothrow
     {
-        bt(_ptr, i) ? btr(_ptr, i) : bts(_ptr, i);
+        bt(_ptr, pos) ? btr(_ptr, pos) : bts(_ptr, pos);
     }
 
     ///
@@ -1440,15 +1433,15 @@ public:
     /**********************************************
      * Counts all the set bits in the `BitArray`
      */
-    size_t count() const @nogc pure nothrow
+    size_t count() const scope @safe @nogc pure nothrow
     {
         if (_ptr)
         {
             size_t bitCount;
             foreach (i; 0 .. fullWords)
-                bitCount += countBitsSet(_ptr[i]);
+                bitCount += (() @trusted => countBitsSet(_ptr[i]))();
             if (endBits)
-                bitCount += countBitsSet(_ptr[fullWords] & endMask);
+                bitCount += (() @trusted => countBitsSet(_ptr[fullWords] & endMask))();
             return bitCount;
         }
         else
@@ -4544,7 +4537,7 @@ if (canSwapEndianness!T && isOutputRange!(R, ubyte))
 Counts the number of set bits in the binary representation of `value`.
 For signed integers, the sign bit is included in the count.
 */
-private uint countBitsSet(T)(const T value) @nogc pure nothrow
+private uint countBitsSet(T)(const T value)
 if (isIntegral!T)
 {
     static if (T.sizeof == 8)

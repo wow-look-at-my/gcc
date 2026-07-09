@@ -1,5 +1,5 @@
 /* Subroutines common to both C and C++ pretty-printers.
-   Copyright (C) 2002-2022 Free Software Foundation, Inc.
+   Copyright (C) 2002-2024 Free Software Foundation, Inc.
    Contributed by Gabriel Dos Reis <gdr@integrable-solutions.net>
 
 This file is part of GCC.
@@ -33,6 +33,9 @@ along with GCC; see the file COPYING3.  If not see
 #include "langhooks.h"
 #include "options.h"
 #include "internal-fn.h"
+#include "function.h"
+#include "basic-block.h"
+#include "gimple.h"
 
 /* The pretty-printer code is primarily designed to closely follow
    (GNU) C and C++ grammars.  That is to be contrasted with spaghetti
@@ -321,6 +324,7 @@ pp_c_pointer (c_pretty_printer *pp, tree t)
       _Bool                          -- C99
       _Complex                       -- C99
       _Imaginary                     -- C99
+      nullptr_t                      -- C23
       struct-or-union-specifier
       enum-specifier
       typedef-name.
@@ -398,6 +402,23 @@ c_pretty_printer::simple_type_specifier (tree t)
 	}
       break;
 
+    case BITINT_TYPE:
+      if (TYPE_NAME (t))
+	{
+	  t = TYPE_NAME (t);
+	  simple_type_specifier (t);
+	}
+      else
+	{
+	  int prec = TYPE_PRECISION (t);
+	  if (TYPE_UNSIGNED (t))
+	    pp_c_ws_string (this, "unsigned");
+	  pp_c_ws_string (this, "_BitInt(");;
+	  pp_decimal_int (this, prec);
+	  pp_right_paren (this);
+	}
+      break;
+
     case TYPE_DECL:
       if (DECL_NAME (t))
 	id_expression (t);
@@ -423,6 +444,9 @@ c_pretty_printer::simple_type_specifier (tree t)
 	id_expression (TYPE_NAME (t));
       else
 	translate_string ("<anonymous>");
+      break;
+    case NULLPTR_TYPE:
+      pp_c_ws_string (this, "nullptr_t");
       break;
 
     default:
@@ -462,7 +486,12 @@ pp_c_specifier_qualifier_list (c_pretty_printer *pp, tree t)
 	  {
 	    pp_c_whitespace (pp);
 	    pp_c_left_paren (pp);
-	    pp_c_attributes_display (pp, TYPE_ATTRIBUTES (pointee));
+	    /* If we're dealing with the GNU form of attributes, print this:
+		 void (__attribute__((noreturn)) *f) ();
+	       If it is the standard [[]] attribute, we'll print the attribute
+	       in c_pretty_printer::direct_abstract_declarator/FUNCTION_TYPE.  */
+	    if (!cxx11_attribute_p (TYPE_ATTRIBUTES (pointee)))
+	      pp_c_attributes_display (pp, TYPE_ATTRIBUTES (pointee));
 	  }
 	else if (!c_dialect_cxx ())
 	  pp_c_whitespace (pp);
@@ -591,6 +620,13 @@ c_pretty_printer::direct_abstract_declarator (tree t)
     case FUNCTION_TYPE:
       pp_c_parameter_type_list (this, t);
       direct_abstract_declarator (TREE_TYPE (t));
+      /* If this is the standard [[]] attribute, print
+	 void (*)() [[noreturn]];  */
+      if (cxx11_attribute_p (TYPE_ATTRIBUTES (t)))
+	{
+	  pp_space (this);
+	  pp_c_attributes_display (this, TYPE_ATTRIBUTES (t));
+	}
       break;
 
     case ARRAY_TYPE:
@@ -652,7 +688,11 @@ c_pretty_printer::direct_abstract_declarator (tree t)
 			maxval = TREE_OPERAND (maxval, 0);
 		    }
 
-		  expression (maxval);
+		  /* This covers unspecified bounds.  */
+		  if (TREE_CODE (maxval) == COMPOUND_EXPR)
+		    pp_string (this, "*");
+		  else
+		    expression (maxval);
 		}
 	    }
 	  else if (TYPE_SIZE (t))
@@ -672,12 +712,14 @@ c_pretty_printer::direct_abstract_declarator (tree t)
     case REAL_TYPE:
     case FIXED_POINT_TYPE:
     case ENUMERAL_TYPE:
+    case BITINT_TYPE:
     case RECORD_TYPE:
     case UNION_TYPE:
     case VECTOR_TYPE:
     case COMPLEX_TYPE:
     case TYPE_DECL:
     case ERROR_MARK:
+    case NULLPTR_TYPE:
       break;
 
     default:
@@ -791,6 +833,7 @@ c_pretty_printer::direct_declarator (tree t)
     case REAL_TYPE:
     case FIXED_POINT_TYPE:
     case ENUMERAL_TYPE:
+    case BITINT_TYPE:
     case UNION_TYPE:
     case RECORD_TYPE:
       break;
@@ -814,6 +857,7 @@ c_pretty_printer::declarator (tree t)
     case REAL_TYPE:
     case FIXED_POINT_TYPE:
     case ENUMERAL_TYPE:
+    case BITINT_TYPE:
     case UNION_TYPE:
     case RECORD_TYPE:
       break;
@@ -845,32 +889,7 @@ c_pretty_printer::declaration (tree t)
   pp_c_init_declarator (this, t);
 }
 
-/* Pretty-print ATTRIBUTES using GNU C extension syntax.  */
-
-void
-pp_c_attributes (c_pretty_printer *pp, tree attributes)
-{
-  if (attributes == NULL_TREE)
-    return;
-
-  pp_c_ws_string (pp, "__attribute__");
-  pp_c_left_paren (pp);
-  pp_c_left_paren (pp);
-  for (; attributes != NULL_TREE; attributes = TREE_CHAIN (attributes))
-    {
-      pp_tree_identifier (pp, TREE_PURPOSE (attributes));
-      if (TREE_VALUE (attributes))
-	pp_c_call_argument_list (pp, TREE_VALUE (attributes));
-
-      if (TREE_CHAIN (attributes))
-	pp_separate_with (pp, ',');
-    }
-  pp_c_right_paren (pp);
-  pp_c_right_paren (pp);
-}
-
-/* Pretty-print ATTRIBUTES using GNU C extension syntax for attributes
-   marked to be displayed on disgnostic.  */
+/* Pretty-print ATTRIBUTES marked to be displayed on diagnostic.  */
 
 void
 pp_c_attributes_display (c_pretty_printer *pp, tree a)
@@ -880,10 +899,12 @@ pp_c_attributes_display (c_pretty_printer *pp, tree a)
   if (a == NULL_TREE)
     return;
 
+  const bool std_p = cxx11_attribute_p (a);
+
   for (; a != NULL_TREE; a = TREE_CHAIN (a))
     {
-      const struct attribute_spec *as;
-      as = lookup_attribute_spec (TREE_PURPOSE (a));
+      const struct attribute_spec *as
+	= lookup_attribute_spec (get_attribute_name (a));
       if (!as || as->affects_type_identity == false)
         continue;
       if (c_dialect_cxx ()
@@ -891,26 +912,47 @@ pp_c_attributes_display (c_pretty_printer *pp, tree a)
 	/* In C++ transaction_safe is printed at the end of the declarator.  */
 	continue;
       if (is_first)
-       {
-         pp_c_ws_string (pp, "__attribute__");
-         pp_c_left_paren (pp);
-         pp_c_left_paren (pp);
-         is_first = false;
-       }
+	{
+	  if (std_p)
+	    {
+	      pp_c_left_bracket (pp);
+	      pp_c_left_bracket (pp);
+	    }
+	  else
+	    {
+	      pp_c_ws_string (pp, "__attribute__");
+	      pp_c_left_paren (pp);
+	      pp_c_left_paren (pp);
+	    }
+	  is_first = false;
+	}
       else
-       {
-         pp_separate_with (pp, ',');
-       }
-      pp_tree_identifier (pp, TREE_PURPOSE (a));
+	pp_separate_with (pp, ',');
+      tree ns;
+      if (std_p && (ns = get_attribute_namespace (a)))
+	{
+	  pp_tree_identifier (pp, ns);
+	  pp_colon (pp);
+	  pp_colon (pp);
+	}
+      pp_tree_identifier (pp, get_attribute_name (a));
       if (TREE_VALUE (a))
-       pp_c_call_argument_list (pp, TREE_VALUE (a));
+	pp_c_call_argument_list (pp, TREE_VALUE (a));
     }
 
   if (!is_first)
     {
-      pp_c_right_paren (pp);
-      pp_c_right_paren (pp);
-      pp_c_whitespace (pp);
+      if (std_p)
+	{
+	  pp_c_right_bracket (pp);
+	  pp_c_right_bracket (pp);
+	}
+      else
+	{
+	  pp_c_right_paren (pp);
+	  pp_c_right_paren (pp);
+	  pp_c_whitespace (pp);
+	}
     }
 }
 
@@ -1004,8 +1046,18 @@ pp_c_integer_constant (c_pretty_printer *pp, tree i)
 	  pp_minus (pp);
 	  wi = -wi;
 	}
-      print_hex (wi, pp_buffer (pp)->digit_buffer);
-      pp_string (pp, pp_buffer (pp)->digit_buffer);
+      unsigned int prec = wi.get_precision ();
+      if ((prec + 3) / 4 > sizeof (pp_buffer (pp)->digit_buffer) - 3)
+	{
+	  char *buf = XALLOCAVEC (char, (prec + 3) / 4 + 3);
+	  print_hex (wi, buf);
+	  pp_string (pp, buf);
+	}
+      else
+	{
+	  print_hex (wi, pp_buffer (pp)->digit_buffer);
+	  pp_string (pp, pp_buffer (pp)->digit_buffer);
+	}
     }
 }
 
@@ -1219,6 +1271,8 @@ c_pretty_printer::constant (tree e)
 	  pp_c_character_constant (this, e);
 	else if (TREE_CODE (type) == ENUMERAL_TYPE)
 	  pp_c_enumeration_constant (this, e);
+	else if (NULLPTR_TYPE_P (type))
+	  pp_string (this, "nullptr");
 	else
 	  pp_c_integer_constant (this, e);
       }
@@ -1363,12 +1417,14 @@ c_pretty_printer::primary_expression (tree e)
 	  else
 	    primary_expression (var);
 	}
-      else
+      else if (gimple_assign_single_p (SSA_NAME_DEF_STMT (e)))
 	{
 	  /* Print only the right side of the GIMPLE assignment.  */
 	  gimple *def_stmt = SSA_NAME_DEF_STMT (e);
 	  pp_gimple_stmt_1 (this, def_stmt, 0, TDF_RHS_ONLY);
 	}
+      else
+	expression (e);
       break;
 
     default:
@@ -1595,6 +1651,17 @@ c_pretty_printer::postfix_expression (tree e)
       postfix_expression (TREE_OPERAND (e, 0));
       pp_c_left_bracket (this);
       expression (TREE_OPERAND (e, 1));
+      pp_c_right_bracket (this);
+      break;
+
+    case OMP_ARRAY_SECTION:
+      postfix_expression (TREE_OPERAND (e, 0));
+      pp_c_left_bracket (this);
+      if (TREE_OPERAND (e, 1))
+	expression (TREE_OPERAND (e, 1));
+      pp_colon (this);
+      if (TREE_OPERAND (e, 2))
+	expression (TREE_OPERAND (e, 2));
       pp_c_right_bracket (this);
       break;
 
@@ -2264,6 +2331,7 @@ pp_c_cast_expression (c_pretty_printer *pp, tree e)
     case FIX_TRUNC_EXPR:
     CASE_CONVERT:
     case VIEW_CONVERT_EXPR:
+    case EXCESS_PRECISION_EXPR:
       if (!location_wrapper_p (e))
 	pp_c_type_cast (pp, TREE_TYPE (e));
       pp_c_cast_expression (pp, TREE_OPERAND (e, 0));
@@ -2647,6 +2715,7 @@ c_pretty_printer::expression (tree e)
     case POSTINCREMENT_EXPR:
     case POSTDECREMENT_EXPR:
     case ARRAY_REF:
+    case OMP_ARRAY_SECTION:
     case CALL_EXPR:
     case COMPONENT_REF:
     case BIT_FIELD_REF:
@@ -2689,6 +2758,7 @@ c_pretty_printer::expression (tree e)
     case FIX_TRUNC_EXPR:
     CASE_CONVERT:
     case VIEW_CONVERT_EXPR:
+    case EXCESS_PRECISION_EXPR:
       pp_c_cast_expression (this, e);
       break;
 

@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 S p e c                                  --
 --                                                                          --
---          Copyright (C) 1992-2022, Free Software Foundation, Inc.         --
+--          Copyright (C) 1992-2024, Free Software Foundation, Inc.         --
 --                                                                          --
 -- GNAT is free software;  you can  redistribute it  and/or modify it under --
 -- terms of the  GNU General Public License as published  by the Free Soft- --
@@ -409,8 +409,6 @@ package Sinput is
 
    Current_Source_File : Source_File_Index := No_Source_File;
    --  Source_File table index of source file currently being scanned.
-   --  Initialized so that some tools (such as gprbuild) can be built with
-   --  -gnatVa and pragma Initialize_Scalars without problems.
 
    Current_Source_Unit : Unit_Number_Type := No_Unit;
    --  Unit number of source file currently being scanned. Initialized to
@@ -542,11 +540,6 @@ package Sinput is
    --  the same as the physical line number.
 
    --  WARNING: There is a matching C declaration of this subprogram in fe.h
-
-   function Get_Logical_Line_Number_Img
-     (P : Source_Ptr) return String;
-   --  Same as above function, but returns the line number as a string of
-   --  decimal digits, with no leading space. Destroys Name_Buffer.
 
    function Get_Physical_Line_Number
      (P : Source_Ptr) return Physical_Line_Number;
@@ -693,14 +686,11 @@ package Sinput is
    --  names in some situations.
 
    procedure Write_Location (P : Source_Ptr);
-   --  Writes out a string of the form fff:nn:cc, where fff, nn, cc are the
-   --  file name, line number and column corresponding to the given source
-   --  location. No_Location and Standard_Location appear as the strings
-   --  <no location> and <standard location>. If the location is within an
-   --  instantiation, then the instance location is appended, enclosed in
-   --  square brackets (which can nest if necessary). Note that this routine
-   --  is used only for internal compiler debugging output purposes (which
-   --  is why the somewhat cryptic use of brackets is acceptable).
+   --  Writes P, in the form fff:nn:cc, where fff, nn, cc are the file name,
+   --  line number and column corresponding to the given source location. If
+   --  the location is within an instantiation, then the instance location is
+   --  appended, enclosed in square brackets, which can nest if necessary. This
+   --  is used only for debugging output.
 
    procedure wl (P : Source_Ptr);
    pragma Export (Ada, wl);

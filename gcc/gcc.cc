@@ -1,5 +1,5 @@
 /* Compiler driver program that can handle many languages.
-   Copyright (C) 1987-2022 Free Software Foundation, Inc.
+   Copyright (C) 1987-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -27,8 +27,12 @@ CC recognizes how to compile each input file by suffixes in the file names.
 Once it knows which kind of compilation to perform, the procedure for
 compilation is specified by a string called a "spec".  */
 
+#define INCLUDE_STRING
 #include "config.h"
 #include "system.h"
+#ifdef HOST_HAS_PERSONALITY_ADDR_NO_RANDOMIZE
+#include <sys/personality.h>
+#endif
 #include "coretypes.h"
 #include "multilib.h" /* before tm.h */
 #include "tm.h"
@@ -43,7 +47,15 @@ compilation is specified by a string called a "spec".  */
 #include "opts.h"
 #include "filenames.h"
 #include "spellcheck.h"
+#include "opts-jobserver.h"
+#include "common/common-target.h"
+#include "gcc-urlifier.h"
+#include "compile-cache-format.h"	/* compiler-id sidecar format */
+#include "compile-cache-serve.h"	/* driver-level warm-hit serve */
 
+#ifndef MATH_LIBRARY
+#define MATH_LIBRARY "m"
+#endif
 
 
 /* Manage the manipulation of env vars.
@@ -295,6 +307,14 @@ static size_t dumpdir_length = 0;
    driver added to dumpdir after dumpbase or linker output name.  */
 static bool dumpdir_trailing_dash_added = false;
 
+/* True if -r, -shared, -pie, -no-pie, -z lazy, or -z norelro were
+   specified on the command line, and therefore -fhardened should not
+   add -z now/relro.  */
+static bool avoid_linker_hardening_p;
+
+/* True if -static was specified on the command line.  */
+static bool static_p;
+
 /* Basename of dump and aux outputs, computed from dumpbase (given or
    derived from output name), to override input_basename in non-%w %b
    et al.  */
@@ -440,6 +460,7 @@ static const char *greater_than_spec_func (int, const char **);
 static const char *debug_level_greater_than_spec_func (int, const char **);
 static const char *dwarf_version_greater_than_spec_func (int, const char **);
 static const char *find_fortran_preinclude_file (int, const char **);
+static const char *join_spec_func (int, const char **);
 static char *convert_white_space (char *);
 static char *quote_spec (char *);
 static char *quote_spec_arg (char *);
@@ -572,6 +593,7 @@ or with constant text in a single argument.
  %l     process LINK_SPEC as a spec.
  %L     process LIB_SPEC as a spec.
  %M     Output multilib_os_dir.
+ %P	Output a RUNPATH_OPTION for each directory in startfile_prefixes.
  %G     process LIBGCC_SPEC as a spec.
  %R     Output the concatenation of target_system_root and
         target_sysroot_suffix.
@@ -703,6 +725,13 @@ proper position among the other output files.  */
 #define CPP_SPEC ""
 #endif
 
+/* Operating systems can define OS_CC1_SPEC to provide extra args to cc1 and
+   cc1plus or extra switch-translations.  The OS_CC1_SPEC is appended
+   to CC1_SPEC in the initialization of cc1_spec.  */
+#ifndef OS_CC1_SPEC
+#define OS_CC1_SPEC ""
+#endif
+
 /* config.h can define CC1_SPEC to provide extra args to cc1 and cc1plus
    or extra switch-translations.  */
 #ifndef CC1_SPEC
@@ -828,21 +857,19 @@ proper position among the other output files.  */
 #define LINK_COMPRESS_DEBUG_SPEC \
 	" %{gz*:%e-gz is not supported in this configuration} "
 #elif HAVE_LD_COMPRESS_DEBUG == 1
-/* GNU style on input, GNU ld options.  Reject, not useful.  */
-#define LINK_COMPRESS_DEBUG_SPEC \
-	" %{gz*:%e-gz is not supported in this configuration} "
-#elif HAVE_LD_COMPRESS_DEBUG == 2
-/* GNU style, GNU gold options.  */
-#define LINK_COMPRESS_DEBUG_SPEC \
-	" %{gz|gz=zlib-gnu:" LD_COMPRESS_DEBUG_OPTION "=zlib}" \
-	" %{gz=none:"        LD_COMPRESS_DEBUG_OPTION "=none}" \
-	" %{gz=zlib:%e-gz=zlib is not supported in this configuration} "
-#elif HAVE_LD_COMPRESS_DEBUG == 3
 /* ELF gABI style.  */
 #define LINK_COMPRESS_DEBUG_SPEC \
 	" %{gz|gz=zlib:"  LD_COMPRESS_DEBUG_OPTION "=zlib}" \
 	" %{gz=none:"	  LD_COMPRESS_DEBUG_OPTION "=none}" \
-	" %{gz=zlib-gnu:" LD_COMPRESS_DEBUG_OPTION "=zlib-gnu} "
+	" %{gz=zstd:%e-gz=zstd is not supported in this configuration} " \
+	" %{gz=zlib-gnu:}" /* Ignore silently zlib-gnu option value.  */
+#elif HAVE_LD_COMPRESS_DEBUG == 2
+/* ELF gABI style and ZSTD.  */
+#define LINK_COMPRESS_DEBUG_SPEC \
+	" %{gz|gz=zlib:"  LD_COMPRESS_DEBUG_OPTION "=zlib}" \
+	" %{gz=none:"	  LD_COMPRESS_DEBUG_OPTION "=none}" \
+	" %{gz=zstd:"	  LD_COMPRESS_DEBUG_OPTION "=zstd}" \
+	" %{gz=zlib-gnu:}" /* Ignore silently zlib-gnu option value.  */
 #else
 #error Unknown value for HAVE_LD_COMPRESS_DEBUG.
 #endif
@@ -876,37 +903,38 @@ proper position among the other output files.  */
 #endif
 
 #ifdef HAVE_AS_DEBUG_PREFIX_MAP
-#define ASM_MAP " %{fdebug-prefix-map=*:--debug-prefix-map %*}"
+#define ASM_MAP " %{ffile-prefix-map=*:--debug-prefix-map %*} %{fdebug-prefix-map=*:--debug-prefix-map %*}"
 #else
 #define ASM_MAP ""
 #endif
 
 /* Assembler options for compressed debug sections.  */
-#if HAVE_LD_COMPRESS_DEBUG < 2
+#if HAVE_LD_COMPRESS_DEBUG == 0
 /* Reject if the linker cannot write compressed debug sections.  */
 #define ASM_COMPRESS_DEBUG_SPEC \
 	" %{gz*:%e-gz is not supported in this configuration} "
-#else /* HAVE_LD_COMPRESS_DEBUG >= 2 */
+#else /* HAVE_LD_COMPRESS_DEBUG >= 1 */
 #if HAVE_AS_COMPRESS_DEBUG == 0
 /* No assembler support.  Ignore silently.  */
 #define ASM_COMPRESS_DEBUG_SPEC \
 	" %{gz*:} "
 #elif HAVE_AS_COMPRESS_DEBUG == 1
-/* GNU style, GNU as options.  */
-#define ASM_COMPRESS_DEBUG_SPEC \
-	" %{gz|gz=zlib-gnu:" AS_COMPRESS_DEBUG_OPTION "}" \
-	" %{gz=none:"        AS_NO_COMPRESS_DEBUG_OPTION "}" \
-	" %{gz=zlib:%e-gz=zlib is not supported in this configuration} "
-#elif HAVE_AS_COMPRESS_DEBUG == 2
 /* ELF gABI style.  */
 #define ASM_COMPRESS_DEBUG_SPEC \
 	" %{gz|gz=zlib:"  AS_COMPRESS_DEBUG_OPTION "=zlib}" \
 	" %{gz=none:"	  AS_COMPRESS_DEBUG_OPTION "=none}" \
-	" %{gz=zlib-gnu:" AS_COMPRESS_DEBUG_OPTION "=zlib-gnu} "
+	" %{gz=zlib-gnu:}" /* Ignore silently zlib-gnu option value.  */
+#elif HAVE_AS_COMPRESS_DEBUG == 2
+/* ELF gABI style and ZSTD.  */
+#define ASM_COMPRESS_DEBUG_SPEC \
+	" %{gz|gz=zlib:"  AS_COMPRESS_DEBUG_OPTION "=zlib}" \
+	" %{gz=none:"	  AS_COMPRESS_DEBUG_OPTION "=none}" \
+	" %{gz=zstd:"	  AS_COMPRESS_DEBUG_OPTION "=zstd}" \
+	" %{gz=zlib-gnu:}" /* Ignore silently zlib-gnu option value.  */
 #else
 #error Unknown value for HAVE_AS_COMPRESS_DEBUG.
 #endif
-#endif /* HAVE_LD_COMPRESS_DEBUG >= 2 */
+#endif /* HAVE_LD_COMPRESS_DEBUG >= 1 */
 
 /* Define ASM_DEBUG_SPEC to be a spec suitable for translating '-g'
    to the assembler, when compiling assembly sources only.  */
@@ -925,26 +953,11 @@ proper position among the other output files.  */
 # else
 #  define ASM_DEBUG_DWARF_OPTION "--gdwarf2"
 # endif
-# if defined(DBX_DEBUGGING_INFO) && defined(DWARF2_DEBUGGING_INFO) \
-     && defined(HAVE_AS_GDWARF2_DEBUG_FLAG) && defined(HAVE_AS_GSTABS_DEBUG_FLAG)
-#  define ASM_DEBUG_SPEC						\
-      (PREFERRED_DEBUGGING_TYPE == DBX_DEBUG				\
-       ? "%{%:debug-level-gt(0):"					\
-	 "%{gdwarf*:" ASM_DEBUG_DWARF_OPTION "};"			\
-	 ":%{g*:--gstabs}}" ASM_MAP					\
-       : "%{%:debug-level-gt(0):"					\
-	 "%{gstabs*:--gstabs;"						\
-	 ":%{g*:" ASM_DEBUG_DWARF_OPTION "}}}" ASM_MAP)
-# else
-#  if defined(DBX_DEBUGGING_INFO) && defined(HAVE_AS_GSTABS_DEBUG_FLAG)
-#   define ASM_DEBUG_SPEC "%{g*:%{%:debug-level-gt(0):--gstabs}}" ASM_MAP
-#  endif
 #  if defined(DWARF2_DEBUGGING_INFO) && defined(HAVE_AS_GDWARF2_DEBUG_FLAG)
 #   define ASM_DEBUG_SPEC "%{g*:%{%:debug-level-gt(0):" \
 	ASM_DEBUG_DWARF_OPTION "}}" ASM_MAP
 #  endif
 # endif
-#endif
 #ifndef ASM_DEBUG_SPEC
 # define ASM_DEBUG_SPEC ""
 #endif
@@ -958,14 +971,7 @@ proper position among the other output files.  */
 	"%:dwarf-version-gt(3):--gdwarf-4 ;"				\
 	"%:dwarf-version-gt(2):--gdwarf-3 ;"				\
 	":--gdwarf2 }"
-#  if defined(DBX_DEBUGGING_INFO) && defined(DWARF2_DEBUGGING_INFO)
-#  define ASM_DEBUG_OPTION_SPEC						\
-      (PREFERRED_DEBUGGING_TYPE == DBX_DEBUG				\
-       ? "%{%:debug-level-gt(0):"					\
-	 "%{gdwarf*:" ASM_DEBUG_OPTION_DWARF_OPT "}}" 			\
-       : "%{%:debug-level-gt(0):"					\
-	 "%{!gstabs*:%{g*:" ASM_DEBUG_OPTION_DWARF_OPT "}}}")
-# elif defined(DWARF2_DEBUGGING_INFO)
+# if defined(DWARF2_DEBUGGING_INFO)
 #   define ASM_DEBUG_OPTION_SPEC "%{g*:%{%:debug-level-gt(0):" \
 	ASM_DEBUG_OPTION_DWARF_OPT "}}"
 #  endif
@@ -1159,13 +1165,13 @@ proper position among the other output files.  */
    "%{fuse-ld=*:-fuse-ld=%*} " LINK_COMPRESS_DEBUG_SPEC \
    "%X %{o*} %{e*} %{N} %{n} %{r}\
     %{s} %{t} %{u*} %{z} %{Z} %{!nostdlib:%{!r:%{!nostartfiles:%S}}} \
-    %{static|no-pie|static-pie:} %@{L*} %(mfwrap) %(link_libgcc) " \
+    %{static|no-pie|static-pie:} %@{L*} %(link_libgcc) " \
     VTABLE_VERIFICATION_SPEC " " SANITIZER_EARLY_SPEC " %o "" \
     %{fopenacc|fopenmp|%:gt(%{ftree-parallelize-loops=*:%*} 1):\
 	%:include(libgomp.spec)%(link_gomp)}\
     %{fgnu-tm:%:include(libitm.spec)%(link_itm)}\
-    %(mflib) " STACK_SPLIT_SPEC "\
-    %{fprofile-arcs|fprofile-generate*|coverage:-lgcov} " SANITIZER_SPEC " \
+    " STACK_SPLIT_SPEC "\
+    %{fprofile-arcs|fcondition-coverage|fprofile-generate*|coverage:-lgcov} " SANITIZER_SPEC " \
     %{!nostdlib:%{!r:%{!nodefaultlibs:%(link_ssp) %(link_gcc_c_sequence)}}}\
     %{!nostdlib:%{!r:%{!nostartfiles:%E}}} %{T*}  \n%(post_link) }}}}}}"
 #endif
@@ -1191,10 +1197,14 @@ proper position among the other output files.  */
 # define SYSROOT_HEADERS_SUFFIX_SPEC ""
 #endif
 
+#ifndef RUNPATH_OPTION
+# define RUNPATH_OPTION "-rpath"
+#endif
+
 static const char *asm_debug = ASM_DEBUG_SPEC;
 static const char *asm_debug_option = ASM_DEBUG_OPTION_SPEC;
 static const char *cpp_spec = CPP_SPEC;
-static const char *cc1_spec = CC1_SPEC;
+static const char *cc1_spec = CC1_SPEC OS_CC1_SPEC;
 static const char *cc1plus_spec = CC1PLUS_SPEC;
 static const char *link_gcc_c_sequence_spec = LINK_GCC_C_SEQUENCE_SPEC;
 static const char *link_ssp_spec = LINK_SSP_SPEC;
@@ -1244,7 +1254,9 @@ static const char *cpp_unique_options =
  %{remap} %{%:debug-level-gt(2):-dD}\
  %{!iplugindir*:%{fplugin*:%:find-plugindir()}}\
  %{H} %C %{D*&U*&A*} %{i*} %Z %i\
- %{E|M|MM:%W{o*}}";
+ %{E|M|MM:%W{o*}}\
+ %{fdeps-format=*:%{!fdeps-file=*:-fdeps-file=%:join(%{!o:%b.ddi}%{o*:%.ddi%*})}}\
+ %{fdeps-format=*:%{!fdeps-target=*:-fdeps-target=%:join(%{!o:%b.o}%{o*:%.o%*})}}";
 
 /* This contains cpp options which are common with cc1_options and are passed
    only when preprocessing only to avoid duplication.  We pass the cc1 spec
@@ -1279,10 +1291,11 @@ static const char *cc1_options =
  %{-target-help:--target-help}\
  %{-version:--version}\
  %{-help=*:--help=%*}\
- %{!fsyntax-only:%{S:%W{o*}%{!o*:-o %w%b.s}}}\
+ %{!fsyntax-only:\
+   %{S:-fasm-output-only %W{o*}%{!o*:-o %w%b.s}}}\
  %{fsyntax-only:-o %j} %{-param*}\
  %{coverage:-fprofile-arcs -ftest-coverage}\
- %{fprofile-arcs|fprofile-generate*|coverage:\
+ %{fprofile-arcs|fcondition-coverage|fprofile-generate*|coverage:\
    %{!fprofile-update=single:\
      %{pthread:-fprofile-update=prefer-atomic}}}";
 
@@ -1297,16 +1310,59 @@ static const char *asm_options =
 ASM_COMPRESS_DEBUG_SPEC
 "%a %Y %{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}";
 
-static const char *invoke_as =
+/* Integrated assembler: by default (-fintegrated-as, Init(1)) cc1plus
+   assembles in-process via libgas, so there is no separate `as` stage -- the
+   compile-to-object is a single process.  The object's -o name is then
+   handed to cc1plus HERE (the %{!fno-integrated-as:...%O} arm below, the
+   same construct stock GCC's asm_options handed to `as`), NOT in
+   cc1_options: only the specs that actually compile to an object reference
+   %(invoke_as), while the PCH specs (@c-header / @c++-header et al.) supply
+   their own `-o %g.s` plus --output-pch and must NOT receive a second -o
+   (cc1 rejects a duplicate with "output filename specified twice").
+
+   With -fno-integrated-as the classic two-process pipeline runs instead:
+   cc1plus writes textual assembly to a temporary .s (-fasm-output-only, the
+   same exemption -S and the PCH specs use; %| honors -pipe) and the
+   external `as` produces the real object -- %(asm_options) carries the
+   object -o exactly as in stock GCC's invoke_as and as the @assembler spec
+   still does for hand-written .s inputs.  check_live_switch() marks the
+   earlier of a -fintegrated-as/-fno-integrated-as pair dead, so the
+   %{fno-integrated-as:...} matchers get last-one-wins semantics for free.
+   The driver also auto-selects this arm (by injecting -fno-integrated-as in
+   process_command) whenever -Wa,/-Xassembler options are present, because
+   the in-process assembler cannot take options; likewise for -save-temps*
+   (which promises the intermediate .s on disk) and -gsplit-dwarf (whose
+   .dwo extraction is ASM_FINAL_SPEC's objcopy pass after the as step) --
+   see the audit block there.  Such compiles are compile-cache-ineligible on
+   both the serve and store sides (tag: skip-no-integrated-as).
+
+   The compare-debug dump-opt hook is kept ahead of both arms because it
+   rewrites cc1's own -o dump naming and must still run.  */
 #ifdef AS_NEEDS_DASH_FOR_PIPED_INPUT
+#define INVOKE_AS_EXTERNAL \
+"%{!S:-fasm-output-only -o %|.s |\n as %(asm_debug) %(asm_options) %|.s %A }"
+#else
+#define INVOKE_AS_EXTERNAL \
+"%{!S:-fasm-output-only -o %|.s |\n as %(asm_debug) %(asm_options) %m.s %A }"
+#endif
+#ifdef HAVE_LIBGAS
+static const char *invoke_as =
 "%{!fwpa*:\
    %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
-   %{!S:-o %|.s |\n as %(asm_options) %|.s %A }\
+   %{fno-integrated-as:" INVOKE_AS_EXTERNAL "}\
+   %{!fno-integrated-as:%{!S:%{c:%W{o*}%{!o*:-o %w%b%O}}%{!c:-o %d%w%u%O}}}\
   }";
 #else
+/* Built without libgas (HAVE_LIBGAS unset -- not a combined tree, or a
+   target the embedded assembler does not support): the external pipeline is
+   the only pipeline, regardless of any -fintegrated-as on the command line
+   (which cc1 then rejects with a sorry; the spec must still route the
+   compile through `as` so the error is the compiler's, not a cascade of
+   missing-object failures).  */
+static const char *invoke_as =
 "%{!fwpa*:\
    %{fcompare-debug=*|fdump-final-insns=*:%:compare-debug-dump-opt()}\
-   %{!S:-o %|.s |\n as %(asm_options) %m.s %A }\
+   " INVOKE_AS_EXTERNAL "\
   }";
 #endif
 
@@ -1347,7 +1403,11 @@ static const char *const multilib_defaults_raw[] = MULTILIB_DEFAULTS;
 
 static const char *const driver_self_specs[] = {
   "%{fdump-final-insns:-fdump-final-insns=.} %<fdump-final-insns",
-  DRIVER_SELF_SPECS, CONFIGURE_SPECS, GOMP_SELF_SPECS, GTM_SELF_SPECS
+  DRIVER_SELF_SPECS, CONFIGURE_SPECS, GOMP_SELF_SPECS, GTM_SELF_SPECS,
+  /* This discards -fmultiflags at the end of self specs processing in the
+     driver, so that it is effectively Ignored, without actually marking it as
+     Ignored, which would get it discarded before self specs could remap it.  */
+  "%<fmultiflags"
 };
 
 #ifndef OPTION_DEFAULT_SPECS
@@ -1432,6 +1492,7 @@ static const struct compiler default_compilers[] =
   {".r", "#Ratfor", 0, 0, 0},
   {".go", "#Go", 0, 1, 0},
   {".d", "#D", 0, 1, 0}, {".dd", "#D", 0, 1, 0}, {".di", "#D", 0, 1, 0},
+  {".mod", "#Modula-2", 0, 0, 0}, {".m2i", "#Modula-2", 0, 0, 0},
   /* Next come the entries for C.  */
   {".c", "@c", 0, 0, 1},
   {"@c",
@@ -1461,14 +1522,14 @@ static const struct compiler default_compilers[] =
 		%(cpp_options) -o %{save-temps*:%b.i} %{!save-temps*:%g.i} \n\
 		    cc1 -fpreprocessed %{save-temps*:%b.i} %{!save-temps*:%g.i} \
 			%(cc1_options)\
-			%{!fsyntax-only:%{!S:-o %g.s} \
-			    %{!fdump-ada-spec*:%{!o*:--output-pch=%i.gch}\
-					       %W{o*:--output-pch=%*}}%V}}\
+			%{!fsyntax-only:%{!S:-fasm-output-only -o %g.s} \
+			    %{!fdump-ada-spec*:%{!o*:--output-pch %w%i.gch}\
+					       %W{o*:--output-pch %w%*}}%{!S:%V}}}\
 	  %{!save-temps*:%{!traditional-cpp:%{!no-integrated-cpp:\
 		cc1 %(cpp_unique_options) %(cc1_options)\
-		    %{!fsyntax-only:%{!S:-o %g.s} \
-		        %{!fdump-ada-spec*:%{!o*:--output-pch=%i.gch}\
-					   %W{o*:--output-pch=%*}}%V}}}}}}}", 0, 0, 0},
+		    %{!fsyntax-only:%{!S:-fasm-output-only -o %g.s} \
+		        %{!fdump-ada-spec*:%{!o*:--output-pch %w%i.gch}\
+					   %W{o*:--output-pch %w%*}}%{!S:%V}}}}}}}}", 0, 0, 0},
   {".i", "@cpp-output", 0, 0, 0},
   {"@cpp-output",
    "%{!M:%{!MM:%{!E:cc1 -fpreprocessed %i %(cc1_options) %{!fsyntax-only:%(invoke_as)}}}}", 0, 0, 0},
@@ -1776,6 +1837,7 @@ static const struct spec_function static_spec_functions[] =
   { "debug-level-gt",		debug_level_greater_than_spec_func },
   { "dwarf-version-gt",		dwarf_version_greater_than_spec_func },
   { "fortran-preinclude-file",	find_fortran_preinclude_file},
+  { "join",			join_spec_func},
 #ifdef EXTRA_SPEC_FUNCTIONS
   EXTRA_SPEC_FUNCTIONS
 #endif
@@ -2398,8 +2460,7 @@ read_specs (const char *filename, bool main_p, bool user_p)
 	      if (*p1++ != '<' || p[-2] != '>')
 		fatal_error (input_location,
 			     "specs %%include syntax malformed after "
-			     "%ld characters",
-			     (long) (p1 - buffer + 1));
+			     "%td characters", p1 - buffer + 1);
 
 	      p[-2] = '\0';
 	      new_filename = find_a_file (&startfile_prefixes, p1, R_OK, true);
@@ -2419,8 +2480,7 @@ read_specs (const char *filename, bool main_p, bool user_p)
 	      if (*p1++ != '<' || p[-2] != '>')
 		fatal_error (input_location,
 			     "specs %%include syntax malformed after "
-			     "%ld characters",
-			     (long) (p1 - buffer + 1));
+			     "%td characters", p1 - buffer + 1);
 
 	      p[-2] = '\0';
 	      new_filename = find_a_file (&startfile_prefixes, p1, R_OK, true);
@@ -2446,8 +2506,7 @@ read_specs (const char *filename, bool main_p, bool user_p)
 	      if (! ISALPHA ((unsigned char) *p1))
 		fatal_error (input_location,
 			     "specs %%rename syntax malformed after "
-			     "%ld characters",
-			     (long) (p1 - buffer));
+			     "%td characters", p1 - buffer);
 
 	      p2 = p1;
 	      while (*p2 && !ISSPACE ((unsigned char) *p2))
@@ -2456,8 +2515,7 @@ read_specs (const char *filename, bool main_p, bool user_p)
 	      if (*p2 != ' ' && *p2 != '\t')
 		fatal_error (input_location,
 			     "specs %%rename syntax malformed after "
-			     "%ld characters",
-			     (long) (p2 - buffer));
+			     "%td characters", p2 - buffer);
 
 	      name_len = p2 - p1;
 	      *p2++ = '\0';
@@ -2467,8 +2525,7 @@ read_specs (const char *filename, bool main_p, bool user_p)
 	      if (! ISALPHA ((unsigned char) *p2))
 		fatal_error (input_location,
 			     "specs %%rename syntax malformed after "
-			     "%ld characters",
-			     (long) (p2 - buffer));
+			     "%td characters", p2 - buffer);
 
 	      /* Get new spec name.  */
 	      p3 = p2;
@@ -2478,8 +2535,7 @@ read_specs (const char *filename, bool main_p, bool user_p)
 	      if (p3 != p - 1)
 		fatal_error (input_location,
 			     "specs %%rename syntax malformed after "
-			     "%ld characters",
-			     (long) (p3 - buffer));
+			     "%td characters", p3 - buffer);
 	      *p3 = '\0';
 
 	      for (sl = specs; sl; sl = sl->next)
@@ -2518,8 +2574,8 @@ read_specs (const char *filename, bool main_p, bool user_p)
 	    }
 	  else
 	    fatal_error (input_location,
-			 "specs unknown %% command after %ld characters",
-			 (long) (p1 - buffer));
+			 "specs unknown %% command after %td characters",
+			 p1 - buffer);
 	}
 
       /* Find the colon that should end the suffix.  */
@@ -2530,8 +2586,8 @@ read_specs (const char *filename, bool main_p, bool user_p)
       /* The colon shouldn't be missing.  */
       if (*p1 != ':')
 	fatal_error (input_location,
-		     "specs file malformed after %ld characters",
-		     (long) (p1 - buffer));
+		     "specs file malformed after %td characters",
+		     p1 - buffer);
 
       /* Skip back over trailing whitespace.  */
       p2 = p1;
@@ -2544,8 +2600,8 @@ read_specs (const char *filename, bool main_p, bool user_p)
       p = skip_whitespace (p1 + 1);
       if (p[1] == 0)
 	fatal_error (input_location,
-		     "specs file malformed after %ld characters",
-		     (long) (p - buffer));
+		     "specs file malformed after %td characters",
+		     p - buffer);
 
       p1 = p;
       /* Find next blank line or end of string.  */
@@ -3583,42 +3639,6 @@ execute (void)
   }
 }
 
-/* Find all the switches given to us
-   and make a vector describing them.
-   The elements of the vector are strings, one per switch given.
-   If a switch uses following arguments, then the `part1' field
-   is the switch itself and the `args' field
-   is a null-terminated vector containing the following arguments.
-   Bits in the `live_cond' field are:
-   SWITCH_LIVE to indicate this switch is true in a conditional spec.
-   SWITCH_FALSE to indicate this switch is overridden by a later switch.
-   SWITCH_IGNORE to indicate this switch should be ignored (used in %<S).
-   SWITCH_IGNORE_PERMANENTLY to indicate this switch should be ignored.
-   SWITCH_KEEP_FOR_GCC to indicate that this switch, otherwise ignored,
-   should be included in COLLECT_GCC_OPTIONS.
-   in all do_spec calls afterwards.  Used for %<S from self specs.
-   The `known' field describes whether this is an internal switch.
-   The `validated' field describes whether any spec has looked at this switch;
-   if it remains false at the end of the run, the switch must be meaningless.
-   The `ordering' field is used to temporarily mark switches that have to be
-   kept in a specific order.  */
-
-#define SWITCH_LIVE    			(1 << 0)
-#define SWITCH_FALSE   			(1 << 1)
-#define SWITCH_IGNORE			(1 << 2)
-#define SWITCH_IGNORE_PERMANENTLY	(1 << 3)
-#define SWITCH_KEEP_FOR_GCC		(1 << 4)
-
-struct switchstr
-{
-  const char *part1;
-  const char **args;
-  unsigned int live_cond;
-  bool known;
-  bool validated;
-  bool ordering;
-};
-
 static struct switchstr *switches;
 
 static int n_switches;
@@ -4161,6 +4181,48 @@ next_item:
     }
 }
 
+/* Forward certain options to offloading compilation.  */
+
+static void
+forward_offload_option (size_t opt_index, const char *arg, bool validated)
+{
+  switch (opt_index)
+    {
+    case OPT_l:
+      /* Use a '_GCC_' prefix and standard name ('-l_GCC_m' irrespective of the
+	 host's 'MATH_LIBRARY', for example), so that the 'mkoffload's can tell
+	 this has been synthesized here, and translate/drop as necessary.  */
+      /* Note that certain libraries ('-lc', '-lgcc', '-lgomp', for example)
+	 are injected by default in offloading compilation, and therefore not
+	 forwarded here.  */
+      /* GCC libraries.  */
+      if (/* '-lgfortran' */ strcmp (arg, "gfortran") == 0 )
+	save_switch (concat ("-foffload-options=-l_GCC_", arg, NULL),
+		     0, NULL, validated, true);
+      /* Other libraries.  */
+      else
+	{
+	  /* The case will need special consideration where on the host
+	     '!need_math', but for offloading compilation still need
+	     '-foffload-options=-l_GCC_m'.  The problem is that we don't get
+	     here anything like '-lm', because it's not synthesized in
+	     'gcc/fortran/gfortranspec.cc:lang_specific_driver', for example.
+	     Generally synthesizing '-foffload-options=-l_GCC_m' etc. in the
+	     language specific drivers is non-trivial, needs very careful
+	     review of their options handling.  However, this issue is not
+	     actually relevant for the current set of supported host/offloading
+	     configurations.  */
+	  int need_math = (MATH_LIBRARY[0] != '\0');
+	  if (/* '-lm' */ (need_math && strcmp (arg, MATH_LIBRARY) == 0))
+	    save_switch ("-foffload-options=-l_GCC_m",
+			 0, NULL, validated, true);
+	}
+      break;
+    default:
+      gcc_unreachable ();
+    }
+}
+
 /* Handle a driver option; arguments and return value as for
    handle_option.  */
 
@@ -4335,8 +4397,17 @@ driver_handle_option (struct gcc_options *opts,
       break;
 
     case OPT_fdiagnostics_format_:
-      diagnostic_output_format_init (dc,
-				     (enum diagnostics_output_format)value);
+	{
+	  const char *basename = (opts->x_dump_base_name ? opts->x_dump_base_name
+				  : opts->x_main_input_basename);
+	  diagnostic_output_format_init (dc, basename,
+					 (enum diagnostics_output_format)value,
+					 opts->x_flag_diagnostics_json_formatting);
+	  break;
+	}
+
+    case OPT_fdiagnostics_text_art_charset_:
+      dc->set_text_art_charset ((enum diagnostic_text_art_charset)value);
       break;
 
     case OPT_Wa_:
@@ -4392,8 +4463,15 @@ driver_handle_option (struct gcc_options *opts,
 	    }
 	/* Record the part after the last comma.  */
 	add_infile (arg + prev, "*");
+	if (strcmp (arg, "-z,lazy") == 0 || strcmp (arg, "-z,norelro") == 0)
+	  avoid_linker_hardening_p = true;
       }
       do_save = false;
+      break;
+
+    case OPT_z:
+      if (strcmp (arg, "lazy") == 0 || strcmp (arg, "norelro") == 0)
+	avoid_linker_hardening_p = true;
       break;
 
     case OPT_Xlinker:
@@ -4415,6 +4493,17 @@ driver_handle_option (struct gcc_options *opts,
       /* POSIX allows separation of -l and the lib arg; canonicalize
 	 by concatenating -l with its arg */
       add_infile (concat ("-l", arg, NULL), "*");
+
+      /* Forward to offloading compilation '-l[...]' flags for standard,
+	 well-known libraries.  */
+      /* Doing this processing here means that we don't get to see libraries
+	 injected via specs, such as '-lquadmath' injected via
+	 '[build]/[target]/libgfortran/libgfortran.spec'.  However, this issue
+	 is not actually relevant for the current set of host/offloading
+	 configurations.  */
+      if (ENABLE_OFFLOADING)
+	forward_offload_option (opt_index, arg, validated);
+
       do_save = false;
       break;
 
@@ -4575,20 +4664,35 @@ driver_handle_option (struct gcc_options *opts,
       save_switch ("-o", 1, &arg, validated, true);
       return true;
 
-#ifdef ENABLE_DEFAULT_PIE
     case OPT_pie:
+#ifdef ENABLE_DEFAULT_PIE
       /* -pie is turned on by default.  */
+      validated = true;
 #endif
+      /* FALLTHROUGH */
+    case OPT_r:
+    case OPT_shared:
+    case OPT_no_pie:
+      avoid_linker_hardening_p = true;
+      break;
+
+    case OPT_static:
+      static_p = true;
+      break;
 
     case OPT_static_libgcc:
     case OPT_shared_libgcc:
     case OPT_static_libgfortran:
+    case OPT_static_libquadmath:
     case OPT_static_libphobos:
+    case OPT_static_libgm2:
     case OPT_static_libstdc__:
-      /* These are always valid, since gcc.cc itself understands the
-	 first two, gfortranspec.cc understands -static-libgfortran,
-	 d-spec.cc understands -static-libphobos, and g++spec.cc
-	 understands -static-libstdc++ */
+      /* These are always valid; gcc.cc itself understands the first two
+	 gfortranspec.cc understands -static-libgfortran,
+	 libgfortran.spec handles -static-libquadmath,
+	 d-spec.cc understands -static-libphobos,
+	 gm2spec.cc understands -static-libgm2,
+	 and g++spec.cc understands -static-libstdc++.  */
       validated = true;
       break;
 
@@ -4606,6 +4710,10 @@ driver_handle_option (struct gcc_options *opts,
 	save_switch (concat ("-foffload-options=", arg, NULL),
 		     0, NULL, validated, true);
       do_save = false;
+      break;
+
+    case OPT_gcodeview:
+      add_infile ("--pdb=", "*");
       break;
 
     default:
@@ -4936,6 +5044,100 @@ process_command (unsigned int decoded_options_count,
 			   CL_DRIVER, &handlers, global_dc);
     }
 
+  /* Audit -Wa,/-Xassembler options (A2).  They are consumed only by the
+     external assembler's %Y substitution in %(asm_options), but the default
+     compile-to-object pipeline has no external assembler: cc1plus assembles
+     in-process via libgas, whose entry point (gas_assemble_buffer) accepts
+     no options -- so on a .c/.cc -> .o compile they used to be dropped
+     SILENTLY.  Never drop them: when any non-empty assembler option is
+     present (an empty -Wa, contributes nothing, matching stock %Y), either
+
+       - the user explicitly forced -fintegrated-as: refuse loudly (the
+	 integrated assembler cannot honor the options; mirrors clang's
+	 unsupported -Wa handling), or
+
+       - otherwise auto-select the external-assembler pipeline for this
+	 whole invocation by injecting -fno-integrated-as: invoke_as's
+	 fallback arm then runs `as` with %Y as stock GCC did, cc1 sees the
+	 flag via %{f*}, and the compile cache skips serve+store
+	 (skip-no-integrated-as).  Noted under -v / GCC_COMPILE_CACHE_DEBUG.
+
+     Hand-written .s/.S inputs always went through the @assembler specs and
+     honor %Y either way; the injected flag is unused by them.  */
+  if (!print_help_list && !print_version && !print_subprocess_help)
+  {
+    /* (--help/--version/--target-help add their own assembler options and
+       run no compile; leave those informational flows alone.)  */
+    bool have_asm_options = false;
+    for (unsigned int ai = 0; ai < assembler_options.length (); ai++)
+      if (assembler_options[ai] && assembler_options[ai][0] != '\0')
+	{
+	  have_asm_options = true;
+	  break;
+	}
+
+    /* Options whose promised artifacts only the external-assembler pipeline
+       produces.  -save-temps (any flavor: plain, =cwd, =obj) promises the
+       intermediate .s on disk, but the integrated assembler has no textual
+       assembly stage to save.  -gsplit-dwarf relies on ASM_FINAL_SPEC's
+       objcopy --extract-dwo/--strip-dwo pass over the assembler's object,
+       which only runs after a real `as` step.  Auto-select the external
+       pipeline for these exactly like the assembler-options audit above so
+       both behave as stock GCC did.  */
+    const char *ext_as_opt = NULL;
+    if (save_temps_flag != SAVE_TEMPS_NONE)
+      ext_as_opt = "-save-temps";
+    else
+      {
+	int split_dwarf = 0;	/* last -g[no-]split-dwarf wins */
+	for (unsigned int oi = 1; oi < decoded_options_count; oi++)
+	  if (decoded_options[oi].opt_index == OPT_gsplit_dwarf)
+	    split_dwarf = (decoded_options[oi].value != 0);
+	if (split_dwarf)
+	  ext_as_opt = "-gsplit-dwarf";
+      }
+
+    if (have_asm_options || ext_as_opt)
+      {
+	int explicit_ias = -1;	/* last explicit -f[no-]integrated-as */
+	for (unsigned int oi = 1; oi < decoded_options_count; oi++)
+	  if (decoded_options[oi].opt_index == OPT_fintegrated_as)
+	    explicit_ias = (decoded_options[oi].value != 0);
+	if (have_asm_options && explicit_ias == 1)
+	  fatal_error (input_location,
+		       "%<-Wa,%>/%<-Xassembler%> options cannot be passed to "
+		       "the integrated assembler; remove %<-fintegrated-as%> "
+		       "or the assembler options");
+#ifdef HAVE_LIBGAS
+	else if (explicit_ias == -1)
+	  {
+	    save_switch ("-fno-integrated-as", 0, NULL,
+			 /*validated=*/true, /*known=*/true);
+	    if (verbose_flag || env.get ("GCC_COMPILE_CACHE_DEBUG"))
+	      {
+		if (have_asm_options)
+		  fnotice (stderr,
+			   "note: -Wa,/-Xassembler options present: using the "
+			   "external assembler for this invocation "
+			   "(compile cache disabled)\n");
+		else
+		  fnotice (stderr,
+			   "note: %s: using the external assembler for this "
+			   "invocation (compile cache disabled)\n",
+			   ext_as_opt);
+	      }
+	  }
+#endif
+	/* explicit_ias == 0 (or no libgas, where the external pipeline is
+	   the only pipeline): the external path is already selected.
+	   An explicit -fintegrated-as alongside -save-temps/-gsplit-dwarf
+	   keeps the integrated assembler (the user chose it knowingly);
+	   there is then no .s to save and no as-stage objcopy to split the
+	   DWARF -- only the -Wa,/-Xassembler combination, which would DROP
+	   user options, is a hard error.  */
+      }
+  }
+
   /* If the user didn't specify any, default to all configured offload
      targets.  */
   if (ENABLE_OFFLOADING && offload_targets == NULL)
@@ -4944,6 +5146,35 @@ process_command (unsigned int decoded_options_count,
 #if OFFLOAD_DEFAULTED
       offload_targets_default = true;
 #endif
+    }
+
+  /* TODO: check if -static -pie works and maybe use it.  */
+  if (flag_hardened)
+    {
+      if (!avoid_linker_hardening_p && !static_p)
+	{
+#if defined HAVE_LD_PIE && defined LD_PIE_SPEC
+	  save_switch (LD_PIE_SPEC, 0, NULL, /*validated=*/true, /*known=*/false);
+#endif
+	  /* These are passed straight down to collect2 so we have to break
+	     it up like this.  */
+	  if (HAVE_LD_NOW_SUPPORT)
+	    {
+	      add_infile ("-z", "*");
+	      add_infile ("now", "*");
+	    }
+	  if (HAVE_LD_RELRO_SUPPORT)
+	    {
+	      add_infile ("-z", "*");
+	      add_infile ("relro", "*");
+	    }
+	}
+      /* We can't use OPT_Whardened yet.  Sigh.  */
+      else
+	warning_at (UNKNOWN_LOCATION, 0,
+		    "linker hardening options not enabled by %<-fhardened%> "
+		    "because other link options were specified on the command "
+		    "line");
     }
 
   /* Handle -gtoggle as it would later in toplev.cc:process_options to
@@ -5503,7 +5734,7 @@ set_collect_gcc_options (void)
   obstack_grow (&collect_obstack, "COLLECT_GCC_OPTIONS=",
 		sizeof ("COLLECT_GCC_OPTIONS=") - 1);
 
-  first_time = TRUE;
+  first_time = true;
   for (i = 0; (int) i < n_switches; i++)
     {
       const char *const *args;
@@ -5511,7 +5742,7 @@ set_collect_gcc_options (void)
       if (!first_time)
 	obstack_grow (&collect_obstack, " ", 1);
 
-      first_time = FALSE;
+      first_time = false;
 
       /* Ignore elided switches.  */
       if ((switches[i].live_cond
@@ -5549,7 +5780,7 @@ set_collect_gcc_options (void)
     {
       if (!first_time)
 	obstack_grow (&collect_obstack, " ", 1);
-      first_time = FALSE;
+      first_time = false;
 
       obstack_grow (&collect_obstack, "'-dumpdir' '", 12);
       const char *p, *q;
@@ -5702,6 +5933,812 @@ insert_wrapper (const char *wrapper)
   gcc_assert (i == n);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Driver-level compile cache (Stage 5.2): answer a warm hit without ever    */
+/* spawning cc1/cc1plus or as.                                               */
+/* ------------------------------------------------------------------------ */
+
+/* True if GCC_COMPILE_CACHE_DEBUG is set (lazily probed).  Mirrors the
+   compiler side so the driver's "manifest-hit"/"manifest-miss" lines look the
+   same.  */
+static bool
+driver_cc_debug_p (void)
+{
+  static int dbg = -1;
+  if (dbg == -1)
+    {
+      const char *e = env.get ("GCC_COMPILE_CACHE_DEBUG");
+      dbg = (e && e[0]) ? 1 : 0;
+    }
+  return dbg == 1;
+}
+
+/* Read the cache's "compiler-id" sidecar (DIR/compiler-id), written by
+   cc1/cc1plus on a miss-store, into *CHECKSUM (16 bytes, caller-provided) and a
+   freshly xmalloc'd *LANG.  Returns true on success.  The sidecar lets the
+   driver form the manifest key without linking the compiler's checksum object
+   or knowing lang_hooks.name.  */
+static bool
+driver_read_compiler_id (const char *cache_dir, unsigned char checksum[16],
+			 char **lang)
+{
+  *lang = NULL;
+  char *path = concat (cache_dir, "/", CC_COMPILER_ID_NAME, NULL);
+  FILE *f = fopen (path, "rb");
+  free (path);
+  if (!f)
+    return false;
+
+  /* Fixed prefix: 8 magic + u16 ver + u16 reserved + 16 checksum + u32 len.  */
+  unsigned char head[8 + 2 + 2 + 16 + 4];
+  bool ok = (fread (head, 1, sizeof (head), f) == sizeof (head));
+  if (ok
+      && memcmp (head, CC_COMPILER_ID_MAGIC, CC_MAGIC_LEN) == 0
+      && cc_get_u16 (head + 8) == CC_COMPILER_ID_VERSION)
+    {
+      memcpy (checksum, head + 12, 16);
+      uint32_t llen = cc_get_u32 (head + 28);
+      char *buf = (char *) xmalloc ((size_t) llen + 1);
+      if (llen == 0 || fread (buf, 1, llen, f) == llen)
+	{
+	  buf[llen] = '\0';
+	  *lang = buf;
+	}
+      else
+	{
+	  free (buf);
+	  ok = false;
+	}
+    }
+  else
+    ok = false;
+  fclose (f);
+  return ok && *lang;
+}
+
+/* The cc1/cc1plus command line has just been assembled into ARGBUF (its [0] is
+   the program name, e.g. "cc1plus").  If this is an integrated-as compile to an
+   object with -fcompile-cache active, try to serve the cached object directly
+   from the driver -- WITHOUT spawning cc1/cc1plus or as.
+
+   The key trick that makes the driver and cc1plus agree on the manifest key:
+   we decode ARGBUF with the SAME decode_cmdline_options_to_array () the
+   compiler runs on the SAME argv, so the cl_decoded_option array (and thus the
+   key the shared serve unit computes) is identical to the compiler's.  The
+   source file is the first OPT_SPECIAL_input_file -- exactly how the compiler
+   derives main_input_filename (opts-global.cc).
+
+   Returns true if the cache served the object (caller must NOT execute the
+   command).  Returns false to fall through to the normal spawn.  */
+static bool
+driver_try_serve_from_cache (void)
+{
+  if (argbuf.length () < 1)
+    return false;
+
+  /* Respect dry-run modes: -### (verbose_only_flag) prints commands without
+     running them, and -n (do nothing) likewise.  Serving (which writes the .o)
+     would violate the user's request, so fall through to the normal print.  */
+  if (verbose_only_flag)
+    return false;
+
+  /* Only intercept the C/C++ compiler proper.  */
+  const char *prog = lbasename (argbuf[0]);
+  if (strcmp (prog, "cc1") != 0 && strcmp (prog, "cc1plus") != 0)
+    return false;
+
+  /* Decode the assembled cc1 argv exactly as the compiler will: all
+     languages + common + target, deliberately WITHOUT CL_DRIVER -- cc1plus
+     decodes without it, and the mask changes decode semantics, not just
+     recognition: NoDriverArg options (-MD/-MMD) take their argument only
+     when CL_DRIVER is absent from the mask.  With CL_DRIVER included, the
+     cc1-level "-MD file" decoded argless and its file (spelled from -o by
+     the specs) masqueraded as the first OPT_SPECIAL_input_file -- the serve
+     then hashed the (usually nonexistent) .d as "the source" and silently
+     declined, so the driver tier NEVER served a -MD compile (i.e. every
+     ninja/cmake TU) and every warm hit paid a full cc1plus exec instead.
+     argbuf[0] is the program name -- it is argv[0] (decode skips argv[0]);
+     do NOT prepend an extra dummy, or argbuf[0] ("cc1plus") would be decoded
+     as the first input file and masquerade as the source.  */
+  unsigned int argc = argbuf.length ();
+  const char **argv = XNEWVEC (const char *, argc);
+  for (unsigned i = 0; i < argbuf.length (); i++)
+    argv[i] = argbuf[i];
+
+  struct cl_decoded_option *decoded = NULL;
+  unsigned int decoded_count = 0;
+  decode_cmdline_options_to_array (argc, argv,
+				   CL_LANG_ALL | CL_COMMON | CL_TARGET,
+				   &decoded, &decoded_count);
+  free (argv);
+
+  /* Scan for: the cache dir, integrated-as state, disqualifying modes, the
+     source file, and the output object.  The integrated assembler is the
+     default (common.opt: fintegrated-as Init(1)) and the driver does not put
+     -fintegrated-as on the cc1 command line unless the user did, so default
+     this true; an explicit -fno-integrated-as (restored A1 escape hatch, and
+     auto-injected when -Wa,/-Xassembler options are present) reaches here
+     via %{f*} and flips it off, which makes the compile cache-ineligible for
+     the driver tier below (cc1plus's own gating check #10 skips its serve
+     and store tiers for the same reason).  */
+  const char *cache_dir = NULL;
+  const char *src_path = NULL;
+  const char *out_path = NULL;
+#ifdef HAVE_LIBGAS
+  bool integrated_as = true;
+#else
+  bool integrated_as = false;	/* no libgas: never an in-process object */
+#endif
+  bool disqualify = false;
+  bool saw_g = false;
+
+  /* Dependency-output state.  A served hit must also honor the -MD contract
+     (write the .d file ninja/make will read), so collect the request here;
+     the manifest's header records ARE the include closure, letting the serve
+     unit synthesize the file.  Forms whose output the records cannot
+     reproduce exactly decline the driver serve below (cc1plus's tier -- or
+     the real compile -- then produces the file with cpp's own semantics):
+     -M/-MM (dependency-only modes), -MMD/-MM (system headers excluded, which
+     the records do not distinguish), -MG (missing-header rules), or a -MD
+     lacking an explicit target/file on the cc1 line (cpp's default-target
+     derivation is not reimplemented here).  */
+  bool deps_md = false;		/* -MD (cc1 form carries the default file) */
+  bool deps_unsupported = false;/* -M/-MM/-MMD/-MG seen */
+  const char *deps_md_file = NULL;	/* -MD's own argument */
+  const char *deps_mf = NULL;		/* -MF argument (overrides) */
+  bool deps_phony = false;		/* -MP */
+  const char **deps_tgts = XNEWVEC (const char *, decoded_count);
+  bool *deps_tgt_quoted = XNEWVEC (bool, decoded_count);
+  unsigned deps_tgt_count = 0;
+
+  for (unsigned i = 1; i < decoded_count; i++)
+    {
+      const cl_decoded_option *o = &decoded[i];
+      switch (o->opt_index)
+	{
+	case OPT_fcompile_cache_:
+	  cache_dir = o->arg;
+	  break;
+	case OPT_fintegrated_as:
+	  integrated_as = (o->value != 0);
+	  break;
+	case OPT_o:
+	  out_path = o->arg;
+	  break;
+	case OPT_SPECIAL_input_file:
+	  if (!src_path)
+	    src_path = o->arg;	/* first input == main_input_filename */
+	  break;
+	case OPT_E:
+	case OPT_S:
+	case OPT_fsyntax_only:
+	  disqualify = true;	/* not a compile-to-object */
+	  break;
+	case OPT__output_pch:
+	  /* PCH generation (-x c++-header): the real product is the .gch, and
+	     the -o is only a discarded temp .s.  Serving a cached object here
+	     would skip cc1plus and never write the PCH.  */
+	  disqualify = true;
+	  break;
+	case OPT_g:
+	case OPT_ggdb:
+	case OPT_gdwarf:
+	case OPT_gdwarf_:
+	  saw_g = true;
+	  break;
+	case OPT_MD:
+	  deps_md = true;
+	  deps_md_file = o->arg;
+	  break;
+	case OPT_MF:
+	  deps_mf = o->arg;
+	  break;
+	case OPT_MT:
+	case OPT_MQ:
+	  deps_tgts[deps_tgt_count] = o->arg;
+	  deps_tgt_quoted[deps_tgt_count] = (o->opt_index == OPT_MQ);
+	  deps_tgt_count++;
+	  break;
+	case OPT_MP:
+	  deps_phony = true;
+	  break;
+	case OPT_M:
+	case OPT_MM:
+	case OPT_MMD:
+	case OPT_MG:
+	  deps_unsupported = true;
+	  break;
+	default:
+	  break;
+	}
+    }
+
+  /* Resolve the dependency request: -MF wins over -MD's own file.  An
+     unsupported form (or a supported one missing its file/targets) declines
+     the serve entirely rather than serving an object while leaving the
+     build system's dependency info silently empty or wrong.  */
+  const char *deps_path = NULL;
+  if (deps_md || deps_unsupported)
+    {
+      deps_path = deps_mf ? deps_mf : deps_md_file;
+      if (deps_unsupported || !deps_md || !deps_path || deps_tgt_count == 0)
+	disqualify = true;
+    }
+
+  /* External-assembler compiles are cache-ineligible by design (soundness
+     over speed: the cache stores in-process-assembled objects, and the
+     external as's output is not guaranteed byte-identical to them).  Say so
+     under the debug env, mirroring cc1plus's tag.  NOTE: with the current
+     invoke_as, a -fno-integrated-as compile is a two-command `cc1 | as`
+     pipeline whose cc1 command executes from do_spec_1's '\n' break, which
+     has no serve hook -- so in practice cc1's own skip-no-integrated-as tag
+     (gating check #10) is the one that prints; this branch is defensive for
+     any future spec layout that routes such a command through the do_spec
+     end-of-spec path below.  */
+  if (cache_dir && cache_dir[0] && !integrated_as && driver_cc_debug_p ())
+    {
+      fprintf (stderr, "compile-cache: skip-no-integrated-as - %s\n",
+	       out_path ? out_path : "-");
+      fflush (stderr);
+    }
+
+  bool served = false;
+  if (cache_dir && cache_dir[0] && integrated_as && !disqualify
+      && src_path && out_path)
+    {
+      unsigned char checksum[16];
+      char *lang = NULL;
+      if (driver_read_compiler_id (cache_dir, checksum, &lang))
+	{
+	  char *cwd = getpwd ();
+	  cc_serve_ctx ctx;
+	  ctx.cache_dir = cache_dir;
+	  ctx.checksum = checksum;
+	  ctx.lang_name = lang;
+	  ctx.decoded = decoded;
+	  ctx.decoded_count = decoded_count;
+	  ctx.paths_affect_output = saw_g;
+	  ctx.cwd = cwd ? cwd : "";
+	  ctx.verify_hash = cc_verify_hash_env_p ();
+	  ctx.debug = driver_cc_debug_p ();
+	  ctx.deps_path = deps_path;
+	  ctx.deps_targets = deps_tgts;
+	  ctx.deps_target_quoted = deps_tgt_quoted;
+	  ctx.deps_target_count = deps_tgt_count;
+	  ctx.deps_phony = deps_phony;
+	  served = compile_cache_serve_object (&ctx, src_path, out_path);
+	  free (lang);
+	}
+    }
+
+  /* decoded uses the opts obstack; the array itself is heap.  */
+  free (deps_tgts);
+  free (deps_tgt_quoted);
+  free (decoded);
+  return served;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Transparent auto-PCH (Stage 6): detect a shared #include prelude, build a */
+/* .gch for it once (keyed by prelude bytes + flag cell + compiler id), and  */
+/* inject -include <stub> into the cc1plus command on every later TU.        */
+/* ------------------------------------------------------------------------ */
+
+/* True if GCC_AUTO_PCH_DEBUG is set (lazily probed).  */
+static bool
+driver_apch_debug_p (void)
+{
+  static int dbg = -1;
+  if (dbg == -1)
+    {
+      const char *e = env.get ("GCC_AUTO_PCH_DEBUG");
+      dbg = (e && e[0]) ? 1 : 0;
+    }
+  return dbg == 1;
+}
+
+static void
+driver_apch_log (const char *what, const char *detail)
+{
+  if (!driver_apch_debug_p ())
+    return;
+  fprintf (stderr, "auto-pch: %s%s%s\n", what, detail ? " " : "",
+	   detail ? detail : "");
+  fflush (stderr);
+}
+
+/* mkdir -p for PATH (must be absolute or cwd-relative).  Best-effort; the
+   caller's subsequent open/rename reports real failures.  */
+static void
+driver_apch_mkdirs (const char *path)
+{
+  char *tmp = xstrdup (path);
+  for (char *p = tmp + 1; *p; p++)
+    if (IS_DIR_SEPARATOR (*p))
+      {
+	*p = '\0';
+	mkdir (tmp, 0777);
+	*p = DIR_SEPARATOR;
+      }
+  mkdir (tmp, 0777);
+  free (tmp);
+}
+
+/* Everything driver_auto_pch_probe_inject () learns that
+   driver_auto_pch_generate () needs.  */
+struct driver_apch_plan
+{
+  bool gen;			/* entry absent: generate after a serve miss */
+  char *base;			/* entry base path (xmalloc'd) */
+  unsigned char *prelude;	/* prelude bytes (xmalloc'd) */
+  size_t plen;
+  char *src_arg;		/* the source token as it appears in argbuf
+				   (owned copy) */
+};
+
+static void
+driver_apch_plan_free (struct driver_apch_plan *plan)
+{
+  free (plan->base);
+  free (plan->prelude);
+  free (plan->src_arg);
+  plan->base = NULL;
+  plan->prelude = NULL;
+  plan->src_arg = NULL;
+  plan->gen = false;
+}
+
+/* Append the injection options for entry BASE to ARGBUF.  */
+static void
+driver_apch_inject (const char *base)
+{
+  const char *stub = concat (base, "/stub.h", NULL);
+  argbuf.safe_push ("-include");
+  argbuf.safe_push (stub);
+  argbuf.safe_push (concat ("-fauto-pch-ref=", stub, NULL));
+  driver_apch_log ("inject", stub);
+}
+
+/* Cap on how much of the source the prelude scanner looks at.  A prelude
+   longer than this is truncated at the last accepted include inside the cap,
+   which stays sound (the stub is still a byte-exact prefix).  */
+#define APCH_SCAN_CAP (64 * 1024)
+
+/* Minimum number of #include <...> lines to bother with a PCH.  */
+#define APCH_MIN_INCLUDES 3
+
+/* Phase 1, BEFORE the driver .o-serve probe: decide whether this command is
+   auto-PCH eligible; if a valid entry exists, inject it NOW so the serve
+   probe (and cc1plus) see the final argv -- the manifest key covers the
+   injected options, which is what makes driver/cc1plus key agreement hold in
+   PCH mode.  If the entry is absent, record a generation plan; the caller
+   runs it only after the .o serve declines (a warm .o hit needs no PCH).  */
+static void
+driver_auto_pch_probe_inject (struct driver_apch_plan *plan)
+{
+  plan->gen = false;
+  plan->base = NULL;
+  plan->prelude = NULL;
+  plan->plen = 0;
+  plan->src_arg = NULL;
+
+  if (argbuf.length () < 2)
+    return;
+  if (verbose_only_flag)
+    return;
+
+  /* Only C++ compiles in v1.  */
+  const char *prog = lbasename (argbuf[0]);
+  if (strcmp (prog, "cc1plus") != 0)
+    return;
+
+  /* Enabled?  Cheap env probe first; -fauto-pch is checked in the scan.  */
+  const char *env_on = env.get ("GCC_AUTO_PCH");
+  bool enabled = (env_on && env_on[0] && strcmp (env_on, "0") != 0);
+
+  unsigned int argc = argbuf.length ();
+  const char **argv = XNEWVEC (const char *, argc);
+  for (unsigned i = 0; i < argbuf.length (); i++)
+    argv[i] = argbuf[i];
+
+  /* Same mask as driver_try_serve_from_cache (and cc1plus itself): no
+     CL_DRIVER, or NoDriverArg options (-MD/-MMD) decode argless and their
+     file argument masquerades as an input file.  */
+  struct cl_decoded_option *decoded = NULL;
+  unsigned int decoded_count = 0;
+  decode_cmdline_options_to_array (argc, argv,
+				   CL_LANG_ALL | CL_COMMON | CL_TARGET,
+				   &decoded, &decoded_count);
+  free (argv);
+
+  const char *cache_dir = NULL;
+  const char *src_path = NULL;
+  bool disqualify = false;
+  bool saw_g = false;
+  bool have_out = false;
+
+  for (unsigned i = 1; i < decoded_count && !disqualify; i++)
+    {
+      const cl_decoded_option *o = &decoded[i];
+      switch (o->opt_index)
+	{
+	case OPT_fauto_pch:
+	  enabled = (o->value != 0);
+	  break;
+	case OPT_fcompile_cache_:
+	  cache_dir = o->arg;
+	  break;
+	case OPT_o:
+	  have_out = true;
+	  break;
+	case OPT_SPECIAL_input_file:
+	  if (src_path)
+	    disqualify = true;		/* one input only */
+	  else
+	    src_path = o->arg;
+	  break;
+	case OPT_g:
+	case OPT_ggdb:
+	case OPT_gdwarf:
+	case OPT_gdwarf_:
+	  saw_g = true;
+	  break;
+
+	/* Not a plain compile-to-object.  */
+	case OPT_E:
+	case OPT_S:
+	case OPT_fsyntax_only:
+	case OPT__output_pch:
+	case OPT_fpreprocessed:
+	/* The user runs their own PCH / prefix-header setup.  */
+	case OPT_include:
+	case OPT_imacros:
+	case OPT_fpch_preprocess:
+	case OPT_fpch_deps:
+	/* Dependency output: v1 keeps .d files byte-identical by simply not
+	   engaging (the PCH would swallow the prelude headers from them).  */
+	case OPT_M:
+	case OPT_MM:
+	case OPT_MD:
+	case OPT_MMD:
+	case OPT_MF:
+	case OPT_MG:
+	case OPT_MP:
+	case OPT_MQ:
+	case OPT_MT:
+	case OPT_fdeps_format_:
+	case OPT_fdeps_file_:
+	case OPT_fdeps_target_:
+	/* Modules / header units have their own pipeline.  */
+	case OPT_fmodules_ts:
+	case OPT_fmodule_header:
+	case OPT_fmodule_header_:
+	case OPT_fmodule_only:
+	/* Profiling bakes run/path state; keep v1 narrow.  */
+	case OPT_fprofile_generate:
+	case OPT_fprofile_generate_:
+	case OPT_fprofile_use:
+	case OPT_fprofile_use_:
+	case OPT_fprofile_arcs:
+	case OPT_ftest_coverage:
+	case OPT_p:
+	case OPT_pg:
+	/* Plugins can see arbitrary state.  */
+	case OPT_fplugin_:
+	case OPT_fplugin_arg_:
+	/* Diagnostic modes whose stderr the injection would alter.  */
+	case OPT_H:
+	case OPT_version:
+	  disqualify = true;
+	  break;
+
+	/* The internal marker the specs put on every non-object compile
+	   (-S and the PCH specs): the driver's -S itself never reaches the
+	   cc1plus argv, this does.  */
+	case OPT_fasm_output_only:
+	  disqualify = true;
+	  break;
+
+	default:
+	  break;
+	}
+    }
+
+  /* The cache dir can come from the flag (visible in the decoded argv) or
+     from the environment -- same resolution the compiler side uses.  */
+  if (!cache_dir || !cache_dir[0])
+    cache_dir = env.get ("GCC_COMPILE_CACHE_DIR");
+
+  if (!enabled || disqualify || !cache_dir || !cache_dir[0]
+      || !src_path || !src_path[0] || !strcmp (src_path, "-") || !have_out)
+    {
+      if (enabled && !disqualify && (!cache_dir || !cache_dir[0]))
+	driver_apch_log ("off", "no compile cache dir (flag or env)");
+      free (decoded);
+      return;
+    }
+
+  /* Compiler id (written by cc1plus on the first miss-store).  Without it we
+     cannot key the entry; the very first compile into a cold cache proceeds
+     plain and the next one picks the feature up.  */
+  unsigned char checksum[16];
+  char *lang = NULL;
+  if (!driver_read_compiler_id (cache_dir, checksum, &lang))
+    {
+      driver_apch_log ("off", "no compiler-id sidecar yet (cold cache)");
+      free (decoded);
+      return;
+    }
+
+  /* Read the head of the source and scan for a prelude, producing the
+     normalized stub (include lines verbatim, comment/blank lines blanked,
+     line positions preserved).  */
+  unsigned char *head = NULL;
+  size_t head_len = 0;
+  {
+    FILE *f = fopen (src_path, "rb");
+    if (f)
+      {
+	head = (unsigned char *) xmalloc (APCH_SCAN_CAP);
+	head_len = fread (head, 1, APCH_SCAN_CAP, f);
+	fclose (f);
+      }
+  }
+  unsigned char *norm = NULL;
+  size_t plen = 0;
+  unsigned nincl = 0;
+  if (head)
+    cc_auto_pch_scan_prelude (head, head_len, &norm, &plen, &nincl);
+  free (head);
+  if (!norm || nincl < APCH_MIN_INCLUDES || plen == 0)
+    {
+      if (driver_apch_debug_p ())
+	{
+	  char msg[96];
+	  snprintf (msg, sizeof (msg), "%u include(s) in prelude of %s",
+		    nincl, src_path);
+	  driver_apch_log ("skip", msg);
+	}
+      free (norm);
+      free (lang);
+      free (decoded);
+      return;
+    }
+
+  cc_serve_ctx ctx;
+  ctx.cache_dir = cache_dir;
+  ctx.checksum = checksum;
+  ctx.lang_name = lang;
+  ctx.decoded = decoded;
+  ctx.decoded_count = decoded_count;
+  ctx.paths_affect_output = saw_g;
+  ctx.cwd = "";
+  ctx.verify_hash = cc_verify_hash_env_p ();
+  ctx.debug = driver_apch_debug_p ();
+  ctx.deps_path = NULL;		/* the auto-PCH probe serves no object */
+  ctx.deps_targets = NULL;
+  ctx.deps_target_quoted = NULL;
+  ctx.deps_target_count = 0;
+  ctx.deps_phony = false;
+
+  char *base = cc_auto_pch_entry_base (&ctx, norm, plen);
+  enum cc_auto_pch_probe_result pr
+    = cc_auto_pch_probe (&ctx, base, norm, plen);
+
+  switch (pr)
+    {
+    case CC_APCH_USABLE:
+      driver_apch_inject (base);
+      free (base);
+      free (norm);
+      break;
+    case CC_APCH_NEGATIVE:
+      driver_apch_log ("negative", base);
+      free (base);
+      free (norm);
+      break;
+    case CC_APCH_ABSENT:
+      plan->gen = true;
+      plan->base = base;
+      plan->prelude = norm;
+      plan->plen = plen;
+      plan->src_arg = xstrdup (src_path);
+      driver_apch_log ("plan-gen", base);
+      break;
+    }
+
+  free (lang);
+  free (decoded);
+}
+
+/* Phase 2, after the .o serve declined: build the .gch for PLAN (won via an
+   O_EXCL lock; losers just compile plain this once), store stub + manifest +
+   gch under the entry (gch renamed last = completeness marker), and inject.
+   ANY failure -- non-zero exit OR any stderr from the PCH build -- writes a
+   "negative" marker instead: the prelude provokes parse-time diagnostics
+   that a PCH would swallow from later TUs, so this key must compile plain
+   (keeping stderr byte-identical by construction).  */
+static void
+driver_auto_pch_generate (struct driver_apch_plan *plan)
+{
+  if (!plan->gen || !plan->base)
+    return;
+
+  const char *base = plan->base;
+  driver_apch_mkdirs (base);
+
+  /* One generator per entry.  */
+  char *lock = concat (base, "/gen.lock", NULL);
+  int lfd = open (lock, O_CREAT | O_EXCL | O_WRONLY, 0644);
+  if (lfd < 0)
+    {
+      struct stat lst;
+      if (stat (lock, &lst) == 0 && time (NULL) - lst.st_mtime > 300)
+	{
+	  unlink (lock);		/* steal a stale lock */
+	  lfd = open (lock, O_CREAT | O_EXCL | O_WRONLY, 0644);
+	}
+      if (lfd < 0)
+	{
+	  driver_apch_log ("lock-busy", base);
+	  free (lock);
+	  return;			/* compile plain this once */
+	}
+    }
+  close (lfd);
+
+  long pid = (long) getpid ();
+  char *gch_tmp = xasprintf ("%s/gch.tmp%ld", base, pid);
+  char *man_tmp = xasprintf ("%s/manifest.tmp%ld", base, pid);
+  char *asm_tmp = xasprintf ("%s/asm.tmp%ld", base, pid);
+  char *err_tmp = xasprintf ("%s/err.tmp%ld", base, pid);
+  char *stub_final = concat (base, "/stub.h", NULL);
+  char *gch_final = concat (base, "/stub.h.gch", NULL);
+  char *man_final = concat (base, "/manifest", NULL);
+  char *neg_final = concat (base, "/negative", NULL);
+  bool ok = false;
+
+  /* Write the (normalized) stub AT ITS FINAL PATH before building: the .gch
+     bakes the stub's file name into its line table, and the injection-time
+     remap (and any diagnostics before it) must see the stable entry path,
+     never a temp name.  We hold the gen lock, and the entry only counts as
+     complete once the gch itself is renamed in below, so publishing the
+     inert stub early is safe.  */
+  {
+    FILE *sf = fopen (stub_final, "wb");
+    if (sf)
+      {
+	ok = (fwrite (plan->prelude, 1, plan->plen, sf) == plan->plen);
+	ok = (fclose (sf) == 0) && ok;
+      }
+  }
+
+  if (ok)
+    {
+      /* Build the PCH-build argv from this compile's argv: same flag cell,
+	 stub as input, PCH as output, asm to a discarded temp, and the
+	 internal option that makes cc1plus write the closure manifest.  */
+      vec<const char *> gen;
+      gen.create (argbuf.length () + 8);
+      for (unsigned i = 0; i < argbuf.length (); i++)
+	{
+	  const char *a = argbuf[i];
+	  if (!strcmp (a, "-o") || !strcmp (a, "-dumpbase")
+	      || !strcmp (a, "-dumpbase-ext") || !strcmp (a, "-dumpdir"))
+	    {
+	      i++;			/* skip the option and its argument */
+	      continue;
+	    }
+	  if (plan->src_arg && !strcmp (a, plan->src_arg))
+	    {
+	      gen.safe_push (stub_final);	/* the stub replaces the source */
+	      continue;
+	    }
+	  gen.safe_push (a);
+	}
+      gen.safe_push ("-fasm-output-only");
+      gen.safe_push ("-o");
+      gen.safe_push (asm_tmp);
+      gen.safe_push ("--output-pch");
+      gen.safe_push (gch_tmp);
+      char *store_opt = concat ("-fauto-pch-store=", man_tmp, NULL);
+      gen.safe_push (store_opt);
+      gen.safe_push (NULL);
+
+      char *prog = find_a_program (argbuf[0]);
+      const char *exe = prog ? prog : argbuf[0];
+
+      /* The PCH build's stderr must contain only real diagnostics -- ANY
+	 output marks the entry negative.  The spawned cc1plus inherits our
+	 environment, and GCC_COMPILE_CACHE_DEBUG would make it print benign
+	 "compile-cache:" chatter to stderr; neutralize it for the child
+	 (empty means off on both sides) and restore afterwards.  */
+      const char *saved_dbg = env.get ("GCC_COMPILE_CACHE_DEBUG");
+      char *saved_dbg_dup = saved_dbg && saved_dbg[0]
+			    ? xstrdup (saved_dbg) : NULL;
+      if (saved_dbg_dup)
+	xputenv ("GCC_COMPILE_CACHE_DEBUG=");
+
+      struct timeval tv0, tv1;
+      gettimeofday (&tv0, NULL);
+      int status = -1, errnum = 0;
+      const char *errmsg
+	= pex_one (PEX_LAST | PEX_SEARCH, exe,
+		   CONST_CAST2 (char * const *, const char **,
+				gen.address ()),
+		   "cc1plus (auto-pch)", NULL, err_tmp, &status, &errnum);
+      gettimeofday (&tv1, NULL);
+
+      if (saved_dbg_dup)
+	{
+	  char *restore = concat ("GCC_COMPILE_CACHE_DEBUG=", saved_dbg_dup,
+				  NULL);
+	  xputenv (restore);
+	  free (saved_dbg_dup);
+	}
+
+      /* Any stderr at all disqualifies the PCH (see the function comment).  */
+      struct stat est;
+      bool err_empty = (stat (err_tmp, &est) != 0 || est.st_size == 0);
+      ok = (errmsg == NULL && status == 0 && err_empty);
+
+      if (driver_apch_debug_p ())
+	{
+	  long ms = (tv1.tv_sec - tv0.tv_sec) * 1000
+		    + (tv1.tv_usec - tv0.tv_usec) / 1000;
+	  char msg[128];
+	  snprintf (msg, sizeof (msg), "status=%d stderr=%s wall=%ldms",
+		    status, err_empty ? "empty" : "NONEMPTY", ms);
+	  driver_apch_log (ok ? "gen-ok" : "gen-fail", msg);
+	}
+
+      free (prog);
+      free (store_opt);
+      gen.release ();
+    }
+
+  if (ok)
+    {
+      /* Completeness order: manifest first, gch LAST (the stub is already
+	 at its final path).  */
+      ok = (rename (man_tmp, man_final) == 0
+	    && rename (gch_tmp, gch_final) == 0);
+      if (ok)
+	driver_apch_inject (base);
+    }
+
+  if (!ok)
+    {
+      /* Negative entry: keep the manifest when the build produced one (rc==0
+	 warnings case) so a later header edit revalidates and retries.  */
+      struct stat mst;
+      if (stat (man_tmp, &mst) == 0 && mst.st_size > 0)
+	rename (man_tmp, man_final);
+      FILE *nf = fopen (neg_final, "wb");
+      if (nf)
+	{
+	  fputs ("auto-pch: prelude unusable (build failed or warned)\n", nf);
+	  fclose (nf);
+	}
+      driver_apch_log ("negative-store", base);
+    }
+
+  unlink (gch_tmp);
+  unlink (man_tmp);
+  unlink (asm_tmp);
+  unlink (err_tmp);
+  unlink (lock);
+  free (gch_tmp);
+  free (man_tmp);
+  free (asm_tmp);
+  free (err_tmp);
+  free (stub_final);
+  free (gch_final);
+  free (man_final);
+  free (neg_final);
+  free (lock);
+}
+
 /* Process the spec SPEC and run the commands specified therein.
    Returns 0 if the spec is successfully processed; -1 if failed.  */
 
@@ -5721,6 +6758,32 @@ do_spec (const char *spec)
 	argbuf.pop ();
 
       set_collect_gcc_options ();
+
+      /* Auto-PCH phase 1: if a valid prelude PCH exists for this command,
+	 inject -include <stub> BEFORE the serve probe, so the manifest key
+	 (computed identically here and in cc1plus) covers the final argv.
+	 If the entry is absent, PLAN records a deferred generation.  */
+      struct driver_apch_plan apch_plan;
+      driver_auto_pch_probe_inject (&apch_plan);
+
+      /* Driver-level compile-cache serve (Stage 5.2): if this assembled
+	 command is an integrated-as compile-to-object with -fcompile-cache and
+	 the cache holds a warm hit, place the cached .o now and SKIP the spawn
+	 entirely -- no cc1/cc1plus, no as.  On a miss we fall through and run
+	 the command normally (cc1plus then compiles + stores, as before).  */
+      if (argbuf.length () > 0 && driver_try_serve_from_cache ())
+	{
+	  driver_apch_plan_free (&apch_plan);
+	  return 0;
+	}
+
+      /* Auto-PCH phase 2: the .o serve declined, so this TU will really
+	 compile -- build the missing .gch now (one-time cost, amortized by
+	 every later TU sharing the prelude) and inject it for this compile
+	 too.  Never runs when phase 1 already injected or bailed.  */
+      if (apch_plan.gen)
+	driver_auto_pch_generate (&apch_plan);
+      driver_apch_plan_free (&apch_plan);
 
       if (argbuf.length () > 0)
 	value = execute ();
@@ -5895,6 +6958,7 @@ struct spec_path_info {
   size_t append_len;
   bool omit_relative;
   bool separate_options;
+  bool realpaths;
 };
 
 static void *
@@ -5903,6 +6967,16 @@ spec_path (char *path, void *data)
   struct spec_path_info *info = (struct spec_path_info *) data;
   size_t len = 0;
   char save = 0;
+
+  /* The path must exist; we want to resolve it to the realpath so that this
+     can be embedded as a runpath.  */
+  if (info->realpaths)
+     path = lrealpath (path);
+
+  /* However, if we failed to resolve it - perhaps because there was a bogus
+     -B option on the command line, then punt on this entry.  */
+  if (!path)
+    return NULL;
 
   if (info->omit_relative && !IS_ABSOLUTE_PATH (path))
     return NULL;
@@ -6135,6 +7209,22 @@ do_spec_1 (const char *spec, int inswitch, const char *soft_matched_part)
 	      info.omit_relative = false;
 #endif
 	      info.separate_options = false;
+	      info.realpaths = false;
+
+	      for_each_path (&startfile_prefixes, true, 0, spec_path, &info);
+	    }
+	    break;
+
+	  case 'P':
+	    {
+	      struct spec_path_info info;
+
+	      info.option = RUNPATH_OPTION;
+	      info.append_len = 0;
+	      info.omit_relative = false;
+	      info.separate_options = true;
+	      /* We want to embed the actual paths that have the libraries.  */
+	      info.realpaths = true;
 
 	      for_each_path (&startfile_prefixes, true, 0, spec_path, &info);
 	    }
@@ -6461,6 +7551,7 @@ do_spec_1 (const char *spec, int inswitch, const char *soft_matched_part)
 	      info.append_len = strlen (info.append);
 	      info.omit_relative = false;
 	      info.separate_options = true;
+	      info.realpaths = false;
 
 	      for_each_path (&include_prefixes, false, info.append_len,
 			     spec_path, &info);
@@ -6469,6 +7560,18 @@ do_spec_1 (const char *spec, int inswitch, const char *soft_matched_part)
 	      if (*sysroot_hdrs_suffix_spec)
 		info.append = concat (info.append, dir_separator_str,
 				      multilib_dir, NULL);
+	      else if (multiarch_dir)
+		{
+		  /* For multiarch, search include-fixed/<multiarch-dir>
+		     before include-fixed.  */
+		  info.append = concat (info.append, dir_separator_str,
+					multiarch_dir, NULL);
+		  info.append_len = strlen (info.append);
+		  for_each_path (&include_prefixes, false, info.append_len,
+				 spec_path, &info);
+
+		  info.append = "include-fixed";
+		}
 	      info.append_len = strlen (info.append);
 	      for_each_path (&include_prefixes, false, info.append_len,
 			     spec_path, &info);
@@ -7426,6 +8529,27 @@ check_live_switch (int switchnum, int prefix_length)
 	    && (switches[switchnum].live_cond & SWITCH_IGNORE_PERMANENTLY)
 	       == 0);
 
+  /* -o: cc1 -- unlike the external as and ld, both of which take the last
+     of several -o options -- rejects a duplicate -o outright ("output
+     filename specified twice"), and the integrated-assembler compile hands
+     %W{o*} straight to cc1 (see invoke_as).  Give -o last-one-wins
+     semantics in the driver itself, mirroring what as/ld did with the full
+     list; process_command's output_file already resolves the same way.
+     This must precede the one-letter-prefix bailout below, which would
+     otherwise keep every -o live for {o*} matches.  */
+  if (name[0] == 'o' && name[1] == '\0')
+    {
+      for (i = switchnum + 1; i < n_switches; i++)
+	if (switches[i].part1[0] == 'o' && switches[i].part1[1] == '\0')
+	  {
+	    switches[switchnum].validated = true;
+	    switches[switchnum].live_cond = SWITCH_FALSE;
+	    return 0;
+	  }
+      switches[switchnum].live_cond |= SWITCH_LIVE;
+      return 1;
+    }
+
   /* In the common case of {<at-most-one-letter>*}, a negating
      switch would always match, so ignore that case.  We will just
      send the conflicting switches to the compiler phase.  */
@@ -7589,55 +8713,58 @@ print_configuration (FILE *file)
 
 #define RETRY_ICE_ATTEMPTS 3
 
-/* Returns true if FILE1 and FILE2 contain equivalent data, 0 otherwise.  */
+/* Returns true if FILE1 and FILE2 contain equivalent data, 0 otherwise.
+   If lines start with 0x followed by 1-16 lowercase hexadecimal digits
+   followed by a space, ignore anything before that space.  These are
+   typically function addresses from libbacktrace and those can differ
+   due to ASLR.  */
 
 static bool
 files_equal_p (char *file1, char *file2)
 {
-  struct stat st1, st2;
-  off_t n, len;
-  int fd1, fd2;
-  const int bufsize = 8192;
-  char *buf = XNEWVEC (char, bufsize);
+  FILE *f1 = fopen (file1, "rb");
+  FILE *f2 = fopen (file2, "rb");
+  char line1[256], line2[256];
 
-  fd1 = open (file1, O_RDONLY);
-  fd2 = open (file2, O_RDONLY);
-
-  if (fd1 < 0 || fd2 < 0)
-    goto error;
-
-  if (fstat (fd1, &st1) < 0 || fstat (fd2, &st2) < 0)
-    goto error;
-
-  if (st1.st_size != st2.st_size)
-    goto error;
-
-  for (n = st1.st_size; n; n -= len)
+  bool line_start = true;
+  while (fgets (line1, sizeof (line1), f1))
     {
-      len = n;
-      if ((int) len > bufsize / 2)
-	len = bufsize / 2;
-
-      if (read (fd1, buf, len) != (int) len
-	  || read (fd2, buf + bufsize / 2, len) != (int) len)
-	{
-	  goto error;
-	}
-
-      if (memcmp (buf, buf + bufsize / 2, len) != 0)
+      if (!fgets (line2, sizeof (line2), f2))
 	goto error;
+      char *p1 = line1, *p2 = line2;
+      if (line_start
+	  && line1[0] == '0'
+	  && line1[1] == 'x'
+	  && line2[0] == '0'
+	  && line2[1] == 'x')
+	{
+	  int i, j;
+	  for (i = 0; i < 16; ++i)
+	    if (!ISXDIGIT (line1[2 + i]) || ISUPPER (line1[2 + i]))
+	      break;
+	  for (j = 0; j < 16; ++j)
+	    if (!ISXDIGIT (line2[2 + j]) || ISUPPER (line2[2 + j]))
+	      break;
+	  if (i && line1[2 + i] == ' ' && j && line2[2 + j] == ' ')
+	    {
+	      p1 = line1 + i + 3;
+	      p2 = line2 + j + 3;
+	    }
+	}
+      if (strcmp (p1, p2) != 0)
+	goto error;
+      line_start = strchr (line1, '\n') != NULL;
     }
+  if (fgets (line2, sizeof (line2), f2))
+    goto error;
 
-  free (buf);
-  close (fd1);
-  close (fd2);
-
+  fclose (f1);
+  fclose (f2);
   return 1;
 
 error:
-  free (buf);
-  close (fd1);
-  close (fd2);
+  fclose (f1);
+  fclose (f2);
   return 0;
 }
 
@@ -7844,6 +8971,10 @@ try_generate_repro (const char **argv)
     new_argv[out_arg + 1] = "-";
   else
     new_argv[out_arg] = "-o-";
+
+#ifdef HOST_HAS_PERSONALITY_ADDR_NO_RANDOMIZE
+  personality (personality (0xffffffffU) | ADDR_NO_RANDOMIZE);
+#endif
 
   int status;
   for (attempt = 0; attempt < RETRY_ICE_ATTEMPTS; ++attempt)
@@ -8214,6 +9345,7 @@ driver::global_initializations ()
   diagnostic_initialize (global_dc, 0);
   diagnostic_color_init (global_dc);
   diagnostic_urls_init (global_dc);
+  global_dc->set_urlifier (make_gcc_urlifier (0));
 
 #ifdef GCC_DRIVER_HOST_INITIALIZATION
   /* Perform host dependent initialization when needed.  */
@@ -8290,7 +9422,7 @@ driver::build_multilib_strings () const
     obstack_1grow (&multilib_obstack, 0);
     multilib_reuse = XOBFINISH (&multilib_obstack, const char *);
 
-    need_space = FALSE;
+    need_space = false;
     for (size_t i = 0; i < ARRAY_SIZE (multilib_defaults_raw); i++)
       {
 	if (need_space)
@@ -8298,7 +9430,7 @@ driver::build_multilib_strings () const
 	obstack_grow (&multilib_obstack,
 		      multilib_defaults_raw[i],
 		      strlen (multilib_defaults_raw[i]));
-	need_space = TRUE;
+	need_space = true;
       }
 
     obstack_1grow (&multilib_obstack, 0);
@@ -8780,7 +9912,7 @@ driver::maybe_print_and_exit () const
     {
       printf (_("%s %s%s\n"), progname, pkgversion_string,
 	      version_string);
-      printf ("Copyright %s 2022 Free Software Foundation, Inc.\n",
+      printf ("Copyright %s 2024 Free Software Foundation, Inc.\n",
 	      _("(C)"));
       fputs (_("This is free software; see the source for copying conditions.  There is NO\n\
 warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n"),
@@ -9178,38 +10310,9 @@ driver::final_actions () const
 void
 driver::detect_jobserver () const
 {
-  /* Detect jobserver and drop it if it's not working.  */
-  const char *makeflags = env.get ("MAKEFLAGS");
-  if (makeflags != NULL)
-    {
-      const char *needle = "--jobserver-auth=";
-      const char *n = strstr (makeflags, needle);
-      if (n != NULL)
-	{
-	  int rfd = -1;
-	  int wfd = -1;
-
-	  bool jobserver
-	    = (sscanf (n + strlen (needle), "%d,%d", &rfd, &wfd) == 2
-	       && rfd > 0
-	       && wfd > 0
-	       && is_valid_fd (rfd)
-	       && is_valid_fd (wfd));
-
-	  /* Drop the jobserver if it's not working now.  */
-	  if (!jobserver)
-	    {
-	      unsigned offset = n - makeflags;
-	      char *dup = xstrdup (makeflags);
-	      dup[offset] = '\0';
-
-	      const char *space = strchr (makeflags + offset, ' ');
-	      if (space != NULL)
-		strcpy (dup + offset, space);
-	      xputenv (concat ("MAKEFLAGS=", dup, NULL));
-	    }
-	}
-    }
+  jobserver_info jinfo;
+  if (!jinfo.is_active && !jinfo.skipped_makeflags.empty ())
+    xputenv (xstrdup (jinfo.skipped_makeflags.c_str ()));
 }
 
 /* Determine what the exit code of the driver should be.  */
@@ -9359,12 +10462,15 @@ validate_switches (const char *start, bool user_spec, bool braced)
   const char *atom;
   size_t len;
   int i;
-  bool suffix = false;
-  bool starred = false;
+  bool suffix;
+  bool starred;
 
 #define SKIP_WHITE() do { while (*p == ' ' || *p == '\t') p++; } while (0)
 
 next_member:
+  suffix = false;
+  starred = false;
+
   SKIP_WHITE ();
 
   if (*p == '!')
@@ -9874,6 +10980,17 @@ set_multilib_dir (void)
       ++p;
     }
 
+  multilib_dir =
+    targetm_common.compute_multilib (
+      switches,
+      n_switches,
+      multilib_dir,
+      multilib_defaults,
+      multilib_select,
+      multilib_matches,
+      multilib_exclusions,
+      multilib_reuse);
+
   if (multilib_dir == NULL && multilib_os_dir != NULL
       && strcmp (multilib_os_dir, ".") == 0)
     {
@@ -10149,19 +11266,19 @@ print_multilib_info (void)
 	  /* If there are extra options, print them now.  */
 	  if (multilib_extra && *multilib_extra)
 	    {
-	      int print_at = TRUE;
+	      int print_at = true;
 	      const char *q;
 
 	      for (q = multilib_extra; *q != '\0'; q++)
 		{
 		  if (*q == ' ')
-		    print_at = TRUE;
+		    print_at = true;
 		  else
 		    {
 		      if (print_at)
 			putchar ('@');
 		      putchar (*q);
-		      print_at = FALSE;
+		      print_at = false;
 		    }
 		}
 	    }
@@ -10313,8 +11430,9 @@ sanitize_spec_function (int argc, const char **argv)
     return (flag_sanitize & SANITIZE_THREAD) ? "" : NULL;
   if (strcmp (argv[0], "undefined") == 0)
     return ((flag_sanitize
-	     & (SANITIZE_UNDEFINED | SANITIZE_UNDEFINED_NONDEFAULT))
-	    && !flag_sanitize_undefined_trap_on_error) ? "" : NULL;
+	     & ~flag_sanitize_trap
+	     & (SANITIZE_UNDEFINED | SANITIZE_UNDEFINED_NONDEFAULT)))
+	   ? "" : NULL;
   if (strcmp (argv[0], "leak") == 0)
     return ((flag_sanitize
 	     & (SANITIZE_ADDRESS | SANITIZE_LEAK | SANITIZE_THREAD))
@@ -10947,6 +12065,27 @@ find_fortran_preinclude_file (int argc, const char **argv)
   return result;
 }
 
+/* The function takes any number of arguments and joins them together.
+
+   This seems to be necessary to build "-fjoined=foo.b" from "-fseparate foo.a"
+   with a %{fseparate*:-fjoined=%.b$*} rule without adding undesired spaces:
+   when doing $* replacement we first replace $* with the rest of the switch
+   (in this case ""), and then add any arguments as arguments after the result,
+   resulting in "-fjoined= foo.b".  Using this function with e.g.
+   %{fseparate*:-fjoined=%:join(%.b$*)} gets multiple words as separate argv
+   elements instead of separated by spaces, and we paste them together.  */
+
+static const char *
+join_spec_func (int argc, const char **argv)
+{
+  if (argc == 1)
+    return argv[0];
+  for (int i = 0; i < argc; ++i)
+    obstack_grow (&obstack, argv[i], strlen (argv[i]));
+  obstack_1grow (&obstack, '\0');
+  return XOBFINISH (&obstack, const char *);
+}
+
 /* If any character in ORIG fits QUOTE_P (_, P), reallocate the string
    so as to precede every one of them with a backslash.  Return the
    original string or the reallocated one.  */
@@ -11234,6 +12373,7 @@ driver::finalize ()
   input_from_pipe = 0;
   suffix_subst = NULL;
 
+  XDELETEVEC (mdswitches);
   mdswitches = NULL;
   n_mdswitches = 0;
 

@@ -6,7 +6,7 @@
  *                                                                          *
  *                              C Header File                               *
  *                                                                          *
- *          Copyright (C) 1992-2021, Free Software Foundation, Inc.         *
+ *          Copyright (C) 1992-2024, Free Software Foundation, Inc.         *
  *                                                                          *
  * GNAT is free software;  you can  redistribute it  and/or modify it under *
  * terms of the  GNU General Public License as published  by the Free Soft- *
@@ -158,14 +158,14 @@ enum alias_set_op
   ALIAS_SET_SUPERSET
 };
 
-/* Relate the alias sets of GNU_NEW_TYPE and GNU_OLD_TYPE according to OP.
+/* Relate the alias sets of NEW_TYPE and OLD_TYPE according to OP.
    If this is a multi-dimensional array type, do this recursively.
 
    OP may be
    - ALIAS_SET_COPY:     the new set is made a copy of the old one.
    - ALIAS_SET_SUPERSET: the new set is made a superset of the old one.
    - ALIAS_SET_SUBSET:   the new set is made a subset of the old one.  */
-extern void relate_alias_sets (tree gnu_new_type, tree gnu_old_type,
+extern void relate_alias_sets (tree new_type, tree old_type,
 			       enum alias_set_op op);
 
 /* Given GNAT_ENTITY, an object (constant, variable, parameter, exception)
@@ -245,11 +245,12 @@ extern void gigi (Node_Id gnat_root,
 		  struct List_Header *list_headers_ptr,
 		  Nat number_file,
 		  struct File_Info_Type *file_info_ptr,
+		  Entity_Id standard_address,
 		  Entity_Id standard_boolean,
-		  Entity_Id standard_integer,
 		  Entity_Id standard_character,
-		  Entity_Id standard_long_long_float,
 		  Entity_Id standard_exception_type,
+		  Entity_Id standard_integer,
+		  Entity_Id standard_long_long_float,
 		  Int gigi_operating_mode);
 
 #ifdef __cplusplus
@@ -349,7 +350,7 @@ struct attrib
 };
 
 /* Table of machine-independent internal attributes.  */
-extern const struct attribute_spec gnat_internal_attribute_table[];
+extern const struct scoped_attribute_specs gnat_internal_attribute_table;
 
 /* Define the entries in the standard data array.  */
 enum standard_datatypes
@@ -399,18 +400,7 @@ enum standard_datatypes
   /* Identifier for the name of the Not_Handled_By_Others field.  */
   ADT_not_handled_by_others_name_id,
 
-  /* Types and decls used by the SJLJ exception mechanism.  */
-  ADT_jmpbuf_type,
-  ADT_jmpbuf_ptr_type,
-  ADT_get_jmpbuf_decl,
-  ADT_set_jmpbuf_decl,
-  ADT_get_excptr_decl,
-  ADT_not_handled_by_others_decl,
-  ADT_setjmp_decl,
-  ADT_update_setjmp_buf_decl,
-  ADT_raise_nodefer_decl,
-
-  /* Types and decls used by the ZCX exception mechanism.  */
+  /* Types and decls used by the exception mechanism.  */
   ADT_reraise_zcx_decl,
   ADT_set_exception_parameter_decl,
   ADT_begin_handler_decl,
@@ -469,25 +459,15 @@ extern GTY(()) tree gnat_raise_decls_ext[(int) LAST_REASON_CODE + 1];
 #define parent_name_id gnat_std_decls[(int) ADT_parent_name_id]
 #define not_handled_by_others_name_id \
 	  gnat_std_decls[(int) ADT_not_handled_by_others_name_id]
-#define jmpbuf_type gnat_std_decls[(int) ADT_jmpbuf_type]
-#define jmpbuf_ptr_type gnat_std_decls[(int) ADT_jmpbuf_ptr_type]
-#define get_jmpbuf_decl gnat_std_decls[(int) ADT_get_jmpbuf_decl]
-#define set_jmpbuf_decl gnat_std_decls[(int) ADT_set_jmpbuf_decl]
-#define get_excptr_decl gnat_std_decls[(int) ADT_get_excptr_decl]
-#define not_handled_by_others_decl \
-	  gnat_std_decls[(int) ADT_not_handled_by_others_decl]
-#define setjmp_decl gnat_std_decls[(int) ADT_setjmp_decl]
-#define update_setjmp_buf_decl gnat_std_decls[(int) ADT_update_setjmp_buf_decl]
-#define raise_nodefer_decl gnat_std_decls[(int) ADT_raise_nodefer_decl]
 #define reraise_zcx_decl gnat_std_decls[(int) ADT_reraise_zcx_decl]
 #define set_exception_parameter_decl \
 	  gnat_std_decls[(int) ADT_set_exception_parameter_decl]
 #define begin_handler_decl gnat_std_decls[(int) ADT_begin_handler_decl]
+#define end_handler_decl gnat_std_decls[(int) ADT_end_handler_decl]
+#define unhandled_except_decl gnat_std_decls[(int) ADT_unhandled_except_decl]
 #define others_decl gnat_std_decls[(int) ADT_others_decl]
 #define all_others_decl gnat_std_decls[(int) ADT_all_others_decl]
 #define unhandled_others_decl gnat_std_decls[(int) ADT_unhandled_others_decl]
-#define end_handler_decl gnat_std_decls[(int) ADT_end_handler_decl]
-#define unhandled_except_decl gnat_std_decls[(int) ADT_unhandled_except_decl]
 
 /* Routines expected by the gcc back-end. They must have exactly the same
    prototype and names as below.  */
@@ -503,12 +483,6 @@ extern void gnat_zaplevel (void);
 /* Set SUPERCONTEXT of the BLOCK for the current binding level to FNDECL
    and point FNDECL to this BLOCK.  */
 extern void set_current_block_context (tree fndecl);
-
-/* Set the jmpbuf_decl for the current binding level to DECL.  */
-extern void set_block_jmpbuf_decl (tree decl);
-
-/* Get the setjmp_decl, if any, for the current binding level.  */
-extern tree get_block_jmpbuf_decl (void);
 
 /* Record DECL as belonging to the current lexical scope and use GNAT_NODE
    for location information and flag propagation.  */
@@ -547,7 +521,7 @@ extern int gnat_types_compatible_p (tree t1, tree t2);
 extern bool gnat_useless_type_conversion (tree expr);
 
 /* Return true if T, a {FUNCTION,METHOD}_TYPE, has the specified flags.  */
-extern bool fntype_same_flags_p (const_tree, tree, bool, bool, bool);
+extern bool fntype_same_flags_p (const_tree, tree, bool, bool);
 
 /* Create an expression whose value is that of EXPR,
    converted to type TYPE.  The TREE_TYPE of the value
@@ -789,6 +763,12 @@ extern void update_pointer_to (tree old_type, tree new_type);
    minimum (if !MAX_P) possible value of the discriminant.  */
 extern tree max_size (tree exp, bool max_p);
 
+/* Try to compute the maximum (if MAX_P) or minimum (if !MAX_P) value for the
+   expression EXP, for very simple expressions.  Substitute variable references
+   with their respective type's min/max values.  Return the computed value if
+   any, or EXP if no value can be computed. */
+extern tree max_value (tree exp, bool max_p);
+
 /* Remove all conversions that are done in EXP.  This includes converting
    from a padded type or to a left-justified modular type.  If TRUE_ADDRESS
    is true, always return the address of the containing object even if
@@ -939,6 +919,34 @@ extern tree build_allocator (tree type, tree init, tree result_type,
                              Entity_Id gnat_proc, Entity_Id gnat_pool,
                              Node_Id gnat_node, bool);
 
+/* Build a load of SRC using the storage model of GNAT_SMO.  */
+extern tree build_storage_model_load (Entity_Id gnat_smo, tree src);
+
+/* Build a load of SRC into DEST using the storage model of GNAT_SMO.
+   If SIZE is specified, use it, otherwise use the size of SRC.  */
+extern tree build_storage_model_load (Entity_Id gnat_smo, tree dest, tree src,
+				      tree size = NULL_TREE);
+
+/* Build a store of SRC into DEST using the storage model of GNAT_SMO.
+   If SIZE is specified, use it, otherwise use the size of DEST.  */
+extern tree build_storage_model_store (Entity_Id gnat_smo, tree dest, tree src,
+				       tree size = NULL_TREE);
+
+/* Given a tree EXP, instantiate occurrences of LOAD_EXPR in it and associate
+   them with the storage model of GNAT_SMO.  */
+extern tree instantiate_load_in_expr (tree exp, Entity_Id gnat_smo);
+
+/* This macro calls the above function but short-circuits the common
+   case of a constant to save time and also checks for NULL.  */
+
+#define INSTANTIATE_LOAD_IN_EXPR(EXP, GNAT_SMO) \
+  ((EXP) == NULL_TREE || TREE_CONSTANT (EXP) ? (EXP)	\
+   : instantiate_load_in_expr (EXP, GNAT_SMO))
+
+/* Given an array or slice reference, instantiate occurrences of LOAD_EXPR in
+   it and associate them with the storage model of GNAT_SMO.  */
+extern void instantiate_load_in_array_ref (tree ref, Entity_Id gnat_smo);
+
 /* Indicate that we need to take the address of T and that it therefore
    should not be allocated in a register.  Returns true if successful.  */
 extern bool gnat_mark_addressable (tree t);
@@ -1024,6 +1032,10 @@ extern Entity_Id get_debug_scope (Node_Id gnat_node, bool *is_subprogram);
    declaration, can be materialized as a reference (REFERENCE_TYPE).  This
    should be synchronized with Exp_Dbug.Debug_Renaming_Declaration.  */
 extern bool can_materialize_object_renaming_p (Node_Id expr);
+
+/* Return whether GNAT_ENTITY is a simple constant, i.e. it represents only
+   its value and reading it has no side effects.  */
+extern bool simple_constant_p (Entity_Id gnat_entity);
 
 /* Return the size of TYPE, which must be a positive power of 2.  */
 extern unsigned int resolve_atomic_size (tree type);
@@ -1224,6 +1236,14 @@ static inline tree
 operand_type (tree expr)
 {
   return TREE_TYPE (TREE_OPERAND (expr, 0));
+}
+
+/* Return the second value of a list.  */
+
+static inline tree
+list_second (tree list)
+{
+  return TREE_VALUE (TREE_CHAIN (list));
 }
 
 /* Return the third value of a list.  */

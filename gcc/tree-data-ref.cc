@@ -1,5 +1,5 @@
 /* Data references and dependences detectors.
-   Copyright (C) 2003-2022 Free Software Foundation, Inc.
+   Copyright (C) 2003-2024 Free Software Foundation, Inc.
    Contributed by Sebastian Pop <pop@cri.ensmp.fr>
 
 This file is part of GCC.
@@ -73,6 +73,7 @@ along with GCC; see the file COPYING3.  If not see
 
 */
 
+#define INCLUDE_ALGORITHM
 #include "config.h"
 #include "system.h"
 #include "coretypes.h"
@@ -100,6 +101,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "vr-values.h"
 #include "range-op.h"
 #include "tree-ssa-loop-ivopts.h"
+#include "calls.h"
 
 static struct datadep_stats
 {
@@ -593,8 +595,9 @@ compute_distributive_range (tree type, value_range &op0_range,
   gcc_assert (INTEGRAL_TYPE_P (type) && !TYPE_OVERFLOW_TRAPS (type));
   if (result_range)
     {
-      range_operator *op = range_op_handler (code, type);
-      op->fold_range (*result_range, type, op0_range, op1_range);
+      range_op_handler op (code);
+      if (!op.fold_range (*result_range, type, op0_range, op1_range))
+	result_range->set_varying (type);
     }
 
   /* The distributive property guarantees that if TYPE is no narrower
@@ -639,12 +642,14 @@ compute_distributive_range (tree type, value_range &op0_range,
   range_cast (op0_range, ssizetype);
   range_cast (op1_range, ssizetype);
   value_range wide_range;
-  range_operator *op = range_op_handler (code, ssizetype);
+  range_op_handler op (code);
   bool saved_flag_wrapv = flag_wrapv;
   flag_wrapv = 1;
-  op->fold_range (wide_range, ssizetype, op0_range, op1_range);
+  if (!op.fold_range (wide_range, ssizetype, op0_range, op1_range))
+    wide_range.set_varying (ssizetype);;
   flag_wrapv = saved_flag_wrapv;
-  if (wide_range.num_pairs () != 1 || !range_int_cst_p (&wide_range))
+  if (wide_range.num_pairs () != 1
+      || wide_range.varying_p () || wide_range.undefined_p ())
     return false;
 
   wide_int lb = wide_range.lower_bound ();
@@ -760,13 +765,24 @@ split_constant_offset_1 (tree type, tree op0, enum tree_code code, tree op1,
   if (INTEGRAL_TYPE_P (type) && TYPE_OVERFLOW_TRAPS (type))
     return false;
 
+  if (TREE_CODE (op0) == SSA_NAME
+      && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (op0))
+    return false;
+  if (op1
+      && TREE_CODE (op1) == SSA_NAME
+      && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (op1))
+    return false;
+
   switch (code)
     {
     case INTEGER_CST:
       *var = size_int (0);
       *off = fold_convert (ssizetype, op0);
       if (result_range)
-	result_range->set (op0, op0);
+	{
+	  wide_int w = wi::to_wide (op0);
+	  result_range->set (TREE_TYPE (op0), w, w);
+	}
       return true;
 
     case POINTER_PLUS_EXPR:
@@ -792,7 +808,7 @@ split_constant_offset_1 (tree type, tree op0, enum tree_code code, tree op1,
 	return false;
 
       split_constant_offset (op0, &var0, &off0, &op0_range, cache, limit);
-      op1_range.set (op1, op1);
+      op1_range.set (TREE_TYPE (op1), wi::to_wide (op1), wi::to_wide (op1));
       *off = size_binop (MULT_EXPR, off0, fold_convert (ssizetype, op1));
       if (!compute_distributive_range (type, op0_range, code, op1_range,
 				       off, result_range))
@@ -852,9 +868,6 @@ split_constant_offset_1 (tree type, tree op0, enum tree_code code, tree op1,
 
     case SSA_NAME:
       {
-	if (SSA_NAME_OCCURS_IN_ABNORMAL_PHI (op0))
-	  return false;
-
 	gimple *def_stmt = SSA_NAME_DEF_STMT (op0);
 	enum tree_code subcode;
 
@@ -1022,9 +1035,10 @@ split_constant_offset (tree exp, tree *var, tree *off, value_range *exp_range,
 	  get_range_query (cfun)->range_of_expr (vr, exp);
 	  if (vr.undefined_p ())
 	    vr.set_varying (TREE_TYPE (exp));
-	  wide_int var_min = wi::to_wide (vr.min ());
-	  wide_int var_max = wi::to_wide (vr.max ());
-	  value_range_kind vr_kind = vr.kind ();
+	  tree vr_min, vr_max;
+	  value_range_kind vr_kind = get_legacy_range (vr, vr_min, vr_max);
+	  wide_int var_min = wi::to_wide (vr_min);
+	  wide_int var_max = wi::to_wide (vr_max);
 	  wide_int var_nonzero = get_nonzero_bits (exp);
 	  vr_kind = intersect_range_with_nonzero_bits (vr_kind,
 						       &var_min, &var_max,
@@ -1174,7 +1188,12 @@ dr_analyze_innermost (innermost_loop_behavior *drb, tree ref,
       base = TREE_OPERAND (base, 0);
     }
   else
-    base = build_fold_addr_expr (base);
+    {
+      if (may_be_nonaddressable_p (base))
+	return opt_result::failure_at (stmt,
+				       "failed: base not addressable.\n");
+      base = build_fold_addr_expr (base);
+    }
 
   if (in_loop)
     {
@@ -1631,6 +1650,13 @@ runtime_alias_check_p (ddr_p ddr, class loop *loop, bool speed_p)
     return opt_result::failure_at (DR_STMT (DDR_A (ddr)),
 				   "runtime alias check not supported for"
 				   " outer loop.\n");
+
+  /* FORNOW: We don't support handling different address spaces.  */
+  if (TYPE_ADDR_SPACE (TREE_TYPE (TREE_TYPE (DR_BASE_ADDRESS (DDR_A (ddr)))))
+      != TYPE_ADDR_SPACE (TREE_TYPE (TREE_TYPE (DR_BASE_ADDRESS (DDR_B (ddr))))))
+    return opt_result::failure_at (DR_STMT (DDR_A (ddr)),
+				   "runtime alias check between different "
+				   "address spaces not supported.\n");
 
   return opt_result::success ();
 }
@@ -2472,9 +2498,10 @@ create_waw_or_war_checks (tree *cond_expr,
   limit = fold_build2 (PLUS_EXPR, sizetype, limit,
 		       size_int (last_chunk_a + last_chunk_b));
 
-  tree subject = fold_build2 (POINTER_DIFF_EXPR, ssizetype, addr_b, addr_a);
-  subject = fold_build2 (PLUS_EXPR, sizetype,
-			 fold_convert (sizetype, subject), bias);
+  tree subject = fold_build2 (MINUS_EXPR, sizetype,
+			      fold_convert (sizetype, addr_b),
+			      fold_convert (sizetype, addr_a));
+  subject = fold_build2 (PLUS_EXPR, sizetype, subject, bias);
 
   *cond_expr = fold_build2 (GT_EXPR, boolean_type_node, subject, limit);
   if (dump_enabled_p ())
@@ -2620,7 +2647,7 @@ create_intersect_range_checks (class loop *loop, tree *cond_expr,
 	 Because the maximum values are inclusive, there is an alias
 	 if the maximum value of one segment is equal to the minimum
 	 value of the other.  */
-      min_align = MIN (dr_a.align, dr_b.align);
+      min_align = std::min (dr_a.align, dr_b.align);
       cmp_code = LT_EXPR;
     }
 
@@ -2968,6 +2995,27 @@ dr_may_alias_p (const struct data_reference *a, const struct data_reference *b,
      disambiguation.  */
   if (!loop_nest)
     {
+      tree tree_size_a = TYPE_SIZE_UNIT (TREE_TYPE (DR_REF (a)));
+      tree tree_size_b = TYPE_SIZE_UNIT (TREE_TYPE (DR_REF (b)));
+
+      if (DR_BASE_ADDRESS (a)
+	  && DR_BASE_ADDRESS (b)
+	  && operand_equal_p (DR_BASE_ADDRESS (a), DR_BASE_ADDRESS (b))
+	  && operand_equal_p (DR_OFFSET (a), DR_OFFSET (b))
+	  && tree_size_a
+	  && tree_size_b
+	  && poly_int_tree_p (tree_size_a)
+	  && poly_int_tree_p (tree_size_b)
+	  && !ranges_maybe_overlap_p (wi::to_poly_widest (DR_INIT (a)),
+				      wi::to_poly_widest (tree_size_a),
+				      wi::to_poly_widest (DR_INIT (b)),
+				      wi::to_poly_widest (tree_size_b)))
+	{
+	  gcc_assert (integer_zerop (DR_STEP (a))
+		      && integer_zerop (DR_STEP (b)));
+	  return false;
+	}
+
       aff_tree off1, off2;
       poly_widest_int size1, size2;
       get_inner_reference_aff (DR_REF (a), &off1, &size1);
@@ -4017,7 +4065,7 @@ initialize_matrix_A (lambda_matrix A, tree chrec, unsigned index, int mult)
       }
 
     case INTEGER_CST:
-      return chrec;
+      return cst_and_fits_in_hwi (chrec) ? chrec : chrec_dont_know;
 
     default:
       gcc_unreachable ();
@@ -5153,8 +5201,6 @@ build_classic_dist_vector_1 (struct data_dependence_relation *ddr,
 	  non_affine_dependence_relation (ddr);
 	  return false;
 	}
-      else
-	*init_b = true;
     }
 
   return true;
@@ -5790,6 +5836,15 @@ get_references_in_stmt (gimple *stmt, vec<data_ref_loc, va_heap> *references)
 	    }
 	  case IFN_MASK_LOAD:
 	  case IFN_MASK_STORE:
+	  break;
+	  case IFN_MASK_CALL:
+	    {
+	      tree orig_fndecl
+		= gimple_call_addr_fndecl (gimple_call_arg (stmt, 0));
+	      if (!orig_fndecl
+		  || (flags_from_decl_or_type (orig_fndecl) & ECF_CONST) == 0)
+		clobbers_memory = true;
+	    }
 	    break;
 	  default:
 	    clobbers_memory = true;
@@ -5826,7 +5881,7 @@ get_references_in_stmt (gimple *stmt, vec<data_ref_loc, va_heap> *references)
     }
   else if (stmt_code == GIMPLE_CALL)
     {
-      unsigned i, n;
+      unsigned i = 0, n;
       tree ptr, type;
       unsigned int align;
 
@@ -5853,13 +5908,16 @@ get_references_in_stmt (gimple *stmt, vec<data_ref_loc, va_heap> *references)
 				   ptr);
 	    references->safe_push (ref);
 	    return false;
+	  case IFN_MASK_CALL:
+	    i = 1;
+	    gcc_fallthrough ();
 	  default:
 	    break;
 	  }
 
       op0 = gimple_call_lhs (stmt);
       n = gimple_call_num_args (stmt);
-      for (i = 0; i < n; i++)
+      for (; i < n; i++)
 	{
 	  op1 = gimple_call_arg (stmt, i);
 
@@ -6329,7 +6387,7 @@ dr_step_indicator (struct data_reference *dr, int useful_min)
       value_range vr;
       if (TREE_CODE (step) != SSA_NAME
 	  || !get_range_query (cfun)->range_of_expr (vr, step)
-	  || vr.kind () != VR_RANGE)
+	  || vr.undefined_p ())
 	{
 	  step_min = wi::to_wide (TYPE_MIN_VALUE (type));
 	  step_max = wi::to_wide (TYPE_MAX_VALUE (type));

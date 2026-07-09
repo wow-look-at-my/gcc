@@ -9,7 +9,6 @@
  */
 module core.sys.windows.prsht;
 version (Windows):
-@system:
 
 version (ANSI) {} else version = Unicode;
 pragma(lib, "comctl32");
@@ -248,7 +247,7 @@ struct PROPSHEETPAGEW {
 alias PROPSHEETPAGEW*        LPPROPSHEETPAGEW;
 alias const(PROPSHEETPAGEW)* LPCPROPSHEETPAGEW;
 
-mixin DECLARE_HANDLE!("HPROPSHEETPAGE");
+alias HPROPSHEETPAGE = HANDLE;
 
 struct PROPSHEETHEADERA {
     DWORD dwSize = PROPSHEETHEADERA.sizeof;

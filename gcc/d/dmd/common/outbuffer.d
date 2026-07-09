@@ -1,7 +1,7 @@
 /**
  * An expandable buffer in which you can write text or binary data.
  *
- * Copyright: Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright: Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:   Walter Bright, https://www.digitalmars.com
  * License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:    $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/root/outbuffer.d, root/_outbuffer.d)
@@ -61,7 +61,7 @@ struct OutBuffer
     /**
     Construct given size.
     */
-    this(size_t initialSize) nothrow
+    this(size_t initialSize) nothrow @safe
     {
         reserve(initialSize);
     }
@@ -109,12 +109,12 @@ struct OutBuffer
     }
 
     /// For porting with ease from dmd.backend.outbuf.Outbuffer
-    ubyte* buf() nothrow {
+    ubyte* buf() nothrow @system {
         return data.ptr;
     }
 
     /// For porting with ease from dmd.backend.outbuf.Outbuffer
-    ubyte** bufptr() nothrow {
+    ubyte** bufptr() nothrow @system {
         static struct Array { size_t length; ubyte* ptr; }
         auto a = cast(Array*) &data;
         assert(a.length == data.length && a.ptr == data.ptr);
@@ -156,7 +156,7 @@ struct OutBuffer
     Params:
     nbytes = the number of additional bytes to reserve
     */
-    extern (C++) void reserve(size_t nbytes) pure nothrow
+    extern (C++) void reserve(size_t nbytes) pure nothrow @trusted
     {
         //debug (stomp) printf("OutBuffer::reserve: size = %lld, offset = %lld, nbytes = %lld\n", data.length, offset, nbytes);
         const minSize = offset + nbytes;
@@ -210,7 +210,7 @@ struct OutBuffer
         offset = 0;
     }
 
-    private void indent() pure nothrow
+    private void indent() pure nothrow @safe
     {
         if (level)
         {
@@ -223,19 +223,19 @@ struct OutBuffer
     }
 
     // Write an array to the buffer, no reserve check
-    @trusted nothrow
+    @system nothrow
     void writen(const void *b, size_t len)
     {
         memcpy(data.ptr + offset, b, len);
         offset += len;
     }
 
-    extern (C++) void write(const(void)* data, size_t nbytes) pure nothrow
+    extern (C++) void write(const(void)* data, size_t nbytes) pure nothrow @system
     {
         write(data[0 .. nbytes]);
     }
 
-    void write(const(void)[] buf) pure nothrow
+    void write(scope const(void)[] buf) pure nothrow @trusted
     {
         if (doindent && !notlinehead)
             indent();
@@ -281,8 +281,8 @@ struct OutBuffer
         write(&v, v.sizeof);
     }
 
-    /// NOT zero-terminated
-    extern (C++) void writestring(const(char)* s) pure nothrow
+    /// Buffer will NOT be zero-terminated
+    extern (C++) void writestring(const(char)* s) pure nothrow @system
     {
         if (!s)
             return;
@@ -291,44 +291,45 @@ struct OutBuffer
     }
 
     /// ditto
-    void writestring(const(char)[] s) pure nothrow
+    void writestring(scope const(char)[] s) pure nothrow @safe
     {
         write(s);
     }
 
     /// ditto
-    void writestring(string s) pure nothrow
+    void writestring(scope string s) pure nothrow @safe
     {
         write(s);
     }
 
-    /// NOT zero-terminated, followed by newline
-    void writestringln(const(char)[] s) pure nothrow
+    /// Buffer will NOT be zero-terminated, followed by newline
+    void writestringln(const(char)[] s) pure nothrow @safe
     {
         writestring(s);
         writenl();
     }
 
-    // Zero-terminated
-    void writeString(const(char)* s) pure nothrow @trusted
+    /** Write C string AND null byte
+     */
+    void writeStringz(const(char)* s) pure nothrow @system
     {
         write(s[0 .. strlen(s)+1]);
     }
 
     /// ditto
-    void writeString(const(char)[] s) pure nothrow
+    void writeStringz(const(char)[] s) pure nothrow @safe
     {
         write(s);
         writeByte(0);
     }
 
     /// ditto
-    void writeString(string s) pure nothrow
+    void writeStringz(string s) pure nothrow @safe
     {
-        writeString(cast(const(char)[])(s));
+        writeStringz(cast(const(char)[])(s));
     }
 
-    extern (C++) void prependstring(const(char)* string) pure nothrow
+    extern (C++) void prependstring(const(char)* string) pure nothrow @system
     {
         size_t len = strlen(string);
         reserve(len);
@@ -337,9 +338,12 @@ struct OutBuffer
         offset += len;
     }
 
-    /// write newline
-    extern (C++) void writenl() pure nothrow
+    /// strip trailing tabs or spaces, write newline
+    extern (C++) void writenl() pure nothrow @safe
     {
+        while (offset > 0 && (data[offset - 1] == ' ' || data[offset - 1] == '\t'))
+            offset--;
+
         version (Windows)
         {
             writeword(0x0A0D); // newline is CR,LF on Microsoft OS's
@@ -384,7 +388,7 @@ struct OutBuffer
         this.data[offset++] = cast(ubyte) b;
     }
 
-    extern (C++) void writeByte(uint b) pure nothrow
+    extern (C++) void writeByte(uint b) pure nothrow @safe
     {
         if (doindent && !notlinehead && b != '\n')
             indent();
@@ -393,7 +397,7 @@ struct OutBuffer
         offset++;
     }
 
-    extern (C++) void writeUTF8(uint b) pure nothrow
+    extern (C++) void writeUTF8(uint b) pure nothrow @safe
     {
         reserve(6);
         if (b <= 0x7F)
@@ -426,7 +430,7 @@ struct OutBuffer
             assert(0);
     }
 
-    extern (C++) void prependbyte(uint b) pure nothrow
+    extern (C++) void prependbyte(uint b) pure nothrow @trusted
     {
         reserve(1);
         memmove(data.ptr + 1, data.ptr, offset);
@@ -434,7 +438,7 @@ struct OutBuffer
         offset++;
     }
 
-    extern (C++) void writewchar(uint w) pure nothrow
+    extern (C++) void writewchar(uint w) pure nothrow @safe
     {
         version (Windows)
         {
@@ -446,7 +450,7 @@ struct OutBuffer
         }
     }
 
-    extern (C++) void writeword(uint w) pure nothrow
+    extern (C++) void writeword(uint w) pure nothrow @trusted
     {
         version (Windows)
         {
@@ -464,7 +468,7 @@ struct OutBuffer
         offset += 2;
     }
 
-    extern (C++) void writeUTF16(uint w) pure nothrow
+    extern (C++) void writeUTF16(uint w) pure nothrow @trusted
     {
         reserve(4);
         if (w <= 0xFFFF)
@@ -482,7 +486,7 @@ struct OutBuffer
             assert(0);
     }
 
-    extern (C++) void write4(uint w) pure nothrow
+    extern (C++) void write4(uint w) pure nothrow @trusted
     {
         version (Windows)
         {
@@ -499,7 +503,7 @@ struct OutBuffer
         offset += 4;
     }
 
-    extern (C++) void write(const OutBuffer* buf) pure nothrow
+    extern (C++) void write(const OutBuffer* buf) pure nothrow @trusted
     {
         if (buf)
         {
@@ -509,7 +513,7 @@ struct OutBuffer
         }
     }
 
-    extern (C++) void fill0(size_t nbytes) pure nothrow
+    extern (C++) void fill0(size_t nbytes) pure nothrow @trusted
     {
         reserve(nbytes);
         memset(data.ptr + offset, 0, nbytes);
@@ -523,14 +527,14 @@ struct OutBuffer
      * Returns:
      *  slice of the allocated space to be filled in
      */
-    extern (D) char[] allocate(size_t nbytes) pure nothrow
+    extern (D) char[] allocate(size_t nbytes) pure nothrow @safe
     {
         reserve(nbytes);
         offset += nbytes;
         return cast(char[])data[offset - nbytes .. offset];
     }
 
-    extern (C++) void vprintf(const(char)* format, va_list args) nothrow
+    extern (C++) void vprintf(const(char)* format, va_list args) nothrow @system
     {
         int count;
         if (doindent && !notlinehead)
@@ -566,7 +570,7 @@ struct OutBuffer
 
     static if (__VERSION__ < 2092)
     {
-        extern (C++) void printf(const(char)* format, ...) nothrow
+        extern (C++) void printf(const(char)* format, ...) nothrow @system
         {
             va_list ap;
             va_start(ap, format);
@@ -576,7 +580,7 @@ struct OutBuffer
     }
     else
     {
-        pragma(printf) extern (C++) void printf(const(char)* format, ...) nothrow
+        pragma(printf) extern (C++) void printf(const(char)* format, ...) nothrow @system
         {
             va_list ap;
             va_start(ap, format);
@@ -590,13 +594,13 @@ struct OutBuffer
      * Params:
      *  u = integral value to append
      */
-    extern (C++) void print(ulong u) pure nothrow
+    extern (C++) void print(ulong u) pure nothrow @safe
     {
         UnsignedStringBuf buf = void;
         writestring(unsignedToTempString(u, buf));
     }
 
-    extern (C++) void bracket(char left, char right) pure nothrow
+    extern (C++) void bracket(char left, char right) pure nothrow @trusted
     {
         reserve(2);
         memmove(data.ptr + 1, data.ptr, offset);
@@ -609,7 +613,7 @@ struct OutBuffer
      * Insert left at i, and right at j.
      * Return index just past right.
      */
-    extern (C++) size_t bracket(size_t i, const(char)* left, size_t j, const(char)* right) pure nothrow
+    extern (C++) size_t bracket(size_t i, const(char)* left, size_t j, const(char)* right) pure nothrow @system
     {
         size_t leftlen = strlen(left);
         size_t rightlen = strlen(right);
@@ -619,7 +623,7 @@ struct OutBuffer
         return j + leftlen + rightlen;
     }
 
-    extern (C++) void spread(size_t offset, size_t nbytes) pure nothrow
+    extern (C++) void spread(size_t offset, size_t nbytes) pure nothrow @system
     {
         reserve(nbytes);
         memmove(data.ptr + offset + nbytes, data.ptr + offset, this.offset - offset);
@@ -629,19 +633,19 @@ struct OutBuffer
     /****************************************
      * Returns: offset + nbytes
      */
-    extern (C++) size_t insert(size_t offset, const(void)* p, size_t nbytes) pure nothrow
+    extern (C++) size_t insert(size_t offset, const(void)* p, size_t nbytes) pure nothrow @system
     {
         spread(offset, nbytes);
         memmove(data.ptr + offset, p, nbytes);
         return offset + nbytes;
     }
 
-    size_t insert(size_t offset, const(char)[] s) pure nothrow
+    size_t insert(size_t offset, const(char)[] s) pure nothrow @system
     {
         return insert(offset, s.ptr, s.length);
     }
 
-    extern (C++) void remove(size_t offset, size_t nbytes) pure nothrow @nogc
+    extern (C++) void remove(size_t offset, size_t nbytes) pure nothrow @nogc @system
     {
         memmove(data.ptr + offset, data.ptr + offset + nbytes, this.offset - (offset + nbytes));
         this.offset -= nbytes;
@@ -707,15 +711,21 @@ struct OutBuffer
         return cast(char*)data.ptr;
     }
 
+    // Peek at slice of data without taking ownership
+    extern (D) ubyte[] peekSlice() pure nothrow
+    {
+        return data[0 .. offset];
+    }
+
     // Append terminating null if necessary and take ownership of data
-    extern (C++) char* extractChars() pure nothrow
+    extern (C++) char* extractChars() pure nothrow @safe
     {
         if (!offset || data[offset - 1] != '\0')
             writeByte(0);
         return extractData();
     }
 
-    void writesLEB128(int value) pure nothrow
+    void writesLEB128(int value) pure nothrow @safe
     {
         while (1)
         {
@@ -732,7 +742,7 @@ struct OutBuffer
         }
     }
 
-    void writeuLEB128(uint value) pure nothrow
+    void writeuLEB128(uint value) pure nothrow @safe
     {
         do
         {
@@ -743,6 +753,25 @@ struct OutBuffer
                 b |= 0x80;
             writeByte(b);
         } while (value);
+    }
+
+    /**
+     * Write an array as a string of hexadecimal digits
+     * Params:
+     *     data = bytes to write
+     *     upperCase = whether to upper case hex digits A-F
+     */
+    void writeHexString(scope const(ubyte)[] data, bool upperCase) pure nothrow @safe
+    {
+        auto slice = this.allocate(2 * data.length);
+        const a = upperCase ? 'A' : 'a';
+        foreach (i, c; data)
+        {
+            char hi = (c >> 4) & 0xF;
+            slice[i * 2] = cast(char)(hi < 10 ? hi + '0' : hi - 10 + a);
+            char lo = c & 0xF;
+            slice[i * 2 + 1] = cast(char)(lo < 10 ? lo + '0' : lo - 10 + a);
+        }
     }
 
     /**
@@ -757,7 +786,7 @@ struct OutBuffer
 
     Returns: `true` iff the operation succeeded.
     */
-    extern(D) bool moveToFile(const char* filename)
+    extern(D) bool moveToFile(const char* filename) @system
     {
         bool result = true;
         const bool identical = this[] == FileMapping!(const ubyte)(filename)[];
@@ -798,7 +827,7 @@ private:
 
 alias UnsignedStringBuf = char[20];
 
-char[] unsignedToTempString(ulong value, char[] buf, uint radix = 10) @safe pure nothrow @nogc
+char[] unsignedToTempString(ulong value, return scope char[] buf, uint radix = 10) @safe pure nothrow @nogc
 {
     size_t i = buf.length;
     do
@@ -917,4 +946,27 @@ unittest
 
     buf.setsize(4);
     assert(buf.length == 4);
+}
+
+unittest
+{
+    OutBuffer buf;
+
+    buf.writenl();
+    buf.writestring("abc \t ");
+    buf.writenl(); // strips trailing whitespace
+    buf.writenl(); // doesn't strip previous newline
+
+    version(Windows)
+        assert(buf[] == "\r\nabc\r\n\r\n");
+    else
+        assert(buf[] == "\nabc\n\n");
+}
+
+unittest
+{
+    OutBuffer buf;
+    buf.writeHexString([0xAA, 0xBB], false);
+    buf.writeHexString([0xCC], true);
+    assert(buf[] == "aabbCC");
 }
