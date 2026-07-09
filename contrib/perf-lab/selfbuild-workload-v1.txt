@@ -1,0 +1,64 @@
+# selfbuild workload v1 -- FROZEN 2026-07-05. Do not edit this list; a new
+# workload is a new file (selfbuild-workload-v2.txt) and a new README column
+# regime. Numbers measured against different workload versions are not
+# comparable.
+#
+# Source content is pinned by the WORKLOAD tree checkout (see perf-lab.yml
+# PERF_LAB_SELFBUILD_WORKLOAD_SHA = 820ff02b98af9dda4eb8094322347ab458de351e,
+# the fork point / last upstream commit, pure upstream GCC 14.4.1-prerelease),
+# NOT by the stage under test. Every path below was verified to exist at both
+# the fork point (820ff02b9) and the current fork tip (5c426dfdd).
+#
+# Composition: all 16 libcpp/*.cc at the pinned SHA, plus 25 heavyweight gcc/
+# files (picked by host-object size in a real build of this fork, plus the
+# canonical front/middle-end heavies). Generated sources (insn-*.cc,
+# gimple-match-*.cc, ...) are deliberately excluded: they live only in build
+# trees, not in the source workload.
+#
+# Format: one path per line, relative to the workload source tree.
+# Lines starting with '#' and blank lines are ignored.
+
+# --- libcpp (all *.cc at the pinned SHA) ---
+libcpp/charset.cc
+libcpp/directives.cc
+libcpp/errors.cc
+libcpp/expr.cc
+libcpp/files.cc
+libcpp/identifiers.cc
+libcpp/init.cc
+libcpp/lex.cc
+libcpp/line-map.cc
+libcpp/macro.cc
+libcpp/makeucnid.cc
+libcpp/makeuname2c.cc
+libcpp/mkdeps.cc
+libcpp/pch.cc
+libcpp/symtab.cc
+libcpp/traditional.cc
+
+# --- gcc/ heavyweights (25) ---
+gcc/combine.cc
+gcc/config/i386/i386-expand.cc
+gcc/config/i386/i386.cc
+gcc/cp/decl.cc
+gcc/cp/module.cc
+gcc/cp/parser.cc
+gcc/cp/pt.cc
+gcc/dwarf2out.cc
+gcc/expr.cc
+gcc/fold-const.cc
+gcc/gimple-fold.cc
+gcc/gimple.cc
+gcc/gimplify.cc
+gcc/ipa-cp.cc
+gcc/ira-build.cc
+gcc/ira-color.cc
+gcc/ira.cc
+gcc/omp-low.cc
+gcc/range-op.cc
+gcc/simplify-rtx.cc
+gcc/tree-cfg.cc
+gcc/tree-vect-loop.cc
+gcc/tree-vect-slp.cc
+gcc/tree-vect-stmts.cc
+gcc/tree.cc

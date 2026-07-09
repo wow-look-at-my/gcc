@@ -20796,7 +20796,10 @@ and reuse it on a later compilation of identical input, skipping the
 compiler back end entirely on a cache hit.  The cache is content-addressed:
 the lookup key is a hash over the compiler's own version, the source
 language and dialect, the exact bytes of the complete preprocessed source
-closure (every included file's contents), and the code-generation- and
+closure (every included file's contents), the result of every
+@code{__has_include} and @code{__has_include_next} test the translation
+unit evaluated (a header can appear or disappear without changing the
+closure's contents, flipping such a test), and the code-generation- and
 ABI-relevant command-line options.  A change to any of these produces a new
 key, so a stale result is never served.
 
@@ -20843,6 +20846,23 @@ takes precedence when both are present.  Setting the environment variable
 line to standard error per translation unit reporting whether the cache was
 a hit, a miss, or stored.
 
+On a warm hit the recorded include closure is revalidated against the
+filesystem before anything is served.  A file whose complete stat identity
+(size, modification and status-change times at full nanosecond resolution,
+device and inode numbers) matches the record is accepted without re-reading
+it; any difference at all falls back to re-hashing that file's contents, so
+even a rewrite that carefully restores the modification time (for example
+@command{touch -d}) is caught via the advanced change time.  Identities are
+only trusted when the store could prove they describe the hashed bytes;
+files modified while the storing compilation was already running re-verify
+by content until a later store observes them at rest.  Setting the
+environment variable @env{GCC_COMPILE_CACHE_PARANOID} to any non-empty value
+other than @samp{0} (equivalently, @env{GCC_COMPILE_CACHE_VERIFY} to
+@samp{hash}) disables the stat shortcut entirely and re-hashes every
+recorded file's contents on every hit; this trades warm-hit speed for
+end-to-end content verification and is intended for audits and for storage
+whose timestamps or inode numbers cannot be trusted.
+
 Setting the environment variable @env{GCC_COMPILE_CACHE_SALT} to a non-empty
 value mixes that string into every cache key.  Because the key changes, all
 previously cached entries become unreachable and the next compilation of each
@@ -20874,6 +20894,53 @@ In the GCC CI workflow, a @code{workflow_dispatch} run with the boolean input
 on-disk directory and the @code{actions/cache} entry) before building, forcing
 a cold run.
 @end table
+
+@opindex fauto-pch
+@item -fauto-pch
+Automatically build and reuse precompiled headers for shared
+@code{#include} preludes, using the compile cache directory for storage.
+Requires the compile cache to be configured (@option{-fcompile-cache=} or
+@env{GCC_COMPILE_CACHE_DIR}); it is also enabled by setting the environment
+variable @env{GCC_AUTO_PCH} to a non-empty value other than @samp{0}.  C++
+only.
+
+When a translation unit begins with a run of lines containing only
+comments, blank lines, and @code{#include <@dots{}>} directives (at least
+three includes), the driver builds a precompiled header for that prelude
+once and transparently prepends @option{-include} of an equivalent stub
+header to later compilations whose prelude and compilation options match.
+The stored header is validated against the recorded include closure before
+every use, exactly like a compile-cache hit, and is rebuilt when any header
+it depends on changes; when in doubt the compilation silently proceeds
+without a precompiled header.  Dependency output is unchanged by this
+option, and compilations it could not reproduce faithfully (for example,
+preludes whose headers emit warnings while being precompiled, or
+compilations using @option{-include}, @option{-M} dependency output, C++
+modules, or profiling instrumentation) simply do not use it.  Diagnostics
+are normally unchanged as well, with one caveat that applies to GCC
+precompiled headers generally, not just to this option: warnings triggered
+when template code defined in a precompiled header is instantiated by the
+main translation unit may be emitted where an ordinary textual compilation
+of the same code suppresses them (for example
+@option{-Wignored-attributes} on SIMD vector types used as template
+arguments in Eigen).  Such diagnostics are identical to those produced by
+consuming an equivalent hand-built precompiled header.
+
+Compiled objects are byte-identical to those produced by consuming an
+equivalent hand-built precompiled header (@option{-x c++-header} plus
+@option{-include}), and the result for a given prelude and option set is
+deterministic.  In the common case the object is also byte-identical to a
+compilation that uses no precompiled header at all.  However, as with GCC
+precompiled headers generally, restoring pre-parsed header state can change
+how anonymous string and numeric literals are merged and laid out in
+read-only data relative to a fresh parse of the same code (the linker
+performs the same merging at link time either way).  Machine code, symbols,
+and program behavior are unaffected by this difference.
+
+The first eligible compilation pays the one-time cost of building each
+precompiled header; subsequent compilations sharing the prelude skip
+re-parsing it.  Setting the environment variable @env{GCC_AUTO_PCH_DEBUG}
+to a non-empty value prints one line per decision to standard error.
 
 @opindex fcompare-debug
 @opindex fno-compare-debug

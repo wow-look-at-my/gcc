@@ -36,6 +36,51 @@
 
 struct cl_decoded_option;
 
+/* ---- Stat identity (manifest v3 stat shortcut) ---- */
+
+/* The full stat identity of one recorded file, as compared by the serve-time
+   stat shortcut (ccache's inode-cache bar: size + mtime sec/nsec + ctime
+   sec/nsec + dev + ino all matching lets a hit skip re-hashing the bytes; any
+   difference falls back to the content re-hash).  Extracted by
+   cc_statid_from_stat below, which the STORE side (compile-cache.cc) and the
+   SERVE side (compile-cache-serve.cc) both inline -- one definition, so both
+   agree byte-for-byte on every platform, including the nsec availability
+   #if.  */
+struct cc_statid
+{
+  uint64_t size;
+  uint64_t mtime_s;
+  uint64_t ctime_s;
+  uint64_t dev;
+  uint64_t ino;
+  uint32_t mtime_ns;
+  uint32_t ctime_ns;
+};
+
+/* Fill *ID from *ST.  struct stat is visible here via system.h (every
+   includer pulls it in first).  Hosts without st_mtim/st_ctim nanosecond
+   fields record 0 on both sides, which compares consistently.  */
+static inline void
+cc_statid_from_stat (const struct stat *st, struct cc_statid *id)
+{
+  id->size = (uint64_t) st->st_size;
+  id->mtime_s = (uint64_t) st->st_mtime;
+  id->ctime_s = (uint64_t) st->st_ctime;
+  id->dev = (uint64_t) st->st_dev;
+  id->ino = (uint64_t) st->st_ino;
+#if defined (__linux__) || defined (__GLIBC__) || defined (__FreeBSD__) \
+    || defined (__NetBSD__) || defined (__OpenBSD__) || defined (__sun)
+  id->mtime_ns = (uint32_t) st->st_mtim.tv_nsec;
+  id->ctime_ns = (uint32_t) st->st_ctim.tv_nsec;
+#elif defined (__APPLE__)
+  id->mtime_ns = (uint32_t) st->st_mtimespec.tv_nsec;
+  id->ctime_ns = (uint32_t) st->st_ctimespec.tv_nsec;
+#else
+  id->mtime_ns = 0;
+  id->ctime_ns = 0;
+#endif
+}
+
 /* Everything the serve unit needs, supplied by the caller from its own world.
    The driver and cc1plus each fill this from their own globals; the serve code
    itself touches no global compiler state, so the manifest key it computes is
@@ -71,13 +116,159 @@ struct cc_serve_ctx
   /* Current working directory, used only when paths_affect_output.  */
   const char *cwd;
 
-  /* GCC_COMPILE_CACHE_VERIFY=hash forces a full per-header content re-hash on a
-     hit instead of the size+mtime stat shortcut.  */
+  /* GCC_COMPILE_CACHE_VERIFY=hash (alias GCC_COMPILE_CACHE_PARANOID=1) forces
+     a full per-header content re-hash on a hit instead of the stat-identity
+     shortcut; see cc_verify_hash_env_p ().  */
   bool verify_hash;
 
   /* GCC_COMPILE_CACHE_DEBUG: emit "compile-cache: <action> <key12> <out>".  */
   bool debug;
+
+  /* Driver-tier dependency-file synthesis.  When DEPS_PATH is non-NULL, a
+     served manifest hit must also write a make-style dependency file there
+     honoring the -MD contract (every file of the include closure, system
+     headers included) -- the recorded header set IS that closure, so the
+     driver can emit the .d without running the preprocessor.  The driver
+     only requests this for the forms it can reproduce exactly (-MD with an
+     explicit dependency file and at least one -MT/-MQ target, optional
+     -MP); for anything else it declines the serve instead and cc1plus's
+     tier takes over.  All three pointers are borrowed.  A hit that fails to
+     write the file reports a miss (the object may already be placed; the
+     ensuing real compile simply overwrites it and writes its own .d).  */
+  const char *deps_path;		/* dependency file (-MF / -MD arg) */
+  const char *const *deps_targets;	/* target names, command-line order */
+  const bool *deps_target_quoted;	/* per-target: munge like -MQ */
+  unsigned deps_target_count;
+  bool deps_phony;			/* -MP: phony target per header */
 };
+
+/* ---- B2: prefix-map-aware -g keys (shared by ALL key computations) ---- */
+
+/* Under -g the main source path and cwd (and, in the object key, every
+   closure path) bake into DWARF -- but only AFTER the user's
+   -ffile-prefix-map/-fdebug-prefix-map rewrites, so the keys hash the
+   REWRITTEN strings.  These helpers replicate gcc/file-prefix-map.cc's
+   semantics exactly (last '=' split, prepended list = last matching option
+   wins, per-entry -fcanon-prefix-map state captured in command-line order,
+   lrealpath/lbasename canonicalization, plain filename_ncmp prefix match)
+   from a decoded-option array, with no compiler globals -- so the driver
+   and cc1plus compute identical mappings from the identical cc1 argv.
+   Only the DWARF-relevant lists participate (-ffile-prefix-map +
+   -fdebug-prefix-map); -fmacro-prefix-map/-fprofile-prefix-map options
+   remain hashed raw like any other output-affecting option.
+
+   A map option whose OLD prefix matches the raw source path or cwd is
+   excluded ("dropped") from the option hash: its output effect on those
+   strings is captured by hashing the mapped strings themselves, which is
+   what lets two build dirs that map themselves to one canonical prefix
+   share keys.  Map options that match neither stay hashed raw
+   (conservative: they may rewrite other DWARF paths).  With no maps, every
+   mapping is the identity and nothing is dropped -- the hashed material is
+   exactly the pre-B2 bytes.  */
+
+struct cc_pmap_ent
+{
+  char *old_prefix;
+  size_t old_len;
+  char *new_prefix;
+  size_t new_len;
+  bool canonicalize;		/* -fcanon-prefix-map state at this option */
+  unsigned opt_i;		/* index into the decoded-option array */
+};
+
+struct cc_prefix_maps
+{
+  struct cc_pmap_ent *ents;	/* command-line order; consult BACKWARDS
+				   (mirrors file-prefix-map.cc's prepend) */
+  unsigned count;
+  bool *dropped;		/* per decoded-option index; may be NULL */
+  unsigned dropped_n;
+};
+
+/* Build PM from DECODED[1..COUNT-1].  PM must be zero-initialized or
+   freshly cc_pmaps_free'd.  Cheap when no map options are present
+   (pm->count stays 0 and every other helper is a near no-op).  */
+extern void cc_pmaps_collect (struct cc_prefix_maps *pm,
+			      const cl_decoded_option *decoded,
+			      unsigned decoded_count);
+
+/* Mark for exclusion every collected map option whose OLD prefix matches
+   SRC_PATH or CWD (per that entry's canonicalize rule).  */
+extern void cc_pmaps_mark_dropped (struct cc_prefix_maps *pm,
+				   unsigned decoded_count,
+				   const char *src_path, const char *cwd);
+
+/* Apply PM to FILENAME exactly like file-prefix-map.cc's remap_filename;
+   always returns a freshly xmalloc'd string (identity copy when no entry
+   matches).  */
+extern char *cc_pmaps_remap_alloc (const struct cc_prefix_maps *pm,
+				   const char *filename);
+
+static inline bool
+cc_pmaps_opt_dropped_p (const struct cc_prefix_maps *pm, unsigned opt_i)
+{
+  return pm->dropped != NULL && opt_i < pm->dropped_n && pm->dropped[opt_i];
+}
+
+extern void cc_pmaps_free (struct cc_prefix_maps *pm);
+
+/* ---- Shared manifest-entry access (one interpreter for the v2 bytes) ---- */
+
+/* Parsed byte locations of one manifest entry (v3 layout: 40-byte head,
+   HDR_COUNT 80-byte header records, PROBE_COUNT variable-length probe
+   records; see compile-cache-format.h).  Offsets are absolute within the
+   manifest buffer.  */
+struct cc_man_entry
+{
+  const unsigned char *ok_raw;	/* the entry's 20-byte object key */
+  uint32_t warnings;
+  uint32_t werrors;
+  uint32_t eflags;		/* CC_MAN_EFLAG_* */
+  uint32_t hdr_count;
+  uint32_t probe_count;
+  uint64_t hdr_recs_off;
+  uint64_t probe_recs_off;
+  uint64_t next_off;		/* one past this entry's last record */
+};
+
+/* Parse + bounds-check the entry at OFF in MAN/MLEN into *OUT (walking its
+   variable-length probe records to find NEXT_OFF).  Returns false on any
+   truncation / malformation, after which the caller must stop walking the
+   manifest.  */
+extern bool cc_man_entry_parse (const unsigned char *man, size_t mlen,
+				uint64_t off, struct cc_man_entry *out);
+
+/* Fetch a length-prefixed string from the manifest string area with bounds
+   checks; NULL if OFF is out of range.  */
+extern const char *cc_man_string (const unsigned char *man, size_t mlen,
+				  uint32_t off);
+
+/* True when the environment requests the airtight serve mode
+   (GCC_COMPILE_CACHE_VERIFY=hash, or its alias GCC_COMPILE_CACHE_PARANOID
+   set non-empty and not "0"): every header content re-hashes on a hit
+   instead of the stat-identity shortcut.  One definition (in the serve
+   unit) so the driver and cc1plus honor identical spellings.  */
+extern bool cc_verify_hash_env_p (void);
+
+/* Eviction support (GCC_COMPILE_CACHE_MAX_SIZE): best-effort "last used"
+   bump -- set PATH's atime+mtime to now iff its mtime is older than one
+   hour.  Eviction ranks entries by mtime (atime is unreliable under
+   noatime), so every serve tier calls this on the entries it consumed; the
+   1h threshold keeps a hot entry from dirtying its inode on every hit.
+   Never fails loudly (a shared read-only cache simply doesn't bump).  One
+   definition so the driver and cc1plus tiers apply the identical policy.  */
+extern void cc_touch_entry (const char *path);
+
+/* Re-validate ENT against the filesystem: every header record must still
+   resolve (full stat-identity shortcut, else content re-hash; VERIFY_HASH
+   forces the re-hash) and every probe record must still reproduce (each
+   candidate path still absent; a FOUND probe's resolved path still present
+   and not a directory).  Entries with unknown flag bits never validate.
+   Shared by the driver serve, the cc1plus pre-parse serve, and the auto-PCH
+   probe, so all three accept exactly the same states.  */
+extern bool cc_man_entry_records_valid (const unsigned char *man, size_t mlen,
+					const struct cc_man_entry *ent,
+					bool verify_hash);
 
 /* Try to answer a warm hit for source SRC_PATH, placing the cached object at
    OUT_PATH, using CTX.  Computes the manifest key MK from the source bytes +
@@ -97,5 +288,33 @@ struct cc_serve_ctx
 extern bool compile_cache_serve_object (const cc_serve_ctx *ctx,
 					const char *src_path,
 					const char *out_path);
+
+/* ---- Transparent auto-PCH (driver side; see the section in the .cc) ---- */
+
+/* Scan raw source bytes for a leading include-only prelude and produce the
+   NORMALIZED stub for it: include logical lines verbatim, all other lines
+   blanked, line positions preserved (see the .cc).  Sets *NORM (xmalloc'd;
+   NULL when no include was accepted), *NORM_LEN, and *INCLUDE_COUNT.  */
+extern bool cc_auto_pch_scan_prelude (const unsigned char *src, size_t len,
+				      unsigned char **norm, size_t *norm_len,
+				      unsigned *include_count);
+
+/* Derive the cache entry base path "<dir>/pch/<2hex>/<38hex>" for this
+   prelude under CTX's flag cell + compiler id.  xmalloc'd.  */
+extern char *cc_auto_pch_entry_base (const cc_serve_ctx *ctx,
+				     const unsigned char *prelude,
+				     size_t plen);
+
+/* Probe result for cc_auto_pch_probe.  */
+enum cc_auto_pch_probe_result
+{
+  CC_APCH_USABLE,	/* entry valid: inject -include <base>/stub.h */
+  CC_APCH_ABSENT,	/* no (valid) entry: candidate for generation */
+  CC_APCH_NEGATIVE	/* valid do-not-use marker: compile normally */
+};
+
+extern enum cc_auto_pch_probe_result
+cc_auto_pch_probe (const cc_serve_ctx *ctx, const char *base,
+		   const unsigned char *prelude, size_t plen);
 
 #endif /* GCC_COMPILE_CACHE_SERVE_H */

@@ -1,5 +1,22 @@
 # Single-Process Compilation for GCC
 
+> **Status: Stage A is LANDED in this fork.** With the embedded assembler
+> (libgas, x86-64 combined tree -- `contrib/gas-embed/`) linked in,
+> `-fintegrated-as` defaults ON and a compile-to-object is cc1/cc1plus alone;
+> the `.o` cache (`-fcompile-cache`) serves/stores that in-process object.
+> The fold is **no longer unconditional**: `-fno-integrated-as` (restored,
+> clang-parity) selects the classic textual `cc1 | as` pipeline per
+> invocation, the driver auto-selects it when `-Wa,`/`-Xassembler` options
+> are present (the in-process `gas_assemble_buffer()` takes no options, and
+> they are never dropped silently), when any `-save-temps` flavor is active
+> (the promised intermediate `.s` only exists on the textual pipeline), or
+> when `-gsplit-dwarf` is active (the `.dwo` split is `ASM_FINAL_SPEC`'s
+> objcopy pass after the external `as` step), and trees built WITHOUT libgas
+> (`HAVE_LIBGAS` unset -- any non-combined tree or unsupported target)
+> default off and build working two-process compilers.  External-assembler
+> compiles are compile-cache-ineligible both ways (`skip-no-integrated-as`).
+> The sections below describe the stock-GCC baseline and the original plan.
+
 ## Goal
 
 One OS process per compile. `g++ foo.cc -c` should be a single process from source

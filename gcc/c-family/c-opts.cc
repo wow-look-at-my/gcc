@@ -1207,6 +1207,18 @@ c_common_post_options (const char **pfilename)
   cb->dir_change = cb_dir_change;
   if (lang_hooks.preprocess_options)
     lang_hooks.preprocess_options (parse_in);
+
+  /* Record per-file content digests at read time only when a compile cache
+     directory is configured -- the cache is the sole consumer of the digests,
+     and hashing the whole include closure costs ~1.8% of a -O0 compile for
+     nothing when it is off.  Must be decided before cpp_read_main_file ()
+     below reads the first file.  (compile_cache_enabled_p () itself cannot
+     run this early -- it latches its answer, and eligibility state like
+     asm_file_name is not final yet -- so this over-approximates: with a dir
+     configured but the TU later ineligible we hash exactly as the
+     unconditional code did.)  */
+  cpp_opts->hash_file_contents = compile_cache_configured_p ();
+
   cpp_post_options (parse_in);
   init_global_opts_from_cpp (&global_options, cpp_get_options (parse_in));
   /* For C++23 and explicit -finput-charset=UTF-8, turn on -Winvalid-utf8
