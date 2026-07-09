@@ -1,0 +1,139 @@
+# Build-performance results matrix: one dispatch fans out one job per
+# (corpus workload x toolchain config) cell; every job measures its cell's
+# build wall seconds and reports it to the self-updating table on the wiki:
+#
+#   https://github.com/wow-look-at-my/gcc/wiki/Build-Performance-Matrix
+#
+# Fire and forget: each job marks its cell in-flight when it starts and
+# reports the measured value when it finishes (profiling-results-matrix's
+# post step auto-records "aborted" for jobs that die without reporting, and
+# in-flight entries older than the config TTL render as "lost"). Cells are
+# independent -- re-dispatching overwrites them (last writer wins), and
+# after the published fork dist changes, bump `epoch` in
+# profiling-matrix.config.ts so stale numbers render struck through until
+# re-measured.
+#
+# The measurement itself is .github/scripts/ci-corpus.mjs in its
+# CORPUS_TIMING_LEG single-leg mode (the same pinned workloads and build
+# recipes as ci.yml's corpus validation job; timing only, no byte-identity
+# gating). The fork toolchain is the latest published develop-matt/v14 dist
+# from buildhost (anonymous download; ci.yml's build job publishes it).
+
+name: Profiling matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      reset:
+        description: 'Wipe all recorded matrix cells first (clean slate)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # the action pushes rendered results to the repo wiki
+
+env:
+  DIST_URL: 'https://dl.pazer.build/gcc?branch=develop-matt/v14&os=linux&arch=amd64'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      # Cone-mode sparse checkout of .github also materializes all repo-root
+      # files, which includes profiling-matrix.config.ts (same pattern as
+      # ci.yml's corpus job) -- the action reads the config from the workspace.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Reset matrix data
+        if: inputs.reset
+        uses: wow-look-at-my/profiling-results-matrix@v1
+        with:
+          status: reset
+
+  measure:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # rows/cols mirror profiling-matrix.config.ts; a cell is <row>/<col>.
+        row: [llama-release, llama-relwithdebinfo, fmt, sqlite, zlib-ng, openssl]
+        col: [stock, fork, fork-cache-cold, fork-cache-warm, ccache-fork]
+        include:
+          # Row -> ci-corpus.mjs project where it differs from the row key.
+          - row: llama-release
+            project: llama.cpp
+            buildtype: Release
+          - row: llama-relwithdebinfo
+            project: llama.cpp
+          # Column -> timing leg + toolchain. Columns without cc/cxx use the
+          # fork dist via GCC_DIST (the script's default compiler paths).
+          - col: stock
+            leg: plain
+            cc: gcc-13
+            cxx: g++-13
+          - col: fork
+            leg: plain
+          - col: fork-cache-cold
+            leg: cache-cold
+          - col: fork-cache-warm
+            leg: cache-warm
+          - col: ccache-fork
+            leg: prewarmed
+            ccwrap: ccache
+    name: ${{ matrix.row }} / ${{ matrix.col }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+
+      - name: Mark cell in-flight
+        uses: wow-look-at-my/profiling-results-matrix@v1
+        with:
+          cell: ${{ matrix.row }}/${{ matrix.col }}
+          status: in-flight
+
+      # ninja for the cmake projects; gmp/mpfr/mpc/isl are the fork cc1's
+      # runtime deps; g++-13 pins the stock column's compiler; ccache serves
+      # the ccache column. cmake, perl, unzip, git and node/npm (llama.cpp
+      # webui pre-build) are preinstalled on ubuntu-latest.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache g++-13 libgmp-dev libmpfr-dev libmpc-dev libisl-dev
+
+      - name: Download fork dist
+        if: matrix.col != 'stock'
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          curl -fL --retry 4 -o "$RUNNER_TEMP/gcc-dist.tar.zst" "$DIST_URL"
+          tar -C "$RUNNER_TEMP/dist" --zstd -xf "$RUNNER_TEMP/gcc-dist.tar.zst"
+          "$RUNNER_TEMP/dist/gcc-dist/bin/gcc" --version | head -1
+
+      # Empty env values are falsy in the script, so unset matrix keys fall
+      # back to its defaults (fork dist compilers, RelWithDebInfo, no wrap).
+      # CCACHE_* only matters for the ccache column (harmless elsewhere):
+      # BASEDIR + NOHASHDIR make the timed fresh-dir build hit the cache the
+      # populate build filled despite the differing build directories.
+      - name: Measure ${{ matrix.row }} / ${{ matrix.col }}
+        id: leg
+        env:
+          GCC_DIST: ${{ runner.temp }}/dist/gcc-dist
+          CORPUS_TIMING_LEG: ${{ matrix.leg }}
+          CORPUS_BUILD_TYPE: ${{ matrix.buildtype }}
+          CORPUS_CC: ${{ matrix.cc }}
+          CORPUS_CXX: ${{ matrix.cxx }}
+          CORPUS_CC_WRAP: ${{ matrix.ccwrap }}
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+          CCACHE_BASEDIR: ${{ runner.temp }}/corpus
+          CCACHE_NOHASHDIR: '1'
+        run: node "$GITHUB_WORKSPACE/.github/scripts/ci-corpus.mjs" "${{ matrix.project || matrix.row }}"
+
+      - name: Report result
+        uses: wow-look-at-my/profiling-results-matrix@v1
+        with:
+          cell: ${{ matrix.row }}/${{ matrix.col }}
+          status: done
+          value: ${{ steps.leg.outputs.wall }}

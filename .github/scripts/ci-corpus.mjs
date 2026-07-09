@@ -28,7 +28,26 @@
 //   CORPUS_CC / CORPUS_CXX
 //                override the compiler command, possibly multi-word (local
 //                testing with an uninstalled tree: ".../xgcc -B.../gcc")
+//   CORPUS_CC_WRAP
+//                prefix prepended to both compiler commands (e.g. "ccache"
+//                for the profiling matrix's ccache column)
 //   CORPUS_WORK  scratch dir (default $RUNNER_TEMP/corpus)
+//   CORPUS_BUILD_TYPE
+//                llama.cpp only: CMAKE_BUILD_TYPE override (default
+//                RelWithDebInfo -- the validation flow relies on that
+//                default; only the profiling matrix's Release row sets this)
+//   CORPUS_TIMING_LEG
+//                single-leg timing mode for .github/workflows/profiling.yml:
+//                skip the off/cold/warm validation sequence and instead time
+//                ONE build, printing integer wall seconds and appending
+//                wall=<secs> to $GITHUB_OUTPUT. Legs:
+//                  plain       one build, compile cache off
+//                  cache-cold  one build, -fcompile-cache into an empty dir
+//                  cache-warm  untimed -fcompile-cache populate build, then
+//                              a timed fresh-dir build served from the cache
+//                  prewarmed   like cache-warm but with the compile cache
+//                              off both times -- the warm cache is external
+//                              (CORPUS_CC_WRAP=ccache + CCACHE_* env)
 //
 // Node ESM, standard-library only (matches ci-verify-cache.mjs conventions).
 
@@ -62,8 +81,10 @@ const HIT_FLOOR = { openssl: 400, 'zlib-ng': 30, sqlite: 2, fmt: 20, 'llama.cpp'
 
 const RT = process.env.RUNNER_TEMP || os.tmpdir();
 const dist = process.env.GCC_DIST || path.join(RT, 'gcc-dist');
-const CC = process.env.CORPUS_CC || path.join(dist, 'bin', 'gcc');
-const CXX = process.env.CORPUS_CXX || path.join(dist, 'bin', 'g++');
+const wrapCmd = (cmd) =>
+  process.env.CORPUS_CC_WRAP ? `${process.env.CORPUS_CC_WRAP} ${cmd}` : cmd;
+const CC = wrapCmd(process.env.CORPUS_CC || path.join(dist, 'bin', 'gcc'));
+const CXX = wrapCmd(process.env.CORPUS_CXX || path.join(dist, 'bin', 'g++'));
 const work = path.join(process.env.CORPUS_WORK || path.join(RT, 'corpus'), project);
 const srcDir = path.join(work, 'src');
 const cacheDir = path.join(work, 'cc-cache');
@@ -278,7 +299,8 @@ function build(phase, dir, cache) {
       // off (no libcurl-dev on the runner), ccache off (GGML_CCACHE=OFF --
       // the fork's cache is the one under test).
       run(phase, ['cmake', '-S', srcDir, '-B', dir, '-G', 'Ninja',
-                  '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DLLAMA_CURL=OFF', '-DGGML_CCACHE=OFF',
+                  `-DCMAKE_BUILD_TYPE=${process.env.CORPUS_BUILD_TYPE || 'RelWithDebInfo'}`,
+                  '-DLLAMA_CURL=OFF', '-DGGML_CCACHE=OFF',
                   `-DCMAKE_C_FLAGS=${flags.join(' ')}`, `-DCMAKE_CXX_FLAGS=${flags.join(' ')}`],
           { env, quietStdout: true });
       run(phase, ['cmake', '--build', dir, '-j', nproc], { env, quietStdout: true });
@@ -349,6 +371,34 @@ run('setup', [...splitCmd(CC), '--version'], { quietStdout: true });
 fetchSource();
 if (project === 'llama.cpp') prebuildWebui();
 fs.mkdirSync(cacheDir, { recursive: true });
+
+// ---------------------------------------------------------------------------
+// Single-leg timing mode (profiling.yml; see the env docs up top). Times ONE
+// build and exits: no byte-identity, no hit floors -- ci.yml's corpus job
+// (CORPUS_TIMING_LEG unset) remains the correctness gate, this mode only
+// measures. The timed section is exactly the build (configure+compile+link);
+// the populate pass of the warm legs and the post-build quick test are not.
+// ---------------------------------------------------------------------------
+const timingLeg = process.env.CORPUS_TIMING_LEG;
+if (timingLeg) {
+  const LEGS = ['plain', 'cache-cold', 'cache-warm', 'prewarmed'];
+  if (!LEGS.includes(timingLeg))
+    fail(`unknown CORPUS_TIMING_LEG '${timingLeg}' (expected ${LEGS.join('|')})`);
+  const useCompileCache = timingLeg.startsWith('cache-');
+  if (timingLeg === 'cache-warm' || timingLeg === 'prewarmed')
+    build('populate', path.join(work, 'build-populate'), useCompileCache);
+  const dir = path.join(work, `build-${timingLeg}`);
+  const t0 = Date.now();
+  build(timingLeg, dir, useCompileCache);
+  const wall = Math.round((Date.now() - t0) / 1000);
+  quickTest(timingLeg, dir);
+  if (process.env.GITHUB_OUTPUT)
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `wall=${wall}\n`);
+  process.stdout.write(
+    `\nTIMING ${project} leg=${timingLeg} wall=${wall}s ` +
+    `(timed build only; fetch/webui/populate/quick-test excluded)\n`);
+  process.exit(0);
+}
 
 const phases = [
   { name: 'off', cache: false },
