@@ -15,10 +15,20 @@ object file directly, so `g++ -c foo.cc -o foo.o` runs as a **single process**.
   embedded GAS via `gas_assemble_buffer()` (linked in as `libgas.a`), which
   writes the `.o` in-process. The driver's spec no longer invokes `as`.
 
-The flag is **off by default**; without it GCC behaves exactly as before. The
-in-process object output is **byte-identical** to the conventional
-`cc1plus | as --64` pipeline (verified by sha256 across trivial, heavy-C++,
-`-g`, and inline-`asm()` translation units).
+The flag is **on by default** whenever libgas is linked in (`common.opt`
+`Init(1)` gated by `HAVE_LIBGAS`, which gcc/Makefile.in defines only when the
+combined-tree build produced `../libgas.a`; on any other tree the default
+flips off and GCC builds/behaves exactly as stock, two processes and all).
+`-fno-integrated-as` restores the classic textual pipeline per invocation
+(cc1plus writes a temp `.s`, the driver runs the external `as`); the driver
+also auto-selects that pipeline whenever `-Wa,`/`-Xassembler` options are
+present, since `gas_assemble_buffer()` takes no options -- such options are
+never silently dropped (an explicit `-fintegrated-as` combined with them is a
+hard error instead).  External-assembler compiles are ineligible for
+`-fcompile-cache` (tag `skip-no-integrated-as`).  The in-process object
+output is **byte-identical** to the conventional `cc1plus | as --64` pipeline
+(verified by sha256 across trivial, heavy-C++, `-g`, and inline-`asm()`
+translation units, and continuously by ci-verify-cache checks 23/24).
 
 The embedded assembler entry point `gas_assemble_buffer()` turns an in-memory
 GAS-syntax assembly buffer into an ELF `.o` with no subprocess, and never exits
@@ -168,6 +178,15 @@ the built archives (`nm ... | grep 'U ZSTD_'`) and adds `-lzstd` only when
 needed; GCC's own `$(ZSTD_LIB)` configure variable does the same for the
 `GAS_LIBS` link in `gcc/cp/Make-lang.in`. Without zstd (no libzstd-dev), the
 archives have no `ZSTD_*` references and `-lzstd` is neither needed nor linked.
+
+`build-libgas.sh` env knobs: `GAS_SRC` (gas source dir) and `GAS_EMBED_DIR`
+(this directory) point it at a checkout, as before; `CC` and `EXTRA_CFLAGS`
+select the compiler and extra flags for the objects it compiles and the test
+harness link. Instrumented/PGO trees MUST pass matching flags (e.g.
+`EXTRA_CFLAGS='-fprofile-generate'`): the harness links the combined-tree
+archives, and instrumented archives reference `__gcov_*` symbols that only
+resolve when the harness link carries the same flag. Defaults reproduce the
+historical plain build.
 
 ## Proof
 

@@ -1064,7 +1064,20 @@ ggc_min_heapsize_heuristic (void)
   limit_kbytes /= ONE_K;
 
   /* The heuristic is RAM/8, with a lower bound of 4M and an upper
-     bound of 128M (when RAM >= 1GB).  */
+     bound of 512M (when RAM >= 4GB).  Raising the first-collection
+     threshold above the historical 128M stops mid-compile collections
+     on template-heavy C++ TUs (which now allocate hundreds of MB of
+     GGC memory), saving the entire GC share of compile time (~3-4%
+     wall on such TUs) for a modest peak-RSS cost; small machines still
+     get RAM/8, and the RLIMIT_RSS / data-limit clamps below still
+     apply.
+
+     Batch/CI users with RAM to burn can additionally disable
+     heuristic collection outright with --param ggc-min-expand=2147483647
+     (the only non-heuristic collections come from selftests and __RTL
+     test input).  Peak GGC heap then approaches ~0.8x the TU's total
+     GGC allocation, unbounded in TU size, which is why that is an
+     opt-in and not the default.  */
   phys_kbytes /= 8;
 
 #if defined(HAVE_GETRLIMIT) && defined (RLIMIT_RSS)
@@ -1087,7 +1100,7 @@ ggc_min_heapsize_heuristic (void)
   phys_kbytes = MIN (phys_kbytes, limit_kbytes);
 
   phys_kbytes = MAX (phys_kbytes, 4 * ONE_K);
-  phys_kbytes = MIN (phys_kbytes, 128 * ONE_K);
+  phys_kbytes = MIN (phys_kbytes, 512 * ONE_K);
 
   return phys_kbytes;
 }

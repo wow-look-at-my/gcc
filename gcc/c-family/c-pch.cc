@@ -28,6 +28,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "c-pragma.h"
 #include "langhooks.h"
 #include "hosthooks.h"
+#include "compile-cache.h"
 
 /* This is a list of flag variables that must match exactly, and their
    names for the error message.  The possible values for *flag_var must
@@ -184,6 +185,11 @@ c_common_write_pch (void)
 
   fclose (pch_outfile);
 
+  /* Auto-PCH: when the driver asked for it (-fauto-pch-store=PATH on this
+     PCH build), record the include closure this .gch baked in, so the
+     driver can validate the entry before ever injecting it.  */
+  compile_cache_auto_pch_store (parse_in);
+
   timevar_pop (TV_PCH_SAVE);
 }
 
@@ -307,12 +313,38 @@ c_common_valid_pch (cpp_reader *pfile, const char *name, int fd)
    is loaded.  */
 void (*lang_post_pch_load) (void);
 
+/* Auto-PCH: the consumed PCH was built from a stub header that is a
+   byte-exact copy of the current main file's prelude, at a cache-internal
+   path.  Rewrite every restored ordinary line map naming the stub to name
+   the main input instead: line numbers already agree (byte-copy), so
+   diagnostics whose include chain or location goes through the stub become
+   byte-identical to a non-PCH compile, and -g debug info records the same
+   file name either way.  */
+static void
+auto_pch_remap_stub_filename (const char *stub_path)
+{
+  if (!line_table || !main_input_filename || !stub_path)
+    return;
+  const char *interned = NULL;
+  for (unsigned i = 0; i < LINEMAPS_ORDINARY_USED (line_table); i++)
+    {
+      line_map_ordinary *map = LINEMAPS_ORDINARY_MAP_AT (line_table, i);
+      const char *file = ORDINARY_MAP_FILE_NAME (map);
+      if (file && filename_cmp (file, stub_path) == 0)
+	{
+	  if (!interned)
+	    interned = xstrdup (main_input_filename);
+	  map->to_file = interned;
+	}
+    }
+}
+
 /* Load in the PCH file NAME, open on FD.  It was originally searched for
    by ORIG_NAME.  */
 
 void
 c_common_read_pch (cpp_reader *pfile, const char *name,
-		   int fd, const char *orig_name ATTRIBUTE_UNUSED)
+		   int fd, const char *orig_name)
 {
   FILE *f;
   struct save_macro_data *smd;
@@ -368,6 +400,15 @@ c_common_read_pch (cpp_reader *pfile, const char *name,
      been loaded.  */
   if (lang_post_pch_load)
     (*lang_post_pch_load) ();
+
+  /* Auto-PCH bookkeeping: tell the compile cache a PCH was consumed (a
+     foreign one disables the .o store -- its closure would be incomplete;
+     our own gets the gch manifest merged in instead), and rename the stub
+     in the restored line maps so diagnostics match a non-PCH compile.  */
+  compile_cache_note_pch_read (orig_name);
+  if (flag_auto_pch_ref && orig_name
+      && filename_cmp (orig_name, flag_auto_pch_ref) == 0)
+    auto_pch_remap_stub_filename (orig_name);
 
 end:
   timevar_pop (TV_PCH_RESTORE);
