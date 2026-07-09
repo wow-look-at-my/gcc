@@ -238,12 +238,22 @@ function prebuildWebui() {
   process.stdout.write('[webui] built once into tools/ui/dist (shared by off/cold/warm)\n');
 }
 
-// Extra compile flags for a build in DIR with/without the cache. llama.cpp
-// builds with -g (RelWithDebInfo), so it also prefix-maps the build dir --
-// the flag whose cache-key handling (B2) this leg exists to exercise.
+// llama.cpp's CMAKE_BUILD_TYPE (only the profiling matrix's Release row
+// overrides the default; see the CORPUS_BUILD_TYPE docs up top).
+const llamaBuildType = process.env.CORPUS_BUILD_TYPE || 'RelWithDebInfo';
+
+// Extra compile flags for a build in DIR with/without the cache. The
+// RelWithDebInfo (-g) llama.cpp build also prefix-maps the build dir -- the
+// flag whose cache-key handling (B2) that leg exists to exercise. Under -g
+// ONLY: the fork's cache normalizes *-prefix-map into the key only when
+// paths affect the output (cc_paths_affect_output_p -- B2, by design), so
+// in a Release build the raw dir-dependent flag lands in every key verbatim
+// and poisons cross-directory serves (the epoch-1 llama-release warm=386s
+// cell: a full recompile passed off as a warm cache measurement).
 function extraFlags(dir, cache) {
   const flags = [];
-  if (project === 'llama.cpp') flags.push(`-ffile-prefix-map=${dir}=.`);
+  if (project === 'llama.cpp' && llamaBuildType === 'RelWithDebInfo')
+    flags.push(`-ffile-prefix-map=${dir}=.`);
   if (cache) flags.push(`-fcompile-cache=${cacheDir}`);
   return flags;
 }
@@ -299,7 +309,7 @@ function build(phase, dir, cache) {
       // off (no libcurl-dev on the runner), ccache off (GGML_CCACHE=OFF --
       // the fork's cache is the one under test).
       run(phase, ['cmake', '-S', srcDir, '-B', dir, '-G', 'Ninja',
-                  `-DCMAKE_BUILD_TYPE=${process.env.CORPUS_BUILD_TYPE || 'RelWithDebInfo'}`,
+                  `-DCMAKE_BUILD_TYPE=${llamaBuildType}`,
                   '-DLLAMA_CURL=OFF', '-DGGML_CCACHE=OFF',
                   `-DCMAKE_C_FLAGS=${flags.join(' ')}`, `-DCMAKE_CXX_FLAGS=${flags.join(' ')}`],
           { env, quietStdout: true });
@@ -391,12 +401,27 @@ if (timingLeg) {
   const t0 = Date.now();
   build(timingLeg, dir, useCompileCache);
   const wall = Math.round((Date.now() - t0) / 1000);
+  // Count the timed pass's cache-debug lines (from its phase log) so an
+  // all-miss "warm" measurement is visible in the job log instead of
+  // silently timing a full recompile. Legs without the compile cache
+  // (plain, prewarmed) report all zeros by construction.
+  const hits = countHits(timingLeg);
   quickTest(timingLeg, dir);
   if (process.env.GITHUB_OUTPUT)
     fs.appendFileSync(process.env.GITHUB_OUTPUT, `wall=${wall}\n`);
   process.stdout.write(
     `\nTIMING ${project} leg=${timingLeg} wall=${wall}s ` +
+    `hits=${JSON.stringify(hits)} ` +
     `(timed build only; fetch/webui/populate/quick-test excluded)\n`);
+  // Timing mode stays non-gating (ci.yml's corpus job is the correctness
+  // gate), but a *-warm leg that never hit the cache measured the wrong
+  // thing -- the epoch-1 llama-release warm=386s cell -- so warn LOUDLY;
+  // do not fail the job.
+  if (timingLeg.endsWith('-warm') && hits.manifestHit + hits.hit === 0)
+    process.stdout.write(
+      `::warning title=corpus ${project} ${timingLeg}::timed warm build had ` +
+      `ZERO compile-cache hits (${JSON.stringify(hits)}) -- it measured a ` +
+      `full recompile, not a cache-served build\n`);
   process.exit(0);
 }
 

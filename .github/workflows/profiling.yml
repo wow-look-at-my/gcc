@@ -16,8 +16,11 @@
 # The measurement itself is .github/scripts/ci-corpus.mjs in its
 # CORPUS_TIMING_LEG single-leg mode (the same pinned workloads and build
 # recipes as ci.yml's corpus validation job; timing only, no byte-identity
-# gating). The fork toolchain is the latest published develop-matt/v14 dist
-# from buildhost (anonymous download; ci.yml's build job publishes it).
+# gating). The fork toolchain is the latest published develop-matt/v14 PGO
+# dist from buildhost (anonymous download; ci.yml's package-pgo job
+# publishes it on release-branch pushes) -- the PGO build is the released
+# compiler, ~8% faster cc1plus with byte-identical output, so it is the one
+# worth measuring.
 
 name: Profiling matrix
 
@@ -42,7 +45,9 @@ permissions:
   contents: write   # the action pushes rendered results to the repo wiki
 
 env:
-  DIST_URL: 'https://dl.pazer.build/gcc?branch=develop-matt/v14&os=linux&arch=amd64'
+  # gcc/pgo: the PGO-built release package (same gcc-dist/ tarball layout as
+  # plain gcc, verified; anonymous download OK -- probed 200, ~34.4 MB).
+  DIST_URL: 'https://dl.pazer.build/gcc/pgo?branch=develop-matt/v14&os=linux&arch=amd64'
 
 jobs:
   prepare:

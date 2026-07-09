@@ -13,8 +13,9 @@
 // excluded. Workload pins and per-column toolchain setup live in
 // .github/scripts/ci-corpus.mjs (CORPUS_TIMING_LEG mode) and the workflow.
 //
-// The "fork dist" columns use the latest published dist of develop-matt/v14
-// (https://dl.pazer.build/gcc?branch=develop-matt/v14&os=linux&arch=amd64).
+// The fork-toolchain columns use the latest published PGO dist of
+// develop-matt/v14 (the released compiler; ci.yml's package-pgo job):
+// https://dl.pazer.build/gcc/pgo?branch=develop-matt/v14&os=linux&arch=amd64
 // When that dist meaningfully changes (new optimization stage lands), bump
 // `epoch` below and commit: pushes touching this file re-run the whole
 // matrix (see profiling.yml's push trigger), and old numbers render struck
@@ -30,7 +31,11 @@ const config = {
   // The gcc wiki git repo exists (bootstrapped by hand), so pin it: a probe
   // failure should fail loudly rather than quietly fall back to a branch.
   storage: 'wiki',
-  epoch: 1,
+  // Epoch 2: prefix-map poisoning fix for the Release row's cache columns
+  // (epoch-1 llama-release warm=386s measured a full recompile) and the
+  // switch of the fork columns to the PGO dist -- every epoch-1 value is
+  // stale for one of those reasons, so invalidate them all.
+  epoch: 2,
   unit: 's',
   // Cells are marked in-flight when their job STARTS (not when queued); a
   // leg is timeboxed to 60 min, so anything in-flight past 90 min is a
@@ -46,7 +51,7 @@ const config = {
   ],
   cols: [
     { key: 'stock', label: 'Ubuntu `gcc-13` (stock)' },
-    { key: 'fork', label: 'fork dist' },
+    { key: 'fork', label: 'fork dist (PGO)' },
     { key: 'fork-cache-cold', label: 'fork + `-fcompile-cache` (cold)' },
     { key: 'fork-cache-warm', label: 'fork + `-fcompile-cache` (warm)' },
     { key: 'ccache-fork', label: '`ccache` (warm) + fork dist' },

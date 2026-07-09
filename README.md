@@ -104,7 +104,8 @@ the wiki: **[Build-Performance-Matrix](https://github.com/wow-look-at-my/gcc/wik
 Rows are the pinned corpus projects from ci.yml's validation job
 (llama.cpp Release/RelWithDebInfo, fmt, sqlite, zlib-ng, openssl no-asm);
 columns are toolchain configs (stock Ubuntu gcc-13, the published fork
-dist, fork `-fcompile-cache` cold/warm, ccache-warm + fork); each cell is
+PGO dist, fork `-fcompile-cache` cold/warm, ccache-warm + fork); each cell
+is
 the wall seconds of one timed `-j$(nproc)` build on a hosted 4-vCPU
 runner. To (re)fill it: push a change to the matrix config (an epoch bump
 counts) or run Actions → **Profiling matrix** → Run workflow —
