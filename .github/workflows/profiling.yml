@@ -28,6 +28,15 @@ on:
         description: 'Wipe all recorded matrix cells first (clean slate)'
         type: boolean
         default: false
+  # A push that changes the matrix config re-measures the matrix: an epoch
+  # bump (or row/col change) committed to the config IS the re-run trigger,
+  # no manual dispatch needed. This is also the bootstrap path -- the REST
+  # workflow_dispatch endpoint 404s for a workflow file that has never been
+  # on the default branch (GitHub's workflow registry does not index
+  # branch-only files), while push events run straight from the pushed ref.
+  push:
+    paths:
+      - 'profiling-matrix.config.ts'
 
 permissions:
   contents: write   # the action pushes rendered results to the repo wiki

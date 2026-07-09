@@ -106,7 +106,8 @@ Rows are the pinned corpus projects from ci.yml's validation job
 columns are toolchain configs (stock Ubuntu gcc-13, the published fork
 dist, fork `-fcompile-cache` cold/warm, ccache-warm + fork); each cell is
 the wall seconds of one timed `-j$(nproc)` build on a hosted 4-vCPU
-runner. To (re)fill it: Actions → **Profiling matrix** → Run workflow —
+runner. To (re)fill it: push a change to the matrix config (an epoch bump
+counts) or run Actions → **Profiling matrix** → Run workflow —
 each cell is an independent job that reports its own result via
 [profiling-results-matrix](https://github.com/wow-look-at-my/profiling-results-matrix)
 (dead jobs surface as aborted/lost, never as a forever-in-flight cell).

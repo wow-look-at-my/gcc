@@ -16,7 +16,8 @@
 // The "fork dist" columns use the latest published dist of develop-matt/v14
 // (https://dl.pazer.build/gcc?branch=develop-matt/v14&os=linux&arch=amd64).
 // When that dist meaningfully changes (new optimization stage lands), bump
-// `epoch` below and re-dispatch the workflow: old numbers render struck
+// `epoch` below and commit: pushes touching this file re-run the whole
+// matrix (see profiling.yml's push trigger), and old numbers render struck
 // through until re-measured.
 //
 // Config contract: default-export one MatrixConfig-shaped object; the action
