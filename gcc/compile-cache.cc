@@ -49,6 +49,10 @@
    an identical key.  Declared here (extern) for the store path's use.  */
 extern bool cc_option_affects_output_p (const cl_decoded_option *decoded);
 extern bool cc_option_is_search_path_p (const cl_decoded_option *decoded);
+/* Likewise the search-path normalization the MK twins share (ccache
+   base_dir parity; see its definition for the collision-bar discussion).  */
+extern const char *cc_mk_search_path_relative (const char *path,
+					       const char *cwd);
 
 #include <sys/stat.h>
 #include <dirent.h>		/* shard scans for B1 eviction */
@@ -1268,6 +1272,12 @@ cc_compute_manifest_key (const char *src_path)
   cc_hash_component (&ctx, CC_TAG_CHECKSUM, executable_checksum, 16);
   cc_hash_str (&ctx, CC_TAG_LANG, lang_hooks.name);
 
+  /* The cwd: CC_TAG_CWD material under -g below, and the base the
+     search-path values relativize against either way.  The driver twin's
+     ctx->cwd resolves to the same string (same process directory; under -g
+     the -fworking-directory the specs inject IS that directory).  */
+  const char *pwd = get_src_pwd ();
+
   /* Under -g the source path + cwd bake into DWARF -- but only after the
      user's -f{file,debug}-prefix-map rewrites, so hash the MAPPED strings
      and drop the map options the mapping consumed (B2; identity + no drops
@@ -1277,7 +1287,6 @@ cc_compute_manifest_key (const char *src_path)
   memset (&pm, 0, sizeof (pm));
   if (cc_paths_affect_output_p ())
     {
-      const char *pwd = get_src_pwd ();
       cc_pmaps_collect (&pm, save_decoded_options, save_decoded_options_count);
       cc_pmaps_mark_dropped (&pm, save_decoded_options_count, src_path,
 			     pwd ? pwd : "");
@@ -1292,7 +1301,10 @@ cc_compute_manifest_key (const char *src_path)
   /* (4) Output-affecting options + (anti-shadow) search-path VALUES.  Walked
      in command-line order so option ordering is part of the key.  Map
      options whose effect is already captured by the mapped src/cwd above
-     are excluded (cc_pmaps_opt_dropped_p; never set without -g).  */
+     are excluded (cc_pmaps_opt_dropped_p; never set without -g).
+     Search-path values inside the build dir hash cwd-relative so relocated
+     build trees share manifests (cc_mk_search_path_relative; ccache base_dir
+     parity -- MK is a lookup index, every serve is still record-verified).  */
   for (unsigned i = 1; i < save_decoded_options_count; i++)
     {
       const cl_decoded_option *o = &save_decoded_options[i];
@@ -1303,8 +1315,12 @@ cc_compute_manifest_key (const char *src_path)
       if (!affects && !search)
 	continue;
       for (size_t k = 0; k < o->canonical_option_num_elements; k++)
-	cc_hash_str (&ctx, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT,
-		     o->canonical_option[k]);
+	{
+	  const char *val = o->canonical_option[k];
+	  if (search)
+	    val = cc_mk_search_path_relative (val, pwd ? pwd : "");
+	  cc_hash_str (&ctx, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT, val);
+	}
     }
   cc_pmaps_free (&pm);
 

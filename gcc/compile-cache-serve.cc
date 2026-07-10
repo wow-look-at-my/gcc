@@ -516,6 +516,48 @@ cc_option_is_search_path_p (const cl_decoded_option *decoded)
     }
 }
 
+/* Relativize one search-path VALUE against CWD for MANIFEST-key hashing
+   (ccache base_dir parity): a search dir INSIDE the current (build)
+   directory hashes as its cwd-relative form, so two build trees differing
+   only in their absolute location -- e.g. cmake's absolute -I<builddir>/sub
+   for generated headers -- produce the same MK and share manifest entries.
+   This lowers only the MK collision bar (MK is a lookup index): every serve
+   still re-verifies the recorded per-header identities and the object key
+   stays a full-closure content address, so a candidate whose headers do not
+   match simply falls through to a real compile.  A value outside CWD, or a
+   relative one, hashes unchanged, preserving the anti-shadowing bar for
+   every directory the build tree does not own.  See "Deliberate QoI trades"
+   in .github/TESTSUITE.md.
+
+   Returns PATH itself, a suffix of PATH, or a literal "." -- never an
+   allocation.  Non-path elements of a search option (the "-I" token itself)
+   pass through untouched (they never begin with CWD).  Both MK twins
+   (ccs_compute_manifest_key here / cc_compute_manifest_key in
+   compile-cache.cc) MUST call this with their side's cwd -- the same value
+   CC_TAG_CWD hashes under -g (driver: ctx->cwd; cc1plus: get_src_pwd ()),
+   which is what keeps the twins byte-identical.  */
+const char *
+cc_mk_search_path_relative (const char *path, const char *cwd)
+{
+  if (!path || !cwd || !cwd[0] || !IS_ABSOLUTE_PATH (path))
+    return path;
+  size_t cwd_len = strlen (cwd);
+  /* Ignore trailing separators on CWD; a bare root ("/") never relativizes
+     (cwd_len stays 1 and the separator check below cannot pass).  */
+  while (cwd_len > 1 && IS_DIR_SEPARATOR (cwd[cwd_len - 1]))
+    cwd_len--;
+  if (cwd_len <= 1 || filename_ncmp (path, cwd, cwd_len) != 0)
+    return path;
+  if (path[cwd_len] == '\0')
+    return ".";			/* the search dir IS the cwd */
+  if (!IS_DIR_SEPARATOR (path[cwd_len]))
+    return path;		/* /foo vs /foobar: not inside */
+  const char *rel = path + cwd_len;
+  while (IS_DIR_SEPARATOR (*rel))
+    rel++;
+  return rel[0] ? rel : ".";	/* "/cwd///" collapses to "." */
+}
+
 /* ------------------------------------------------------------------------ */
 /* B2: prefix-map-aware -g keys (see compile-cache-serve.h)                 */
 /* ------------------------------------------------------------------------ */
@@ -744,7 +786,10 @@ ccs_compute_manifest_key (const cc_serve_ctx *ctx, const char *src_path,
   /* (4) Output-affecting options + (anti-shadow) search-path VALUES, in
      command-line order.  decoded[0] is the program-name slot; skip it.
      Map options whose effect is already captured by the mapped src/cwd
-     above are excluded (cc_pmaps_opt_dropped_p; never set without -g).  */
+     above are excluded (cc_pmaps_opt_dropped_p; never set without -g).
+     Search-path values inside the build dir hash cwd-relative so relocated
+     build trees share manifests (cc_mk_search_path_relative; ccache base_dir
+     parity -- MK is a lookup index, every serve is still record-verified).  */
   for (unsigned i = 1; i < ctx->decoded_count; i++)
     {
       const cl_decoded_option *o = &ctx->decoded[i];
@@ -755,8 +800,14 @@ ccs_compute_manifest_key (const cc_serve_ctx *ctx, const char *src_path,
       if (!affects && !search)
 	continue;
       for (size_t k = 0; k < o->canonical_option_num_elements; k++)
-	ccs_hash_str (&ctx_sha, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT,
-		      o->canonical_option[k]);
+	{
+	  const char *val = o->canonical_option[k];
+	  if (search)
+	    val = cc_mk_search_path_relative (val,
+					      ctx->cwd ? ctx->cwd : "");
+	  ccs_hash_str (&ctx_sha, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT,
+			val);
+	}
     }
   cc_pmaps_free (&pm);
 
