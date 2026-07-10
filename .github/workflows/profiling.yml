@@ -16,11 +16,15 @@
 # The measurement itself is .github/scripts/ci-corpus.mjs in its
 # CORPUS_TIMING_LEG single-leg mode (the same pinned workloads and build
 # recipes as ci.yml's corpus validation job; timing only, no byte-identity
-# gating). The fork toolchain is the latest published develop-matt/v14 PGO
-# dist from buildhost (anonymous download; ci.yml's package-pgo job
-# publishes it on release-branch pushes) -- the PGO build is the released
-# compiler, ~8% faster cc1plus with byte-identical output, so it is the one
-# worth measuring.
+# gating). The fork toolchain is the latest published PGO dist from
+# buildhost (anonymous download; ci.yml's package-pgo job publishes it on
+# release-branch pushes and on dispatch with build_pgo=true) -- the PGO
+# build is the released compiler, ~8% faster cc1plus with byte-identical
+# output, so it is the one worth measuring.  The dist is resolved for the
+# PUSHED ref's branch first (an epoch bump on a working branch measures
+# that branch's own published compiler -- required for the numbers to
+# reflect the compiler changes the bump advertises), falling back to the
+# release branch's dist when the branch has never published one.
 
 name: Profiling matrix
 
@@ -47,6 +51,9 @@ permissions:
 env:
   # gcc/pgo: the PGO-built release package (same gcc-dist/ tarball layout as
   # plain gcc, verified; anonymous download OK -- probed 200, ~34.4 MB).
+  # DIST_URL_BRANCH (the pushed ref's own dist) is tried first; DIST_URL is
+  # the release-branch fallback.
+  DIST_URL_BRANCH: 'https://dl.pazer.build/gcc/pgo?branch=${{ github.ref_name }}&os=linux&arch=amd64'
   DIST_URL: 'https://dl.pazer.build/gcc/pgo?branch=develop-matt/v14&os=linux&arch=amd64'
 
 jobs:
@@ -131,7 +138,12 @@ jobs:
         if: matrix.col != 'stock'
         run: |
           mkdir -p "$RUNNER_TEMP/dist"
-          curl -fL --retry 4 -o "$RUNNER_TEMP/gcc-dist.tar.zst" "$DIST_URL"
+          # The pushed branch's own dist first (a 404 means the branch never
+          # published one), then the release branch's.
+          if ! curl -fL --retry 4 -o "$RUNNER_TEMP/gcc-dist.tar.zst" "$DIST_URL_BRANCH"; then
+            echo "no dist for this branch; falling back to $DIST_URL"
+            curl -fL --retry 4 -o "$RUNNER_TEMP/gcc-dist.tar.zst" "$DIST_URL"
+          fi
           tar -C "$RUNNER_TEMP/dist" --zstd -xf "$RUNNER_TEMP/gcc-dist.tar.zst"
           "$RUNNER_TEMP/dist/gcc-dist/bin/gcc" --version | head -1
 
