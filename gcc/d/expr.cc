@@ -1497,7 +1497,7 @@ public:
   void visit (PtrExp *e) final override
   {
     Type *tnext = NULL;
-    size_t offset;
+    dinteger_t offset;
     tree result;
 
     if (e->e1->op == EXP::add)
@@ -2032,27 +2032,31 @@ public:
     /* Compile the declaration.  */
     build_lambda_tree (e->fd, e->type->toBasetype ());
 
-    /* If nested, this will be a trampoline.  */
-    if (e->fd->isNested ())
-      {
-	tree func = build_address (get_symbol_decl (e->fd));
-	tree object;
+    tree func = build_address (get_symbol_decl (e->fd));
+    Type *tb = e->type->toBasetype ();
 
-	if (this->constp_)
+    /* If a delegate is expected, the literal will be inferred as a delegate
+       even if it accesses no variables from an enclosing function.  */
+    if (tb->ty == TY::Tdelegate)
+      {
+	/* Static delegate variables have no context pointer.  */
+	if (this->constp_ || !e->fd->isNested ())
 	  {
-	    /* Static delegate variables have no context pointer.  */
-	    object = null_pointer_node;
-	    this->result_ = build_method_call (func, object, e->fd->type);
+	    this->result_ = build_method_call (func, null_pointer_node,
+					       e->fd->type);
 	    TREE_CONSTANT (this->result_) = 1;
 	  }
 	else
 	  {
-	    object = get_frame_for_symbol (e->fd);
+	    gcc_assert (e->fd->isNested ());
+	    tree object = get_frame_for_symbol (e->fd);
 	    this->result_ = build_method_call (func, object, e->fd->type);
 	  }
       }
     else
       {
+	/* The function literal is a function pointer.  */
+	gcc_assert (tb->ty == TY::Tpointer);
 	this->result_ = build_nop (build_ctype (e->type),
 				   build_address (get_symbol_decl (e->fd)));
       }
@@ -2072,7 +2076,7 @@ public:
   void visit (SymOffExp *e) final override
   {
     /* Build the address and offset of the symbol.  */
-    size_t soffset = e->isSymOffExp ()->offset;
+    dinteger_t soffset = e->isSymOffExp ()->offset;
     tree result = get_decl_tree (e->var);
     TREE_USED (result) = 1;
 
@@ -2172,7 +2176,7 @@ public:
 	      {
 		/* Generate a slice for non-zero initialized aggregates,
 		   otherwise create an empty array.  */
-		gcc_assert (e->type->isConst ()
+		gcc_assert (e->type->nextOf ()->isConst ()
 			    && e->type->nextOf ()->ty == TY::Tvoid);
 
 		tree type = build_ctype (e->type);
@@ -2241,6 +2245,8 @@ public:
 	       storage class, then the instance is allocated on the stack
 	       rather than the heap or using the class specific allocator.  */
 	    tree var = build_local_temp (TREE_TYPE (type));
+	    SET_DECL_ALIGN (var, cd->alignsize * BITS_PER_UNIT);
+	    DECL_USER_ALIGN (var) = 1;
 	    new_call = build_nop (type, build_address (var));
 	    setup_exp = modify_expr (var, aggregate_initializer_decl (cd));
 	  }
@@ -2678,8 +2684,9 @@ public:
 	/* Array literal for a `scope' dynamic array.  */
 	gcc_assert (tb->ty == TY::Tarray);
 	ctor = force_target_expr (ctor);
-	this->result_ = d_array_value (type, size_int (e->elements->length),
-				       build_address (ctor));
+	ctor = d_array_value (type, size_int (e->elements->length),
+			      build_address (ctor));
+	this->result_ = compound_expr (saved_elems, ctor);
       }
     else
       {

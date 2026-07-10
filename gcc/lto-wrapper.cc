@@ -1083,13 +1083,16 @@ copy_file (const char *dest, const char *src)
    the copy to the linker.  */
 
 static void
-find_crtoffloadtable (int save_temps, const char *dumppfx)
+find_crtoffloadtable (int save_temps, bool pie_or_shared, const char *dumppfx)
 {
   char **paths = NULL;
   const char *library_path = getenv ("LIBRARY_PATH");
   if (!library_path)
     return;
-  unsigned n_paths = parse_env_var (library_path, &paths, "/crtoffloadtable.o");
+  unsigned n_paths = parse_env_var (library_path, &paths,
+				    pie_or_shared
+				    ? "/crtoffloadtableS.o"
+				    : "/crtoffloadtable.o");
 
   unsigned i;
   for (i = 0; i < n_paths; i++)
@@ -1108,7 +1111,8 @@ find_crtoffloadtable (int save_temps, const char *dumppfx)
       }
   if (i == n_paths)
     fatal_error (input_location,
-		 "installation error, cannot find %<crtoffloadtable.o%>");
+		 "installation error, cannot find %<crtoffloadtable%s.o%>",
+		 pie_or_shared ? "S" : "");
 
   free_array_of_ptrs ((void **) paths, n_paths);
 }
@@ -1189,18 +1193,16 @@ debug_objcopy (const char *infile, bool rename)
 
   const char *p;
   const char *orig_infile = infile;
-  off_t inoff = 0;
-  long loffset;
+  int64_t inoff = 0;
   int consumed;
   if ((p = strrchr (infile, '@'))
       && p != infile
-      && sscanf (p, "@%li%n", &loffset, &consumed) >= 1
+      && sscanf (p, "@%" PRIi64 "%n", &inoff, &consumed) >= 1
       && strlen (p) == (unsigned int) consumed)
     {
       char *fname = xstrdup (infile);
       fname[p - infile] = '\0';
       infile = fname;
-      inoff = (off_t) loffset;
     }
   int infd = open (infile, O_RDONLY | O_BINARY);
   if (infd == -1)
@@ -1423,6 +1425,11 @@ run_gcc (unsigned argc, char *argv[])
   char **lto_argv, **ltoobj_argv;
   bool linker_output_rel = false;
   bool skip_debug = false;
+#ifdef ENABLE_DEFAULT_PIE
+  bool pie_or_shared = true;
+#else
+  bool pie_or_shared = false;
+#endif
   const char *incoming_dumppfx = dumppfx = NULL;
   static char current_dir[] = { '.', DIR_SEPARATOR, '\0' };
 
@@ -1468,8 +1475,7 @@ run_gcc (unsigned argc, char *argv[])
     {
       char *p;
       int fd;
-      off_t file_offset = 0;
-      long loffset;
+      int64_t file_offset = 0;
       int consumed;
       char *filename = argv[i];
 
@@ -1482,14 +1488,13 @@ run_gcc (unsigned argc, char *argv[])
 	}
 
       if ((p = strrchr (argv[i], '@'))
-	  && p != argv[i] 
-	  && sscanf (p, "@%li%n", &loffset, &consumed) >= 1
+	  && p != argv[i]
+	  && sscanf (p, "@%" PRIi64 "%n", &file_offset, &consumed) >= 1
 	  && strlen (p) == (unsigned int) consumed)
 	{
 	  filename = XNEWVEC (char, p - argv[i] + 1);
 	  memcpy (filename, argv[i], p - argv[i]);
 	  filename[p - argv[i]] = '\0';
-	  file_offset = (off_t) loffset;
 	}
       fd = open (filename, O_RDONLY | O_BINARY);
       /* Linker plugin passes -fresolution and -flinker-output options.
@@ -1588,6 +1593,16 @@ run_gcc (unsigned argc, char *argv[])
 
 	case OPT_fdiagnostics_color_:
 	  diagnostic_color_init (global_dc, option->value);
+	  break;
+
+	case OPT_pie:
+	case OPT_shared:
+	case OPT_static_pie:
+	  pie_or_shared = true;
+	  break;
+
+	case OPT_no_pie:
+	  pie_or_shared = false;
 	  break;
 
 	default:
@@ -1760,20 +1775,18 @@ cont1:
       for (i = 0; i < num_offload_files; i++)
 	{
 	  char *p;
-	  long loffset;
 	  int fd, consumed;
-	  off_t file_offset = 0;
+	  int64_t file_offset = 0;
 	  char *filename = offload_argv[i];
 
 	  if ((p = strrchr (offload_argv[i], '@'))
 	      && p != offload_argv[i]
-	      && sscanf (p, "@%li%n", &loffset, &consumed) >= 1
+	      && sscanf (p, "@%" PRIi64 "%n", &file_offset, &consumed) >= 1
 	      && strlen (p) == (unsigned int) consumed)
 	    {
 	      filename = XNEWVEC (char, p - offload_argv[i] + 1);
 	      memcpy (filename, offload_argv[i], p - offload_argv[i]);
 	      filename[p - offload_argv[i]] = '\0';
-	      file_offset = (off_t) loffset;
 	    }
 	  fd = open (filename, O_RDONLY | O_BINARY);
 	  if (fd == -1)
@@ -1798,7 +1811,7 @@ cont1:
 
       if (offload_names)
 	{
-	  find_crtoffloadtable (save_temps, dumppfx);
+	  find_crtoffloadtable (save_temps, pie_or_shared, dumppfx);
 	  for (i = 0; offload_names[i]; i++)
 	    printf ("%s\n", offload_names[i]);
 	  free_array_of_ptrs ((void **) offload_names, i);

@@ -702,8 +702,10 @@ _GLIBCXX_BEGIN_NAMESPACE_CONTAINER
     {
       if (__n != 0)
 	{
-	  if (size_type(this->_M_impl._M_end_of_storage
-			- this->_M_impl._M_finish) >= __n)
+	  if (__position.base() == this->_M_impl._M_finish)
+	    _M_fill_append(__n, __x);
+	  else if (size_type(this->_M_impl._M_end_of_storage
+			       - this->_M_impl._M_finish) >= __n)
 	    {
 #if __cplusplus < 201103L
 	      value_type __x_copy = __x;
@@ -798,6 +800,60 @@ _GLIBCXX_BEGIN_NAMESPACE_CONTAINER
 	}
     }
 
+  template<typename _Tp, typename _Alloc>
+    _GLIBCXX20_CONSTEXPR
+    void
+    vector<_Tp, _Alloc>::
+    _M_fill_append(size_type __n, const value_type& __x)
+    {
+       if (size_type(this->_M_impl._M_end_of_storage
+		     - this->_M_impl._M_finish) >= __n)
+	 {
+	   _GLIBCXX_ASAN_ANNOTATE_GROW(__n);
+	   this->_M_impl._M_finish =
+	     std::__uninitialized_fill_n_a(this->_M_impl._M_finish, __n, __x,
+					   _M_get_Tp_allocator());
+	   _GLIBCXX_ASAN_ANNOTATE_GREW(__n);
+	 }
+       else
+	 {
+	   // Make local copies of these members because the compiler thinks
+	   // the allocator can alter them if 'this' is globally reachable.
+	   pointer __old_start = this->_M_impl._M_start;
+	   pointer __old_finish = this->_M_impl._M_finish;
+	   const size_type __old_size = __old_finish - __old_start;
+
+	   const size_type __len =
+	     _M_check_len(__n, "vector::_M_fill_append");
+	   pointer __new_start(this->_M_allocate(__len));
+	   pointer __new_finish(__new_start + __old_size);
+	   __try
+	     {
+	       // See _M_realloc_insert above.
+	       __new_finish = std::__uninitialized_fill_n_a(
+				__new_finish, __n, __x,
+				_M_get_Tp_allocator());
+	       std::__uninitialized_move_if_noexcept_a(
+		 __old_start, __old_finish, __new_start,
+		 _M_get_Tp_allocator());
+	     }
+	   __catch(...)
+	     {
+		std::_Destroy(__new_start + __old_size, __new_finish,
+			      _M_get_Tp_allocator());
+		_M_deallocate(__new_start, __len);
+		__throw_exception_again;
+	      }
+	   std::_Destroy(__old_start, __old_finish, _M_get_Tp_allocator());
+	   _GLIBCXX_ASAN_ANNOTATE_REINIT;
+	   _M_deallocate(__old_start,
+			 this->_M_impl._M_end_of_storage - __old_start);
+	   this->_M_impl._M_start = __new_start;
+	   this->_M_impl._M_finish = __new_finish;
+	   this->_M_impl._M_end_of_storage = __new_start + __len;
+	 }
+    }
+
 #if __cplusplus >= 201103L
   template<typename _Tp, typename _Alloc>
     _GLIBCXX20_CONSTEXPR
@@ -816,6 +872,9 @@ _GLIBCXX_BEGIN_NAMESPACE_CONTAINER
 
 	  if (__navail >= __n)
 	    {
+	      if (!this->_M_impl._M_finish)
+		__builtin_unreachable();
+
 	      _GLIBCXX_ASAN_ANNOTATE_GROW(__n);
 	      this->_M_impl._M_finish =
 		std::__uninitialized_default_n_a(this->_M_impl._M_finish,
@@ -1002,9 +1061,16 @@ _GLIBCXX_BEGIN_NAMESPACE_CONTAINER
 		// reachable.
 		pointer __old_start = this->_M_impl._M_start;
 		pointer __old_finish = this->_M_impl._M_finish;
+		if ((__old_finish - __old_start) < 0)
+		  __builtin_unreachable();
 
 		const size_type __len =
 		  _M_check_len(__n, "vector::_M_range_insert");
+#if __cplusplus < 201103L
+		if (__len < (__n + (__old_finish - __old_start)))
+		  __builtin_unreachable();
+#endif
+
 		pointer __new_start(this->_M_allocate(__len));
 		pointer __new_finish(__new_start);
 		__try
@@ -1049,9 +1115,12 @@ _GLIBCXX_BEGIN_NAMESPACE_CONTAINER
     vector<bool, _Alloc>::
     _M_reallocate(size_type __n)
     {
+      const iterator __begin = begin(), __end = end();
+      if (size_type(__end - __begin) > __n)
+	__builtin_unreachable();
       _Bit_pointer __q = this->_M_allocate(__n);
       iterator __start(std::__addressof(*__q), 0);
-      iterator __finish(_M_copy_aligned(begin(), end(), __start));
+      iterator __finish(_M_copy_aligned(__begin, __end, __start));
       this->_M_deallocate();
       this->_M_impl._M_start = __start;
       this->_M_impl._M_finish = __finish;
@@ -1077,11 +1146,12 @@ _GLIBCXX_BEGIN_NAMESPACE_CONTAINER
 	{
 	  const size_type __len = 
 	    _M_check_len(__n, "vector<bool>::_M_fill_insert");
+	  iterator __begin = begin(), __end = end();
 	  _Bit_pointer __q = this->_M_allocate(__len);
 	  iterator __start(std::__addressof(*__q), 0);
-	  iterator __i = _M_copy_aligned(begin(), __position, __start);
+	  iterator __i = _M_copy_aligned(__begin, __position, __start);
 	  std::fill(__i, __i + difference_type(__n), __x);
-	  iterator __finish = std::copy(__position, end(),
+	  iterator __finish = std::copy(__position, __end,
 					__i + difference_type(__n));
 	  this->_M_deallocate();
 	  this->_M_impl._M_end_of_storage = __q + _S_nword(__len);

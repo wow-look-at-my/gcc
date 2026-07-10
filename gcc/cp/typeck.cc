@@ -305,7 +305,30 @@ cp_compare_floating_point_conversion_ranks (tree t1, tree t2)
 
   const struct real_format *fmt1 = REAL_MODE_FORMAT (TYPE_MODE (t1));
   const struct real_format *fmt2 = REAL_MODE_FORMAT (TYPE_MODE (t2));
-  gcc_assert (fmt1->b == 2 && fmt2->b == 2);
+  /* Currently, extended floating point types are only binary, and
+     they never have a proper subset or superset of values with
+     decimal floating point types except for the _Float16 vs. _Decimal128
+     pair, so return 3 for unordered conversion ranks.  */
+  gcc_assert (fmt1->b == 2);
+  if (fmt2->b == 10)
+    {
+      /* _Float16 needs at most 21 decimal digits (e.g.
+	 0x1.a3cp-14f16 is exactly 0.000100076198577880859375DL),
+	 so it is not a proper subset of _Decimal64 but is subset
+	 of _Decimal128.  While std::bfloat16_t needs at most 96
+	 decimal digits, so even _Decimal128 doesn't cover it.
+	 _Float32 has at least one value which needs 112 decimal
+	 digits, _Float64 at least 767 decimal digits.  */
+      if (fmt1->emin == -13
+	  && fmt1->emax == 16
+	  && fmt1->p == 11
+	  && fmt2->emin == -6142
+	  && fmt2->emax == 6145
+	  && fmt2->p == 34)
+	return -2;
+      return 3;
+    }
+  gcc_assert (fmt2->b == 2);
   /* For {ibm,mips}_extended_format formats, the type has variable
      precision up to ~2150 bits when the first double is around maximum
      representable double and second double is subnormal minimum.
@@ -393,6 +416,9 @@ cp_compare_floating_point_conversion_ranks (tree t1, tree t2)
      has higher rank.  */
   if (cnt > 1 && mv2 == long_double_type_node)
     return -2;
+  /* And similarly if t2 is float, t2 has lower rank.  */
+  if (cnt > 1 && mv2 == float_type_node)
+    return 2;
   /* Otherwise, they have equal rank, but extended types
      (other than std::bfloat16_t) have higher subrank.
      std::bfloat16_t shouldn't have equal rank to any standard
@@ -2125,13 +2151,6 @@ cxx_sizeof_expr (location_t loc, tree e, tsubst_flags_t complain)
   location_t e_loc = cp_expr_loc_or_loc (e, loc);
   STRIP_ANY_LOCATION_WRAPPER (e);
 
-  /* To get the size of a static data member declared as an array of
-     unknown bound, we need to instantiate it.  */
-  if (VAR_P (e)
-      && VAR_HAD_UNKNOWN_BOUND (e)
-      && DECL_TEMPLATE_INSTANTIATION (e))
-    instantiate_decl (e, /*defer_ok*/true, /*expl_inst_mem*/false);
-
   if (TREE_CODE (e) == PARM_DECL
       && DECL_ARRAY_PARAMETER_P (e)
       && (complain & tf_warning))
@@ -3844,7 +3863,9 @@ cp_build_indirect_ref_1 (location_t loc, tree ptr, ref_operator errorstring,
       else if (do_fold && TREE_CODE (pointer) == ADDR_EXPR
 	       && same_type_p (t, TREE_TYPE (TREE_OPERAND (pointer, 0))))
 	/* The POINTER was something like `&x'.  We simplify `*&x' to
-	   `x'.  */
+	   `x'.  This can change the value category: '*&TARGET_EXPR'
+	   is an lvalue and folding it into 'TARGET_EXPR' turns it into
+	   a prvalue of class type.  */
 	return TREE_OPERAND (pointer, 0);
       else
 	{
@@ -3969,13 +3990,129 @@ cp_build_array_ref (location_t loc, tree array, tree idx,
       }
 
     case COND_EXPR:
-      ret = build_conditional_expr
-	       (loc, TREE_OPERAND (array, 0),
-	       cp_build_array_ref (loc, TREE_OPERAND (array, 1), idx,
-				   complain),
-	       cp_build_array_ref (loc, TREE_OPERAND (array, 2), idx,
-				   complain),
-	       complain);
+      tree op0, op1, op2;
+      op0 = TREE_OPERAND (array, 0);
+      op1 = TREE_OPERAND (array, 1);
+      op2 = TREE_OPERAND (array, 2);
+      if (TREE_SIDE_EFFECTS (idx) || !tree_invariant_p (idx))
+	{
+	  /* If idx could possibly have some SAVE_EXPRs, turning
+	     (op0 ? op1 : op2)[idx] into
+	     op0 ? op1[idx] : op2[idx] can lead into temporaries
+	     initialized in one conditional path and uninitialized
+	     uses of them in the other path.
+	     And if idx is a really large expression, evaluating it
+	     twice is also not optimal.
+	     On the other side, op0 must be sequenced before evaluation
+	     of op1 and op2 and for C++17 op0, op1 and op2 must be
+	     sequenced before idx.
+	     If idx is INTEGER_CST, we can just do the optimization
+	     without any SAVE_EXPRs, if op1 and op2 are both ARRAY_TYPE
+	     VAR_DECLs or COMPONENT_REFs thereof (so their address
+	     is constant or relative to frame), optimize into
+	     (SAVE_EXPR <op0>, SAVE_EXPR <idx>, SAVE_EXPR <op0>)
+	     ? op1[SAVE_EXPR <idx>] : op2[SAVE_EXPR <idx>]
+	     Otherwise avoid this optimization.  */
+	  if (flag_strong_eval_order == 2)
+	    {
+	      if (TREE_CODE (TREE_TYPE (array)) == ARRAY_TYPE)
+		{
+		  tree xop1 = op1;
+		  tree xop2 = op2;
+		  while (xop1 && handled_component_p (xop1))
+		    {
+		      switch (TREE_CODE (xop1))
+			{
+			case ARRAY_REF:
+			case ARRAY_RANGE_REF:
+			  if (!tree_invariant_p (TREE_OPERAND (xop1, 1))
+			      || TREE_OPERAND (xop1, 2) != NULL_TREE
+			      || TREE_OPERAND (xop1, 3) != NULL_TREE)
+			    {
+			      xop1 = NULL_TREE;
+			      continue;
+			    }
+			  break;
+
+			case COMPONENT_REF:
+			  if (TREE_OPERAND (xop1, 2) != NULL_TREE)
+			    {
+			      xop1 = NULL_TREE;
+			      continue;
+			    }
+			  break;
+
+			default:
+			  break;
+			}
+		      xop1 = TREE_OPERAND (xop1, 0);
+		    }
+		  if (xop1)
+		    STRIP_ANY_LOCATION_WRAPPER (xop1);
+		  while (xop2 && handled_component_p (xop2))
+		    {
+		      switch (TREE_CODE (xop2))
+			{
+			case ARRAY_REF:
+			case ARRAY_RANGE_REF:
+			  if (!tree_invariant_p (TREE_OPERAND (xop2, 1))
+			      || TREE_OPERAND (xop2, 2) != NULL_TREE
+			      || TREE_OPERAND (xop2, 3) != NULL_TREE)
+			    {
+			      xop2 = NULL_TREE;
+			      continue;
+			    }
+			  break;
+
+			case COMPONENT_REF:
+			  if (TREE_OPERAND (xop2, 2) != NULL_TREE)
+			    {
+			      xop2 = NULL_TREE;
+			      continue;
+			    }
+			  break;
+
+			default:
+			  break;
+			}
+		      xop2 = TREE_OPERAND (xop2, 0);
+		    }
+		  if (xop2)
+		    STRIP_ANY_LOCATION_WRAPPER (xop2);
+
+		  if (!xop1
+		      || !xop2
+		      || !(CONSTANT_CLASS_P (xop1)
+			   || decl_address_invariant_p (xop1))
+		      || !(CONSTANT_CLASS_P (xop2)
+			   || decl_address_invariant_p (xop2)))
+		    {
+		      /* Force default conversion on array if
+			 we can't optimize this and array is ARRAY_TYPE
+			 COND_EXPR, we can't leave COND_EXPRs with
+			 ARRAY_TYPE in the IL.  */
+		      array = cp_default_conversion (array, complain);
+		      if (error_operand_p (array))
+			return error_mark_node;
+		      break;
+		    }
+		}
+	      else if (!POINTER_TYPE_P (TREE_TYPE (array))
+		       || !tree_invariant_p (op1)
+		       || !tree_invariant_p (op2))
+		break;
+	    }
+	  if (TREE_SIDE_EFFECTS (idx))
+	    {
+	      idx = save_expr (idx);
+	      op0 = save_expr (op0);
+	      tree tem = build_compound_expr (loc, op0, idx);
+	      op0 = build_compound_expr (loc, tem, op0);
+	    }
+	}
+      op1 = cp_build_array_ref (loc, op1, idx, complain);
+      op2 = cp_build_array_ref (loc, op2, idx, complain);
+      ret = build_conditional_expr (loc, op0, op1, op2, complain);
       protected_set_expr_location (ret, loc);
       return ret;
 
@@ -4077,7 +4214,8 @@ cp_build_array_ref (location_t loc, tree array, tree idx,
     tree ar = cp_default_conversion (array, complain);
     tree ind = cp_default_conversion (idx, complain);
 
-    if (!first && flag_strong_eval_order == 2 && TREE_SIDE_EFFECTS (ind))
+    if (!processing_template_decl
+	&& !first && flag_strong_eval_order == 2 && TREE_SIDE_EFFECTS (ind))
       ar = first = save_expr (ar);
 
     /* Put the integer in IND to simplify error checking.  */
@@ -4179,11 +4317,28 @@ get_member_function_from_ptrfunc (tree *instance_ptrptr, tree function,
       if (!nonvirtual && is_dummy_object (instance_ptr))
 	nonvirtual = true;
 
-      if (TREE_SIDE_EFFECTS (instance_ptr))
-	instance_ptr = instance_save_expr = save_expr (instance_ptr);
+      /* Use force_target_expr even when instance_ptr doesn't have
+	 side-effects, unless it is a simple decl or constant, so
+	 that we don't ubsan instrument the expression multiple times.
+	 Don't use save_expr, as save_expr can avoid building a SAVE_EXPR
+	 and building a SAVE_EXPR manually can be optimized away during
+	 cp_fold.  See PR116449 and PR117259.  */
+      if (TREE_SIDE_EFFECTS (instance_ptr)
+	  || (!nonvirtual
+	      && !DECL_P (instance_ptr)
+	      && !TREE_CONSTANT (instance_ptr)))
+	instance_ptr = instance_save_expr
+	  = save_expr (force_target_expr (TREE_TYPE (instance_ptr),
+					  instance_ptr, complain));
 
-      if (TREE_SIDE_EFFECTS (function))
-	function = save_expr (function);
+      /* See above comment.  */
+      if (TREE_SIDE_EFFECTS (function)
+	  || (!nonvirtual
+	      && !DECL_P (function)
+	      && !TREE_CONSTANT (function)))
+	function
+	  = save_expr (force_target_expr (TREE_TYPE (function), function,
+					  complain));
 
       /* Start by extracting all the information from the PMF itself.  */
       e3 = pfn_from_ptrmemfunc (function);
@@ -4456,8 +4611,10 @@ cp_build_function_call_vec (tree function, vec<tree, va_gc> **params,
 
   /* Check for errors in format strings and inappropriately
      null parameters.  */
-  bool warned_p = check_function_arguments (input_location, fndecl, fntype,
-					    nargs, argarray, NULL);
+  bool warned_p
+    = ((complain & tf_warning)
+       && check_function_arguments (input_location, fndecl, fntype,
+				    nargs, argarray, NULL));
 
   ret = build_cxx_call (function, nargs, argarray, complain, orig_fndecl);
 
@@ -4806,6 +4963,11 @@ tree
 build_omp_array_section (location_t loc, tree array_expr, tree index,
 			 tree length)
 {
+  if (TREE_CODE (array_expr) == TYPE_DECL
+      || type_dependent_expression_p (array_expr))
+    return build3_loc (loc, OMP_ARRAY_SECTION, NULL_TREE, array_expr, index,
+		       length);
+
   tree type = TREE_TYPE (array_expr);
   gcc_assert (type);
   type = non_reference (type);
@@ -5411,7 +5573,7 @@ cp_build_binary_op (const op_location_t &location,
           case stv_firstarg:
             {
               op0 = convert (TREE_TYPE (type1), op0);
-	      op0 = save_expr (op0);
+	      op0 = cp_save_expr (op0);
               op0 = build_vector_from_val (type1, op0);
 	      orig_type0 = type0 = TREE_TYPE (op0);
               code0 = TREE_CODE (type0);
@@ -5421,7 +5583,7 @@ cp_build_binary_op (const op_location_t &location,
           case stv_secondarg:
             {
               op1 = convert (TREE_TYPE (type0), op1);
-	      op1 = save_expr (op1);
+	      op1 = cp_save_expr (op1);
               op1 = build_vector_from_val (type0, op1);
 	      orig_type1 = type1 = TREE_TYPE (op1);
               code1 = TREE_CODE (type1);
@@ -5501,6 +5663,7 @@ cp_build_binary_op (const op_location_t &location,
 	  if (!TYPE_P (type1))
 	    type1 = TREE_TYPE (type1);
 	  if (type0
+	      && type1
 	      && INDIRECT_TYPE_P (type0)
 	      && same_type_p (TREE_TYPE (type0), type1))
 	    {
@@ -5944,9 +6107,9 @@ cp_build_binary_op (const op_location_t &location,
 	    return error_mark_node;
 
 	  if (TREE_SIDE_EFFECTS (op0))
-	    op0 = save_expr (op0);
+	    op0 = cp_save_expr (op0);
 	  if (TREE_SIDE_EFFECTS (op1))
-	    op1 = save_expr (op1);
+	    op1 = cp_save_expr (op1);
 
 	  pfn0 = pfn_from_ptrmemfunc (op0);
 	  pfn0 = cp_fully_fold (pfn0);
@@ -6182,8 +6345,8 @@ cp_build_binary_op (const op_location_t &location,
 	  && !processing_template_decl
 	  && sanitize_flags_p (SANITIZE_POINTER_COMPARE))
 	{
-	  op0 = save_expr (op0);
-	  op1 = save_expr (op1);
+	  op0 = cp_save_expr (op0);
+	  op1 = cp_save_expr (op1);
 
 	  tree tt = builtin_decl_explicit (BUILT_IN_ASAN_POINTER_COMPARE);
 	  instrument_expr = build_call_expr_loc (location, tt, 2, op0, op1);
@@ -6443,14 +6606,14 @@ cp_build_binary_op (const op_location_t &location,
 	    return error_mark_node;
 	  if (first_complex)
 	    {
-	      op0 = save_expr (op0);
+	      op0 = cp_save_expr (op0);
 	      real = cp_build_unary_op (REALPART_EXPR, op0, true, complain);
 	      imag = cp_build_unary_op (IMAGPART_EXPR, op0, true, complain);
 	      switch (code)
 		{
 		case MULT_EXPR:
 		case TRUNC_DIV_EXPR:
-		  op1 = save_expr (op1);
+		  op1 = cp_save_expr (op1);
 		  imag = build2 (resultcode, real_type, imag, op1);
 		  /* Fall through.  */
 		case PLUS_EXPR:
@@ -6463,13 +6626,13 @@ cp_build_binary_op (const op_location_t &location,
 	    }
 	  else
 	    {
-	      op1 = save_expr (op1);
+	      op1 = cp_save_expr (op1);
 	      real = cp_build_unary_op (REALPART_EXPR, op1, true, complain);
 	      imag = cp_build_unary_op (IMAGPART_EXPR, op1, true, complain);
 	      switch (code)
 		{
 		case MULT_EXPR:
-		  op0 = save_expr (op0);
+		  op0 = cp_save_expr (op0);
 		  imag = build2 (resultcode, real_type, op0, imag);
 		  /* Fall through.  */
 		case PLUS_EXPR:
@@ -7913,6 +8076,10 @@ cxx_mark_addressable (tree exp, bool array_ref_p)
 		    || DECL_IN_AGGR_P (x) == 0
 		    || TREE_STATIC (x)
 		    || DECL_EXTERNAL (x));
+	if (VAR_P (x)
+	    && DECL_ANON_UNION_VAR_P (x)
+	    && !TREE_ADDRESSABLE (x))
+	  cxx_mark_addressable (DECL_VALUE_EXPR (x));
 	/* Fall through.  */
 
       case RESULT_DECL:
@@ -8153,6 +8320,8 @@ cp_build_compound_expr (tree lhs, tree rhs, tsubst_flags_t complain)
       return rhs;
     }
 
+  rhs = resolve_nondeduced_context (rhs, complain);
+
   if (type_unknown_p (rhs))
     {
       if (complain & tf_error)
@@ -8160,7 +8329,7 @@ cp_build_compound_expr (tree lhs, tree rhs, tsubst_flags_t complain)
 		  "no context to resolve type of %qE", rhs);
       return error_mark_node;
     }
-  
+
   tree ret = build2 (COMPOUND_EXPR, TREE_TYPE (rhs), lhs, rhs);
   if (eptype)
     ret = build1 (EXCESS_PRECISION_EXPR, eptype, ret);
@@ -11405,24 +11574,13 @@ check_return_expr (tree retval, bool *no_warning, bool *dangling)
 
   /* Actually copy the value returned into the appropriate location.  */
   if (retval && retval != result)
-    {
-      /* If there's a postcondition for a scalar return value, wrap
-	 retval in a call to the postcondition function.  */
-      if (tree post = apply_postcondition_to_return (retval))
-	retval = post;
-      retval = cp_build_init_expr (result, retval);
-    }
+    retval = cp_build_init_expr (result, retval);
 
   if (current_function_return_value == bare_retval)
     INIT_EXPR_NRV_P (retval) = true;
 
   if (tree set = maybe_set_retval_sentinel ())
     retval = build2 (COMPOUND_EXPR, void_type_node, retval, set);
-
-  /* If there's a postcondition for an aggregate return value, call the
-     postcondition function after the return object is initialized.  */
-  if (tree post = apply_postcondition_to_return (result))
-    retval = build2 (COMPOUND_EXPR, void_type_node, retval, post);
 
   return retval;
 }

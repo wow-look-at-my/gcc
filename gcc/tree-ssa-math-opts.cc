@@ -1052,6 +1052,7 @@ pass_cse_reciprocals::execute (function *fun)
 		    continue;
 
 		  gimple_replace_ssa_lhs (call, arg1);
+		  reset_flow_sensitive_info (arg1);
 		  if (gimple_call_internal_p (call) != (ifn != IFN_LAST))
 		    {
 		      auto_vec<tree, 4> args;
@@ -2866,7 +2867,17 @@ convert_mult_to_widen (gimple *stmt, gimple_stmt_iterator *gsi)
     return false;
   if (actual_precision != TYPE_PRECISION (type1)
       || from_unsigned1 != TYPE_UNSIGNED (type1))
-    type1 = build_nonstandard_integer_type (actual_precision, from_unsigned1);
+    {
+      if (!useless_type_conversion_p (type1, TREE_TYPE (rhs1)))
+	{
+	  if (TREE_CODE (rhs1) == INTEGER_CST)
+	    rhs1 = fold_convert (type1, rhs1);
+	  else
+	    rhs1 = build_and_insert_cast (gsi, loc, type1, rhs1);
+	}
+      type1 = build_nonstandard_integer_type (actual_precision,
+					      from_unsigned1);
+    }
   if (!useless_type_conversion_p (type1, TREE_TYPE (rhs1)))
     {
       if (TREE_CODE (rhs1) == INTEGER_CST)
@@ -2876,7 +2887,17 @@ convert_mult_to_widen (gimple *stmt, gimple_stmt_iterator *gsi)
     }
   if (actual_precision != TYPE_PRECISION (type2)
       || from_unsigned2 != TYPE_UNSIGNED (type2))
-    type2 = build_nonstandard_integer_type (actual_precision, from_unsigned2);
+    {
+      if (!useless_type_conversion_p (type2, TREE_TYPE (rhs2)))
+	{
+	  if (TREE_CODE (rhs2) == INTEGER_CST)
+	    rhs2 = fold_convert (type2, rhs2);
+	  else
+	    rhs2 = build_and_insert_cast (gsi, loc, type2, rhs2);
+	}
+      type2 = build_nonstandard_integer_type (actual_precision,
+					      from_unsigned2);
+    }
   if (!useless_type_conversion_p (type2, TREE_TYPE (rhs2)))
     {
       if (TREE_CODE (rhs2) == INTEGER_CST)
@@ -3017,6 +3038,11 @@ convert_plusminus_to_widen (gimple_stmt_iterator *gsi, gimple *stmt,
   if (to_mode == from_mode)
     return false;
 
+  /* For fixed point types, the mode classes could be different
+     so reject that case. */
+  if (GET_MODE_CLASS (from_mode) != GET_MODE_CLASS (to_mode))
+    return false;
+
   from_unsigned1 = TYPE_UNSIGNED (type1);
   from_unsigned2 = TYPE_UNSIGNED (type2);
   optype = type1;
@@ -3087,7 +3113,17 @@ convert_plusminus_to_widen (gimple_stmt_iterator *gsi, gimple *stmt,
   actual_precision = GET_MODE_PRECISION (actual_mode);
   if (actual_precision != TYPE_PRECISION (type1)
       || from_unsigned1 != TYPE_UNSIGNED (type1))
-    type1 = build_nonstandard_integer_type (actual_precision, from_unsigned1);
+    {
+      if (!useless_type_conversion_p (type1, TREE_TYPE (mult_rhs1)))
+	{
+	  if (TREE_CODE (mult_rhs1) == INTEGER_CST)
+	    mult_rhs1 = fold_convert (type1, mult_rhs1);
+	  else
+	    mult_rhs1 = build_and_insert_cast (gsi, loc, type1, mult_rhs1);
+	}
+      type1 = build_nonstandard_integer_type (actual_precision,
+					      from_unsigned1);
+    }
   if (!useless_type_conversion_p (type1, TREE_TYPE (mult_rhs1)))
     {
       if (TREE_CODE (mult_rhs1) == INTEGER_CST)
@@ -3097,7 +3133,17 @@ convert_plusminus_to_widen (gimple_stmt_iterator *gsi, gimple *stmt,
     }
   if (actual_precision != TYPE_PRECISION (type2)
       || from_unsigned2 != TYPE_UNSIGNED (type2))
-    type2 = build_nonstandard_integer_type (actual_precision, from_unsigned2);
+    {
+      if (!useless_type_conversion_p (type2, TREE_TYPE (mult_rhs2)))
+	{
+	  if (TREE_CODE (mult_rhs2) == INTEGER_CST)
+	    mult_rhs2 = fold_convert (type2, mult_rhs2);
+	  else
+	    mult_rhs2 = build_and_insert_cast (gsi, loc, type2, mult_rhs2);
+	}
+      type2 = build_nonstandard_integer_type (actual_precision,
+					      from_unsigned2);
+    }
   if (!useless_type_conversion_p (type2, TREE_TYPE (mult_rhs2)))
     {
       if (TREE_CODE (mult_rhs2) == INTEGER_CST)
@@ -3827,6 +3873,7 @@ maybe_optimize_guarding_check (vec<gimple *> &mul_stmts, gimple *cond_stmt,
   else
     gimple_cond_make_false (zero_cond);
   update_stmt (zero_cond);
+  reset_flow_sensitive_info_in_bb (bb);
   *cfg_changed = true;
 }
 
@@ -4937,7 +4984,11 @@ match_uaddc_usubc (gimple_stmt_iterator *gsi, gimple *stmt, tree_code code)
 			TYPE_MODE (type)) == CODE_FOR_nothing
       || (rhs[2]
 	  && optab_handler (code == PLUS_EXPR ? uaddc5_optab : usubc5_optab,
-			    TYPE_MODE (type)) == CODE_FOR_nothing))
+			    TYPE_MODE (type)) == CODE_FOR_nothing)
+      || !types_compatible_p (type,
+			      TREE_TYPE (TREE_TYPE (gimple_call_lhs (ovf1))))
+      || !types_compatible_p (type,
+			      TREE_TYPE (TREE_TYPE (gimple_call_lhs (ovf2)))))
     return false;
   tree arg1, arg2, arg3 = NULL_TREE;
   gimple *re1 = NULL, *re2 = NULL;

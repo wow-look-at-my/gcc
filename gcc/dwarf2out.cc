@@ -5959,7 +5959,7 @@ equate_type_number_to_die (tree type, dw_die_ref type_die)
 static dw_die_ref maybe_create_die_with_external_ref (tree);
 struct GTY(()) sym_off_pair 
 {
-  const char * GTY((skip)) sym;
+  const char *sym;
   unsigned HOST_WIDE_INT off;
 };
 static GTY(()) hash_map<tree, sym_off_pair> *external_die_map;
@@ -22666,6 +22666,28 @@ gen_array_type_die (tree type, dw_die_ref context_die)
 		      && TYPE_REVERSE_STORAGE_ORDER (type),
 		      context_die);
 
+  /* Add bit stride information to boolean vectors of single bits so that
+     elements can be correctly read and displayed by a debugger.  */
+  if (VECTOR_BOOLEAN_TYPE_P (type))
+    {
+      enum machine_mode tmode = TYPE_MODE_RAW (type);
+      if (GET_MODE_CLASS (tmode) == MODE_VECTOR_BOOL)
+	{
+	  /* Calculate bit-size of element based on mnode.  */
+	  poly_uint16 bit_size = exact_div (GET_MODE_BITSIZE (tmode),
+					    GET_MODE_NUNITS (tmode));
+	  /* Set bit stride in the array type DIE.  */
+	  add_AT_unsigned (array_die, DW_AT_bit_stride, bit_size.coeffs[0]);
+	  /* Find DIE corresponding to the element type so that we could
+	     add DW_AT_bit_size to it.  */
+	  dw_die_ref elem_die = get_AT_ref (array_die, DW_AT_type);
+	  /* Avoid adding DW_AT_bit_size twice.  */
+	  if (get_AT (elem_die, DW_AT_bit_size) == NULL)
+	    add_AT_unsigned (elem_die, DW_AT_bit_size,
+			     TYPE_PRECISION (element_type));
+	}
+    }
+
   add_gnat_descriptive_type_attribute (array_die, type, context_die);
   if (TYPE_ARTIFICIAL (type))
     add_AT_flag (array_die, DW_AT_artificial, 1);
@@ -26300,10 +26322,10 @@ gen_type_die_with_usage (tree type, dw_die_ref context_die,
      for the parent typedef which TYPE is a type of.  */
   if (typedef_variant_p (type))
     {
-      if (TREE_ASM_WRITTEN (type))
+      tree name = TYPE_NAME (type);
+      if (TREE_ASM_WRITTEN (name))
 	return;
 
-      tree name = TYPE_NAME (type);
       tree origin = decl_ultimate_origin (name);
       if (origin != NULL && origin != name)
 	{
@@ -26316,8 +26338,6 @@ gen_type_die_with_usage (tree type, dw_die_ref context_die,
 
       /* Give typedefs the right scope.  */
       context_die = scope_die_for (type, context_die);
-
-      TREE_ASM_WRITTEN (type) = 1;
 
       gen_decl_die (name, NULL, NULL, context_die);
       return;
@@ -30918,7 +30938,8 @@ resolve_addr_in_expr (dw_attr_node *a, dw_loc_descr_ref loc)
               return false;
             remove_addr_table_entry (loc->dw_loc_oprnd1.val_entry);
 	    loc->dw_loc_oprnd1.val_entry
-	      = add_addr_table_entry (rtl, ate_kind_rtx);
+	      = add_addr_table_entry (rtl, loc->dtprel
+				      ? ate_kind_rtx_dtprel : ate_kind_rtx);
           }
 	break;
       case DW_OP_const4u:

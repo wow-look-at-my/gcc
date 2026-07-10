@@ -2915,7 +2915,8 @@ static void
 insert_vi_for_tree (tree t, varinfo_t vi)
 {
   gcc_assert (vi);
-  gcc_assert (!vi_for_tree->put (t, vi));
+  bool existed = vi_for_tree->put (t, vi);
+  gcc_assert (!existed);
 }
 
 /* Find the variable info for tree T in VI_FOR_TREE.  If T does not
@@ -3614,7 +3615,10 @@ get_constraint_for_1 (tree t, vec<ce_s> *results, bool address_p,
 		    size = -1;
 		  for (; curr; curr = vi_next (curr))
 		    {
-		      if (curr->offset - vi->offset < size)
+		      /* The start of the access might happen anywhere
+			 within vi, so conservatively assume it was
+			 at its end.  */
+		      if (curr->offset - (vi->offset + vi->size - 1) < size)
 			{
 			  cs.var = curr->id;
 			  results->safe_push (cs);
@@ -4116,7 +4120,6 @@ handle_call_arg (gcall *stmt, tree arg, vec<ce_s> *results, int flags,
     {
       make_transitive_closure_constraints (tem);
       callarg_transitive = true;
-      gcc_checking_assert (!(flags & EAF_NO_DIRECT_READ));
     }
 
   /* If necessary, produce varinfo for indirect accesses to ARG.  */

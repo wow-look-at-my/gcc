@@ -1049,6 +1049,12 @@ decl_mangling_context (tree decl)
       tree extra = LAMBDA_TYPE_EXTRA_SCOPE (TREE_TYPE (decl));
       if (extra)
 	return extra;
+      tcontext = CP_DECL_CONTEXT (decl);
+      if (LAMBDA_TYPE_P (tcontext))
+	/* Lambda type context means this lambda appears between the
+	   lambda-introducer and the open brace of another lambda (c++/119175).
+	   That isn't a real scope; look further into the enclosing scope.  */
+	return decl_mangling_context (TYPE_NAME (tcontext));
     }
   else if (template_type_parameter_p (decl))
      /* template type parms have no mangling context.  */
@@ -2154,10 +2160,23 @@ write_real_cst (const tree value)
   int i, limit, dir;
 
   tree type = TREE_TYPE (value);
-  int words = GET_MODE_BITSIZE (SCALAR_FLOAT_TYPE_MODE (type)) / 32;
+  int bits = GET_MODE_BITSIZE (SCALAR_FLOAT_TYPE_MODE (type));
+  int words = bits / 32;
 
   real_to_target (target_real, &TREE_REAL_CST (value),
 		  TYPE_MODE (type));
+
+  if (words == 0)
+    {
+      /* _Float16 and std::bfloat16_t are the only supported types smaller than
+	 32 bits.  */
+      gcc_assert (bits == 16);
+      sprintf (buffer, "%04lx", (unsigned long) target_real[0]);
+      write_chars (buffer, 4);
+      return;
+    }
+
+  gcc_assert (bits % 32 == 0);
 
   /* The value in target_real is in the target word order,
      so we must write it out backward if that happens to be
@@ -3629,10 +3648,15 @@ write_expression (tree expr)
 
       if (nelts)
 	{
-	  tree domain;
 	  ++processing_template_decl;
-	  domain = compute_array_index_type (NULL_TREE, nelts,
-					     tf_warning_or_error);
+	  /* Avoid compute_array_index_type complaints about
+	     non-constant nelts.  */
+	  tree max = cp_build_binary_op (input_location, MINUS_EXPR,
+					 fold_convert (sizetype, nelts),
+					 size_one_node,
+					 tf_warning_or_error);
+	  max = maybe_constant_value (max);
+	  tree domain = build_index_type (max);
 	  type = build_cplus_array_type (type, domain);
 	  --processing_template_decl;
 	}
@@ -4196,6 +4220,8 @@ write_array_type (const tree type)
 	    }
 	  else
 	    {
+	      gcc_checking_assert (TREE_CODE (max) == MINUS_EXPR
+				   && integer_onep (TREE_OPERAND (max, 1)));
 	      max = TREE_OPERAND (max, 0);
 	      write_expression (max);
 	    }

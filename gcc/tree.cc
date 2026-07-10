@@ -4006,7 +4006,19 @@ skip_simple_arithmetic (tree expr)
 	expr = TREE_OPERAND (expr, 0);
       else if (BINARY_CLASS_P (expr))
 	{
-	  if (tree_invariant_p (TREE_OPERAND (expr, 1)))
+	  /* Before commutative binary operands are canonicalized,
+	     it is quite common to have constants in the first operand.
+	     Check for that common case first so that we don't walk
+	     large expressions with tree_invariant_p unnecessarily.
+	     This can still have terrible compile time complexity,
+	     we should limit the depth of the tree_invariant_p and
+	     skip_simple_arithmetic recursion.  */
+	  if ((TREE_CONSTANT (TREE_OPERAND (expr, 0))
+	       || (TREE_READONLY (TREE_OPERAND (expr, 0))
+		   && !TREE_SIDE_EFFECTS (TREE_OPERAND (expr, 0))))
+	      && tree_invariant_p (TREE_OPERAND (expr, 0)))
+	    expr = TREE_OPERAND (expr, 1);
+	  else if (tree_invariant_p (TREE_OPERAND (expr, 1)))
 	    expr = TREE_OPERAND (expr, 0);
 	  else if (tree_invariant_p (TREE_OPERAND (expr, 0)))
 	    expr = TREE_OPERAND (expr, 1);
@@ -6012,6 +6024,8 @@ type_hash_canon_hash (tree type)
 
   hstate.add_int (TREE_CODE (type));
 
+  hstate.add_flag (TYPE_STRUCTURAL_EQUALITY_P (type));
+
   if (TREE_TYPE (type))
     hstate.add_object (TYPE_HASH (TREE_TYPE (type)));
 
@@ -6107,6 +6121,10 @@ type_cache_hasher::equal (type_hash *a, type_hash *b)
   if (COMPLETE_TYPE_P (a->type) && COMPLETE_TYPE_P (b->type)
       && (TYPE_ALIGN (a->type) != TYPE_ALIGN (b->type)
 	  || TYPE_MODE (a->type) != TYPE_MODE (b->type)))
+    return false;
+
+  if (TYPE_STRUCTURAL_EQUALITY_P (a->type)
+      != TYPE_STRUCTURAL_EQUALITY_P (b->type))
     return false;
 
   switch (TREE_CODE (a->type))
@@ -6598,13 +6616,27 @@ simple_cst_equal (const_tree t1, const_tree t2)
 	vec<constructor_elt, va_gc> *v2 = CONSTRUCTOR_ELTS (t2);
 
 	if (vec_safe_length (v1) != vec_safe_length (v2))
-	  return false;
+	  return 0;
 
         for (idx = 0; idx < vec_safe_length (v1); ++idx)
-	  /* ??? Should we handle also fields here? */
-	  if (!simple_cst_equal ((*v1)[idx].value, (*v2)[idx].value))
-	    return false;
-	return true;
+	  {
+	    if ((*v1)[idx].index
+		&& TREE_CODE ((*v1)[idx].index) == FIELD_DECL)
+	      {
+		if ((*v1)[idx].index != (*v2)[idx].index)
+		  return 0;
+	      }
+	    else
+	      {
+		cmp = simple_cst_equal ((*v1)[idx].index, (*v2)[idx].index);
+		if (cmp <= 0)
+		  return cmp;
+	      }
+	    cmp = simple_cst_equal ((*v1)[idx].value, (*v2)[idx].value);
+	    if (cmp <= 0)
+	      return cmp;
+	  }
+	return 1;
       }
 
     case SAVE_EXPR:
@@ -7347,12 +7379,23 @@ build_array_type_1 (tree elt_type, tree index_type, bool typeless_storage,
   TYPE_DOMAIN (t) = index_type;
   TYPE_ADDR_SPACE (t) = TYPE_ADDR_SPACE (elt_type);
   TYPE_TYPELESS_STORAGE (t) = typeless_storage;
+
+  /* Set TYPE_STRUCTURAL_EQUALITY_P.  */
+  if (set_canonical
+      && (TYPE_STRUCTURAL_EQUALITY_P (elt_type)
+	  || (index_type && TYPE_STRUCTURAL_EQUALITY_P (index_type))
+	  || in_lto_p))
+    SET_TYPE_STRUCTURAL_EQUALITY (t);
+
   layout_type (t);
 
   if (shared)
     {
       hashval_t hash = type_hash_canon_hash (t);
+      tree probe_type = t;
       t = type_hash_canon (hash, t);
+      if (t != probe_type)
+	return t;
     }
 
   if (TYPE_CANONICAL (t) == t && set_canonical)
@@ -7360,7 +7403,7 @@ build_array_type_1 (tree elt_type, tree index_type, bool typeless_storage,
       if (TYPE_STRUCTURAL_EQUALITY_P (elt_type)
 	  || (index_type && TYPE_STRUCTURAL_EQUALITY_P (index_type))
 	  || in_lto_p)
-	SET_TYPE_STRUCTURAL_EQUALITY (t);
+	gcc_unreachable ();
       else if (TYPE_CANONICAL (elt_type) != elt_type
 	       || (index_type && TYPE_CANONICAL (index_type) != index_type))
 	TYPE_CANONICAL (t)
@@ -7507,18 +7550,25 @@ build_function_type (tree value_type, tree arg_types,
       TYPE_NO_NAMED_ARGS_STDARG_P (t) = 1;
     }
 
-  /* If we already have such a type, use the old one.  */
-  hashval_t hash = type_hash_canon_hash (t);
-  t = type_hash_canon (hash, t);
-
   /* Set up the canonical type. */
   any_structural_p   = TYPE_STRUCTURAL_EQUALITY_P (value_type);
   any_noncanonical_p = TYPE_CANONICAL (value_type) != value_type;
   canon_argtypes = maybe_canonicalize_argtypes (arg_types,
 						&any_structural_p,
 						&any_noncanonical_p);
+  /* Set TYPE_STRUCTURAL_EQUALITY_P early.  */
   if (any_structural_p)
     SET_TYPE_STRUCTURAL_EQUALITY (t);
+
+  /* If we already have such a type, use the old one.  */
+  hashval_t hash = type_hash_canon_hash (t);
+  tree probe_type = t;
+  t = type_hash_canon (hash, t);
+  if (t != probe_type)
+    return t;
+
+  if (any_structural_p)
+    gcc_assert (TYPE_STRUCTURAL_EQUALITY_P (t));
   else if (any_noncanonical_p)
     TYPE_CANONICAL (t) = build_function_type (TYPE_CANONICAL (value_type),
 					      canon_argtypes);
@@ -7661,10 +7711,6 @@ build_method_type_directly (tree basetype,
   argtypes = tree_cons (NULL_TREE, ptype, argtypes);
   TYPE_ARG_TYPES (t) = argtypes;
 
-  /* If we already have such a type, use the old one.  */
-  hashval_t hash = type_hash_canon_hash (t);
-  t = type_hash_canon (hash, t);
-
   /* Set up the canonical type. */
   any_structural_p
     = (TYPE_STRUCTURAL_EQUALITY_P (basetype)
@@ -7675,8 +7721,20 @@ build_method_type_directly (tree basetype,
   canon_argtypes = maybe_canonicalize_argtypes (TREE_CHAIN (argtypes),
 						&any_structural_p,
 						&any_noncanonical_p);
+
+  /* Set TYPE_STRUCTURAL_EQUALITY_P early.  */
   if (any_structural_p)
     SET_TYPE_STRUCTURAL_EQUALITY (t);
+
+  /* If we already have such a type, use the old one.  */
+  hashval_t hash = type_hash_canon_hash (t);
+  tree probe_type = t;
+  t = type_hash_canon (hash, t);
+  if (t != probe_type)
+    return t;
+
+  if (any_structural_p)
+    gcc_assert (TYPE_STRUCTURAL_EQUALITY_P (t));
   else if (any_noncanonical_p)
     TYPE_CANONICAL (t)
       = build_method_type_directly (TYPE_CANONICAL (basetype),
@@ -7717,10 +7775,16 @@ build_offset_type (tree basetype, tree type)
 
   TYPE_OFFSET_BASETYPE (t) = TYPE_MAIN_VARIANT (basetype);
   TREE_TYPE (t) = type;
+  if (TYPE_STRUCTURAL_EQUALITY_P (basetype)
+      || TYPE_STRUCTURAL_EQUALITY_P (type))
+    SET_TYPE_STRUCTURAL_EQUALITY (t);
 
   /* If we already have such a type, use the old one.  */
   hashval_t hash = type_hash_canon_hash (t);
+  tree probe_type = t;
   t = type_hash_canon (hash, t);
+  if (t != probe_type)
+    return t;
 
   if (!COMPLETE_TYPE_P (t))
     layout_type (t);
@@ -7729,7 +7793,7 @@ build_offset_type (tree basetype, tree type)
     {
       if (TYPE_STRUCTURAL_EQUALITY_P (basetype)
 	  || TYPE_STRUCTURAL_EQUALITY_P (type))
-	SET_TYPE_STRUCTURAL_EQUALITY (t);
+	gcc_unreachable ();
       else if (TYPE_CANONICAL (TYPE_MAIN_VARIANT (basetype)) != basetype
 	       || TYPE_CANONICAL (type) != type)
 	TYPE_CANONICAL (t)
@@ -7758,6 +7822,8 @@ build_complex_type (tree component_type, bool named)
   tree probe = make_node (COMPLEX_TYPE);
 
   TREE_TYPE (probe) = TYPE_MAIN_VARIANT (component_type);
+  if (TYPE_STRUCTURAL_EQUALITY_P (TREE_TYPE (probe)))
+    SET_TYPE_STRUCTURAL_EQUALITY (probe);
 
   /* If we already have such a type, use the old one.  */
   hashval_t hash = type_hash_canon_hash (probe);
@@ -7769,11 +7835,10 @@ build_complex_type (tree component_type, bool named)
 	 out the type.  We need to check the canonicalization and
 	 maybe set the name.  */
       gcc_checking_assert (COMPLETE_TYPE_P (t)
-			   && !TYPE_NAME (t)
-			   && TYPE_CANONICAL (t) == t);
+			   && !TYPE_NAME (t));
 
       if (TYPE_STRUCTURAL_EQUALITY_P (TREE_TYPE (t)))
-	SET_TYPE_STRUCTURAL_EQUALITY (t);
+	;
       else if (TYPE_CANONICAL (TREE_TYPE (t)) != TREE_TYPE (t))
 	TYPE_CANONICAL (t)
 	  = build_complex_type (TYPE_CANONICAL (TREE_TYPE (t)), named);
@@ -14109,10 +14174,25 @@ verify_type (const_tree t)
     }
   if (TYPE_MAIN_VARIANT (t) == t && ct && TYPE_MAIN_VARIANT (ct) != ct)
    {
-      error ("%<TYPE_CANONICAL%> of main variant is not main variant");
-      debug_tree (ct);
-      debug_tree (TYPE_MAIN_VARIANT (ct));
-      error_found = true;
+     /* This can happen when build_type_attribute_variant is called on
+	C/C++ arrays of qualified types.  volatile int[2] is unqualified
+	ARRAY_TYPE with volatile int element type.
+	TYPE_CANONICAL (volatile int) is itself and so is
+	TYPE_CANONICAL (volatile int[2]).  build_type_attribute_qual_variant
+	creates a distinct type copy (so TYPE_MAIN_VARIANT is itself) and sets
+	its TYPE_CANONICAL to the unqualified ARRAY_TYPE (so volatile int[2]).
+	But this is not the TYPE_MAIN_VARIANT, which is int[2].  So, just
+	verify that TYPE_MAIN_VARIANT (ct) is already the final type we
+	need.  */
+      tree mvc = TYPE_MAIN_VARIANT (ct);
+      if (TYPE_CANONICAL (mvc) != mvc)
+	{
+	  error ("main variant of %<TYPE_CANONICAL%> of main variant is not"
+		 " its own %<TYPE_CANONICAL%>");
+	  debug_tree (ct);
+	  debug_tree (TYPE_MAIN_VARIANT (ct));
+	  error_found = true;
+	}
    }
 
 
@@ -14963,6 +15043,13 @@ valid_new_delete_pair_p (tree new_asm, tree delete_asm,
   if ((new_name[2] != 'w' || delete_name[2] != 'l')
       && (new_name[2] != 'a' || delete_name[2] != 'a'))
     return false;
+  if (new_name[3] == 'I' || delete_name[3] == 'I')
+    {
+      /* When ::operator new or ::operator delete are function templates,
+	 return uncertain mismatch, we need demangler in that case.  */
+      *pcertain = false;
+      return false;
+    }
   /* 'j', 'm' and 'y' correspond to size_t.  */
   if (new_name[3] != 'j' && new_name[3] != 'm' && new_name[3] != 'y')
     return false;

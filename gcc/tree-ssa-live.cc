@@ -609,6 +609,22 @@ clear_unused_block_pointer_1 (tree *tp, int *, void *)
   return NULL_TREE;
 }
 
+/* Clear references to unused BLOCKs from DECL_VALUE_EXPRs of variables
+   in BLOCK.  */
+
+static void
+clear_unused_block_pointer_in_block (tree block)
+{
+  for (tree t = BLOCK_VARS (block); t; t = DECL_CHAIN (t))
+    if (VAR_P (t) && DECL_HAS_VALUE_EXPR_P (t))
+      {
+	tree val = DECL_VALUE_EXPR (t);
+	walk_tree (&val, clear_unused_block_pointer_1, NULL, NULL);
+      }
+  for (tree t = BLOCK_SUBBLOCKS (block); t; t = BLOCK_CHAIN (t))
+    clear_unused_block_pointer_in_block (t);
+}
+
 /* Set all block pointer in debug or clobber stmt to NULL if the block
    is unused, so that they will not be streamed out.  */
 
@@ -664,6 +680,10 @@ clear_unused_block_pointer (void)
 	  walk_tree (gimple_op_ptr (stmt, i), clear_unused_block_pointer_1,
 		     NULL, NULL);
       }
+
+  /* Walk all variables mentioned in the functions BLOCK tree and clear
+     DECL_VALUE_EXPR from unused blocks where present.  */
+  clear_unused_block_pointer_in_block (DECL_INITIAL (current_function_decl));
 }
 
 /* Dump scope blocks starting at SCOPE to FILE.  INDENT is the
@@ -1684,14 +1704,18 @@ virtual_operand_live::get_live_in (basic_block bb)
   edge_iterator ei;
   edge e;
   tree livein = NULL_TREE;
+  bool first = true;
   FOR_EACH_EDGE (e, ei, bb->preds)
     if (e->flags & EDGE_DFS_BACK)
       /* We can ignore backedges since if there's a def there it would
 	 have forced a PHI in the source because it also acts as use
 	 downstream.  */
       continue;
-    else if (!livein)
-      livein = get_live_out (e->src);
+    else if (first)
+      {
+	livein = get_live_out (e->src);
+	first = false;
+      }
     else if (get_live_out (e->src) != livein)
       /* When there's no virtual use downstream this indicates a point
 	 where we'd insert a PHI merging the different live virtual

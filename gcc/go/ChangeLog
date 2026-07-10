@@ -1,3 +1,19 @@
+2026-06-26  Release Manager
+
+	* GCC 14.4.0 released.
+
+2025-05-23  Release Manager
+
+	* GCC 14.3.0 released.
+
+2024-08-01  Release Manager
+
+	* GCC 14.2.0 released.
+
+2024-05-07  Release Manager
+
+	* GCC 14.1.0 released.
+
 2024-04-05  Christophe Lyon  <christophe.lyon@linaro.org>
 
 	* Make-lang.in (go.install-dvi): New rule.

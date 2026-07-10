@@ -108,26 +108,6 @@ fur_source::register_relation (edge e ATTRIBUTE_UNUSED,
 {
 }
 
-// This version of fur_source will pick a range up off an edge.
-
-class fur_edge : public fur_source
-{
-public:
-  fur_edge (edge e, range_query *q = NULL);
-  virtual bool get_operand (vrange &r, tree expr) override;
-  virtual bool get_phi_operand (vrange &r, tree expr, edge e) override;
-private:
-  edge m_edge;
-};
-
-// Instantiate an edge based fur_source.
-
-inline
-fur_edge::fur_edge (edge e, range_query *q) : fur_source (q)
-{
-  m_edge = e;
-}
-
 // Get the value of EXPR on edge m_edge.
 
 bool
@@ -1194,7 +1174,7 @@ fold_using_range::relation_fold_and_or (irange& lhs_range, gimple *s,
     return;
 
   if (reverse_op2)
-    relation2 = relation_negate (relation2);
+    relation2 = relation_swap (relation2);
 
   // x && y is false if the relation intersection of the true cases is NULL.
   if (is_and && relation_intersect (relation1, relation2) == VREL_UNDEFINED)

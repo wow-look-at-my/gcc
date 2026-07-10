@@ -285,7 +285,7 @@ init_expmed (void)
   for (speed = 0; speed < 2; speed++)
     {
       crtl->maybe_hot_insn_p = speed;
-      set_zero_cost (speed, set_src_cost (const0_rtx, mode, speed));
+      set_zero_cost (speed, set_src_cost (const0_rtx, QImode, speed));
 
       for (mode = MIN_MODE_INT; mode <= MAX_MODE_INT;
 	   mode = (machine_mode)(mode + 1))
@@ -5367,6 +5367,9 @@ make_tree (tree type, rtx x)
       t = wide_int_to_tree (type, rtx_mode_t (x, TYPE_MODE (type)));
       return t;
 
+    case CONST_POLY_INT:
+      return wide_int_to_tree (type, const_poly_int_value (x));
+
     case CONST_DOUBLE:
       STATIC_ASSERT (HOST_BITS_PER_WIDE_INT * 2 <= MAX_BITSIZE_MODE_ANY_INT);
       if (TARGET_SUPPORTS_WIDE_INT == 0 && GET_MODE (x) == VOIDmode)
@@ -5458,9 +5461,6 @@ make_tree (tree type, rtx x)
       /* fall through.  */
 
     default:
-      if (CONST_POLY_INT_P (x))
-	return wide_int_to_tree (t, const_poly_int_value (x));
-
       t = build_decl (RTL_LOCATION (x), VAR_DECL, NULL_TREE, type);
 
       /* If TYPE is a POINTER_TYPE, we might need to convert X from
@@ -5617,11 +5617,9 @@ emit_store_flag_1 (rtx target, enum rtx_code code, rtx op0, rtx op1,
   enum insn_code icode;
   machine_mode compare_mode;
   enum mode_class mclass;
-  enum rtx_code scode;
 
   if (unsignedp)
     code = unsigned_condition (code);
-  scode = swap_condition (code);
 
   /* If one operand is constant, make it the second one.  Only do this
      if the other operand is not constant as well.  */
@@ -5736,6 +5734,8 @@ emit_store_flag_1 (rtx target, enum rtx_code code, rtx op0, rtx op1,
 
 	  if (GET_MODE_CLASS (mode) == MODE_FLOAT)
 	    {
+	      enum rtx_code scode = swap_condition (code);
+
 	      tem = emit_cstore (target, icode, scode, mode, compare_mode,
 				 unsignedp, op1, op0, normalizep, target_mode);
 	      if (tem)

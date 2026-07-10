@@ -1933,6 +1933,43 @@ early_ra::record_artificial_refs (unsigned int flags)
   m_current_point += 1;
 }
 
+// Return true if:
+//
+// - X is a SUBREG, in which case it is a SUBREG of some REG Y
+//
+// - one 64-bit word of Y can be modified while preserving all other words
+//
+// - X refers to no more than one 64-bit word of Y
+//
+// - assigning FPRs to Y would put more than one 64-bit word in each FPR
+//
+// For example, this is true of:
+//
+// - (subreg:DI (reg:TI R) 0) and
+// - (subreg:DI (reg:TI R) 8)
+//
+// but is not true of:
+//
+// - (subreg:V2SI (reg:V2x2SI R) 0) or
+// - (subreg:V2SI (reg:V2x2SI R) 8).
+static bool
+allocno_assignment_is_rmw (rtx x)
+{
+  if (partial_subreg_p (x))
+    {
+      auto outer_mode = GET_MODE (x);
+      auto inner_mode = GET_MODE (SUBREG_REG (x));
+      if (known_eq (REGMODE_NATURAL_SIZE (inner_mode), 0U + UNITS_PER_WORD)
+	  && known_lt (GET_MODE_SIZE (outer_mode), UNITS_PER_VREG))
+	{
+	  auto nregs = targetm.hard_regno_nregs (V0_REGNUM, inner_mode);
+	  if (maybe_ne (nregs * UNITS_PER_WORD, GET_MODE_SIZE (inner_mode)))
+	    return true;
+	}
+    }
+  return false;
+}
+
 // Model the register references in INSN as part of a backwards walk.
 void
 early_ra::record_insn_refs (rtx_insn *insn)
@@ -1945,9 +1982,21 @@ early_ra::record_insn_refs (rtx_insn *insn)
       record_fpr_def (DF_REF_REGNO (ref));
     else
       {
-	auto range = get_allocno_subgroup (DF_REF_REG (ref));
+	rtx reg = DF_REF_REG (ref);
+	auto range = get_allocno_subgroup (reg);
 	for (auto &allocno : range.allocnos ())
 	  {
+	    // Make sure that assigning to the DF_REF_REG clobbers the
+	    // whole of this allocno, not just some of it.
+	    if (allocno_assignment_is_rmw (reg))
+	      {
+		m_allocation_successful = false;
+		if (dump_file && (dump_flags & TDF_DETAILS))
+		  fprintf (dump_file, "read-modify-write of allocno %d",
+			   allocno.id);
+		break;
+	      }
+
 	    // If the destination is unused, record a momentary blip
 	    // in its live range.
 	    if (!bitmap_bit_p (m_live_allocnos, allocno.id))
@@ -2575,6 +2624,32 @@ early_ra::form_chains ()
   if (dump_file && (dump_flags & TDF_DETAILS))
     fprintf (dump_file, "\nChaining allocnos:\n");
 
+  // Record conflicts of hard register and ABI conflicts before the
+  // forming of chains so chains have the updated candidates
+  for (auto *allocno1 : m_allocnos)
+    {
+      // Record conflicts with direct uses for FPR hard registers.
+      auto *group1 = allocno1->group ();
+      for (unsigned int fpr = allocno1->offset; fpr < 32; ++fpr)
+	if (fpr_conflicts_with_allocno_p (fpr, allocno1))
+	  group1->fpr_candidates &= ~(1U << (fpr - allocno1->offset));
+
+      // Record conflicts due to partially call-clobbered registers.
+      // (Full clobbers are handled by the previous loop.)
+      for (unsigned int abi_id = 0; abi_id < NUM_ABI_IDS; ++abi_id)
+	if (call_in_range_p (abi_id, allocno1->start_point,
+			     allocno1->end_point))
+	  {
+	    auto fprs = partial_fpr_clobbers (abi_id, group1->fpr_size);
+	    group1->fpr_candidates &= ~fprs >> allocno1->offset;
+	  }
+      if (allocno1->is_shared ())
+	{
+	  auto *allocno2 = m_allocnos[allocno1->related_allocno];
+	  merge_fpr_info (allocno2->group (), group1, allocno2->offset);
+	}
+    }
+
   // Perform (modified) interval graph coloring.  First sort by
   // increasing start point.
   m_sorted_allocnos.reserve (m_allocnos.length ());
@@ -2592,30 +2667,12 @@ early_ra::form_chains ()
       if (allocno1->chain_next != INVALID_ALLOCNO)
 	continue;
 
-      // Record conflicts with direct uses for FPR hard registers.
-      auto *group1 = allocno1->group ();
-      for (unsigned int fpr = allocno1->offset; fpr < 32; ++fpr)
-	if (fpr_conflicts_with_allocno_p (fpr, allocno1))
-	  group1->fpr_candidates &= ~(1U << (fpr - allocno1->offset));
-
-      // Record conflicts due to partially call-clobbered registers.
-      // (Full clobbers are handled by the previous loop.)
-      for (unsigned int abi_id = 0; abi_id < NUM_ABI_IDS; ++abi_id)
-	if (call_in_range_p (abi_id, allocno1->start_point,
-			     allocno1->end_point))
-	  {
-	    auto fprs = partial_fpr_clobbers (abi_id, group1->fpr_size);
-	    group1->fpr_candidates &= ~fprs >> allocno1->offset;
-	  }
-
       if (allocno1->is_shared ())
 	{
 	  if (dump_file && (dump_flags & TDF_DETAILS))
 	    fprintf (dump_file, "  Allocno %d shares the same hard register"
 		     " as allocno %d\n", allocno1->id,
 		     allocno1->related_allocno);
-	  auto *allocno2 = m_allocnos[allocno1->related_allocno];
-	  merge_fpr_info (allocno2->group (), group1, allocno2->offset);
 	  m_shared_allocnos.safe_push (allocno1);
 	  continue;
 	}
@@ -2862,7 +2919,13 @@ early_ra::allocate_colors ()
       if (dump_file && (dump_flags & TDF_DETAILS))
 	fprintf (dump_file, "  Allocating [v%d:v%d] to color %d\n",
 		 best, best + color->group->size - 1, color->id);
-      m_allocated_fprs |= ((1U << color->group->size) - 1) << best;
+      // Mark the COLOR's FPRs as allocated.  A full-width color can have
+      // size == 32, so shift a wide enough value: "1U << 32" is undefined,
+      // as is "1UL << 32" on hosts with 32-bit long.  unsigned long long is
+      // at least 64 bits everywhere.  best + size <= 32 (from the candidate
+      // search) keeps the result within the 32-bit mask.
+      gcc_assert (best + color->group->size <= 32);
+      m_allocated_fprs |= ((1ULL << color->group->size) - 1) << best;
     }
 }
 
@@ -3386,6 +3449,12 @@ early_ra::is_dead_insn (rtx_insn *insn)
       return false;
 
   if (side_effects_p (set))
+    return false;
+
+  /* If we can't delete dead exceptions and the insn throws,
+     then the instruction is not dead.  */
+  if (!cfun->can_delete_dead_exceptions
+      && !insn_nothrow_p (insn))
     return false;
 
   return true;

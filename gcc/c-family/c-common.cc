@@ -1240,9 +1240,7 @@ c_build_shufflevector (location_t loc, tree v0, tree v1,
   vec_perm_indices indices (sel, 2, maskl);
 
   tree ret_type = build_vector_type (TREE_TYPE (TREE_TYPE (v0)), maskl);
-  tree mask_type = build_vector_type (build_nonstandard_integer_type
-		(TREE_INT_CST_LOW (TYPE_SIZE (TREE_TYPE (ret_type))), 1),
-		maskl);
+  tree mask_type = build_vector_type (ssizetype, maskl);
   /* Pad out arguments to the common vector size.  */
   if (v0n < maskl)
     {
@@ -3420,20 +3418,41 @@ pointer_int_sum (location_t loc, enum tree_code resultcode,
 	 an overflow error if the constant is negative but INTOP is not.  */
       && (TYPE_OVERFLOW_UNDEFINED (TREE_TYPE (intop))
 	  || (TYPE_PRECISION (TREE_TYPE (intop))
-	      == TYPE_PRECISION (TREE_TYPE (ptrop)))))
+	      == TYPE_PRECISION (TREE_TYPE (ptrop))))
+      && TYPE_PRECISION (TREE_TYPE (intop)) <= TYPE_PRECISION (sizetype))
     {
-      enum tree_code subcode = resultcode;
-      tree int_type = TREE_TYPE (intop);
-      if (TREE_CODE (intop) == MINUS_EXPR)
-	subcode = (subcode == PLUS_EXPR ? MINUS_EXPR : PLUS_EXPR);
-      /* Convert both subexpression types to the type of intop,
-	 because weird cases involving pointer arithmetic
-	 can result in a sum or difference with different type args.  */
-      ptrop = build_binary_op (EXPR_LOCATION (TREE_OPERAND (intop, 1)),
-			       subcode, ptrop,
-			       convert (int_type, TREE_OPERAND (intop, 1)),
-			       true);
-      intop = convert (int_type, TREE_OPERAND (intop, 0));
+      tree intop0 = TREE_OPERAND (intop, 0);
+      tree intop1 = TREE_OPERAND (intop, 1);
+      if (TYPE_PRECISION (TREE_TYPE (intop)) != TYPE_PRECISION (sizetype)
+	  || TYPE_UNSIGNED (TREE_TYPE (intop)) != TYPE_UNSIGNED (sizetype))
+	{
+	  tree optype = c_common_type_for_size (TYPE_PRECISION (sizetype),
+						TYPE_UNSIGNED (sizetype));
+	  intop0 = convert (optype, intop0);
+	  intop1 = convert (optype, intop1);
+	}
+      tree t = fold_build2_loc (loc, MULT_EXPR, TREE_TYPE (intop0), intop0,
+				convert (TREE_TYPE (intop0), size_exp));
+      intop0 = convert (sizetype, t);
+      if (TREE_OVERFLOW_P (intop0) && !TREE_OVERFLOW (t))
+	intop0 = wide_int_to_tree (TREE_TYPE (intop0), wi::to_wide (intop0));
+      t = fold_build2_loc (loc, MULT_EXPR, TREE_TYPE (intop1), intop1,
+			   convert (TREE_TYPE (intop1), size_exp));
+      intop1 = convert (sizetype, t);
+      if (TREE_OVERFLOW_P (intop1) && !TREE_OVERFLOW (t))
+	intop1 = wide_int_to_tree (TREE_TYPE (intop1), wi::to_wide (intop1));
+      intop = build_binary_op (EXPR_LOCATION (intop), TREE_CODE (intop),
+			       intop0, intop1, true);
+
+      /* Create the sum or difference.  */
+      if (resultcode == MINUS_EXPR)
+	intop = fold_build1_loc (loc, NEGATE_EXPR, sizetype, intop);
+
+      ret = fold_build_pointer_plus_loc (loc, ptrop, intop);
+
+      fold_undefer_and_ignore_overflow_warnings ();
+
+      return ret;
     }
 
   /* Convert the integer argument to a type the same size as sizetype
@@ -3900,14 +3919,48 @@ c_common_get_alias_set (tree t)
   /* The C standard specifically allows aliasing between signed and
      unsigned variants of the same type.  We treat the signed
      variant as canonical.  */
-  if ((TREE_CODE (t) == INTEGER_TYPE || TREE_CODE (t) == BITINT_TYPE)
-      && TYPE_UNSIGNED (t))
+  if (TREE_CODE (t) == INTEGER_TYPE && TYPE_UNSIGNED (t))
     {
       tree t1 = c_common_signed_type (t);
 
       /* t1 == t can happen for boolean nodes which are always unsigned.  */
       if (t1 != t)
 	return get_alias_set (t1);
+    }
+  if (TREE_CODE (t) == BITINT_TYPE)
+    {
+      /* For normal INTEGER_TYPEs (except ones built by
+	 build_nonstandard_integer_type), both signed and unsigned variants
+	 of the type are always reachable from GTY roots, so just calling
+	 get_alias_set on the signed type is ok.  For BITINT_TYPE and
+	 non-standard INTEGER_TYPEs, only unsigned could be used and the
+	 corresponding signed type could be created on demand and garbage
+	 collected as unused, so the alias set of unsigned type could keep
+	 changing.
+	 Avoid that by remembering the signed type alias set in
+	 TYPE_ALIAS_SET and also when being asked about !TYPE_UNSIGNED
+	 check if there isn't a corresponding unsigned type with
+	 TYPE_ALIAS_SET_KNOWN_P.  */
+      if (TYPE_UNSIGNED (t))
+	{
+	  /* There is no signed _BitInt(1).  */
+	  if (TYPE_PRECISION (t) == 1)
+	    return -1;
+	  tree t1 = c_common_signed_type (t);
+	  gcc_checking_assert (t != t1);
+	  TYPE_ALIAS_SET (t) = get_alias_set (t1);
+	  return TYPE_ALIAS_SET (t);
+	}
+      else
+	{
+	  tree t1 = c_common_unsigned_type (t);
+	  gcc_checking_assert (t != t1);
+	  if (TYPE_ALIAS_SET_KNOWN_P (t1))
+	    {
+	      TYPE_ALIAS_SET (t) = TYPE_ALIAS_SET (t1);
+	      return TYPE_ALIAS_SET (t);
+	    }
+	}
     }
 
   return -1;
@@ -6160,6 +6213,9 @@ check_function_arguments (location_t loc, const_tree fndecl, const_tree fntype,
 {
   bool warned_p = false;
 
+  if (c_inhibit_evaluation_warnings)
+    return warned_p;
+
   /* Check for null being passed in a pointer argument that must be
      non-null.  In C++, this includes the this pointer.  We also need
      to do this if format checking is enabled.  */
@@ -6902,6 +6958,16 @@ fold_offsetof (tree expr, tree type, enum tree_code ctx)
     case ERROR_MARK:
       return expr;
 
+    case REALPART_EXPR:
+     return fold_offsetof (TREE_OPERAND (expr, 0), type, code);
+
+    case IMAGPART_EXPR:
+     base = fold_offsetof (TREE_OPERAND (expr, 0), type, code);
+     if (base == error_mark_node)
+	return base;
+     off = TYPE_SIZE_UNIT (TREE_TYPE (TREE_TYPE (TREE_OPERAND (expr, 0))));
+     break;
+
     case VAR_DECL:
       error ("cannot apply %<offsetof%> to static data member %qD", expr);
       return error_mark_node;
@@ -7115,6 +7181,13 @@ complete_array_type (tree *ptype, tree initial_value, bool do_default)
   TYPE_TYPELESS_STORAGE (main_type) = TYPE_TYPELESS_STORAGE (type);
   layout_type (main_type);
 
+  /* Set TYPE_STRUCTURAL_EQUALITY_P early.  */
+  if (TYPE_STRUCTURAL_EQUALITY_P (TREE_TYPE (main_type))
+      || TYPE_STRUCTURAL_EQUALITY_P (TYPE_DOMAIN (main_type)))
+    SET_TYPE_STRUCTURAL_EQUALITY (main_type);
+  else
+    TYPE_CANONICAL (main_type) = main_type;
+
   /* Make sure we have the canonical MAIN_TYPE. */
   hashval_t hashcode = type_hash_canon_hash (main_type);
   main_type = type_hash_canon (hashcode, main_type);
@@ -7122,7 +7195,7 @@ complete_array_type (tree *ptype, tree initial_value, bool do_default)
   /* Fix the canonical type.  */
   if (TYPE_STRUCTURAL_EQUALITY_P (TREE_TYPE (main_type))
       || TYPE_STRUCTURAL_EQUALITY_P (TYPE_DOMAIN (main_type)))
-    SET_TYPE_STRUCTURAL_EQUALITY (main_type);
+    gcc_assert (TYPE_STRUCTURAL_EQUALITY_P (main_type));
   else if (TYPE_CANONICAL (TREE_TYPE (main_type)) != TREE_TYPE (main_type)
 	   || (TYPE_CANONICAL (TYPE_DOMAIN (main_type))
 	       != TYPE_DOMAIN (main_type)))
@@ -7130,8 +7203,6 @@ complete_array_type (tree *ptype, tree initial_value, bool do_default)
       = build_array_type (TYPE_CANONICAL (TREE_TYPE (main_type)),
 			  TYPE_CANONICAL (TYPE_DOMAIN (main_type)),
 			  TYPE_TYPELESS_STORAGE (main_type));
-  else
-    TYPE_CANONICAL (main_type) = main_type;
 
   if (quals == 0)
     type = main_type;
@@ -7378,11 +7449,13 @@ sync_resolve_size (tree function, vec<tree, va_gc> *params, bool fetch,
 
   size = tree_to_uhwi (TYPE_SIZE_UNIT (type));
   if (size == 16
-      && fetch
-      && !orig_format
       && TREE_CODE (type) == BITINT_TYPE
       && !targetm.scalar_mode_supported_p (TImode))
-    return -1;
+    {
+      if (fetch && !orig_format)
+	return -1;
+      goto incompatible;
+    }
 
   if (size == 1 || size == 2 || size == 4 || size == 8 || size == 16)
     return size;
@@ -8959,6 +9032,7 @@ convert_vector_to_array_for_subscript (location_t loc,
   if (gnu_vector_type_p (TREE_TYPE (*vecp)))
     {
       tree type = TREE_TYPE (*vecp);
+      tree newitype;
 
       ret = !lvalue_p (*vecp);
 
@@ -8973,8 +9047,12 @@ convert_vector_to_array_for_subscript (location_t loc,
 	 for function parameters.  */
       c_common_mark_addressable_vec (*vecp);
 
+      /* Make sure qualifiers are copied from the vector type to the new element
+	 of the array type.  */
+      newitype = build_qualified_type (TREE_TYPE (type), TYPE_QUALS (type));
+
       *vecp = build1 (VIEW_CONVERT_EXPR,
-		      build_array_type_nelts (TREE_TYPE (type),
+		      build_array_type_nelts (newitype,
 					      TYPE_VECTOR_SUBPARTS (type)),
 		      *vecp);
     }

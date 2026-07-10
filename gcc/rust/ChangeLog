@@ -1,3 +1,27 @@
+2026-06-26  Release Manager
+
+	* GCC 14.4.0 released.
+
+2025-05-23  Release Manager
+
+	* GCC 14.3.0 released.
+
+2024-08-01  Release Manager
+
+	* GCC 14.2.0 released.
+
+2024-07-19  Daniel Bertalan  <dani@danielbertalan.dev>
+
+	Backported from master:
+	2024-07-12  Daniel Bertalan  <dani@danielbertalan.dev>
+
+	* metadata/rust-imports.cc (Import::try_package_in_directory):
+	Change NULL to nullptr.
+
+2024-05-07  Release Manager
+
+	* GCC 14.1.0 released.
+
 2024-04-15  Thomas Schwinge  <tschwinge@baylibre.com>
 
 	* Make-lang.in (RUST_LIBDEPS): Inline into single user.

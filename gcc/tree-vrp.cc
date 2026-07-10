@@ -86,14 +86,16 @@ along with GCC; see the file COPYING3.  If not see
 class remove_unreachable {
 public:
   remove_unreachable (gimple_ranger &r, bool all) : m_ranger (r), final_p (all)
-    { m_list.create (30); }
-  ~remove_unreachable () { m_list.release (); }
+    { m_list.create (30); m_tmp = BITMAP_ALLOC (NULL); }
+  ~remove_unreachable () { BITMAP_FREE (m_tmp); m_list.release (); }
   void handle_early (gimple *s, edge e);
   void maybe_register (gimple *s);
   bool remove_and_update_globals ();
+  bool fully_replaceable (tree name, basic_block bb);
   vec<std::pair<int, int> > m_list;
   gimple_ranger &m_ranger;
   bool final_p;
+  bitmap m_tmp;
 };
 
 // Check if block BB has a __builtin_unreachable () call on one arm, and
@@ -139,8 +141,8 @@ remove_unreachable::maybe_register (gimple *s)
 //    goto <bb 3>; [0.00%]
 //  Any additional use of _1 or _2 in this block invalidates early replacement.
 
-static bool
-fully_replaceable (tree name, basic_block bb)
+bool
+remove_unreachable::fully_replaceable (tree name, basic_block bb)
 {
   use_operand_p use_p;
   imm_use_iterator iter;
@@ -208,9 +210,11 @@ remove_unreachable::handle_early (gimple *s, edge e)
   gcc_checking_assert (gimple_outgoing_range_stmt_p (e->src) == s);
   gcc_checking_assert (!final_p);
 
-  // Check if every export use is dominated by this branch.
+  // Check if every export and its dependencies are dominated by this branch.
+  // Dependencies are required as it needs to dominate potential
+  // recalculations.  See PR 123300.
   tree name;
-  FOR_EACH_GORI_EXPORT_NAME (m_ranger.gori (), e->src, name)
+  FOR_EACH_GORI_EXPORT_AND_DEP_NAME (m_ranger.gori (), e->src, name, m_tmp)
     {
       if (!fully_replaceable (name, e->src))
 	return;
@@ -1315,68 +1319,6 @@ public:
   bool final_p;
 }; // class pass_vrp
 
-const pass_data pass_data_assumptions =
-{
-  GIMPLE_PASS, /* type */
-  "assumptions", /* name */
-  OPTGROUP_NONE, /* optinfo_flags */
-  TV_TREE_ASSUMPTIONS, /* tv_id */
-  PROP_ssa, /* properties_required */
-  PROP_assumptions_done, /* properties_provided */
-  0, /* properties_destroyed */
-  0, /* todo_flags_start */
-  0, /* todo_flags_end */
-};
-
-class pass_assumptions : public gimple_opt_pass
-{
-public:
-  pass_assumptions (gcc::context *ctxt)
-    : gimple_opt_pass (pass_data_assumptions, ctxt)
-  {}
-
-  /* opt_pass methods: */
-  bool gate (function *fun) final override { return fun->assume_function; }
-  unsigned int execute (function *) final override
-    {
-      assume_query query;
-      if (dump_file)
-	fprintf (dump_file, "Assumptions :\n--------------\n");
-
-      for (tree arg = DECL_ARGUMENTS (cfun->decl); arg; arg = DECL_CHAIN (arg))
-	{
-	  tree name = ssa_default_def (cfun, arg);
-	  if (!name || !gimple_range_ssa_p (name))
-	    continue;
-	  tree type = TREE_TYPE (name);
-	  if (!Value_Range::supports_type_p (type))
-	    continue;
-	  Value_Range assume_range (type);
-	  if (query.assume_range_p (assume_range, name))
-	    {
-	      // Set the global range of NAME to anything calculated.
-	      set_range_info (name, assume_range);
-	      if (dump_file)
-		{
-		  print_generic_expr (dump_file, name, TDF_SLIM);
-		  fprintf (dump_file, " -> ");
-		  assume_range.dump (dump_file);
-		  fputc ('\n', dump_file);
-		}
-	    }
-	}
-      if (dump_file)
-	{
-	  fputc ('\n', dump_file);
-	  gimple_dump_cfg (dump_file, dump_flags & ~TDF_DETAILS);
-	  if (dump_flags & TDF_DETAILS)
-	    query.dump (dump_file);
-	}
-      return TODO_discard_function;
-    }
-
-}; // class pass_assumptions
-
 } // anon namespace
 
 gimple_opt_pass *
@@ -1395,10 +1337,4 @@ gimple_opt_pass *
 make_pass_fast_vrp (gcc::context *ctxt)
 {
   return new pass_vrp (ctxt, pass_data_fast_vrp, false);
-}
-
-gimple_opt_pass *
-make_pass_assumptions (gcc::context *ctx)
-{
-  return new pass_assumptions (ctx);
 }

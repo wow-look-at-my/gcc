@@ -860,6 +860,7 @@ bool aarch64_uimm12_shift (unsigned HOST_WIDE_INT);
 int aarch64_movk_shift (const wide_int_ref &, const wide_int_ref &);
 bool aarch64_is_mov_xn_imm (unsigned HOST_WIDE_INT);
 bool aarch64_use_return_insn_p (void);
+bool aarch64_use_simple_return_insn_p (void);
 const char *aarch64_output_casesi (rtx *);
 const char *aarch64_output_load_tp (rtx);
 const char *aarch64_output_sme_zero_za (rtx);
@@ -1008,6 +1009,8 @@ tree aarch64_general_builtin_rsqrt (unsigned int);
 void handle_arm_acle_h (void);
 void handle_arm_neon_h (void);
 
+bool aarch64_check_required_extensions (location_t, tree,
+					aarch64_feature_flags);
 bool aarch64_general_check_builtin_call (location_t, vec<location_t>,
 					 unsigned int, tree, unsigned int,
 					 tree *);

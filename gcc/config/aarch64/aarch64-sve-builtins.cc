@@ -92,7 +92,7 @@ public:
 };
 
 /* Hash traits for registered_function.  */
-struct registered_function_hasher : nofree_ptr_hash <registered_function>
+struct registered_function_hasher : ggc_ptr_hash <registered_function>
 {
   typedef function_instance compare_type;
 
@@ -934,26 +934,18 @@ tree acle_svprfop;
 static GTY(()) vec<registered_function *, va_gc> *registered_functions;
 
 /* Stores the starting function index for each pragma handler.  */
-static unsigned int initial_indexes[NUM_PRAGMA_HANDLERS];
+static  GTY(()) unsigned int initial_indexes[NUM_PRAGMA_HANDLERS];
 
 /* All registered function decls, hashed on the function_instance
    that they implement.  This is used for looking up implementations of
    overloaded functions.  */
-static hash_table<registered_function_hasher> *function_table;
+static GTY(()) hash_table<registered_function_hasher> *function_table;
 
 /* Index 0 maps all overloaded function names that we've registered so far to
    their associated function_instances.  Index 1 does the same for functions
    that we've skipped over without registering.  In both cases, the map keys
    are IDENTIFIER_NODEs.  */
 static GTY(()) hash_map<tree, registered_function *> *overload_names[2];
-
-/* True if we've already complained about attempts to use functions
-   when the required extension is disabled.  */
-static bool reported_missing_extension_p;
-
-/* True if we've already complained about attempts to use functions
-   which require registers that are missing.  */
-static bool reported_missing_registers_p;
 
 /* Record that TYPE is an ABI-defined SVE type that contains NUM_ZR SVE vectors
    and NUM_PR SVE predicates.  MANGLED_NAME, if nonnull, is the ABI-defined
@@ -1076,96 +1068,6 @@ lookup_fndecl (tree fndecl)
   return &(*registered_functions)[subcode]->instance;
 }
 
-/* Report an error against LOCATION that the user has tried to use
-   function FNDECL when extension EXTENSION is disabled.  */
-static void
-report_missing_extension (location_t location, tree fndecl,
-			  const char *extension)
-{
-  /* Avoid reporting a slew of messages for a single oversight.  */
-  if (reported_missing_extension_p)
-    return;
-
-  error_at (location, "ACLE function %qD requires ISA extension %qs",
-	    fndecl, extension);
-  inform (location, "you can enable %qs using the command-line"
-	  " option %<-march%>, or by using the %<target%>"
-	  " attribute or pragma", extension);
-  reported_missing_extension_p = true;
-}
-
-/* Check whether the registers required by SVE function fndecl are available.
-   Report an error against LOCATION and return false if not.  */
-static bool
-check_required_registers (location_t location, tree fndecl)
-{
-  /* Avoid reporting a slew of messages for a single oversight.  */
-  if (reported_missing_registers_p)
-    return false;
-
-  if (TARGET_GENERAL_REGS_ONLY)
-    {
-      /* SVE registers are not usable when -mgeneral-regs-only option
-	 is specified.  */
-      error_at (location,
-		"ACLE function %qD is incompatible with the use of %qs",
-		fndecl, "-mgeneral-regs-only");
-      reported_missing_registers_p = true;
-      return false;
-    }
-
-  return true;
-}
-
-/* Check whether all the AARCH64_FL_* values in REQUIRED_EXTENSIONS are
-   enabled, given that those extensions are required for function FNDECL.
-   Report an error against LOCATION if not.  */
-static bool
-check_required_extensions (location_t location, tree fndecl,
-			   aarch64_feature_flags required_extensions)
-{
-  auto missing_extensions = required_extensions & ~aarch64_asm_isa_flags;
-  if (missing_extensions == 0)
-    return check_required_registers (location, fndecl);
-
-  if (missing_extensions & AARCH64_FL_SM_OFF)
-    {
-      error_at (location, "ACLE function %qD cannot be called when"
-		" SME streaming mode is enabled", fndecl);
-      return false;
-    }
-
-  if (missing_extensions & AARCH64_FL_SM_ON)
-    {
-      error_at (location, "ACLE function %qD can only be called when"
-		" SME streaming mode is enabled", fndecl);
-      return false;
-    }
-
-  if (missing_extensions & AARCH64_FL_ZA_ON)
-    {
-      error_at (location, "ACLE function %qD can only be called from"
-		" a function that has %qs state", fndecl, "za");
-      return false;
-    }
-
-  static const struct {
-    aarch64_feature_flags flag;
-    const char *name;
-  } extensions[] = {
-#define AARCH64_OPT_EXTENSION(EXT_NAME, IDENT, C, D, E, F) \
-    { AARCH64_FL_##IDENT, EXT_NAME },
-#include "aarch64-option-extensions.def"
-  };
-
-  for (unsigned int i = 0; i < ARRAY_SIZE (extensions); ++i)
-    if (missing_extensions & extensions[i].flag)
-      {
-	report_missing_extension (location, fndecl, extensions[i].name);
-	return false;
-      }
-  gcc_unreachable ();
-}
 
 /* Report that LOCATION has a call to FNDECL in which argument ARGNO
    was not an integer constant expression.  ARGNO counts from zero.  */
@@ -1357,7 +1259,7 @@ function_builder::function_builder (handle_pragma_index pragma_index,
 				    bool function_nulls)
 {
   m_overload_type = build_function_type (void_type_node, void_list_node);
-  m_direct_overloads = lang_GNU_CXX ();
+  m_direct_overloads = lang_GNU_CXX () || in_lto_p;
 
   if (initial_indexes[pragma_index] == 0)
     {
@@ -4201,7 +4103,11 @@ function_expander::use_cond_insn (insn_code icode, unsigned int merge_argno)
   add_input_operand (icode, pred);
   for (unsigned int i = 0; i < nops; ++i)
     add_input_operand (icode, args[opno + i]);
-  add_input_operand (icode, fallback_arg);
+  if (fallback_arg == CONST0_RTX (mode)
+      && insn_operand_matches (icode, m_ops.length (), fallback_arg))
+    add_fixed_operand (fallback_arg);
+  else
+    add_input_operand (icode, fallback_arg);
   return generate_insn (icode);
 }
 
@@ -4679,7 +4585,7 @@ handle_arm_sve_h (bool function_nulls_p)
   register_svprfop ();
 
   /* Define the functions.  */
-  function_table = new hash_table<registered_function_hasher> (1023);
+  function_table = hash_table<registered_function_hasher>::create_ggc (1023);
   function_builder builder (arm_sve_handle, function_nulls_p);
   for (unsigned int i = 0; i < ARRAY_SIZE (function_groups); ++i)
     builder.register_function_group (function_groups[i]);
@@ -4761,7 +4667,8 @@ check_builtin_call (location_t location, vec<location_t>, unsigned int code,
 		    tree fndecl, unsigned int nargs, tree *args)
 {
   const registered_function &rfn = *(*registered_functions)[code];
-  if (!check_required_extensions (location, rfn.decl, rfn.required_extensions))
+  if (!aarch64_check_required_extensions (location, rfn.decl,
+					  rfn.required_extensions))
     return false;
   return function_checker (location, rfn.instance, fndecl,
 			   TREE_TYPE (rfn.decl), nargs, args).check ();
@@ -4784,8 +4691,8 @@ rtx
 expand_builtin (unsigned int code, tree exp, rtx target)
 {
   registered_function &rfn = *(*registered_functions)[code];
-  if (!check_required_extensions (EXPR_LOCATION (exp), rfn.decl,
-				  rfn.required_extensions))
+  if (!aarch64_check_required_extensions (EXPR_LOCATION (exp), rfn.decl,
+					  rfn.required_extensions))
     return target;
   return function_expander (rfn.instance, rfn.decl, exp, target).expand ();
 }

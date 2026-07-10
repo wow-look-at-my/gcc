@@ -912,7 +912,7 @@ _GLIBCXX_BEGIN_NAMESPACE_CXX11
 	      __str._M_data(__str._M_use_local_data());
 	  }
 	else // Need to do a deep copy
-	  assign(__str);
+	  _M_assign(__str);
 	__str.clear();
 	return *this;
       }
@@ -3272,7 +3272,6 @@ _GLIBCXX_BEGIN_NAMESPACE_CXX11
 	_GLIBCXX_NODISCARD _GLIBCXX20_CONSTEXPR
 	_If_sv<_Tp, int>
 	compare(size_type __pos, size_type __n, const _Tp& __svt) const
-	noexcept(is_same<_Tp, __sv_type>::value)
 	{
 	  __sv_type __sv = __svt;
 	  return __sv_type(*this).substr(__pos, __n).compare(__sv);
@@ -3293,7 +3292,6 @@ _GLIBCXX_BEGIN_NAMESPACE_CXX11
 	_If_sv<_Tp, int>
 	compare(size_type __pos1, size_type __n1, const _Tp& __svt,
 		size_type __pos2, size_type __n2 = npos) const
-	noexcept(is_same<_Tp, __sv_type>::value)
 	{
 	  __sv_type __sv = __svt;
 	  return __sv_type(*this)
@@ -4496,6 +4494,7 @@ _GLIBCXX_BEGIN_NAMESPACE_CXX11
 	__wc['d'] = L'd';
 	__wc['e'] = L'e';
 	__wc['f'] = L'f';
+	__wc['i'] = L'i'; // for "inf"
 	__wc['n'] = L'n'; // for "nan" and "inf"
 	__wc['p'] = L'p'; // for hexfloats "0x1p1"
 	__wc['x'] = L'x';
@@ -4505,6 +4504,7 @@ _GLIBCXX_BEGIN_NAMESPACE_CXX11
 	__wc['D'] = L'D';
 	__wc['E'] = L'E';
 	__wc['F'] = L'F';
+	__wc['I'] = L'I';
 	__wc['N'] = L'N';
 	__wc['P'] = L'P';
 	__wc['X'] = L'X';

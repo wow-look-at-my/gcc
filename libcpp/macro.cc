@@ -392,6 +392,15 @@ builtin_has_include (cpp_reader *pfile, cpp_hashnode *op, bool has_next)
 {
   int result = 0;
 
+  /* Record that this TU evaluated __has_include (and which form): probes
+     don't enter the include closure, so the in-compiler cache keys on the
+     per-probe records _cpp_has_header takes below and disqualifies its
+     manifest fast-path for the position-dependent _next form (see
+     cpp_reader::used_has_include / used_has_include_next / hi_probes).  */
+  pfile->used_has_include = true;
+  if (has_next)
+    pfile->used_has_include_next = true;
+
   if (!pfile->state.in_directive)
     cpp_error (pfile, CPP_DL_ERROR,
 	       "\"%s\" used outside of preprocessing directive",

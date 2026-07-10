@@ -1407,6 +1407,7 @@ hppa_legitimize_address (rtx x, rtx oldx ATTRIBUTE_UNUSED,
       /* If the index adds a large constant, try to scale the
 	 constant so that it can be loaded with only one insn.  */
       if (GET_CODE (XEXP (idx, 1)) == CONST_INT
+	  && INTVAL (XEXP (idx, 1)) % (1 << shift_val) == 0
 	  && VAL_14_BITS_P (INTVAL (XEXP (idx, 1))
 			    / INTVAL (XEXP (XEXP (idx, 0), 1)))
 	  && INTVAL (XEXP (idx, 1)) % INTVAL (XEXP (XEXP (idx, 0), 1)) == 0)
@@ -10623,10 +10624,7 @@ static void
 pa_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
 {
   rtx fnaddr = XEXP (DECL_RTL (fndecl), 0);
-  rtx start_addr = gen_reg_rtx (Pmode);
-  rtx end_addr = gen_reg_rtx (Pmode);
-  rtx line_length = gen_reg_rtx (Pmode);
-  rtx r_tramp, tmp;
+  rtx start, end, r_tramp, tmp;
 
   emit_block_move (m_tramp, assemble_trampoline_template (),
 		   GEN_INT (TRAMPOLINE_SIZE), BLOCK_OP_NORMAL);
@@ -10634,6 +10632,9 @@ pa_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
 
   if (!TARGET_64BIT)
     {
+      /* Start of trampoline code.  */
+      start = r_tramp;
+
       tmp = adjust_address (m_tramp, Pmode, 48);
       emit_move_insn (tmp, fnaddr);
       tmp = adjust_address (m_tramp, Pmode, 52);
@@ -10641,28 +10642,15 @@ pa_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
 
       /* Create a fat pointer for the trampoline.  */
       tmp = adjust_address (m_tramp, Pmode, 56);
-      emit_move_insn (tmp, r_tramp);
+      emit_move_insn (tmp, start);
       tmp = adjust_address (m_tramp, Pmode, 60);
       emit_move_insn (tmp, gen_rtx_REG (Pmode, 19));
-
-      /* fdc and fic only use registers for the address to flush,
-	 they do not accept integer displacements.  We align the
-	 start and end addresses to the beginning of their respective
-	 cache lines to minimize the number of lines flushed.  */
-      emit_insn (gen_andsi3 (start_addr, r_tramp,
-			     GEN_INT (-MIN_CACHELINE_SIZE)));
-      tmp = force_reg (Pmode, plus_constant (Pmode, r_tramp,
-					     TRAMPOLINE_CODE_SIZE-1));
-      emit_insn (gen_andsi3 (end_addr, tmp,
-			     GEN_INT (-MIN_CACHELINE_SIZE)));
-      emit_move_insn (line_length, GEN_INT (MIN_CACHELINE_SIZE));
-      emit_insn (gen_dcacheflushsi (start_addr, end_addr, line_length));
-      emit_insn (gen_icacheflushsi (start_addr, end_addr, line_length,
-				    gen_reg_rtx (Pmode),
-				    gen_reg_rtx (Pmode)));
     }
   else
     {
+      /* Start of trampoline code.  */
+      start = force_reg (Pmode, plus_constant (Pmode, r_tramp, 32));
+
       tmp = adjust_address (m_tramp, Pmode, 56);
       emit_move_insn (tmp, fnaddr);
       tmp = adjust_address (m_tramp, Pmode, 64);
@@ -10670,28 +10658,15 @@ pa_trampoline_init (rtx m_tramp, tree fndecl, rtx chain_value)
 
       /* Create a fat pointer for the trampoline.  */
       tmp = adjust_address (m_tramp, Pmode, 16);
-      emit_move_insn (tmp, force_reg (Pmode, plus_constant (Pmode,
-							    r_tramp, 32)));
+      emit_move_insn (tmp, start);
       tmp = adjust_address (m_tramp, Pmode, 24);
       emit_move_insn (tmp, gen_rtx_REG (Pmode, 27));
-
-      /* fdc and fic only use registers for the address to flush,
-	 they do not accept integer displacements.  We align the
-	 start and end addresses to the beginning of their respective
-	 cache lines to minimize the number of lines flushed.  */
-      tmp = force_reg (Pmode, plus_constant (Pmode, r_tramp, 32));
-      emit_insn (gen_anddi3 (start_addr, tmp,
-			     GEN_INT (-MIN_CACHELINE_SIZE)));
-      tmp = force_reg (Pmode, plus_constant (Pmode, tmp,
-					     TRAMPOLINE_CODE_SIZE - 1));
-      emit_insn (gen_anddi3 (end_addr, tmp,
-			     GEN_INT (-MIN_CACHELINE_SIZE)));
-      emit_move_insn (line_length, GEN_INT (MIN_CACHELINE_SIZE));
-      emit_insn (gen_dcacheflushdi (start_addr, end_addr, line_length));
-      emit_insn (gen_icacheflushdi (start_addr, end_addr, line_length,
-				    gen_reg_rtx (Pmode),
-				    gen_reg_rtx (Pmode)));
     }
+
+  end = force_reg (Pmode, plus_constant (Pmode, start, TRAMPOLINE_CODE_SIZE));
+
+  /* Flush trampoline.  */
+  emit_insn (gen_clear_cache (start, end));
 
 #ifdef HAVE_ENABLE_EXECUTE_STACK
   emit_library_call (gen_rtx_SYMBOL_REF (Pmode, "__enable_execute_stack"),
@@ -10982,6 +10957,7 @@ pa_legitimate_address_p (machine_mode mode, rtx x, bool strict, code_helper)
 	  /* Long 14-bit displacements always okay for these cases.  */
 	  if (INT14_OK_STRICT
 	      || reload_completed
+	      || (reload_in_progress && !strict)
 	      || mode == QImode
 	      || mode == HImode)
 	    return true;

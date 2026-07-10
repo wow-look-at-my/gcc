@@ -1067,7 +1067,7 @@ struct processor_costs power9_cost = {
   COSTS_N_INSNS (3),	/* SF->DF convert */
 };
 
-/* Instruction costs on POWER10 processors.  */
+/* Instruction costs on Power10/Power11 processors.  */
 static const
 struct processor_costs power10_cost = {
   COSTS_N_INSNS (2),	/* mulsi */
@@ -3424,10 +3424,6 @@ rs6000_override_options_after_change (void)
     }
   else if (!OPTION_SET_P (flag_cunroll_grow_size))
     flag_cunroll_grow_size = flag_peel_loops || optimize >= 3;
-
-  /* If we are inserting ROP-protect instructions, disable shrink wrap.  */
-  if (rs6000_rop_protect)
-    flag_shrink_wrap = 0;
 }
 
 #ifdef TARGET_USES_LINUX64_OPT
@@ -4370,7 +4366,8 @@ rs6000_option_override_internal (bool global_init_p)
      generating power10 instructions.  */
   if (!(rs6000_isa_flags_explicit & OPTION_MASK_P10_FUSION))
     {
-      if (rs6000_tune == PROCESSOR_POWER10)
+      if (rs6000_tune == PROCESSOR_POWER10
+	  || rs6000_tune == PROCESSOR_POWER11)
 	rs6000_isa_flags |= OPTION_MASK_P10_FUSION;
       else
 	rs6000_isa_flags &= ~OPTION_MASK_P10_FUSION;
@@ -4399,6 +4396,7 @@ rs6000_option_override_internal (bool global_init_p)
 			&& rs6000_tune != PROCESSOR_POWER8
 			&& rs6000_tune != PROCESSOR_POWER9
 			&& rs6000_tune != PROCESSOR_POWER10
+			&& rs6000_tune != PROCESSOR_POWER11
 			&& rs6000_tune != PROCESSOR_PPCA2
 			&& rs6000_tune != PROCESSOR_CELL
 			&& rs6000_tune != PROCESSOR_PPC476);
@@ -4413,6 +4411,7 @@ rs6000_option_override_internal (bool global_init_p)
 				 || rs6000_tune == PROCESSOR_POWER8
 				 || rs6000_tune == PROCESSOR_POWER9
 				 || rs6000_tune == PROCESSOR_POWER10
+				 || rs6000_tune == PROCESSOR_POWER11
 				 || rs6000_tune == PROCESSOR_PPCE500MC
 				 || rs6000_tune == PROCESSOR_PPCE500MC64
 				 || rs6000_tune == PROCESSOR_PPCE5500
@@ -4712,6 +4711,7 @@ rs6000_option_override_internal (bool global_init_p)
 	break;
 
       case PROCESSOR_POWER10:
+      case PROCESSOR_POWER11:
 	rs6000_cost = &power10_cost;
 	break;
 
@@ -4823,6 +4823,18 @@ rs6000_option_override_internal (bool global_init_p)
 	  else
 	    rs6000_recip_control |= mask;
 	}
+    }
+
+  /* We only support ROP protection on certain targets.  */
+  if (rs6000_rop_protect)
+    {
+      /* Disallow CPU targets we don't support.  */
+      if (!TARGET_POWER8)
+	error ("%<-mrop-protect%> requires %<-mcpu=power8%> or later");
+
+      /* Disallow ABI targets we don't support.  */
+      if (DEFAULT_ABI != ABI_ELFv2)
+	error ("%<-mrop-protect%> requires the ELFv2 ABI");
     }
 
   /* Initialize all of the registers.  */
@@ -5869,8 +5881,11 @@ rs6000_machine_from_flags (void)
   HOST_WIDE_INT flags = rs6000_isa_flags;
 
   /* Disable the flags that should never influence the .machine selection.  */
-  flags &= ~(OPTION_MASK_PPC_GFXOPT | OPTION_MASK_PPC_GPOPT | OPTION_MASK_ISEL);
+  flags &= ~(OPTION_MASK_PPC_GFXOPT | OPTION_MASK_PPC_GPOPT | OPTION_MASK_ISEL
+	     | OPTION_MASK_ALTIVEC);
 
+  if ((flags & (POWER11_MASKS_SERVER & ~ISA_3_1_MASKS_SERVER)) != 0)
+    return "power11";
   if ((flags & (ISA_3_1_MASKS_SERVER & ~ISA_3_0_MASKS_SERVER)) != 0)
     return "power10";
   if ((flags & (ISA_3_0_MASKS_SERVER & ~ISA_2_7_MASKS_SERVER)) != 0)
@@ -5894,6 +5909,8 @@ void
 emit_asm_machine (void)
 {
   fprintf (asm_out_file, "\t.machine %s\n", rs6000_machine);
+  if (TARGET_ALTIVEC)
+    fprintf (asm_out_file, "\t.machine altivec\n");
 }
 #endif
 
@@ -10117,6 +10134,7 @@ rs6000_reassociation_width (unsigned int opc ATTRIBUTE_UNUSED,
     case PROCESSOR_POWER8:
     case PROCESSOR_POWER9:
     case PROCESSOR_POWER10:
+    case PROCESSOR_POWER11:
       if (DECIMAL_FLOAT_MODE_P (mode))
 	return 1;
       if (VECTOR_MODE_P (mode))
@@ -18198,7 +18216,8 @@ rs6000_adjust_cost (rtx_insn *insn, int dep_type, rtx_insn *dep_insn, int cost,
 
 	/* Separate a load from a narrower, dependent store.  */
 	if ((rs6000_sched_groups || rs6000_tune == PROCESSOR_POWER9
-	     || rs6000_tune == PROCESSOR_POWER10)
+	     || rs6000_tune == PROCESSOR_POWER10
+	     || rs6000_tune == PROCESSOR_POWER11)
 	    && GET_CODE (PATTERN (insn)) == SET
 	    && GET_CODE (PATTERN (dep_insn)) == SET
 	    && MEM_P (XEXP (PATTERN (insn), 1))
@@ -18237,6 +18256,7 @@ rs6000_adjust_cost (rtx_insn *insn, int dep_type, rtx_insn *dep_insn, int cost,
 		 || rs6000_tune == PROCESSOR_POWER8
 		 || rs6000_tune == PROCESSOR_POWER9
 		 || rs6000_tune == PROCESSOR_POWER10
+		 || rs6000_tune == PROCESSOR_POWER11
                  || rs6000_tune == PROCESSOR_CELL)
                 && recog_memoized (dep_insn)
                 && (INSN_CODE (dep_insn) >= 0))
@@ -18811,6 +18831,7 @@ rs6000_issue_rate (void)
   case PROCESSOR_POWER9:
     return 6;
   case PROCESSOR_POWER10:
+  case PROCESSOR_POWER11:
     return 8;
   default:
     return 1;
@@ -19526,8 +19547,10 @@ rs6000_sched_reorder (FILE *dump ATTRIBUTE_UNUSED, int sched_verbose,
   if (rs6000_tune == PROCESSOR_POWER6)
     load_store_pendulum = 0;
 
-  /* Do Power10 dependent reordering.  */
-  if (rs6000_tune == PROCESSOR_POWER10 && last_scheduled_insn)
+  /* Do Power10/Power11 dependent reordering.  */
+  if (last_scheduled_insn
+      && (rs6000_tune == PROCESSOR_POWER10
+	  || rs6000_tune == PROCESSOR_POWER11))
     power10_sched_reorder (ready, n_ready - 1);
 
   return rs6000_issue_rate ();
@@ -19551,8 +19574,10 @@ rs6000_sched_reorder2 (FILE *dump, int sched_verbose, rtx_insn **ready,
       && recog_memoized (last_scheduled_insn) >= 0)
     return power9_sched_reorder2 (ready, *pn_ready - 1);
 
-  /* Do Power10 dependent reordering.  */
-  if (rs6000_tune == PROCESSOR_POWER10 && last_scheduled_insn)
+  /* Do Power10/Power11 dependent reordering.  */
+  if (last_scheduled_insn
+      && (rs6000_tune == PROCESSOR_POWER10
+	  || rs6000_tune == PROCESSOR_POWER11))
     return power10_sched_reorder (ready, *pn_ready - 1);
 
   return cached_can_issue_more;
@@ -22769,7 +22794,8 @@ rs6000_register_move_cost (machine_mode mode,
 		 allocation a move within the same class might turn
 		 out to be a nop.  */
 	      if (rs6000_tune == PROCESSOR_POWER9
-		  || rs6000_tune == PROCESSOR_POWER10)
+		  || rs6000_tune == PROCESSOR_POWER10
+		  || rs6000_tune == PROCESSOR_POWER11)
 		ret = 3 * hard_regno_nregs (FIRST_GPR_REGNO, mode);
 	      else
 		ret = 4 * hard_regno_nregs (FIRST_GPR_REGNO, mode);
@@ -23438,28 +23464,28 @@ altivec_expand_vec_perm_const (rtx target, rtx op0, rtx op1,
      CODE_FOR_altivec_vpkuwum_direct,
      {2, 3, 6, 7, 10, 11, 14, 15, 18, 19, 22, 23, 26, 27, 30, 31}},
     {OPTION_MASK_ALTIVEC,
-     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrghb_direct
-		      : CODE_FOR_altivec_vmrglb_direct,
+     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrghb_direct_be
+		      : CODE_FOR_altivec_vmrglb_direct_le,
      {0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23}},
     {OPTION_MASK_ALTIVEC,
-     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrghh_direct
-		      : CODE_FOR_altivec_vmrglh_direct,
+     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrghh_direct_be
+		      : CODE_FOR_altivec_vmrglh_direct_le,
      {0, 1, 16, 17, 2, 3, 18, 19, 4, 5, 20, 21, 6, 7, 22, 23}},
     {OPTION_MASK_ALTIVEC,
-     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrghw_direct_v4si
-		      : CODE_FOR_altivec_vmrglw_direct_v4si,
+     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrghw_direct_v4si_be
+		      : CODE_FOR_altivec_vmrglw_direct_v4si_le,
      {0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23}},
     {OPTION_MASK_ALTIVEC,
-     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrglb_direct
-		      : CODE_FOR_altivec_vmrghb_direct,
+     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrglb_direct_be
+		      : CODE_FOR_altivec_vmrghb_direct_le,
      {8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31}},
     {OPTION_MASK_ALTIVEC,
-     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrglh_direct
-		      : CODE_FOR_altivec_vmrghh_direct,
+     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrglh_direct_be
+		      : CODE_FOR_altivec_vmrghh_direct_le,
      {8, 9, 24, 25, 10, 11, 26, 27, 12, 13, 28, 29, 14, 15, 30, 31}},
     {OPTION_MASK_ALTIVEC,
-     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrglw_direct_v4si
-		      : CODE_FOR_altivec_vmrghw_direct_v4si,
+     BYTES_BIG_ENDIAN ? CODE_FOR_altivec_vmrglw_direct_v4si_be
+		      : CODE_FOR_altivec_vmrghw_direct_v4si_le,
      {8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31}},
     {OPTION_MASK_P8_VECTOR,
      BYTES_BIG_ENDIAN ? CODE_FOR_p8_vmrgew_v4sf_direct
@@ -24428,6 +24454,7 @@ static struct rs6000_opt_mask const rs6000_opt_masks[] =
   { "float128-hardware",	OPTION_MASK_FLOAT128_HW,	false, true  },
   { "fprnd",			OPTION_MASK_FPRND,		false, true  },
   { "power10",			OPTION_MASK_POWER10,		false, true  },
+  { "power11",			OPTION_MASK_POWER11,		false, false },
   { "hard-dfp",			OPTION_MASK_DFP,		false, true  },
   { "htm",			OPTION_MASK_HTM,		false, true  },
   { "isel",			OPTION_MASK_ISEL,		false, true  },
@@ -25735,10 +25762,13 @@ rs6000_can_inline_p (tree caller, tree callee)
 	}
     }
 
-  /* Ignore -mpower8-fusion and -mpower10-fusion options for inlining
-     purposes.  */
-  callee_isa &= ~(OPTION_MASK_P8_FUSION | OPTION_MASK_P10_FUSION);
-  explicit_isa &= ~(OPTION_MASK_P8_FUSION | OPTION_MASK_P10_FUSION);
+  /* Ignore -mpower8-fusion, -mpower10-fusion and -msave-toc-indirect options
+     for inlining purposes.  */
+  HOST_WIDE_INT ignored_isas = (OPTION_MASK_P8_FUSION
+				| OPTION_MASK_P10_FUSION
+				| OPTION_MASK_SAVE_TOC_INDIRECT);
+  callee_isa &= ~ignored_isas;
+  explicit_isa &= ~ignored_isas;
 
   /* The callee's options must be a subset of the caller's options, i.e.
      a vsx function may inline an altivec function, but a no-vsx function

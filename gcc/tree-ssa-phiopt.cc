@@ -54,6 +54,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "dbgcnt.h"
 #include "tree-ssa-propagate.h"
 #include "tree-ssa-dce.h"
+#include "tree-ssa-loop-niter.h"
 
 /* Return the singleton PHI in the SEQ of PHIs for edges E0 and E1. */
 
@@ -158,6 +159,16 @@ replace_phi_edge_with_variable (basic_block cond_block,
     }
   else
     gcc_unreachable ();
+
+  /* If we are removing the cond on a loop exit,
+     reset number of iteration information of the loop. */
+  if (loop_exits_from_bb_p (cond_block->loop_father, cond_block))
+    {
+      auto loop = cond_block->loop_father;
+      free_numbers_of_iterations_estimates (loop);
+      loop->any_upper_bound = false;
+      loop->any_likely_upper_bound = false;
+    }
 
   if (edge_to_remove && EDGE_COUNT (edge_to_remove->dest->preds) == 1)
     {
@@ -308,11 +319,16 @@ factor_out_conditional_operation (edge e0, edge e1, gphi *phi,
       /* arg0_def_stmt should be conditional.  */
       if (dominated_by_p (CDI_DOMINATORS, gimple_bb (phi), gimple_bb (arg0_def_stmt)))
 	return NULL;
-      /* If arg1 is an INTEGER_CST, fold it to new type.  */
+
+      /* If arg1 is an INTEGER_CST, fold it to new type if it fits, or else
+	 if the bits will not be modified during the conversion, except for
+	 boolean types whose precision is not 1 (see int_fits_type_p).  */
       if (INTEGRAL_TYPE_P (TREE_TYPE (new_arg0))
 	  && (int_fits_type_p (arg1, TREE_TYPE (new_arg0))
 	      || (TYPE_PRECISION (TREE_TYPE (new_arg0))
-		   == TYPE_PRECISION (TREE_TYPE (arg1)))))
+		   == TYPE_PRECISION (TREE_TYPE (arg1))
+		  && (TREE_CODE (TREE_TYPE (new_arg0)) != BOOLEAN_TYPE
+		      || TYPE_PRECISION (TREE_TYPE (new_arg0)) == 1))))
 	{
 	  if (gimple_assign_cast_p (arg0_def_stmt))
 	    {
@@ -329,7 +345,7 @@ factor_out_conditional_operation (edge e0, edge e1, gphi *phi,
 		 it will not generate any zero/sign extend in that case.  */
 	      if ((TYPE_PRECISION (TREE_TYPE (new_arg0))
 		    != TYPE_PRECISION (TREE_TYPE (arg1)))
-	          && new_arg0 != gimple_cond_lhs (cond_stmt)
+		  && new_arg0 != gimple_cond_lhs (cond_stmt)
 		  && new_arg0 != gimple_cond_rhs (cond_stmt)
 		  && gimple_bb (arg0_def_stmt) == e0->src)
 		{
@@ -728,7 +744,8 @@ empty_bb_or_one_feeding_into_p (basic_block bb,
 }
 
 /* Move STMT to before GSI and insert its defining
-   name into INSERTED_EXPRS bitmap. */
+   name into INSERTED_EXPRS bitmap.
+   Also rewrite its if it might be undefined when unconditionalized.  */
 static void
 move_stmt (gimple *stmt, gimple_stmt_iterator *gsi, auto_bitmap &inserted_exprs)
 {
@@ -747,6 +764,31 @@ move_stmt (gimple *stmt, gimple_stmt_iterator *gsi, auto_bitmap &inserted_exprs)
   gimple_stmt_iterator gsi1 = gsi_for_stmt (stmt);
   gsi_move_before (&gsi1, gsi);
   reset_flow_sensitive_info (name);
+
+  /* Rewrite some code which might be undefined when
+     unconditionalized. */
+  if (gimple_assign_single_p (stmt))
+    {
+      tree rhs = gimple_assign_rhs1 (stmt);
+      /* VCE from integral types to another integral types but with
+	 different precisions need to be changed into casts
+	 to be well defined when unconditional. */
+      if (gimple_assign_rhs_code (stmt) == VIEW_CONVERT_EXPR
+	  && INTEGRAL_TYPE_P (TREE_TYPE (name))
+	  && INTEGRAL_TYPE_P (TREE_TYPE (TREE_OPERAND (rhs, 0))))
+	{
+	  if (dump_file && (dump_flags & TDF_DETAILS))
+	    {
+	      fprintf (dump_file, "rewriting stmt with maybe undefined VCE ");
+	      print_gimple_stmt (dump_file, stmt, 0, TDF_SLIM);
+	    }
+	  tree new_rhs = TREE_OPERAND (rhs, 0);
+	  gcc_assert (is_gimple_val (new_rhs));
+	  gimple_assign_set_rhs_code (stmt, NOP_EXPR);
+	  gimple_assign_set_rhs1 (stmt, new_rhs);
+	  update_stmt (stmt);
+	}
+    }
 }
 
 /* RAII style class to temporarily remove flow sensitive
@@ -1168,6 +1210,10 @@ value_replacement (basic_block cond_bb, basic_block middle_bb,
 		&& jump_function_from_stmt (&arg1, stmt)))
 	empty_or_with_defined_p = false;
     }
+
+  /* The middle bb is not empty if there are any phi nodes. */
+  if (phi_nodes (middle_bb))
+    empty_or_with_defined_p = false;
 
   gcond *cond = as_a <gcond *> (*gsi_last_bb (cond_bb));
   code = gimple_cond_code (cond);
@@ -1918,6 +1964,10 @@ minmax_replacement (basic_block cond_bb, basic_block middle_bb, basic_block alt_
 	  || gimple_code (assign) != GIMPLE_ASSIGN)
 	return false;
 
+      /* There cannot be any phi nodes in the middle bb. */
+      if (!gimple_seq_empty_p (phi_nodes (middle_bb)))
+	return false;
+
       lhs = gimple_assign_lhs (assign);
       ass_code = gimple_assign_rhs_code (assign);
       if (ass_code != MAX_EXPR && ass_code != MIN_EXPR)
@@ -1929,6 +1979,10 @@ minmax_replacement (basic_block cond_bb, basic_block middle_bb, basic_block alt_
       assign = last_and_only_stmt (alt_middle_bb);
       if (!assign
 	  || gimple_code (assign) != GIMPLE_ASSIGN)
+	return false;
+
+      /* There cannot be any phi nodes in the alt middle bb. */
+      if (!gimple_seq_empty_p (phi_nodes (alt_middle_bb)))
 	return false;
 
       alt_lhs = gimple_assign_lhs (assign);
@@ -2040,6 +2094,10 @@ minmax_replacement (basic_block cond_bb, basic_block middle_bb, basic_block alt_
 
       if (!assign
 	  || gimple_code (assign) != GIMPLE_ASSIGN)
+	return false;
+
+      /* There cannot be any phi nodes in the middle bb. */
+      if (!gimple_seq_empty_p (phi_nodes (middle_bb)))
 	return false;
 
       lhs = gimple_assign_lhs (assign);
@@ -2546,7 +2604,7 @@ spaceship_replacement (basic_block cond_bb, basic_block middle_bb,
 	}
       else if (tree_to_shwi (arg1) != 2
 	       || absu_hwi (tree_to_shwi (arg0)) != 1
-	       || wi::to_widest (arg0) == wi::to_widest (arg1))
+	       || wi::to_widest (arg0) == wi::to_widest (arg2))
 	return false;
       switch (cmp2)
 	{
@@ -2766,10 +2824,8 @@ spaceship_replacement (basic_block cond_bb, basic_block middle_bb,
 	    {
 	      if (has_cast_debug_uses)
 		{
-		  tree temp3 = make_node (DEBUG_EXPR_DECL);
-		  DECL_ARTIFICIAL (temp3) = 1;
-		  TREE_TYPE (temp3) = TREE_TYPE (orig_use_lhs);
-		  SET_DECL_MODE (temp3, TYPE_MODE (type));
+		  tree temp3
+		    = build_debug_expr_decl (TREE_TYPE (orig_use_lhs));
 		  t = fold_convert (TREE_TYPE (temp3), temp2);
 		  g = gimple_build_debug_bind (temp3, t, phi);
 		  gsi_insert_before (&gsi, g, GSI_SAME_STMT);
@@ -2990,15 +3046,35 @@ cond_removal_in_builtin_zero_pattern (basic_block cond_bb,
       || arg != gimple_cond_lhs (cond))
     return false;
 
-  /* Canonicalize.  */
-  if ((e2->flags & EDGE_TRUE_VALUE
-       && gimple_cond_code (cond) == NE_EXPR)
-      || (e1->flags & EDGE_TRUE_VALUE
-	  && gimple_cond_code (cond) == EQ_EXPR))
+  edge true_edge, false_edge;
+  /* We need to know which is the true edge and which is the false
+     edge so that we know when to invert the condition below.  */
+  extract_true_false_edges_from_block (cond_bb, &true_edge, &false_edge);
+
+  /* Forward the edges over the middle basic block.  */
+  if (true_edge->dest == middle_bb)
+    true_edge = EDGE_SUCC (true_edge->dest, 0);
+  if (false_edge->dest == middle_bb)
+    false_edge = EDGE_SUCC (false_edge->dest, 0);
+
+  /* Canonicalize the args with respect to the edges,
+     arg0 is from the true edge and arg1 is from the
+     false edge.
+     That is `cond ? arg0 : arg1`.*/
+  if (true_edge == e1)
+    gcc_assert (false_edge == e2);
+  else
     {
+      gcc_assert (false_edge == e1);
+      gcc_assert (true_edge == e2);
       std::swap (arg0, arg1);
-      std::swap (e1, e2);
     }
+
+  /* Canonicalize the args such that we get:
+     `arg != 0 ? arg0 : arg1`. So swap arg0/arg1
+     around if cond was an equals.  */
+  if (gimple_cond_code (cond) == EQ_EXPR)
+    std::swap (arg0, arg1);
 
   /* Check PHI arguments.  */
   if (lhs != arg0
@@ -3421,7 +3497,9 @@ cond_if_else_store_replacement_1 (basic_block then_bb, basic_block else_bb,
       || else_assign == NULL
       || !gimple_assign_single_p (else_assign)
       || gimple_clobber_p (else_assign)
-      || gimple_has_volatile_ops (else_assign))
+      || gimple_has_volatile_ops (else_assign)
+      || stmt_references_abnormal_ssa_name (then_assign)
+      || stmt_references_abnormal_ssa_name (else_assign))
     return false;
 
   lhs = gimple_assign_lhs (then_assign);

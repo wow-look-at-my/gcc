@@ -38,6 +38,7 @@
 
 #pragma GCC system_header
 
+#include <bits/c++config.h>
 #if _GLIBCXX_HOSTED
 #  include <iosfwd>
 #endif
@@ -436,8 +437,11 @@ _GLIBCXX_BEGIN_NAMESPACE_VERSION
       _CXX_POINTER_ARITH_OPERATOR_SET(long);
       _CXX_POINTER_ARITH_OPERATOR_SET(unsigned long);
 #ifdef _GLIBCXX_USE_LONG_LONG
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wlong-long"
       _CXX_POINTER_ARITH_OPERATOR_SET(long long);
       _CXX_POINTER_ARITH_OPERATOR_SET(unsigned long long);
+#pragma GCC diagnostic pop
 #endif
 
       // Mathematical Manipulators

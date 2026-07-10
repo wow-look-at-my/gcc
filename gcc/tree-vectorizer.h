@@ -2392,7 +2392,8 @@ extern bool check_reduction_path (dump_user_location_t, loop_p, gphi *, tree,
 				  enum tree_code);
 extern bool needs_fold_left_reduction_p (tree, code_helper);
 /* Drive for loop analysis stage.  */
-extern opt_loop_vec_info vect_analyze_loop (class loop *, vec_info_shared *);
+extern opt_loop_vec_info vect_analyze_loop (class loop *, gimple *,
+					    vec_info_shared *);
 extern tree vect_build_loop_niters (loop_vec_info, bool * = NULL);
 extern void vect_gen_vector_loop_niters (loop_vec_info, tree, tree *,
 					 tree *, bool);
@@ -2423,7 +2424,8 @@ struct vect_loop_form_info
   gcond *inner_loop_cond;
   edge loop_exit;
 };
-extern opt_result vect_analyze_loop_form (class loop *, vect_loop_form_info *);
+extern opt_result vect_analyze_loop_form (class loop *, gimple *,
+					  vect_loop_form_info *);
 extern loop_vec_info vect_create_loop_vinfo (class loop *, vec_info_shared *,
 					     const vect_loop_form_info *,
 					     loop_vec_info = nullptr);
@@ -2494,6 +2496,9 @@ extern slp_tree vect_create_new_slp_node (unsigned, tree_code);
 extern void vect_free_slp_tree (slp_tree);
 extern bool compatible_calls_p (gcall *, gcall *);
 extern int vect_slp_child_index_for_operand (const gimple *, int op, bool);
+
+extern tree prepare_vec_mask (loop_vec_info, tree, tree, tree,
+			      gimple_stmt_iterator *);
 
 /* In tree-vect-patterns.cc.  */
 extern void

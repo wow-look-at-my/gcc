@@ -1323,10 +1323,14 @@ initialize_node_lattices (struct cgraph_node *node)
       int caller_count = 0;
       node->call_for_symbol_thunks_and_aliases (count_callers, &caller_count,
 						true);
-      gcc_checking_assert (caller_count > 0);
       if (caller_count == 1)
 	node->call_for_symbol_thunks_and_aliases (set_single_call_flag,
 						  NULL, true);
+      else if (caller_count == 0)
+	{
+	  gcc_checking_assert (!opt_for_fn (node->decl, flag_toplevel_reorder));
+	  variable = true;
+	}
     }
   else
     {
@@ -4608,7 +4612,8 @@ adjust_clone_incoming_counts (cgraph_node *node,
 	cs->count = cs->count.combine_with_ipa_count (sum);
       }
     else if (!desc->processed_edges->contains (cs)
-	     && cs->caller->clone_of == desc->orig)
+	     && cs->caller->clone_of == desc->orig
+	     && cs->count.compatible_p (desc->count))
       {
 	cs->count += desc->count;
 	if (dump_file)
@@ -5275,11 +5280,30 @@ self_recursive_pass_through_p (cgraph_edge *cs, ipa_jump_func *jfunc, int i,
 			       bool simple = true)
 {
   enum availability availability;
-  if (cs->caller == cs->callee->function_symbol (&availability)
+  if (jfunc->type == IPA_JF_PASS_THROUGH
+      && cs->caller == cs->callee->function_symbol (&availability)
       && availability > AVAIL_INTERPOSABLE
-      && jfunc->type == IPA_JF_PASS_THROUGH
       && (!simple || ipa_get_jf_pass_through_operation (jfunc) == NOP_EXPR)
       && ipa_get_jf_pass_through_formal_id (jfunc) == i
+      && ipa_node_params_sum->get (cs->caller)
+      && !ipa_node_params_sum->get (cs->caller)->ipcp_orig_node)
+    return true;
+  return false;
+}
+
+/* Return true if JFUNC, which describes the i-th parameter of call CS, is an
+   ancestor function with zero offset to itself when the cgraph_node involved
+   is not an IPA-CP clone.  */
+
+static bool
+self_recursive_ancestor_p (cgraph_edge *cs, ipa_jump_func *jfunc, int i)
+{
+  enum availability availability;
+  if (jfunc->type == IPA_JF_ANCESTOR
+      && cs->caller == cs->callee->function_symbol (&availability)
+      && availability > AVAIL_INTERPOSABLE
+      && ipa_get_jf_ancestor_offset (jfunc) == 0
+      && ipa_get_jf_ancestor_formal_id (jfunc) == i
       && ipa_node_params_sum->get (cs->caller)
       && !ipa_node_params_sum->get (cs->caller)->ipcp_orig_node)
     return true;
@@ -5369,6 +5393,8 @@ find_more_scalar_values_for_callers_subset (struct cgraph_node *node,
 				ipa_get_jf_pass_through_operand (jump_func),
 				type);
 	    }
+	  else if (self_recursive_ancestor_p (cs, jump_func, i))
+	    continue;
 	  else
 	    t = ipa_value_from_jfunc (ipa_node_params_sum->get (cs->caller),
 				      jump_func, type);
@@ -5534,7 +5560,8 @@ push_agg_values_for_index_from_edge (struct cgraph_edge *cs, int index,
 	      && !src_plats->aggs_bottom
 	      && (agg_jf_preserved || !src_plats->aggs_by_ref))
 	    {
-	      if (interim && self_recursive_pass_through_p (cs, jfunc, index))
+	      if (interim && (self_recursive_pass_through_p (cs, jfunc, index)
+			      || self_recursive_ancestor_p (cs, jfunc, index)))
 		{
 		  interim->push_adjusted_values (src_idx, index, unit_delta,
 						 res);
@@ -6354,6 +6381,11 @@ ipcp_store_vr_results (void)
 						     TYPE_PRECISION (type),
 						     TYPE_SIGN (type)));
 		  r.update_bitmask (bm);
+		  // Reflecting the bitmask on the ranges can sometime
+		  // produce an UNDEFINED value if the the bitmask update
+		  // was previously deferred.  See PR 120048.
+		  if (tmp.undefined_p ())
+		    tmp.set_varying (type);
 		  ipa_vr vr (tmp);
 		  ts->m_vr->quick_push (vr);
 		}
@@ -6376,6 +6408,11 @@ ipcp_store_vr_results (void)
 						 TYPE_PRECISION (type),
 						 TYPE_SIGN (type)));
 	      r.update_bitmask (bm);
+	      // Reflecting the bitmask on the ranges can sometime
+	      // produce an UNDEFINED value if the the bitmask update
+	      // was previously deferred.  See PR 120048.
+	      if (tmp.undefined_p ())
+		tmp.set_varying (type);
 	      ipa_vr vr (tmp);
 	      ts->m_vr->quick_push (vr);
 	    }

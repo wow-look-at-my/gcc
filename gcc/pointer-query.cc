@@ -74,7 +74,12 @@ get_offset_range (tree x, gimple *stmt, offset_int r[2], range_query *rvals)
     x = TREE_OPERAND (x, 0);
 
   tree type = TREE_TYPE (x);
-  if (!INTEGRAL_TYPE_P (type) && !POINTER_TYPE_P (type))
+  if ((!INTEGRAL_TYPE_P (type)
+       /* ???  We get along without caring about overflow by using
+	  offset_int, but that falls apart when indexes are bigger
+	  than pointer differences.  */
+       || TYPE_PRECISION (type) > TYPE_PRECISION (ptrdiff_type_node))
+      && !POINTER_TYPE_P (type))
     return false;
 
    if (TREE_CODE (x) != INTEGER_CST
@@ -2587,6 +2592,17 @@ array_elt_at_offset (tree artype, HOST_WIDE_INT off,
 tree
 build_printable_array_type (tree eltype, unsigned HOST_WIDE_INT nelts)
 {
+  /* Cannot build an array type of functions or methods without
+     an error diagnostic.  */
+  if (FUNC_OR_METHOD_TYPE_P (eltype))
+    {
+      tree arrtype = make_node (ARRAY_TYPE);
+      TREE_TYPE (arrtype) = eltype;
+      TYPE_SIZE (arrtype) = bitsize_zero_node;
+      TYPE_SIZE_UNIT (arrtype) = size_zero_node;
+      return arrtype;
+    }
+
   if (TYPE_SIZE_UNIT (eltype)
       && TREE_CODE (TYPE_SIZE_UNIT (eltype)) == INTEGER_CST
       && !integer_zerop (TYPE_SIZE_UNIT (eltype))

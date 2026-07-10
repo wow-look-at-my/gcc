@@ -1,3 +1,19 @@
+2026-06-26  Release Manager
+
+	* GCC 14.4.0 released.
+
+2025-05-23  Release Manager
+
+	* GCC 14.3.0 released.
+
+2024-08-01  Release Manager
+
+	* GCC 14.2.0 released.
+
+2024-05-07  Release Manager
+
+	* GCC 14.1.0 released.
+
 2024-04-16  Thomas Schwinge  <tschwinge@baylibre.com>
 
 	* configure.ac (have_cargo): Force to "no" in Canadian cross

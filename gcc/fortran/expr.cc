@@ -1168,6 +1168,7 @@ is_subref_array (gfc_expr * e)
 	 what follows cannot be a subreference array, unless there is a
 	 substring reference.  */
       if (!seen_array && ref->type == REF_COMPONENT
+	  && ref->next == NULL
 	  && ref->u.c.component->ts.type != BT_CHARACTER
 	  && ref->u.c.component->ts.type != BT_CLASS
 	  && !gfc_bt_struct (ref->u.c.component->ts.type))
@@ -3200,6 +3201,11 @@ bool
 gfc_reduce_init_expr (gfc_expr *expr)
 {
   bool t;
+
+  /* It is far too early to resolve a class compcall. Punt to resolution.  */
+  if (expr && expr->expr_type == EXPR_COMPCALL
+      && expr->symtree->n.sym->ts.type == BT_CLASS)
+    return false;
 
   gfc_init_expr_flag = true;
   t = gfc_resolve_expr (expr);
@@ -5491,7 +5497,7 @@ gfc_traverse_expr (gfc_expr *expr, gfc_symbol *sym,
 	  break;
 
 	case REF_INQUIRY:
-	  return true;
+	  return false;
 
 	default:
 	  gcc_unreachable ();

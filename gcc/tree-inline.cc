@@ -65,6 +65,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "symbol-summary.h"
 #include "symtab-thunks.h"
 #include "symtab-clones.h"
+#include "asan.h"
 
 /* I'm not real happy about this, but we need to handle gimple and
    non-gimple trees.  */
@@ -2226,13 +2227,26 @@ copy_bb (copy_body_data *id, basic_block bb,
 	    }
 	  else if (call_stmt
 		   && id->call_stmt
-		   && gimple_call_internal_p (stmt)
-		   && gimple_call_internal_fn (stmt) == IFN_TSAN_FUNC_EXIT)
-	    {
-	      /* Drop TSAN_FUNC_EXIT () internal calls during inlining.  */
-	      gsi_remove (&copy_gsi, false);
-	      continue;
-	    }
+		   && gimple_call_internal_p (stmt))
+	    switch (gimple_call_internal_fn (stmt))
+	      {
+	      case IFN_TSAN_FUNC_EXIT:
+		/* Drop .TSAN_FUNC_EXIT () internal calls during inlining.  */
+		gsi_remove (&copy_gsi, false);
+		continue;
+	      case IFN_ASAN_MARK:
+		/* Drop .ASAN_MARK internal calls during inlining into
+		   no_sanitize functions.  */
+		if (!sanitize_flags_p (SANITIZE_ADDRESS, id->dst_fn)
+		    && !sanitize_flags_p (SANITIZE_HWADDRESS, id->dst_fn))
+		  {
+		    gsi_remove (&copy_gsi, false);
+		    continue;
+		  }
+		break;
+	      default:
+		break;
+	      }
 
 	  /* Statements produced by inlining can be unfolded, especially
 	     when we constant propagated some operands.  We can't fold
@@ -2693,8 +2707,14 @@ copy_edges_for_bb (basic_block bb, profile_count num, profile_count den,
 		   && gimple_call_arg (copy_stmt, 0) == boolean_true_node)
 	    nonlocal_goto = false;
 	  else
-	    make_single_succ_edge (copy_stmt_bb, abnormal_goto_dest,
-				   EDGE_ABNORMAL);
+	    {
+	      make_single_succ_edge (copy_stmt_bb, abnormal_goto_dest,
+				     EDGE_ABNORMAL);
+	      gimple_call_set_ctrl_altering (copy_stmt, true);
+	      if (is_a <gcall *> (copy_stmt)
+		  && (gimple_call_flags (copy_stmt) & ECF_NORETURN))
+		fixup_noreturn_call (copy_stmt);
+	    }
 	}
 
       if ((can_throw || nonlocal_goto)
@@ -3305,7 +3325,9 @@ copy_debug_stmts (copy_body_data *id)
     return;
 
   for (gdebug *stmt : id->debug_stmts)
-    copy_debug_stmt (stmt, id);
+    /* But avoid re-processing debug stmts that have been elided.  */
+    if (gimple_bb (stmt))
+      copy_debug_stmt (stmt, id);
 
   id->debug_stmts.release ();
 }
@@ -5215,7 +5237,20 @@ expand_call_inline (basic_block bb, gimple *stmt, copy_body_data *id,
   if (use_retvar && gimple_call_lhs (stmt))
     {
       gimple *old_stmt = stmt;
-      stmt = gimple_build_assign (gimple_call_lhs (stmt), use_retvar);
+      tree lhs = gimple_call_lhs (stmt);
+      if (!is_gimple_reg (lhs)
+	  && !is_gimple_reg (use_retvar)
+	  && is_gimple_reg_type (TREE_TYPE (lhs)))
+	{
+	  /* If both lhs and use_retvar aren't gimple regs, yet have
+	     gimple reg type, copy through a temporary SSA_NAME.  */
+	  gimple *g = gimple_build_assign (make_ssa_name (TREE_TYPE (lhs)),
+					   use_retvar);
+	  gimple_set_location (g, gimple_location (old_stmt));
+	  gsi_insert_before (&stmt_gsi, g, GSI_SAME_STMT);
+	  use_retvar = gimple_assign_lhs (g);
+	}
+      stmt = gimple_build_assign (lhs, use_retvar);
       gimple_set_location (stmt, gimple_location (old_stmt));
       gsi_replace (&stmt_gsi, stmt, false);
       maybe_clean_or_replace_eh_stmt (old_stmt, stmt);

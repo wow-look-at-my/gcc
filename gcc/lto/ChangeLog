@@ -1,3 +1,81 @@
+2026-06-26  Release Manager
+
+	* GCC 14.4.0 released.
+
+2026-02-26  Michal Jires  <mjires@suse.cz>
+
+	Backported from master:
+	2026-01-11  Michal Jires  <mjires@suse.cz>
+
+	PR lto/121588
+	* lto-symtab.cc (lto_symtab_merge_symbols): Set body_removed
+	for symbols resolved outside of IR.
+
+2025-12-03  Siddhesh Poyarekar  <siddhesh@gotplt.org>
+
+	Backported from master:
+	2025-11-25  Siddhesh Poyarekar  <siddhesh@gotplt.org>
+
+	PR lto/122515
+	* lto-common.cc (lto_read_section_data): Avoid using SSIZE_MAX.
+
+2025-11-18  Siddhesh Poyarekar  <siddhesh@gotplt.org>
+
+	Backported from master:
+	2025-11-04  Siddhesh Poyarekar  <siddhesh@gotplt.org>
+
+	PR lto/122515
+	* lto.h (lto_section_slot): Set type of START to off_t.
+	* lto-common.cc (lto_read_section_data): Adjust.
+	* lto-object.cc (lto_obj_file_open): Set type of OFFSET to
+	int64_t.
+
+2025-05-23  Release Manager
+
+	* GCC 14.3.0 released.
+
+2025-04-14  2024-12-12  Martin Uecker  <uecker@tugraz.at>
+
+	PR lto/119792
+	Revert
+	Backported from master:
+	* lto-common.cc (hash_canonical_type): Add exception.
+
+2025-04-02  Richard Biener  <rguenther@suse.de>
+
+	Backported from master:
+	2025-02-28  Richard Biener  <rguenther@suse.de>
+
+	PR lto/91299
+	* lto-symtab.cc (lto_symtab_merge_symbols): Set DECL_EXTERNAL
+	only after calling get_availability.
+
+2025-03-30  Martin Uecker  <uecker@tugraz.at>
+
+	Backported from master:
+	2024-12-12  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/113688
+	PR c/114014
+	PR c/114713
+	PR c/117724
+	* lto-common.cc (hash_canonical_type): Add exception.
+
+2025-03-30  Martin Uecker  <uecker@tugraz.at>
+
+	Backported from master:
+	2024-12-12  Martin Uecker  <uecker@tugraz.at>
+
+	* lto-common.cc (hash_canonical_type): Add exception.
+
+2024-08-01  Release Manager
+
+	* GCC 14.2.0 released.
+
+2024-05-07  Release Manager
+
+	* GCC 14.1.0 released.
+
 2024-02-21  Martin Jambor  <mjambor@suse.cz>
 
 	PR ipa/113476

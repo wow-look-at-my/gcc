@@ -404,7 +404,8 @@ static inline void
 insert_operand_rank (tree e, int64_t rank)
 {
   gcc_assert (rank > 0);
-  gcc_assert (!operand_rank->put (e, rank));
+  bool existed = operand_rank->put (e, rank);
+  gcc_assert (!existed);
 }
 
 /* Given an expression E, return the rank of the expression.  */
@@ -1567,7 +1568,8 @@ build_and_add_sum (tree type, tree op1, tree op2, enum tree_code opcode)
   if ((!op1def || gimple_nop_p (op1def))
       && (!op2def || gimple_nop_p (op2def)))
     {
-      gsi = gsi_after_labels (single_succ (ENTRY_BLOCK_PTR_FOR_FN (cfun)));
+      gsi = gsi_start_nondebug_after_labels_bb
+		(single_succ (ENTRY_BLOCK_PTR_FOR_FN (cfun)));
       if (!gsi_end_p (gsi)
 	  && is_gimple_call (gsi_stmt (gsi))
 	  && (gimple_call_flags (gsi_stmt (gsi)) & ECF_RETURNS_TWICE))
@@ -3361,7 +3363,7 @@ optimize_range_tests_to_bit_test (enum tree_code opcode, int first, int length,
 	    continue;
 	  highj = ranges[j].high;
 	  if (highj == NULL_TREE)
-	    highj = TYPE_MAX_VALUE (type);
+	    highj = TYPE_MAX_VALUE (TREE_TYPE (lowj));
 	  wide_int mask2;
 	  exp2 = extract_bit_test_mask (ranges[j].exp, prec, lowi, lowj,
 					highj, &mask2, NULL);
@@ -3418,7 +3420,8 @@ optimize_range_tests_to_bit_test (enum tree_code opcode, int first, int length,
 	     We can avoid then subtraction of the minimum value, but the
 	     mask constant could be perhaps more expensive.  */
 	  if (compare_tree_int (lowi, 0) > 0
-	      && compare_tree_int (high, prec) < 0)
+	      && compare_tree_int (high, prec) < 0
+	      && (entry_test_needed || wi::ltu_p (r.upper_bound (), prec)))
 	    {
 	      int cost_diff;
 	      HOST_WIDE_INT m = tree_to_uhwi (lowi);

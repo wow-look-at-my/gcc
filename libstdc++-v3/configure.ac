@@ -391,6 +391,8 @@ dnl # rather than hardcoding that information.
         AC_DEFINE(HAVE_ALIGNED_ALLOC)
         AC_DEFINE(HAVE_AT_QUICK_EXIT)
         AC_DEFINE(HAVE_LINK)
+        AC_DEFINE(HAVE_SYS_STAT_H)
+        AC_DEFINE(HAVE_SYS_TYPES_H)
         AC_DEFINE(HAVE_QUICK_EXIT)
         AC_DEFINE(HAVE_READLINK)
         AC_DEFINE(HAVE_SETENV)
@@ -398,7 +400,16 @@ dnl # rather than hardcoding that information.
         AC_DEFINE(HAVE_SOCKATMARK)
         AC_DEFINE(HAVE_STRERROR_L)
         AC_DEFINE(HAVE_SYMLINK)
+        AC_DEFINE(HAVE_S_ISREG)
         AC_DEFINE(HAVE_TRUNCATE)
+        AC_DEFINE(HAVE_UNISTD_H)
+        AC_DEFINE(HAVE_UNLINKAT)
+        AC_DEFINE(HAVE_USLEEP)
+        AC_DEFINE(_GLIBCXX_USE_CHMOD)
+        AC_DEFINE(_GLIBCXX_USE_MKDIR)
+        AC_DEFINE(_GLIBCXX_USE_CHDIR)
+        AC_DEFINE(_GLIBCXX_USE_GETCWD)
+        AC_DEFINE(_GLIBCXX_USE_UTIME)
         AC_DEFINE(HAVE_USLEEP)
         ;;
     esac
@@ -539,7 +550,10 @@ AC_CHECK_HEADERS([fcntl.h sys/ioctl.h sys/socket.h sys/uio.h poll.h netdb.h arpa
 AC_CHECK_DECL(F_GETFL,,,[#include <fcntl.h>])
 AC_CHECK_DECL(F_SETFL,,,[#include <fcntl.h>])
 if test "$ac_cv_have_decl_F_GETFL$ac_cv_have_decl_F_SETFL" = yesyes ; then
-  AC_CHECK_DECL(O_NONBLOCK,,,[#include <fcntl.h>])
+  AC_CHECK_DECL(O_NONBLOCK,
+    AC_DEFINE(HAVE_O_NONBLOCK,1,[Define if O_NONBLOCK is defined in <fcntl.h>]),
+    [],
+    [#include <fcntl.h>])
 fi
 
 # For Transactional Memory TS

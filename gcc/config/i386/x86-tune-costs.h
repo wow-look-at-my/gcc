@@ -1924,8 +1924,8 @@ struct processor_costs znver4_cost = {
 					   in 32bit, 64bit, 128bit, 256bit and 512bit */
   {8, 8, 8, 12, 12},			/* cost of storing SSE register
 					   in 32bit, 64bit, 128bit, 256bit and 512bit */
-  {6, 6, 6, 6, 6},			/* cost of unaligned loads.  */
-  {8, 8, 8, 8, 8},			/* cost of unaligned stores.  */
+  {6, 6, 10, 10, 12},			/* cost of unaligned loads.  */
+  {8, 8, 8, 12, 12},			/* cost of unaligned stores.  */
   2, 2, 2,				/* cost of moving XMM,YMM,ZMM
 					   register.  */
   6,					/* cost of moving SSE register to integer.  */
@@ -2060,8 +2060,8 @@ struct processor_costs znver5_cost = {
 					   in 32bit, 64bit, 128bit, 256bit and 512bit */
   {8, 8, 8, 12, 12},			/* cost of storing SSE register
 					   in 32bit, 64bit, 128bit, 256bit and 512bit */
-  {6, 6, 6, 6, 6},			/* cost of unaligned loads.  */
-  {8, 8, 8, 8, 8},			/* cost of unaligned stores.  */
+  {6, 6, 10, 10, 12},			/* cost of unaligned loads.  */
+  {8, 8, 8, 12, 12},			/* cost of unaligned stores.  */
   2, 2, 2,				/* cost of moving XMM,YMM,ZMM
 					   register.  */
   6,					/* cost of moving SSE register to integer.  */
@@ -2100,16 +2100,19 @@ struct processor_costs znver5_cost = {
   COSTS_N_INSNS (13),			/* cost of DIVSD instruction.  */
   COSTS_N_INSNS (14),			/* cost of SQRTSS instruction.  */
   COSTS_N_INSNS (20),			/* cost of SQRTSD instruction.  */
-  /* Zen can execute 4 integer operations per cycle.  FP operations
-     take 3 cycles and it can execute 2 integer additions and 2
-     multiplications thus reassociation may make sense up to with of 6.
-     SPEC2k6 bencharks suggests
-     that 4 works better than 6 probably due to register pressure.
+  /* Zen5 can execute:
+      - integer ops: 6 per cycle, at most 3 multiplications.
+	latency 1 for additions, 3 for multiplications (pipelined)
 
-     Integer vector operations are taken by FP unit and execute 3 vector
-     plus/minus operations per cycle but only one multiply.  This is adjusted
-     in ix86_reassociation_width.  */
-  4, 4, 3, 6,				/* reassoc int, fp, vec_int, vec_fp.  */
+	Setting width of 9 for multiplication is probably excessive
+	for register pressure.
+      - fp ops: 2 additions per cycle, latency 2-3
+		2 multiplicaitons per cycle, latency 3
+      - vector intger ops: 4 additions, latency 1
+			   2 multiplications, latency 4
+	We increase width to 6 for multiplications
+	in ix86_reassociation_width.  */
+  6, 6, 4, 6,				/* reassoc int, fp, vec_int, vec_fp.  */
   znver2_memcpy,
   znver2_memset,
   COSTS_N_INSNS (4),			/* cond_taken_branch_cost.  */
@@ -3758,7 +3761,7 @@ struct processor_costs generic_cost = {
   generic_memset,
   COSTS_N_INSNS (4),			/* cond_taken_branch_cost.  */
   COSTS_N_INSNS (2),			/* cond_not_taken_branch_cost.  */
-  "16:11:8",				/* Loop alignment.  */
+  "16",					/* Loop alignment.  */
   "16:11:8",				/* Jump alignment.  */
   "0:0:8",				/* Label alignment.  */
   "16",					/* Func alignment.  */

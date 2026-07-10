@@ -1643,7 +1643,7 @@ check_load_store_for_partial_vectors (loop_vec_info loop_vinfo, tree vectype,
    MASK_TYPE is the type of both masks.  If new statements are needed,
    insert them before GSI.  */
 
-static tree
+tree
 prepare_vec_mask (loop_vec_info loop_vinfo, tree mask_type, tree loop_mask,
 		  tree vec_mask, gimple_stmt_iterator *gsi)
 {
@@ -1993,21 +1993,23 @@ get_group_load_store_type (vec_info *vinfo, stmt_vec_info stmt_info,
   stmt_vec_info first_stmt_info;
   unsigned int group_size;
   unsigned HOST_WIDE_INT gap;
+  bool single_element_p;
   if (STMT_VINFO_GROUPED_ACCESS (stmt_info))
     {
       first_stmt_info = DR_GROUP_FIRST_ELEMENT (stmt_info);
       group_size = DR_GROUP_SIZE (first_stmt_info);
       gap = DR_GROUP_GAP (first_stmt_info);
+      single_element_p = (stmt_info == first_stmt_info
+			  && !DR_GROUP_NEXT_ELEMENT (stmt_info));
     }
   else
     {
       first_stmt_info = stmt_info;
       group_size = 1;
       gap = 0;
+      single_element_p = true;
     }
   dr_vec_info *first_dr_info = STMT_VINFO_DR_INFO (first_stmt_info);
-  bool single_element_p = (stmt_info == first_stmt_info
-			   && !DR_GROUP_NEXT_ELEMENT (stmt_info));
   poly_uint64 nunits = TYPE_VECTOR_SUBPARTS (vectype);
 
   /* True if the vectorized statements would access beyond the last
@@ -2339,6 +2341,7 @@ get_load_store_type (vec_info  *vinfo, stmt_vec_info stmt_info,
 	{
 	  if (!TYPE_VECTOR_SUBPARTS (vectype).is_constant ()
 	      || !TYPE_VECTOR_SUBPARTS (gs_info->offset_vectype).is_constant ()
+	      || VECTOR_BOOLEAN_TYPE_P (gs_info->offset_vectype)
 	      || !constant_multiple_p (TYPE_VECTOR_SUBPARTS
 					 (gs_info->offset_vectype),
 				       TYPE_VECTOR_SUBPARTS (vectype)))
@@ -3942,6 +3945,8 @@ vectorizable_simd_clone_call (vec_info *vinfo, stmt_vec_info stmt_info,
 
   vec<tree>& simd_clone_info = (slp_node ? SLP_TREE_SIMD_CLONE_INFO (slp_node)
 				: STMT_VINFO_SIMD_CLONE_INFO (stmt_info));
+  if (!vec_stmt)
+    simd_clone_info.truncate (0);
   arginfo.reserve (nargs, true);
   auto_vec<slp_tree> slp_op;
   slp_op.safe_grow_cleared (nargs);
@@ -3990,10 +3995,10 @@ vectorizable_simd_clone_call (vec_info *vinfo, stmt_vec_info stmt_info,
 
       /* For linear arguments, the analyze phase should have saved
 	 the base and step in {STMT_VINFO,SLP_TREE}_SIMD_CLONE_INFO.  */
-      if (i * 3 + 4 <= simd_clone_info.length ()
+      if (vec_stmt
+	  && i * 3 + 4 <= simd_clone_info.length ()
 	  && simd_clone_info[i * 3 + 2])
 	{
-	  gcc_assert (vec_stmt);
 	  thisarginfo.linear_step = tree_to_shwi (simd_clone_info[i * 3 + 2]);
 	  thisarginfo.op = simd_clone_info[i * 3 + 1];
 	  thisarginfo.simd_lane_linear
@@ -4048,7 +4053,7 @@ vectorizable_simd_clone_call (vec_info *vinfo, stmt_vec_info stmt_info,
   unsigned group_size = slp_node ? SLP_TREE_LANES (slp_node) : 1;
   unsigned int badness = 0;
   struct cgraph_node *bestn = NULL;
-  if (simd_clone_info.exists ())
+  if (vec_stmt)
     bestn = cgraph_node::get (simd_clone_info[0]);
   else
     for (struct cgraph_node *n = node->simd_clones; n != NULL;
@@ -4317,9 +4322,14 @@ vectorizable_simd_clone_call (vec_info *vinfo, stmt_vec_info stmt_info,
 	    case SIMD_CLONE_ARG_TYPE_MASK:
 	      if (loop_vinfo
 		  && LOOP_VINFO_CAN_USE_PARTIAL_VECTORS_P (loop_vinfo))
-		vect_record_loop_mask (loop_vinfo,
-				       &LOOP_VINFO_MASKS (loop_vinfo),
-				       ncopies, vectype, op);
+		{
+		  unsigned nmasks
+		    = exact_div (ncopies * bestn->simdclone->simdlen,
+				 TYPE_VECTOR_SUBPARTS (vectype)).to_constant ();
+		  vect_record_loop_mask (loop_vinfo,
+					 &LOOP_VINFO_MASKS (loop_vinfo),
+					 nmasks, vectype, op);
+		}
 
 	      break;
 	    }
@@ -4716,7 +4726,12 @@ vectorizable_simd_clone_call (vec_info *vinfo, stmt_vec_info stmt_info,
 		      SIMD_CLONE_ARG_TYPE_MASK);
 
 	  tree masktype = bestn->simdclone->args[mask_i].vector_type;
-	  callee_nelements = TYPE_VECTOR_SUBPARTS (masktype);
+	  if (SCALAR_INT_MODE_P (bestn->simdclone->mask_mode))
+	    /* Guess the number of lanes represented by masktype.  */
+	    callee_nelements = exact_div (bestn->simdclone->simdlen,
+					  bestn->simdclone->nargs - nargs);
+	  else
+	    callee_nelements = TYPE_VECTOR_SUBPARTS (masktype);
 	  o = vector_unroll_factor (nunits, callee_nelements);
 	  for (m = j * o; m < (j + 1) * o; m++)
 	    {
@@ -5955,14 +5970,17 @@ vectorizable_assignment (vec_info *vinfo,
   if (!vectype_in)
     vectype_in = get_vectype_for_scalar_type (vinfo, TREE_TYPE (op), slp_node);
 
-  /* We can handle NOP_EXPR conversions that do not change the number
-     of elements or the vector size.  */
-  if ((CONVERT_EXPR_CODE_P (code)
-       || code == VIEW_CONVERT_EXPR)
-      && (!vectype_in
-	  || maybe_ne (TYPE_VECTOR_SUBPARTS (vectype_in), nunits)
-	  || maybe_ne (GET_MODE_SIZE (TYPE_MODE (vectype)),
-		       GET_MODE_SIZE (TYPE_MODE (vectype_in)))))
+  /* We can handle VIEW_CONVERT conversions that do not change the number
+     of elements or the vector size or other conversions when the component
+     types are nop-convertible.  */
+  if (!vectype_in
+      || maybe_ne (TYPE_VECTOR_SUBPARTS (vectype_in), nunits)
+      || (code == VIEW_CONVERT_EXPR
+	  && maybe_ne (GET_MODE_SIZE (TYPE_MODE (vectype)),
+		       GET_MODE_SIZE (TYPE_MODE (vectype_in))))
+      || (CONVERT_EXPR_CODE_P (code)
+	  && !tree_nop_conversion_p (TREE_TYPE (vectype),
+				     TREE_TYPE (vectype_in))))
     return false;
 
   if (VECTOR_BOOLEAN_TYPE_P (vectype) != VECTOR_BOOLEAN_TYPE_P (vectype_in))
@@ -6540,7 +6558,8 @@ vectorizable_operation (vec_info *vinfo,
   poly_uint64 nunits_in;
   poly_uint64 nunits_out;
   tree vectype_out;
-  int ncopies, vec_num;
+  unsigned int ncopies;
+  unsigned vec_num;
   int i;
   vec<tree> vec_oprnds0 = vNULL;
   vec<tree> vec_oprnds1 = vNULL;
@@ -7117,8 +7136,8 @@ vectorizable_operation (vec_info *vinfo,
 	      && code == BIT_AND_EXPR
 	      && VECTOR_BOOLEAN_TYPE_P (vectype))
 	    {
-	      if (loop_vinfo->scalar_cond_masked_set.contains ({ op0,
-								 ncopies}))
+	      if (loop_vinfo->scalar_cond_masked_set.contains
+						   ({ op0, vec_num * ncopies}))
 		{
 		  mask = vect_get_loop_mask (loop_vinfo, gsi, masks,
 					     vec_num * ncopies, vectype, i);
@@ -7127,8 +7146,8 @@ vectorizable_operation (vec_info *vinfo,
 					   vop0, gsi);
 		}
 
-	      if (loop_vinfo->scalar_cond_masked_set.contains ({ op1,
-								 ncopies }))
+	      if (loop_vinfo->scalar_cond_masked_set.contains
+						  ({ op1, vec_num * ncopies }))
 		{
 		  mask = vect_get_loop_mask (loop_vinfo, gsi, masks,
 					     vec_num * ncopies, vectype, i);
@@ -8747,7 +8766,7 @@ vectorizable_store (vec_info *vinfo,
 					  memory_access_type, loop_lens);
     }
 
-  if (mask && !costing_p)
+  if (loop_vinfo && mask && !costing_p)
     LOOP_VINFO_HAS_MASK_STORE (loop_vinfo) = true;
 
   /* In case the vectorization factor (VF) is bigger than the number
@@ -11901,7 +11920,7 @@ vectorizable_load (vec_info *vinfo,
 
 		  if (dump_enabled_p ())
 		    dump_printf_loc (MSG_NOTE, vect_location,
-				     "vect_model_load_cost:"
+				     "vect_model_load_cost: "
 				     "strided group_size = %d .\n",
 				     group_size);
 		}
@@ -12899,29 +12918,23 @@ vectorizable_early_exit (vec_info *vinfo, stmt_vec_info stmt_info,
      codegen so we must replace the original insn.  */
   gimple *orig_stmt = STMT_VINFO_STMT (vect_orig_stmt (stmt_info));
   gcond *cond_stmt = as_a <gcond *>(orig_stmt);
+
+  tree cst = build_zero_cst (vectype);
+  auto bb = gimple_bb (cond_stmt);
+  edge exit_true_edge = EDGE_SUCC (bb, 0);
+  if (exit_true_edge->flags & EDGE_FALSE_VALUE)
+    exit_true_edge = EDGE_SUCC (bb, 1);
+  gcc_assert (exit_true_edge->flags & EDGE_TRUE_VALUE);
+
   /* When vectorizing we assume that if the branch edge is taken that we're
      exiting the loop.  This is not however always the case as the compiler will
      rewrite conditions to always be a comparison against 0.  To do this it
      sometimes flips the edges.  This is fine for scalar,  but for vector we
-     then have to flip the test, as we're still assuming that if you take the
-     branch edge that we found the exit condition.  i.e. we need to know whether
-     we are generating a `forall` or an `exist` condition.  */
-  auto new_code = NE_EXPR;
-  auto reduc_optab = ior_optab;
-  auto reduc_op = BIT_IOR_EXPR;
-  tree cst = build_zero_cst (vectype);
-  edge exit_true_edge = EDGE_SUCC (gimple_bb (cond_stmt), 0);
-  if (exit_true_edge->flags & EDGE_FALSE_VALUE)
-    exit_true_edge = EDGE_SUCC (gimple_bb (cond_stmt), 1);
-  gcc_assert (exit_true_edge->flags & EDGE_TRUE_VALUE);
-  if (flow_bb_inside_loop_p (LOOP_VINFO_LOOP (loop_vinfo),
-			     exit_true_edge->dest))
-    {
-      new_code = EQ_EXPR;
-      reduc_optab = and_optab;
-      reduc_op = BIT_AND_EXPR;
-      cst = build_minus_one_cst (vectype);
-    }
+     then have to negate the result of the test, as we're still assuming that if
+     you take the branch edge that we found the exit condition.  i.e. we need to
+     know whether we are generating a `forall` or an `exist` condition.  */
+  bool flipped = flow_bb_inside_loop_p (LOOP_VINFO_LOOP (loop_vinfo),
+					exit_true_edge->dest);
 
   /* Analyze only.  */
   if (!vec_stmt)
@@ -12937,14 +12950,13 @@ vectorizable_early_exit (vec_info *vinfo, stmt_vec_info stmt_info,
 	}
 
       if (ncopies > 1
-	  && direct_optab_handler (reduc_optab, mode) == CODE_FOR_nothing)
+	  && direct_optab_handler (ior_optab, mode) == CODE_FOR_nothing)
 	{
 	  if (dump_enabled_p ())
 	      dump_printf_loc (MSG_MISSED_OPTIMIZATION, vect_location,
 			       "can't vectorize early exit because the "
-			       "target does not support boolean vector %s "
+			       "target does not support boolean vector IOR "
 			       "for type %T.\n",
-			       reduc_optab == ior_optab ? "OR" : "AND",
 			       vectype);
 	  return false;
 	}
@@ -12994,6 +13006,29 @@ vectorizable_early_exit (vec_info *vinfo, stmt_vec_info stmt_info,
 	stmts.quick_push (gimple_assign_lhs (stmt));
     }
 
+  /* If we're comparing against a previous forall we need to negate the resullts
+     before we do the final comparison or reduction.  */
+  if (flipped)
+    {
+      /* Rewrite the if(all(mask)) into if (!all(mask)) which is the same as
+	 if (any(~mask)) by negating the masks and flipping the branches.
+
+	1. For unmasked loops we simply reduce the ~mask.
+	2. For masked loops we reduce (~mask & loop_mask) which is the same as
+	   doing (mask & loop_mask) ^ loop_mask.  */
+      for (unsigned i = 0; i < stmts.length (); i++)
+	{
+	  tree inv_lhs = make_temp_ssa_name (vectype, NULL, "vexit_inv");
+	  auto inv_stmt = gimple_build_assign (inv_lhs, BIT_NOT_EXPR, stmts[i]);
+	  vect_finish_stmt_generation (loop_vinfo, stmt_info, inv_stmt,
+				       &cond_gsi);
+	  stmts[i] = inv_lhs;
+	}
+
+      EDGE_SUCC (bb, 0)->flags ^= (EDGE_TRUE_VALUE|EDGE_FALSE_VALUE);
+      EDGE_SUCC (bb, 1)->flags ^= (EDGE_TRUE_VALUE|EDGE_FALSE_VALUE);
+    }
+
   /* Determine if we need to reduce the final value.  */
   if (stmts.length () > 1)
     {
@@ -13023,7 +13058,7 @@ vectorizable_early_exit (vec_info *vinfo, stmt_vec_info stmt_info,
 	  new_temp = make_temp_ssa_name (vectype, NULL, "vexit_reduc");
 	  tree arg0 = workset.pop ();
 	  tree arg1 = workset.pop ();
-	  new_stmt = gimple_build_assign (new_temp, reduc_op, arg0, arg1);
+	  new_stmt = gimple_build_assign (new_temp, BIT_IOR_EXPR, arg0, arg1);
 	  vect_finish_stmt_generation (loop_vinfo, stmt_info, new_stmt,
 				       &cond_gsi);
 	  workset.quick_insert (0, new_temp);
@@ -13043,7 +13078,7 @@ vectorizable_early_exit (vec_info *vinfo, stmt_vec_info stmt_info,
 
   gcc_assert (new_temp);
 
-  gimple_cond_set_condition (cond_stmt, new_code, new_temp, cst);
+  gimple_cond_set_condition (cond_stmt, NE_EXPR, new_temp, cst);
   update_stmt (orig_stmt);
 
   if (slp_node)
@@ -14229,6 +14264,8 @@ supportable_widening_operation (vec_info *vinfo,
 
       internal_fn lo, hi, even, odd;
       lookup_hilo_internal_fn (ifn, &lo, &hi);
+      if (BYTES_BIG_ENDIAN)
+	std::swap (lo, hi);
       *code1 = as_combined_fn (lo);
       *code2 = as_combined_fn (hi);
       optab1 = direct_internal_fn_optab (lo, {vectype, vectype});

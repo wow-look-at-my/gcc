@@ -59,7 +59,12 @@ riscv_pragma_intrinsic_flags_pollute (struct pragma_intrinsic_flags *flags)
   riscv_zvl_flags = riscv_zvl_flags
     | MASK_ZVL32B
     | MASK_ZVL64B
-    | MASK_ZVL128B;
+    | MASK_ZVL128B
+    | MASK_ZVL256B
+    | MASK_ZVL512B
+    | MASK_ZVL1024B
+    | MASK_ZVL2048B
+    | MASK_ZVL4096B;
 
   riscv_vector_elen_flags = riscv_vector_elen_flags
     | MASK_VECTOR_ELEN_32
@@ -218,7 +223,7 @@ riscv_cpu_cpp_builtins (cpp_reader *pfile)
   /* Define architecture extension test macros.  */
   builtin_define_with_int_value ("__riscv_arch_test", 1);
 
-  const riscv_subset_list *subset_list = riscv_current_subset_list ();
+  const riscv_subset_list *subset_list = riscv_cmdline_subset_list ();
   if (!subset_list)
     return;
 

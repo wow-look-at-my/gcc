@@ -1135,9 +1135,9 @@ ix86_valid_target_attribute_inner_p (tree fndecl, tree args, char *p_strings[],
     IX86_ATTR_ISA ("apxf", OPT_mapxf),
     IX86_ATTR_ISA ("evex512", OPT_mevex512),
     IX86_ATTR_ISA ("usermsr", OPT_musermsr),
-    IX86_ATTR_ISA ("avx10.1", OPT_mavx10_1_256),
     IX86_ATTR_ISA ("avx10.1-256", OPT_mavx10_1_256),
     IX86_ATTR_ISA ("avx10.1-512", OPT_mavx10_1_512),
+    IX86_ATTR_ISA ("avx10.1", OPT_mavx10_1_512),
 
     /* enum options */
     IX86_ATTR_ENUM ("fpmath=",	OPT_mfpmath_),
@@ -1264,6 +1264,13 @@ ix86_valid_target_attribute_inner_p (tree fndecl, tree args, char *p_strings[],
 	      mask = attrs[i].mask;
 	      break;
 	    }
+	}
+
+      /* Fixup -msse4 which is RejectNegative to -mno-sse4 when negated.  */
+      if (opt == OPT_msse4 && !opt_set_p)
+	{
+	  opt = OPT_mno_sse4;
+	  opt_set_p = true;
 	}
 
       /* Process the option.  */
@@ -1923,6 +1930,54 @@ ix86_recompute_optlev_based_flags (struct gcc_options *opts,
 	    opts->x_flag_pcc_struct_return = DEFAULT_PCC_STRUCT_RETURN;
 	}
     }
+
+  /* Keep nonleaf frame pointers.  */
+  if (opts->x_flag_omit_frame_pointer)
+    opts->x_target_flags &= ~MASK_OMIT_LEAF_FRAME_POINTER;
+  else if (TARGET_OMIT_LEAF_FRAME_POINTER_P (opts->x_target_flags))
+    opts->x_flag_omit_frame_pointer = 1;
+}
+
+/* Implement part of TARGET_OVERRIDE_OPTIONS_AFTER_CHANGE hook.  */
+
+static void
+ix86_override_options_after_change_1 (struct gcc_options *opts,
+				      struct gcc_options *opts_set)
+{
+#define OPTS_SET_P(OPTION) opts_set->x_ ## OPTION
+#define OPTS(OPTION) opts->x_ ## OPTION
+
+  /* Disable unrolling small loops when there's explicit
+     -f{,no}unroll-loop.  */
+  if ((OPTS_SET_P (flag_unroll_loops))
+     || (OPTS_SET_P (flag_unroll_all_loops)
+	 && OPTS (flag_unroll_all_loops)))
+    {
+      if (!OPTS_SET_P (ix86_unroll_only_small_loops))
+	OPTS (ix86_unroll_only_small_loops) = 0;
+      /* Re-enable -frename-registers and -fweb if funroll-loops
+	 enabled.  */
+      if (!OPTS_SET_P (flag_web))
+	OPTS (flag_web) = OPTS (flag_unroll_loops);
+      if (!OPTS_SET_P (flag_rename_registers))
+	OPTS (flag_rename_registers) = OPTS (flag_unroll_loops);
+      /* -fcunroll-grow-size default follws -f[no]-unroll-loops.  */
+      if (!OPTS_SET_P (flag_cunroll_grow_size))
+	OPTS (flag_cunroll_grow_size)
+	  = (OPTS (flag_unroll_loops)
+	     || OPTS (flag_peel_loops)
+	     || OPTS (optimize) >= 3);
+    }
+  else
+    {
+      if (!OPTS_SET_P (flag_cunroll_grow_size))
+	OPTS (flag_cunroll_grow_size)
+	  = (OPTS (flag_peel_loops)
+	     || OPTS (optimize) >= 3);
+    }
+
+#undef OPTS
+#undef OPTS_SET_P
 }
 
 /* Implement TARGET_OVERRIDE_OPTIONS_AFTER_CHANGE hook.  */
@@ -1930,37 +1985,11 @@ ix86_recompute_optlev_based_flags (struct gcc_options *opts,
 void
 ix86_override_options_after_change (void)
 {
-  /* Default align_* from the processor table.  */
   ix86_default_align (&global_options);
 
   ix86_recompute_optlev_based_flags (&global_options, &global_options_set);
 
-  /* Disable unrolling small loops when there's explicit
-     -f{,no}unroll-loop.  */
-  if ((OPTION_SET_P (flag_unroll_loops))
-     || (OPTION_SET_P (flag_unroll_all_loops)
-	 && flag_unroll_all_loops))
-    {
-      if (!OPTION_SET_P (ix86_unroll_only_small_loops))
-	ix86_unroll_only_small_loops = 0;
-      /* Re-enable -frename-registers and -fweb if funroll-loops
-	 enabled.  */
-      if (!OPTION_SET_P (flag_web))
-	flag_web = flag_unroll_loops;
-      if (!OPTION_SET_P (flag_rename_registers))
-	flag_rename_registers = flag_unroll_loops;
-      /* -fcunroll-grow-size default follws -f[no]-unroll-loops.  */
-      if (!OPTION_SET_P (flag_cunroll_grow_size))
-	flag_cunroll_grow_size = flag_unroll_loops
-				 || flag_peel_loops
-				 || optimize >= 3;
-    }
-  else
-    {
-      if (!OPTION_SET_P (flag_cunroll_grow_size))
-	flag_cunroll_grow_size = flag_peel_loops || optimize >= 3;
-    }
-
+  ix86_override_options_after_change_1 (&global_options, &global_options_set);
 }
 
 /* Clear stack slot assignments remembered from previous functions.
@@ -2363,7 +2392,8 @@ ix86_option_override_internal (bool main_args_p,
 #define DEF_PTA(NAME) \
 	if (((processor_alias_table[i].flags & PTA_ ## NAME) != 0) \
 	    && PTA_ ## NAME != PTA_64BIT \
-	    && (TARGET_64BIT || PTA_ ## NAME != PTA_UINTR) \
+	    && (TARGET_64BIT || (PTA_ ## NAME != PTA_UINTR \
+				 && PTA_ ## NAME != PTA_APX_F))\
 	    && !TARGET_EXPLICIT_ ## NAME ## _P (opts)) \
 	  SET_TARGET_ ## NAME (opts);
 #include "i386-isa.def"
@@ -2530,7 +2560,9 @@ ix86_option_override_internal (bool main_args_p,
 
   set_ix86_tune_features (opts, ix86_tune, opts->x_ix86_dump_tunes);
 
-  ix86_override_options_after_change ();
+  ix86_recompute_optlev_based_flags (opts, opts_set);
+
+  ix86_override_options_after_change_1 (opts, opts_set);
 
   ix86_tune_cost = processor_cost_table[ix86_tune];
   /* TODO: ix86_cost should be chosen at instruction or function granuality
@@ -2564,6 +2596,9 @@ ix86_option_override_internal (bool main_args_p,
   if (TARGET_IAMCU_P (opts->x_target_flags)
       || TARGET_64BIT_P (opts->x_ix86_isa_flags))
     opts->x_ix86_regparm = REGPARM_MAX;
+
+  /* Default align_* from the processor table.  */
+  ix86_default_align (&global_options);
 
   /* Provide default for -mbranch-cost= value.  */
   SET_OPTION_IF_UNSET (opts, opts_set, ix86_branch_cost,
@@ -2601,12 +2636,6 @@ ix86_option_override_internal (bool main_args_p,
       if (!(opts_set->x_target_flags & MASK_NO_RED_ZONE))
         opts->x_target_flags |= MASK_NO_RED_ZONE;
     }
-
-  /* Keep nonleaf frame pointers.  */
-  if (opts->x_flag_omit_frame_pointer)
-    opts->x_target_flags &= ~MASK_OMIT_LEAF_FRAME_POINTER;
-  else if (TARGET_OMIT_LEAF_FRAME_POINTER_P (opts->x_target_flags))
-    opts->x_flag_omit_frame_pointer = 1;
 
   /* If we're doing fast math, we don't care about comparison order
      wrt NaNs.  This lets us use a shorter comparison sequence.  */
@@ -2703,6 +2732,7 @@ ix86_option_override_internal (bool main_args_p,
 			"using 512 as max vector size");
 	}
       else if (TARGET_AVX512F_P (opts->x_ix86_isa_flags)
+	       && (opts->x_ix86_isa_flags_explicit & OPTION_MASK_ISA_AVX512F)
 	       && !(OPTION_MASK_ISA2_EVEX512
 		    & opts->x_ix86_isa_flags2_explicit))
 	warning (0, "Vector size conflicts between AVX10.1 and AVX512, using "
@@ -2723,7 +2753,7 @@ ix86_option_override_internal (bool main_args_p,
 	  && ((OPTION_MASK_ISA2_AVX10_1_256 | OPTION_MASK_ISA2_AVX10_1_512)
 	      & opts->x_ix86_isa_flags2_explicit))
 	{
-	  warning (0, "%<-mno-avx10.1, -mno-avx10.1-256, -mno-avx10.1-512%> "
+	  warning (0, "%<-mno-avx10.1-256, -mno-avx10.1-512%> "
 		      "cannot disable AVX512 instructions when "
 		      "%<-mavx512XXX%>");
 	  /* Reset those unset AVX512 flags set by AVX10 options when AVX10 is
@@ -2819,8 +2849,8 @@ ix86_option_override_internal (bool main_args_p,
   if (flag_nop_mcount)
     error ("%<-mnop-mcount%> is not compatible with this target");
 #endif
-  if (flag_nop_mcount && flag_pic)
-    error ("%<-mnop-mcount%> is not implemented for %<-fPIC%>");
+  if (flag_nop_mcount && flag_pic && !flag_plt)
+    error ("%<-mnop-mcount%> is not implemented for %<-fno-plt%>");
 
   /* Accept -msseregparm only if at least SSE support is enabled.  */
   if (TARGET_SSEREGPARM_P (opts->x_target_flags)
@@ -3040,6 +3070,9 @@ ix86_option_override_internal (bool main_args_p,
 	      if (TARGET_AVX512F_P (opts->x_ix86_isa_flags)
 		  && TARGET_EVEX512_P (opts->x_ix86_isa_flags2))
 		opts->x_ix86_move_max = PVW_AVX512;
+	      /* Align with vectorizer to avoid potential STLF issue.  */
+	      else if (TARGET_AVX_P (opts->x_ix86_isa_flags))
+		opts->x_ix86_move_max = PVW_AVX256;
 	      else
 		opts->x_ix86_move_max = PVW_AVX128;
 	    }
@@ -3064,6 +3097,9 @@ ix86_option_override_internal (bool main_args_p,
 	      if (TARGET_AVX512F_P (opts->x_ix86_isa_flags)
 		  && TARGET_EVEX512_P (opts->x_ix86_isa_flags2))
 		opts->x_ix86_store_max = PVW_AVX512;
+	      /* Align with vectorizer to avoid potential STLF issue.  */
+	      else if (TARGET_AVX_P (opts->x_ix86_isa_flags))
+		opts->x_ix86_store_max = PVW_AVX256;
 	      else
 		opts->x_ix86_store_max = PVW_AVX128;
 	    }

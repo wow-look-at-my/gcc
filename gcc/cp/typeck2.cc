@@ -466,6 +466,25 @@ maybe_push_temp_cleanup (tree sub, vec<tree,va_gc> **flags)
     }
 }
 
+/* F is something added to a cleanup flags vec by maybe_push_temp_cleanup or
+   build_vec_init.  Return the code to disable the cleanup it controls.  */
+
+tree
+build_disable_temp_cleanup (tree f)
+{
+  tree d = f;
+  tree i = boolean_false_node;
+  if (TREE_CODE (f) == TREE_LIST)
+    {
+      /* To disable a build_vec_init cleanup, set
+	 iterator = maxindex.  */
+      d = TREE_PURPOSE (f);
+      i = TREE_VALUE (f);
+      ggc_free (f);
+    }
+  return build2 (MODIFY_EXPR, TREE_TYPE (d), d, i);
+}
+
 /* The recursive part of split_nonconstant_init.  DEST is an lvalue
    expression to which INIT should be assigned.  INIT is a CONSTRUCTOR.
    Return true if the whole of the value was initialized by the
@@ -737,20 +756,7 @@ split_nonconstant_init (tree dest, tree init)
 	init = NULL_TREE;
 
       for (tree f : flags)
-	{
-	  /* See maybe_push_temp_cleanup.  */
-	  tree d = f;
-	  tree i = boolean_false_node;
-	  if (TREE_CODE (f) == TREE_LIST)
-	    {
-	      /* To disable a build_vec_init cleanup, set
-		 iterator = maxindex.  */
-	      d = TREE_PURPOSE (f);
-	      i = TREE_VALUE (f);
-	      ggc_free (f);
-	    }
-	  add_stmt (build2 (MODIFY_EXPR, TREE_TYPE (d), d, i));
-	}
+	add_stmt (build_disable_temp_cleanup (f));
       release_tree_vector (flags);
 
       code = pop_stmt_list (code);
@@ -1531,10 +1537,10 @@ massage_init_elt (tree type, tree init, int nested, int flags,
     new_flags |= LOOKUP_AGGREGATE_PAREN_INIT;
   init = digest_init_r (type, init, nested ? 2 : 1, new_flags, complain);
   /* When we defer constant folding within a statement, we may want to
-     defer this folding as well.  Don't call this on CONSTRUCTORs because
-     their elements have already been folded, and we must avoid folding
-     the result of get_nsdmi.  */
-  if (TREE_CODE (init) != CONSTRUCTOR)
+     defer this folding as well.  Don't call this on CONSTRUCTORs in
+     a template because their elements have already been folded, and
+     we must avoid folding the result of get_nsdmi.  */
+  if (!(processing_template_decl && TREE_CODE (init) == CONSTRUCTOR))
     {
       tree t = fold_non_dependent_init (init, complain);
       if (TREE_CONSTANT (t))
@@ -1768,13 +1774,6 @@ process_init_constructor_record (tree type, tree init, int nested, int flags,
 	    {
 	      gcc_assert (ce->value);
 	      next = massage_init_elt (fldtype, next, nested, flags, complain);
-	      /* We can't actually elide the temporary when initializing a
-		 potentially-overlapping field from a function that returns by
-		 value.  */
-	      if (ce->index
-		  && TREE_CODE (next) == TARGET_EXPR
-		  && unsafe_copy_elision_p (ce->index, next))
-		TARGET_EXPR_ELIDING_P (next) = false;
 	      ++idx;
 	    }
 	}
@@ -1866,6 +1865,13 @@ process_init_constructor_record (tree type, tree init, int nested, int flags,
 	      continue;
 	    }
 	}
+
+      /* We can't actually elide the temporary when initializing a
+	 potentially-overlapping field from a function that returns by
+	 value.  */
+      if (TREE_CODE (next) == TARGET_EXPR
+	  && unsafe_copy_elision_p (field, next))
+	TARGET_EXPR_ELIDING_P (next) = false;
 
       if (is_empty_field (field)
 	  && !TREE_SIDE_EFFECTS (next))
@@ -2341,7 +2347,7 @@ build_m_component_ref (tree datum, tree component, tsubst_flags_t complain)
 				      (cp_type_quals (type)
 				       | cp_type_quals (TREE_TYPE (datum))));
 
-      datum = build_address (datum);
+      datum = cp_build_addr_expr (datum, complain);
 
       /* Convert object to the correct base.  */
       if (binfo)
@@ -2463,9 +2469,12 @@ build_functional_cast_1 (location_t loc, tree exp, tree parms,
 	      return error_mark_node;
 	    }
 	  else if (cxx_dialect < cxx23)
-	    pedwarn (loc, OPT_Wc__23_extensions,
-		     "%<auto(x)%> only available with "
-		     "%<-std=c++2b%> or %<-std=gnu++2b%>");
+	    {
+	      if ((complain & tf_warning_or_error) != 0)
+		pedwarn (loc, OPT_Wc__23_extensions,
+			 "%<auto(x)%> only available with "
+			 "%<-std=c++2b%> or %<-std=gnu++2b%>");
+	    }
 	}
       else
 	{

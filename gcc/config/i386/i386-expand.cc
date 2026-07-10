@@ -2344,34 +2344,44 @@ ix86_expand_copysign (rtx operands[])
     vdest = gen_reg_rtx (vmode);
   else
     dest = NULL_RTX;
-  op1 = lowpart_subreg (vmode, force_reg (mode, operands[2]), mode);
+  op1 = lowpart_subreg (vmode, force_reg (mode, operands[1]), mode);
   mask = ix86_build_signbit_mask (vmode, TARGET_AVX512F && mode != HFmode, 0);
 
-  if (CONST_DOUBLE_P (operands[1]))
+  if (CONST_DOUBLE_P (operands[2]))
     {
-      op0 = simplify_unary_operation (ABS, mode, operands[1], mode);
-      /* Optimize for 0, simplify b = copy_signf (0.0f, a) to b = mask & a.  */
-      if (op0 == CONST0_RTX (mode))
+      if (real_isneg (CONST_DOUBLE_REAL_VALUE (operands[2])))
+	/* Simplify b = copysign (a, negative) to b = mask | a.  */
+	op1 = gen_rtx_IOR (vmode, mask, op1);
+      else
 	{
-	  emit_move_insn (vdest, gen_rtx_AND (vmode, mask, op1));
-	  if (dest)
-	    emit_move_insn (dest, lowpart_subreg (mode, vdest, vmode));
-	  return;
+	  /* Simplify b = copysign (a, positive) to b = invert_mask & a.  */
+	  rtx invert_mask
+	    = ix86_build_signbit_mask (vmode,
+				       TARGET_AVX512F && mode != HFmode,
+				       true);
+	  op1 = gen_rtx_AND (vmode, invert_mask, op1);
 	}
-
-      if (GET_MODE_SIZE (mode) < 16)
-	op0 = ix86_build_const_vector (vmode, false, op0);
-      op0 = force_reg (vmode, op0);
+      emit_move_insn (vdest, op1);
+      if (dest)
+	emit_move_insn (dest, lowpart_subreg (mode, vdest, vmode));
+      return;
     }
   else
-    op0 = lowpart_subreg (vmode, force_reg (mode, operands[1]), mode);
+    op0 = lowpart_subreg (vmode, force_reg (mode, operands[2]), mode);
 
   op2 = gen_reg_rtx (vmode);
   op3 = gen_reg_rtx (vmode);
-  emit_move_insn (op2, gen_rtx_AND (vmode,
-				    gen_rtx_NOT (vmode, mask),
-				    op0));
-  emit_move_insn (op3, gen_rtx_AND (vmode, mask, op1));
+  rtx invert_mask;
+  /* NB: Generate vmovdqa, vpandn, vpand, vpor for AVX and generate pand,
+     pand, por for SSE.  */
+  if (TARGET_AVX)
+    invert_mask = gen_rtx_NOT (vmode, mask);
+  else
+    invert_mask = ix86_build_signbit_mask (vmode,
+					   TARGET_AVX512F && mode != HFmode,
+					   true);
+  emit_move_insn (op2, gen_rtx_AND (vmode, invert_mask, op1));
+  emit_move_insn (op3, gen_rtx_AND (vmode, mask, op0));
   emit_move_insn (vdest, gen_rtx_IOR (vmode, op2, op3));
   if (dest)
     emit_move_insn (dest, lowpart_subreg (mode, vdest, vmode));
@@ -3063,6 +3073,8 @@ ix86_expand_int_compare (enum rtx_code code, rtx op0, rtx op1)
       && GET_MODE_SIZE (GET_MODE (SUBREG_REG (op0))) == 16)
     {
       tmp = SUBREG_REG (op0);
+      if (GET_MODE (tmp) == V8HFmode || GET_MODE (tmp) == V8BFmode)
+	tmp = gen_lowpart (V8HImode, tmp);
       tmp = gen_rtx_UNSPEC (CCZmode, gen_rtvec (2, tmp, tmp), UNSPEC_PTEST);
     }
   else
@@ -4220,23 +4232,23 @@ ix86_expand_sse_movcc (rtx dest, rtx cmp, rtx op_true, rtx op_false)
   switch (mode)
     {
     case E_V2SFmode:
-      if (TARGET_SSE4_1)
+      if (TARGET_SSE_MOVCC_USE_BLENDV && TARGET_SSE4_1)
 	gen = gen_mmx_blendvps;
       break;
     case E_V4SFmode:
-      if (TARGET_SSE4_1)
+      if (TARGET_SSE_MOVCC_USE_BLENDV && TARGET_SSE4_1)
 	gen = gen_sse4_1_blendvps;
       break;
     case E_V2DFmode:
-      if (TARGET_SSE4_1)
+      if (TARGET_SSE_MOVCC_USE_BLENDV && TARGET_SSE4_1)
 	gen = gen_sse4_1_blendvpd;
       break;
     case E_SFmode:
-      if (TARGET_SSE4_1)
+      if (TARGET_SSE_MOVCC_USE_BLENDV && TARGET_SSE4_1)
 	gen = gen_sse4_1_blendvss;
       break;
     case E_DFmode:
-      if (TARGET_SSE4_1)
+      if (TARGET_SSE_MOVCC_USE_BLENDV && TARGET_SSE4_1)
 	gen = gen_sse4_1_blendvsd;
       break;
     case E_V8QImode:
@@ -4244,7 +4256,7 @@ ix86_expand_sse_movcc (rtx dest, rtx cmp, rtx op_true, rtx op_false)
     case E_V4HFmode:
     case E_V4BFmode:
     case E_V2SImode:
-      if (TARGET_SSE4_1)
+      if (TARGET_SSE_MOVCC_USE_BLENDV && TARGET_SSE4_1)
 	{
 	  gen = gen_mmx_pblendvb_v8qi;
 	  blend_mode = V8QImode;
@@ -4254,14 +4266,14 @@ ix86_expand_sse_movcc (rtx dest, rtx cmp, rtx op_true, rtx op_false)
     case E_V2HImode:
     case E_V2HFmode:
     case E_V2BFmode:
-      if (TARGET_SSE4_1)
+      if (TARGET_SSE_MOVCC_USE_BLENDV && TARGET_SSE4_1)
 	{
 	  gen = gen_mmx_pblendvb_v4qi;
 	  blend_mode = V4QImode;
 	}
       break;
     case E_V2QImode:
-      if (TARGET_SSE4_1)
+      if (TARGET_SSE_MOVCC_USE_BLENDV && TARGET_SSE4_1)
 	gen = gen_mmx_pblendvb_v2qi;
       break;
     case E_V16QImode:
@@ -4271,18 +4283,18 @@ ix86_expand_sse_movcc (rtx dest, rtx cmp, rtx op_true, rtx op_false)
     case E_V4SImode:
     case E_V2DImode:
     case E_V1TImode:
-      if (TARGET_SSE4_1)
+      if (TARGET_SSE_MOVCC_USE_BLENDV && TARGET_SSE4_1)
 	{
 	  gen = gen_sse4_1_pblendvb;
 	  blend_mode = V16QImode;
 	}
       break;
     case E_V8SFmode:
-      if (TARGET_AVX)
+      if (TARGET_AVX && TARGET_SSE_MOVCC_USE_BLENDV)
 	gen = gen_avx_blendvps256;
       break;
     case E_V4DFmode:
-      if (TARGET_AVX)
+      if (TARGET_AVX && TARGET_SSE_MOVCC_USE_BLENDV)
 	gen = gen_avx_blendvpd256;
       break;
     case E_V32QImode:
@@ -4291,7 +4303,7 @@ ix86_expand_sse_movcc (rtx dest, rtx cmp, rtx op_true, rtx op_false)
     case E_V16BFmode:
     case E_V8SImode:
     case E_V4DImode:
-      if (TARGET_AVX2)
+      if (TARGET_AVX2 && TARGET_SSE_MOVCC_USE_BLENDV)
 	{
 	  gen = gen_avx2_pblendvb;
 	  blend_mode = V32QImode;
@@ -13475,6 +13487,9 @@ ix86_expand_builtin (tree exp, rtx target, rtx subtarget,
       op1 = expand_normal (arg1);
       op2 = expand_normal (arg2);
 
+      if (GET_MODE (op1) != Pmode)
+	op1 = convert_to_mode (Pmode, op1, 1);
+
       if (!address_operand (op2, VOIDmode))
 	{
 	  op2 = convert_memory_address (Pmode, op2);
@@ -13510,6 +13525,9 @@ ix86_expand_builtin (tree exp, rtx target, rtx subtarget,
       emit_label (ok_label);
       emit_insn (gen_rtx_SET (target, pat));
 
+      if (GET_MODE (op0) != Pmode)
+	op0 = convert_to_mode (Pmode, op0, 1);
+
       for (i = 0; i < 8; i++)
 	{
 	  op = gen_rtx_MEM (V2DImode,
@@ -13534,13 +13552,16 @@ ix86_expand_builtin (tree exp, rtx target, rtx subtarget,
 	if (!REG_P (op0))
 	  op0 = copy_to_mode_reg (SImode, op0);
 
+	if (GET_MODE (op2) != Pmode)
+	  op2 = convert_to_mode (Pmode, op2, 1);
+
 	op = gen_rtx_REG (V2DImode, GET_SSE_REGNO (0));
 	emit_move_insn (op, op1);
 
 	for (i = 0; i < 3; i++)
 	  xmm_regs[i] = gen_rtx_REG (V2DImode, GET_SSE_REGNO (i));
 
-	if (target == 0)
+	if (target == 0 || !register_operand (target, SImode))
 	  target = gen_reg_rtx (SImode);
 
 	emit_insn (gen_encodekey128u32 (target, op0));
@@ -13571,6 +13592,9 @@ ix86_expand_builtin (tree exp, rtx target, rtx subtarget,
 	if (!REG_P (op0))
 	  op0 = copy_to_mode_reg (SImode, op0);
 
+	if (GET_MODE (op3) != Pmode)
+	  op3 = convert_to_mode (Pmode, op3, 1);
+
 	/* Force to use xmm0, xmm1 for keylow, keyhi*/
 	op = gen_rtx_REG (V2DImode, GET_SSE_REGNO (0));
 	emit_move_insn (op, op1);
@@ -13580,7 +13604,7 @@ ix86_expand_builtin (tree exp, rtx target, rtx subtarget,
 	for (i = 0; i < 4; i++)
 	  xmm_regs[i] = gen_rtx_REG (V2DImode, GET_SSE_REGNO (i));
 
-	if (target == 0)
+	if (target == 0 || !register_operand (target, SImode))
 	  target = gen_reg_rtx (SImode);
 
 	emit_insn (gen_encodekey256u32 (target, op0));
@@ -13716,7 +13740,7 @@ ix86_expand_builtin (tree exp, rtx target, rtx subtarget,
 	  }
 	else
 	  {
-	    if (target == 0)
+	    if (target == 0 || !register_operand (target, DImode))
 	      target = gen_reg_rtx (DImode);
 	    icode = CODE_FOR_urdmsr;
 	    op1 = op0;
@@ -17625,6 +17649,8 @@ quarter:
   else if (use_vec_merge)
     {
 do_vec_merge:
+      if (!nonimmediate_operand (val, inner_mode))
+	val = force_reg (inner_mode, val);
       tmp = gen_rtx_VEC_DUPLICATE (mode, val);
       tmp = gen_rtx_VEC_MERGE (mode, tmp, target,
 			       GEN_INT (HOST_WIDE_INT_1U << elt));
@@ -23962,6 +23988,13 @@ ix86_expand_vecop_qihi2 (enum rtx_code code, rtx dest, rtx op1, rtx op2)
   rtx (*gen_truncate)(rtx, rtx) = NULL;
   bool op2vec = GET_MODE_CLASS (GET_MODE (op2)) == MODE_VECTOR_INT;
   bool uns_p = code != ASHIFTRT;
+
+  /* Without VPMOVWB (provided by AVX512BW ISA), the expansion uses the
+     generic permutation to merge the data back into the right place.  This
+     permutation results in VPERMQ, which is slow, so better fall back to
+     ix86_expand_vecop_qihi.  */
+  if (!TARGET_AVX512BW)
+    return false;
 
   if ((qimode == V16QImode && !TARGET_AVX2)
       || (qimode == V32QImode && (!TARGET_AVX512BW || !TARGET_EVEX512))

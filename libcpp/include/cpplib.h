@@ -563,6 +563,15 @@ struct cpp_options
   /* True if dependencies should be restored from a precompiled header.  */
   bool restore_pch_deps;
 
+  /* True to record a SHA-1 digest of every file's raw on-disk bytes at read
+     time (read_file_guts), for cpp_foreach_included_file to hand to the
+     in-compiler compile cache without re-reading the include closure.  Off
+     by default: without a configured compile cache the digests have no
+     consumer, and hashing every header costs ~1.8% of a -O0 compile.
+     cpp_foreach_included_file re-reads un-hashed files on demand, so
+     consumers stay correct whichever way this is set.  */
+  bool hash_file_contents;
+
   /* True if warn about differences between C90 and C99.  */
   signed char cpp_warn_c90_c99_compat;
 
@@ -843,6 +852,20 @@ struct cpp_dir
      try and open.  If this is NULL, the constructed pathname is as
      constructed by append_file_to_dir.  */
   char *(*construct) (const char *header, cpp_dir *dir);
+
+  /* Lazily-built in-memory index of the top-level filenames in this
+     directory, used to skip provably-failing open()s during include
+     resolution (see find_file_in_dir in files.cc).  Built once via
+     opendir/readdir on first use.  Managed entirely within files.cc;
+     opaque here to avoid leaking hashtab.h into the public header.
+     NAME_INDEX is a hash set of the directory's entry names; it is
+     only valid when NAME_INDEX_STATE == 1.  */
+  void *name_index;
+
+  /* State of NAME_INDEX: 0 = not yet built, 1 = built and usable,
+     2 = unavailable (opendir/readdir failed; always fall back to
+     open()).  Declared as unsigned char to keep the struct compact.  */
+  unsigned char name_index_state;
 
   /* The C front end uses these to recognize duplicated
      directories in the search path.  */
@@ -1465,6 +1488,73 @@ extern bool cpp_compare_macros (const cpp_macro *macro1,
 /* In files.cc */
 extern bool cpp_included (cpp_reader *, const char *);
 extern bool cpp_included_before (cpp_reader *, const char *, location_t);
+
+/* Callback invoked once per file that was actually stacked (read) for the
+   current translation unit, with the file's resolved PATH.
+
+   When CONTENT_SHA1 is non-NULL it is the 20-byte SHA-1 of the file's raw
+   on-disk bytes, computed once when the compiler first read the file; BUFFER
+   is then NULL and SIZE is the file's on-disk byte count.  A consumer that
+   only needs a content digest (e.g. the in-compiler compile cache) uses this
+   stored digest directly and avoids re-reading the file.
+
+   When CONTENT_SHA1 is NULL the digest was not available, so BUFFER points at
+   SIZE bytes of the file's contents (re-read from disk if libcpp no longer
+   holds the buffer) for the consumer to hash itself.
+
+   Return false to stop the walk.  See cpp_foreach_included_file.  */
+typedef bool (*cpp_included_file_cb) (const char *path,
+				      const unsigned char *buffer,
+				      size_t size,
+				      const unsigned char *content_sha1,
+				      void *user);
+
+/* Walk every file that was stacked for preprocessing in this TU, invoking
+   CB for each.  CB receives each file's path and either its stored raw-bytes
+   SHA-1 (no re-read) or, when no digest is available, its contents (re-read
+   from disk if libcpp no longer holds the buffer).  Stops early if CB returns
+   false; returns false if a file needed re-reading but could not be read,
+   true otherwise.  */
+extern bool cpp_foreach_included_file (cpp_reader *,
+				       cpp_included_file_cb, void *);
+
+/* True if __has_include / __has_include_next was evaluated during this TU
+   (including probes short-circuited by a false #if operand, which are never
+   recorded below).  */
+extern bool cpp_used_has_include (cpp_reader *);
+
+/* True if specifically __has_include_next was evaluated during this TU.  Its
+   result depends on the include-stack position of the probing file, which a
+   consumer cannot re-verify without preprocessing, so the in-compiler cache
+   keeps such TUs off its pre-parse manifest fast-path.  */
+extern bool cpp_used_has_include_next (cpp_reader *);
+
+/* Flag bits describing one recorded __has_include evaluation.  */
+#define CPP_HI_PROBE_FOUND	0x1	/* the probe returned 1 */
+#define CPP_HI_PROBE_BRACKET	0x2	/* <...> operand (else "...") */
+#define CPP_HI_PROBE_NEXT	0x4	/* __has_include_next */
+#define CPP_HI_PROBE_VERIFIABLE	0x8	/* re-checkable from the records:
+					   RESOLVED (when found) still exists
+					   and every CANDIDATE still absent
+					   reproduces the probe's search */
+
+/* Callback invoked once per recorded __has_include / __has_include_next
+   evaluation of this TU, deduplicated: NAME is the operand spelling after
+   macro expansion, FLAGS a CPP_HI_PROBE_* mask, RESOLVED the path the probe
+   resolved to (NULL unless CPP_HI_PROBE_FOUND), and CANDIDATES the
+   N_CANDIDATES fully joined paths the search proved absent, in search order
+   (empty unless CPP_HI_PROBE_VERIFIABLE).  Return false to stop the walk.  */
+typedef bool (*cpp_has_include_probe_cb) (const char *name, unsigned flags,
+					  const char *resolved,
+					  const char *const *candidates,
+					  unsigned n_candidates, void *user);
+
+/* Walk every recorded __has_include / __has_include_next evaluation of this
+   TU, invoking CB for each.  Stops early (returning false) if CB returns
+   false; returns true otherwise.  */
+extern bool cpp_foreach_has_include_probe (cpp_reader *,
+					   cpp_has_include_probe_cb, void *);
+
 extern void cpp_make_system_header (cpp_reader *, int, int);
 extern bool cpp_push_include (cpp_reader *, const char *);
 extern bool cpp_push_default_include (cpp_reader *, const char *);

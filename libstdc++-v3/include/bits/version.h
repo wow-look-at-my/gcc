@@ -639,7 +639,7 @@
 #undef __glibcxx_want_boyer_moore_searcher
 
 #if !defined(__cpp_lib_chrono)
-# if (__cplusplus >= 202002L) && _GLIBCXX_HOSTED
+# if (__cplusplus >= 202002L) && _GLIBCXX_USE_CXX11_ABI && _GLIBCXX_HOSTED
 #  define __glibcxx_chrono 201907L
 #  if defined(__glibcxx_want_all) || defined(__glibcxx_want_chrono)
 #   define __cpp_lib_chrono 201907L
@@ -739,7 +739,7 @@
 #undef __glibcxx_want_parallel_algorithm
 
 #if !defined(__cpp_lib_scoped_lock)
-# if (__cplusplus >= 201703L) && defined(_GLIBCXX_HAS_GTHREADS) && _GLIBCXX_HOSTED
+# if (__cplusplus >= 201703L)
 #  define __glibcxx_scoped_lock 201703L
 #  if defined(__glibcxx_want_all) || defined(__glibcxx_want_scoped_lock)
 #   define __cpp_lib_scoped_lock 201703L
@@ -1199,10 +1199,15 @@
 #undef __glibcxx_want_shift
 
 #if !defined(__cpp_lib_ranges)
-# if (__cplusplus >= 202100L) && (__glibcxx_concepts)
-#  define __glibcxx_ranges 202211L
+# if (__cplusplus >  202302L) && (__glibcxx_concepts)
+#  define __glibcxx_ranges 202406L
 #  if defined(__glibcxx_want_all) || defined(__glibcxx_want_ranges)
-#   define __cpp_lib_ranges 202211L
+#   define __cpp_lib_ranges 202406L
+#  endif
+# elif (__cplusplus >= 202100L) && (__glibcxx_concepts)
+#  define __glibcxx_ranges 202302L
+#  if defined(__glibcxx_want_all) || defined(__glibcxx_want_ranges)
+#   define __cpp_lib_ranges 202302L
 #  endif
 # elif (__cplusplus >= 202002L) && (__glibcxx_concepts)
 #  define __glibcxx_ranges 202110L
@@ -1793,6 +1798,26 @@
 #endif /* !defined(__cpp_lib_stdatomic_h) && defined(__glibcxx_want_stdatomic_h) */
 #undef __glibcxx_want_stdatomic_h
 
+#if !defined(__cpp_lib_stdbit_h)
+# if (__cplusplus >  202302L)
+#  define __glibcxx_stdbit_h 202603L
+#  if defined(__glibcxx_want_all) || defined(__glibcxx_want_stdbit_h)
+#   define __cpp_lib_stdbit_h 202603L
+#  endif
+# endif
+#endif /* !defined(__cpp_lib_stdbit_h) */
+#undef __glibcxx_want_stdbit_h
+
+#if !defined(__cpp_lib_stdckdint_h)
+# if (__cplusplus >  202302L)
+#  define __glibcxx_stdckdint_h 202603L
+#  if defined(__glibcxx_want_all) || defined(__glibcxx_want_stdckdint_h)
+#   define __cpp_lib_stdckdint_h 202603L
+#  endif
+# endif
+#endif /* !defined(__cpp_lib_stdckdint_h) */
+#undef __glibcxx_want_stdckdint_h
+
 #if !defined(__cpp_lib_adaptor_iterator_pair_constructor)
 # if (__cplusplus >= 202100L) && _GLIBCXX_HOSTED
 #  define __glibcxx_adaptor_iterator_pair_constructor 202106L
@@ -1824,7 +1849,7 @@
 #undef __glibcxx_want_forward_like
 
 #if !defined(__cpp_lib_generator)
-# if (__cplusplus >= 202100L) && (__glibcxx_coroutine)
+# if (__cplusplus >= 202100L) && (__glibcxx_coroutine && __cpp_sized_deallocation)
 #  define __glibcxx_generator 202207L
 #  if defined(__glibcxx_want_all) || defined(__glibcxx_want_generator)
 #   define __cpp_lib_generator 202207L

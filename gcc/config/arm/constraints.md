@@ -39,7 +39,7 @@
 ;; in all states: Pg
 
 ;; The following memory constraints have been used:
-;; in ARM/Thumb-2 state: Uh, Ut, Uv, Uy, Un, Um, Us, Up, Uf, Ux, Ul
+;; in ARM/Thumb-2 state: Uh, Ut, Uv, Uy, Un, Um, Us, Uo, Up, Uf, Ux, Ul, Uz
 ;; in ARM state: Uq
 ;; in Thumb state: Uu, Uw
 ;; in all states: Q
@@ -471,12 +471,12 @@
 (define_memory_constraint "Uj"
  "@internal
   In ARM/Thumb-2 state a VFP load/store address that supports writeback
-  for Neon but not for MVE"
+  for Neon but not for MVE or VFP_FP16INST"
  (and (match_code "mem")
-      (match_test "TARGET_32BIT")
-      (match_test "TARGET_HAVE_MVE
-                   ? arm_coproc_mem_operand_no_writeback (op)
-                   : neon_vector_mem_operand (op, 2, true)")))
+      (match_test "TARGET_32BIT
+		   && (arm_coproc_mem_operand_no_writeback (op)
+		       || (TARGET_NEON_FP16
+			   && neon_vector_mem_operand (op, 2, true)))")))
 
 (define_memory_constraint "Uy"
  "@internal
@@ -584,6 +584,12 @@
   A memory access that is accessible as an LDC/STC operand"
  (and (match_code "mem")
       (match_test "arm_coproc_ldc_stc_legitimate_address (op)")))
+
+(define_memory_constraint "Uo"
+ "@internal
+  A memory operand for Arm/Thumb-2 LDRD/STRD"
+ (and (match_code "mem")
+      (match_test "arm_ldrd_legitimate_address (op)")))
 
 ;; We used to have constraint letters for S and R in ARM state, but
 ;; all uses of these now appear to have been removed.

@@ -962,7 +962,9 @@ can_init_array_with_p (tree type, tree init)
 	return true;
     }
 
-  return false;
+  permerror (input_location, "array must be initialized "
+	     "with a brace-enclosed initializer");
+  return true;
 }
 
 /* Initialize MEMBER, a FIELD_DECL, with INIT, a TREE_LIST of
@@ -3691,6 +3693,11 @@ build_new_1 (vec<tree, va_gc> **placement, tree type, tree nelts,
                 error ("parenthesized initializer in array new");
 	      return error_mark_node;
             }
+
+	  /* Collect flags for disabling subobject cleanups once the complete
+	     object is fully constructed.  */
+	  vec<tree, va_gc> *flags = make_tree_vector ();
+
 	  init_expr
 	    = build_vec_init (data_addr,
 			      cp_build_binary_op (input_location,
@@ -3700,7 +3707,17 @@ build_new_1 (vec<tree, va_gc> **placement, tree type, tree nelts,
 			      vecinit,
 			      explicit_value_init_p,
 			      /*from_array=*/0,
-                              complain);
+			      complain,
+			      &flags);
+
+	  for (tree f : flags)
+	    {
+	      tree cl = build_disable_temp_cleanup (f);
+	      cl = convert_to_void (cl, ICV_STATEMENT, complain);
+	      init_expr = build2 (COMPOUND_EXPR, void_type_node,
+				  init_expr, cl);
+	    }
+	  release_tree_vector (flags);
 	}
       else
 	{
@@ -3809,7 +3826,6 @@ build_new_1 (vec<tree, va_gc> **placement, tree type, tree nelts,
 	  tree end, sentry, begin;
 
 	  begin = get_target_expr (boolean_true_node);
-	  CLEANUP_EH_ONLY (begin) = 1;
 
 	  sentry = TARGET_EXPR_SLOT (begin);
 
@@ -4287,7 +4303,7 @@ create_temporary_var (tree type)
   TREE_USED (decl) = 1;
   DECL_ARTIFICIAL (decl) = 1;
   DECL_IGNORED_P (decl) = 1;
-  DECL_CONTEXT (decl) = current_scope ();
+  DECL_CONTEXT (decl) = current_function_decl;
 
   return decl;
 }
@@ -4917,7 +4933,13 @@ build_vec_init (tree base, tree maxindex, tree init,
 	      if (xvalue)
 		from = move (from);
 	      if (direct_init)
-		from = build_tree_list (NULL_TREE, from);
+		{
+		  /* Wrap the initializer in a CONSTRUCTOR so that
+		     build_vec_init recognizes it as direct-initialization.  */
+		  from = build_constructor_single (init_list_type_node,
+						   NULL_TREE, from);
+		  CONSTRUCTOR_IS_DIRECT_INIT (from) = true;
+		}
 	    }
 	  else
 	    from = NULL_TREE;
@@ -5054,6 +5076,15 @@ build_vec_init (tree base, tree maxindex, tree init,
     {
       if (!saw_non_const)
 	{
+	  /* If we're not generating the loop, we don't need to reset the
+	     iterator.  */
+	  if (cleanup_flags
+	      && !vec_safe_is_empty (*cleanup_flags))
+	    {
+	      auto l = (*cleanup_flags)->last ();
+	      gcc_assert (TREE_PURPOSE (l) == iterator);
+	      (*cleanup_flags)->pop ();
+	    }
 	  tree const_init = build_constructor (atype, const_vec);
 	  return build2 (INIT_EXPR, atype, obase, const_init);
 	}
@@ -5222,9 +5253,13 @@ build_delete (location_t loc, tree otype, tree addr,
       addr = convert_force (build_pointer_type (type), addr, 0, complain);
     }
 
+  tree addr_expr = NULL_TREE;
   if (deleting)
     /* We will use ADDR multiple times so we must save it.  */
-    addr = save_expr (addr);
+    {
+      addr_expr = get_target_expr (addr);
+      addr = TARGET_EXPR_SLOT (addr_expr);
+    }
 
   bool virtual_p = false;
   if (type_build_dtor_call (type))
@@ -5342,6 +5377,9 @@ build_delete (location_t loc, tree otype, tree addr,
 
   if (!integer_nonzerop (ifexp))
     expr = build3 (COND_EXPR, void_type_node, ifexp, expr, void_node);
+
+  if (addr_expr)
+    expr = cp_build_compound_expr (addr_expr, expr, tf_none);
 
   protected_set_expr_location (expr, loc);
   return expr;

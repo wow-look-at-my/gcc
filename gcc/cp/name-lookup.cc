@@ -352,6 +352,10 @@ append_imported_binding_slot (tree *slot, tree name, unsigned ix)
 
       tree new_vec = make_binding_vec (name, want);
       BINDING_VECTOR_NUM_CLUSTERS (new_vec) = have + 1;
+      BINDING_VECTOR_GLOBAL_DUPS_P (new_vec)
+	= BINDING_VECTOR_GLOBAL_DUPS_P (*slot);
+      BINDING_VECTOR_PARTITION_DUPS_P (new_vec)
+	= BINDING_VECTOR_PARTITION_DUPS_P (*slot);
       memcpy (BINDING_VECTOR_CLUSTER_BASE (new_vec),
 	      BINDING_VECTOR_CLUSTER_BASE (*slot),
 	      have * sizeof (binding_cluster));
@@ -3997,7 +4001,10 @@ pushdecl (tree decl, bool hiding)
       if (old && anticipated_builtin_p (old))
 	old = OVL_CHAIN (old);
 
-      check_template_shadow (decl);
+      if (hiding)
+	; /* Hidden bindings don't shadow anything.  */
+      else
+	check_template_shadow (decl);
 
       if (DECL_DECLARES_FUNCTION_P (decl))
 	{
@@ -4129,6 +4136,22 @@ mergeable_namespace_slots (tree ns, tree name, bool is_attached, tree *vec)
   *vec = *mslot;
 
   return vslot;
+}
+
+/* Retrieve the bindings for an existing mergeable entity in namespace
+   NS slot NAME.  Returns NULL if no such bindings exists.  */
+
+static tree
+get_mergeable_namespace_binding (tree ns, tree name, bool is_attached)
+{
+  tree *mslot = find_namespace_slot (ns, name, false);
+  if (!mslot || !*mslot || TREE_CODE (*mslot) != BINDING_VECTOR)
+    return NULL_TREE;
+
+  tree *vslot = get_fixed_binding_slot
+    (mslot, name, is_attached ? BINDING_SLOT_PARTITION : BINDING_SLOT_GLOBAL,
+     false);
+  return vslot ? *vslot : NULL_TREE;
 }
 
 /* DECL is a new mergeable namespace-scope decl.  Add it to the
@@ -4451,6 +4474,43 @@ push_local_binding (tree id, tree decl, bool is_using)
   /* And put DECL on the list of things declared by the current
      binding level.  */
   add_decl_to_level (b, decl);
+}
+
+/* Lookup the FRIEND_TMPL within all merged module imports.  Used to dedup
+   instantiations of temploid hidden friends from imported modules.  */
+
+tree
+lookup_imported_hidden_friend (tree friend_tmpl)
+{
+  /* For a class-scope friend class it should have been found by regular
+     name lookup.  Otherwise we're looking in the current namespace.  */
+  gcc_checking_assert (CP_DECL_CONTEXT (friend_tmpl) == current_namespace);
+
+  tree inner = DECL_TEMPLATE_RESULT (friend_tmpl);
+  if (!DECL_LANG_SPECIFIC (inner)
+      || !DECL_MODULE_IMPORT_P (inner))
+    return NULL_TREE;
+
+  /* Imported temploid friends are not considered as attached to this
+     module for merging purposes.  */
+  tree bind = get_mergeable_namespace_binding (current_namespace,
+					       DECL_NAME (inner), false);
+  if (!bind)
+    return NULL_TREE;
+
+  /* We're only interested in declarations coming from the same module
+     of the friend class we're attempting to instantiate.  */
+  int m = get_originating_module (friend_tmpl);
+  gcc_assert (m != 0);
+
+  /* There should be at most one class template from the module we're
+     looking for, return it.  */
+  for (ovl_iterator iter (bind); iter; ++iter)
+    if (DECL_CLASS_TEMPLATE_P (*iter)
+	&& get_originating_module (*iter) == m)
+      return *iter;
+
+  return NULL_TREE;
 }
 
 
@@ -5065,9 +5125,11 @@ pushdecl_outermost_localscope (tree x)
   cp_binding_level *b = NULL;
   auto_cond_timevar tv (TV_NAME_LOOKUP);
 
-  /* Find the scope just inside the function parms.  */
-  for (cp_binding_level *n = current_binding_level;
-       n->kind != sk_function_parms; n = b->level_chain)
+  /* Find the block scope just inside the function parms.  */
+  cp_binding_level *n = current_binding_level;
+  while (n && n->kind != sk_block)
+    n = n->level_chain;
+  for (; n && n->kind != sk_function_parms; n = b->level_chain)
     b = n;
 
   return b ? do_pushdecl_with_scope (x, b) : error_mark_node;
@@ -6349,7 +6411,8 @@ handle_namespace_attrs (tree ns, tree attributes)
       tree name = get_attribute_name (d);
       tree args = TREE_VALUE (d);
 
-      if (is_attribute_p ("visibility", name))
+      if (is_attribute_p ("visibility", name)
+	  && args != error_mark_node)
 	{
 	  /* attribute visibility is a property of the syntactic block
 	     rather than the namespace as a whole, so we don't touch the
@@ -6371,7 +6434,8 @@ handle_namespace_attrs (tree ns, tree attributes)
 	  push_visibility (TREE_STRING_POINTER (x), 1);
 	  saw_vis = true;
 	}
-      else if (is_attribute_p ("abi_tag", name))
+      else if (is_attribute_p ("abi_tag", name)
+	       && args != error_mark_node)
 	{
 	  if (!DECL_NAME (ns))
 	    {
@@ -6398,7 +6462,8 @@ handle_namespace_attrs (tree ns, tree attributes)
 	    DECL_ATTRIBUTES (ns) = tree_cons (name, args,
 					      DECL_ATTRIBUTES (ns));
 	}
-      else if (is_attribute_p ("deprecated", name))
+      else if (is_attribute_p ("deprecated", name)
+	       && args != error_mark_node)
 	{
 	  if (!DECL_NAME (ns))
 	    {
@@ -7273,10 +7338,9 @@ tree lookup_qualified_name (tree t, const char *p, LOOK_want w, bool c)
 static bool
 qualified_namespace_lookup (tree scope, name_lookup *lookup)
 {
-  timevar_start (TV_NAME_LOOKUP);
+  auto_cond_timevar tv (TV_NAME_LOOKUP);
   query_oracle (lookup->name);
   bool found = lookup->search_qualified (ORIGINAL_NAMESPACE (scope));
-  timevar_stop (TV_NAME_LOOKUP);
   return found;
 }
 

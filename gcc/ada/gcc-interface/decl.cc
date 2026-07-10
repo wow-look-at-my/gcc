@@ -3564,6 +3564,14 @@ gnat_to_gnu_entity (Entity_Id gnat_entity, tree gnu_expr, bool definition)
 	      TYPE_PACKED (gnu_type) = TYPE_PACKED (gnu_base_type);
 	      TYPE_REVERSE_STORAGE_ORDER (gnu_type)
 		= Reverse_Storage_Order (gnat_entity);
+
+	      /* Do the same for subtypes as for the base type, since pointers
+		 to them may symmetrically also point to the latter.  */
+	      prepend_one_attribute
+		(&attr_list, ATTR_MACHINE_ATTRIBUTE,
+		 get_identifier ("may_alias"), NULL_TREE,
+		 gnat_entity);
+
 	      process_attributes (&gnu_type, &attr_list, true, gnat_entity);
 
 	      /* Set the size, alignment and alias set of the type to match
@@ -5320,7 +5328,7 @@ gnat_to_gnu_component_type (Entity_Id gnat_array, bool definition,
   const bool is_bit_packed = Is_Bit_Packed_Array (gnat_array);
   tree gnu_type = gnat_to_gnu_type (gnat_type);
   tree gnu_comp_size;
-  bool has_packed_components;
+  bool has_packed_component;
   unsigned int max_align;
 
   /* If an alignment is specified, use it as a cap on the component type
@@ -5341,16 +5349,22 @@ gnat_to_gnu_component_type (Entity_Id gnat_array, bool definition,
       && !TYPE_FAT_POINTER_P (gnu_type)
       && tree_fits_uhwi_p (TYPE_SIZE (gnu_type)))
     {
-      gnu_type = make_packable_type (gnu_type, false, max_align);
-      has_packed_components = true;
+      tree gnu_packable_type = make_packable_type (gnu_type, false, max_align);
+      if (gnu_packable_type != gnu_type)
+	{
+	  gnu_type = gnu_packable_type;
+	  has_packed_component = true;
+	}
+      else
+	has_packed_component = false;
     }
   else
-    has_packed_components = is_bit_packed;
+    has_packed_component = is_bit_packed;
 
   /* Get and validate any specified Component_Size.  */
   gnu_comp_size
     = validate_size (Component_Size (gnat_array), gnu_type, gnat_array,
-		     has_packed_components ? TYPE_DECL : VAR_DECL, true,
+		     has_packed_component ? TYPE_DECL : VAR_DECL, true,
 		     Has_Component_Size_Clause (gnat_array), NULL, NULL);
 
   /* If the component type is a RECORD_TYPE that has a self-referential size,
@@ -8046,7 +8060,7 @@ typedef struct vinfo
 
    DEBUG_INFO is true if we need to write debug information about the type.
 
-   IN_VARIANT is true if the componennt list is that of a variant.
+   IN_VARIANT is true if the component list is that of a variant.
 
    FIRST_FREE_POS, if nonzero, is the first (lowest) free field position in
    the outer record type down to this variant level.  It is nonzero only if
@@ -8163,7 +8177,7 @@ components_to_record (Node_Id gnat_component_list, Entity_Id gnat_record_type,
       tree gnu_union_type;
       tree this_first_free_pos, gnu_variant_list = NULL_TREE;
       bool union_field_needs_strict_alignment = false;
-      bool innermost_variant_level = true;
+      bool innermost_of_unchecked_union = false;
       auto_vec <vinfo_t, 16> variant_types;
       vinfo_t *gnu_variant;
       unsigned int variants_align = 0;
@@ -8212,15 +8226,19 @@ components_to_record (Node_Id gnat_component_list, Entity_Id gnat_record_type,
       /* For an unchecked union with a fixed part, we need to compute whether
 	 we are at the innermost level of the variant part.  */
       if (unchecked_union && gnu_field_list)
-	for (variant = First_Non_Pragma (Variants (gnat_variant_part));
-	     Present (variant);
-	     variant = Next_Non_Pragma (variant))
-	  if (Present (Component_List (variant))
-	      && Present (Variant_Part (Component_List (variant))))
-	    {
-	      innermost_variant_level = false;
-	      break;
-	    }
+	{
+	  innermost_of_unchecked_union = true;
+
+	  for (variant = First_Non_Pragma (Variants (gnat_variant_part));
+	       Present (variant);
+	       variant = Next_Non_Pragma (variant))
+	    if (Present (Component_List (variant))
+		&& Present (Variant_Part (Component_List (variant))))
+	      {
+		innermost_of_unchecked_union = false;
+		break;
+	      }
+	}
 
       /* We build the variants in two passes.  The bulk of the work is done in
 	 the first pass, that is to say translating the GNAT nodes, building
@@ -8267,17 +8285,17 @@ components_to_record (Node_Id gnat_component_list, Entity_Id gnat_record_type,
 	     the outer variant, so as to flatten the rep-ed layout as much as
 	     possible, the reason being that we cannot do any flattening when
 	     a subtype statically selects a variant later on, for example for
-	     an aggregate.  */
+	     an aggregate; in that case, we force a packed layout because the
+	     moved fields may overlap with packed bit-fields.  */
 	  has_rep
 	    = components_to_record (Component_List (variant), gnat_record_type,
-				    NULL_TREE, gnu_variant_type, packed,
+				    NULL_TREE, gnu_variant_type, packed ||
+				    (all_rep && innermost_of_unchecked_union),
 				    definition, !all_rep_and_size, all_rep,
 				    unchecked_union, true, needs_xv_encodings,
 				    true, this_first_free_pos,
 				    (all_rep || this_first_free_pos)
-				    && !(unchecked_union
-				         && gnu_field_list
-					 && innermost_variant_level)
+				    && !innermost_of_unchecked_union
 				    ? NULL : &gnu_rep_list);
 
 	  /* Translate the qualifier and annotate the GNAT node.  */

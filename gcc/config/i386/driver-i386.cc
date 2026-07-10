@@ -658,18 +658,24 @@ const char *host_detect_local_cpu (int argc, const char **argv)
 		}
 	      else if (has_feature (FEATURE_AVX))
 		{
-		  /* Assume Panther Lake.  */
-		  if (has_feature (FEATURE_PREFETCHI))
-		    cpu = "pantherlake";
 		  /* Assume Clearwater Forest.  */
-		  else if (has_feature (FEATURE_USER_MSR))
+		  if (has_feature (FEATURE_USER_MSR))
 		    cpu = "clearwaterforest";
-		  /* Assume Arrow Lake S.  */
 		  else if (has_feature (FEATURE_SM3))
-		    cpu = "arrowlake-s";
+		    {
+			if (has_feature (FEATURE_KL))
+			  /* Assume Arrow Lake S.  */
+			  cpu = "arrowlake-s";
+			else
+			  /* Assume Panther Lake.  */
+			  cpu = "pantherlake";
+		    }
 		  /* Assume Sierra Forest.  */
-		  else if (has_feature (FEATURE_AVXVNNIINT8))
+		  else if (has_feature (FEATURE_CLDEMOTE))
 		    cpu = "sierraforest";
+		  /* Assume Arrow Lake.  */
+		  else if (has_feature (FEATURE_AVXVNNIINT8))
+		    cpu = "arrowlake";
 		  /* Assume Alder Lake.  */
 		  else if (has_feature (FEATURE_SERIALIZE))
 		    cpu = "alderlake";
@@ -893,7 +899,8 @@ const char *host_detect_local_cpu (int argc, const char **argv)
 	    if (has_feature (isa_names_table[i].feature))
 	      {
 		if (codegen_x86_64
-		    || isa_names_table[i].feature != FEATURE_UINTR)
+		    || (isa_names_table[i].feature != FEATURE_UINTR
+			&& isa_names_table[i].feature != FEATURE_APX_F))
 		  options = concat (options, " ",
 				    isa_names_table[i].option, NULL);
 	      }

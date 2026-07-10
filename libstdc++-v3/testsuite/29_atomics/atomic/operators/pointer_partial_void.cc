@@ -1,6 +1,7 @@
 // { dg-do run { target { c++11_only || c++14_only } } }
 // { dg-require-atomic-builtins "" }
 // { dg-require-effective-target hosted }
+// { dg-additional-options "-Wsystem-headers" }
 
 // Copyright (C) 2012-2024 Free Software Foundation, Inc.
 //
@@ -68,3 +69,4 @@ int main(void)
 
   return 0;
 }
+// { dg-warning "invalid application of 'sizeof' to a void type" "" { target *-*-* } 0 }

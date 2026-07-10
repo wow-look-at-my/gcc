@@ -1730,6 +1730,7 @@ ifeq ($(strip $(filter-out %86 freebsd%,$(target_cpu) $(target_os))),)
   $(TRASYM_DWARF_UNIX_PAIRS) \
   $(ATOMICS_TARGET_PAIRS) \
   $(X86_TARGET_PAIRS) \
+  s-dorepr.adb<libgnat/s-dorepr__freebsd.adb \
   system.ads<libgnat/system-freebsd.ads
 
   GNATLIB_SHARED = gnatlib-shared-dual
@@ -1841,6 +1842,7 @@ ifeq ($(strip $(filter-out s390% linux%,$(target_cpu) $(target_os))),)
   EXTRA_GNATRTL_TASKING_OBJS=s-linux.o
   EH_MECHANISM=-gcc
   THREADSLIB = -lpthread
+  MISCLIB = -ldl
   GNATLIB_SHARED = gnatlib-shared-dual
   LIBRARY_VERSION := $(LIB_VERSION)
 endif
@@ -2238,15 +2240,18 @@ ifeq ($(strip $(filter-out powerpc% linux%,$(target_cpu) $(target_os))),)
   system.ads<libgnat/system-linux-ppc.ads
 
   ifeq ($(strip $(filter-out powerpc64%,$(target_cpu))),)
-    ifneq ($(strip $(MULTISUBDIR)),/32)
+    ifeq ($(strip $(MULTISUBDIR)),/32)
+      LIBGNAT_TARGET_PAIRS += s-atopri.ads<libgnat/s-atopri__32.ads
+    else
       LIBGNAT_TARGET_PAIRS += $(GNATRTL_128BIT_PAIRS)
       EXTRA_GNATRTL_NONTASKING_OBJS += $(GNATRTL_128BIT_OBJS)
     endif
   else
-    LIBGNAT_TARGET_PAIRS += s-atopri.ads<libgnat/s-atopri__32.ads
     ifeq ($(strip $(MULTISUBDIR)),/64)
       LIBGNAT_TARGET_PAIRS += $(GNATRTL_128BIT_PAIRS)
       EXTRA_GNATRTL_NONTASKING_OBJS += $(GNATRTL_128BIT_OBJS)
+    else
+      LIBGNAT_TARGET_PAIRS += s-atopri.ads<libgnat/s-atopri__32.ads
     endif
   endif
 
@@ -2289,6 +2294,7 @@ ifeq ($(strip $(filter-out arm% linux-gnueabi%,$(target_cpu) $(target_os))),)
   EXTRA_GNATRTL_TASKING_OBJS=s-linux.o
   EH_MECHANISM=-arm
   THREADSLIB = -lpthread
+  MISCLIB = -ldl
   GNATLIB_SHARED = gnatlib-shared-dual
   GMEM_LIB = gmemlib
   LIBRARY_VERSION := $(LIB_VERSION)
@@ -2355,7 +2361,9 @@ ifeq ($(strip $(filter-out sparc% linux%,$(target_cpu) $(target_os))),)
   system.ads<libgnat/system-linux-sparc.ads
 
   ifeq ($(strip $(filter-out sparc64 sparcv9,$(target_cpu))),)
-    ifneq ($(strip $(MULTISUBDIR)),/32)
+    ifeq ($(strip $(MULTISUBDIR)),/32)
+      LIBGNAT_TARGET_PAIRS += s-atopri.ads<libgnat/s-atopri__32.ads
+    else
       LIBGNAT_TARGET_PAIRS += $(GNATRTL_128BIT_PAIRS)
       EXTRA_GNATRTL_NONTASKING_OBJS += $(GNATRTL_128BIT_OBJS)
     endif
@@ -2363,6 +2371,8 @@ ifeq ($(strip $(filter-out sparc% linux%,$(target_cpu) $(target_os))),)
     ifeq ($(strip $(MULTISUBDIR)),/64)
       LIBGNAT_TARGET_PAIRS += $(GNATRTL_128BIT_PAIRS)
       EXTRA_GNATRTL_NONTASKING_OBJS += $(GNATRTL_128BIT_OBJS)
+    else
+      LIBGNAT_TARGET_PAIRS += s-atopri.ads<libgnat/s-atopri__32.ads
     endif
   endif
 
@@ -2645,6 +2655,7 @@ ifeq ($(strip $(filter-out %x32 linux%,$(target_cpu) $(target_os))),)
   EXTRA_GNATRTL_TASKING_OBJS=s-linux.o a-exetim.o
   EH_MECHANISM=-gcc
   THREADSLIB=-lpthread -lrt
+  MISCLIB = -ldl
   GNATLIB_SHARED=gnatlib-shared-dual
   GMEM_LIB = gmemlib
   LIBRARY_VERSION := $(LIB_VERSION)

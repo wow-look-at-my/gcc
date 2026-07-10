@@ -246,15 +246,15 @@ build_integer_cst (dinteger_t value, tree type)
 tree
 build_float_cst (const real_t &value, Type *totype)
 {
-  real_t new_value;
+  real_value new_value;
   TypeBasic *tb = totype->isTypeBasic ();
 
   gcc_assert (tb != NULL);
 
   tree type_node = build_ctype (tb);
-  real_convert (&new_value.rv (), TYPE_MODE (type_node), &value.rv ());
+  real_convert (&new_value, TYPE_MODE (type_node), &value.rv ());
 
-  return build_real (type_node, new_value.rv ());
+  return build_real (type_node, new_value);
 }
 
 /* Returns the .length component from the D dynamic array EXP.  */
@@ -665,6 +665,11 @@ build_address (tree exp)
   if (TREE_CODE (exp) == CONST_DECL)
     exp = DECL_INITIAL (exp);
 
+  /* Type `noreturn' has no storage, return `null' for the expression.  */
+  if (DECL_P (exp) && TREE_CODE (exp) != FIELD_DECL
+      && TYPE_MAIN_VARIANT (TREE_TYPE (exp)) == noreturn_type_node)
+    return compound_expr (init, null_pointer_node);
+
   /* Some expression lowering may request an address of a compile-time constant,
      or other non-lvalue expression.  Make sure it is assigned to a location we
      can reference.  */
@@ -704,8 +709,12 @@ d_mark_addressable (tree exp, bool complain)
 {
   switch (TREE_CODE (exp))
     {
-    case ADDR_EXPR:
     case COMPONENT_REF:
+      if (complain && DECL_BIT_FIELD (TREE_OPERAND (exp, 1)))
+	error ("cannot take address of bit-field %qD", TREE_OPERAND (exp, 1));
+
+      /* Fall through.  */
+    case ADDR_EXPR:
     case ARRAY_REF:
     case REALPART_EXPR:
     case IMAGPART_EXPR:
@@ -2298,7 +2307,7 @@ d_build_call (TypeFunction *tf, tree callable, tree object,
 
 	  /* Type `noreturn` is a terminator, as no other arguments can possibly
 	     be evaluated after it.  */
-	  if (TREE_TYPE (targ) == noreturn_type_node)
+	  if (TYPE_MAIN_VARIANT (TREE_TYPE (targ)) == noreturn_type_node)
 	    noreturn_call = true;
 
 	  vec_safe_push (args, targ);
@@ -2318,7 +2327,12 @@ d_build_call (TypeFunction *tf, tree callable, tree object,
       unsigned int ix;
 
       FOR_EACH_VEC_SAFE_ELT (args, ix, arg)
-	saved_args = compound_expr (saved_args, arg);
+	{
+	  saved_args = compound_expr (saved_args, arg);
+
+	  if (TYPE_MAIN_VARIANT (TREE_TYPE (arg)) == noreturn_type_node)
+	    break;
+	}
 
       /* Add a stub result type for the expression.  */
       tree result = build_zero_cst (TREE_TYPE (ctype));

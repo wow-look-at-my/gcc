@@ -82,10 +82,16 @@ cc1-checksum.cc : build/genchecksum$(build_exeext) checksum-options \
 	  $(srcdir)/../move-if-change cc1-checksum.cc.tmp cc1-checksum.cc; \
 	fi
 
-cc1$(exeext): $(C_OBJS) cc1-checksum.o $(BACKEND) $(LIBDEPS)
+# $(GAS_LIBS) (defined in cp/Make-lang.in) resolves gas_assemble_buffer, which
+# toplev.o references unconditionally (in shared libbackend.a) for
+# -fintegrated-as.  Every front end that links the backend must resolve the
+# symbol at link time, even though only cc1plus exercises the integrated
+# assembler at run time.
+cc1$(exeext): $(C_OBJS) cc1-checksum.o $(BACKEND) $(LIBDEPS) $(GAS_DEPS)
 	@$(call LINK_PROGRESS,$(INDEX.c),start)
 	+$(LLINKER) $(ALL_LINKERFLAGS) $(LDFLAGS) -o $@ $(C_OBJS) \
-	  cc1-checksum.o $(BACKEND) $(LIBS) $(BACKENDLIBS)
+	  cc1-checksum.o $(BACKEND) $(LIBS) $(BACKENDLIBS) $(GAS_LIBS) \
+	  $(TCMALLOC_LIBS)
 	@$(call LINK_PROGRESS,$(INDEX.c),end)
 
 components_in_prev = "bfd opcodes binutils fixincludes gas gcc gmp mpfr mpc isl gold intl ld libbacktrace libcpp libcody libdecnumber libiberty libiberty-linker-plugin libiconv zlib lto-plugin libctf libsframe"

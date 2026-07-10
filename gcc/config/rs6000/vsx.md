@@ -4798,12 +4798,14 @@
 		     (const_int 1) (const_int 5)])))]
   "VECTOR_MEM_VSX_P (<MODE>mode)"
 {
-  rtx (*fun) (rtx, rtx, rtx);
-  fun = BYTES_BIG_ENDIAN ? gen_altivec_vmrghw_direct_<mode>
-			 : gen_altivec_vmrglw_direct_<mode>;
-  if (!BYTES_BIG_ENDIAN)
-    std::swap (operands[1], operands[2]);
-  emit_insn (fun (operands[0], operands[1], operands[2]));
+  if (BYTES_BIG_ENDIAN)
+    emit_insn (gen_altivec_vmrghw_direct_v4si_be (operands[0],
+						  operands[1],
+						  operands[2]));
+  else
+    emit_insn (gen_altivec_vmrglw_direct_v4si_le (operands[0],
+						  operands[2],
+						  operands[1]));
   DONE;
 }
   [(set_attr "type" "vecperm")])
@@ -4818,12 +4820,14 @@
 		     (const_int 3) (const_int 7)])))]
   "VECTOR_MEM_VSX_P (<MODE>mode)"
 {
-  rtx (*fun) (rtx, rtx, rtx);
-  fun = BYTES_BIG_ENDIAN ? gen_altivec_vmrglw_direct_<mode>
-			 : gen_altivec_vmrghw_direct_<mode>;
-  if (!BYTES_BIG_ENDIAN)
-    std::swap (operands[1], operands[2]);
-  emit_insn (fun (operands[0], operands[1], operands[2]));
+  if (BYTES_BIG_ENDIAN)
+    emit_insn (gen_altivec_vmrglw_direct_v4si_be (operands[0],
+						  operands[1],
+						  operands[2]));
+  else
+    emit_insn (gen_altivec_vmrghw_direct_v4si_le (operands[0],
+						  operands[2],
+						  operands[1]));
   DONE;
 }
   [(set_attr "type" "vecperm")])
@@ -5128,7 +5132,7 @@
 	(unspec:V2DI_DI
 	  [(match_operand:IEEE128 1 "altivec_register_operand" "v")]
 	 UNSPEC_VSX_SXEXPDP))]
-  "TARGET_P9_VECTOR"
+  "TARGET_FLOAT128_HW"
   "xsxexpqp %0,%1"
   [(set_attr "type" "vecmove")])
 
@@ -5147,7 +5151,7 @@
 	(unspec:VEC_TI [(match_operand:IEEE128 1
 			    "altivec_register_operand" "v")]
 	 UNSPEC_VSX_SXSIG))]
-  "TARGET_P9_VECTOR"
+  "TARGET_FLOAT128_HW"
   "xsxsigqp %0,%1"
   [(set_attr "type" "vecmove")])
 
@@ -5167,7 +5171,7 @@
 	 [(match_operand:IEEE128 1 "altivec_register_operand" "v")
 	  (match_operand:DI 2 "altivec_register_operand" "v")]
 	 UNSPEC_VSX_SIEXPQP))]
-  "TARGET_P9_VECTOR"
+  "TARGET_FLOAT128_HW"
   "xsiexpqp %0,%1,%2"
   [(set_attr "type" "vecmove")])
 
@@ -5179,7 +5183,7 @@
 			 (match_operand:V2DI_DI 2
 			  "altivec_register_operand" "v")]
 	 UNSPEC_VSX_SIEXPQP))]
-  "TARGET_P9_VECTOR"
+  "TARGET_FLOAT128_HW"
   "xsiexpqp %0,%1,%2"
   [(set_attr "type" "vecmove")])
 
@@ -5249,7 +5253,7 @@
    (set (match_operand:SI 0 "register_operand" "=r")
 	(CMP_TEST:SI (match_dup 3)
 		     (const_int 0)))]
-  "TARGET_P9_VECTOR"
+  "TARGET_FLOAT128_HW"
 {
   if (<CODE> == UNORDERED && !HONOR_NANS (<MODE>mode))
     {
@@ -5267,7 +5271,7 @@
 		          (match_operand:IEEE128 2 "altivec_register_operand" "v")]
 	  UNSPEC_VSX_SCMPEXPQP)
 	 (match_operand:SI 3 "zero_constant" "j")))]
-  "TARGET_P9_VECTOR"
+  "TARGET_FLOAT128_HW"
   "xscmpexpqp %0,%1,%2"
   [(set_attr "type" "fpcompare")])
 
@@ -5325,7 +5329,7 @@
    (set (match_operand:SI 0 "register_operand" "=r")
 	(lt:SI (match_dup 2)
 	       (const_int 0)))]
-  "TARGET_P9_VECTOR"
+  "TARGET_FLOAT128_HW"
 {
   operands[2] = gen_reg_rtx (CCFPmode);
 })

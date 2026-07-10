@@ -191,6 +191,8 @@ lvalue_kind (const_tree ref)
       return op1_lvalue_kind;
 
     case STRING_CST:
+      return clk_ordinary | clk_mergeable;
+
     case COMPOUND_LITERAL_EXPR:
       return clk_ordinary;
 
@@ -210,6 +212,10 @@ lvalue_kind (const_tree ref)
 	  && DECL_LANG_SPECIFIC (ref)
 	  && DECL_IN_AGGR_P (ref))
 	return clk_none;
+
+      if (TREE_CODE (ref) == CONST_DECL || DECL_MERGEABLE (ref))
+	return clk_ordinary | clk_mergeable;
+
       /* FALLTHRU */
     case INDIRECT_REF:
     case ARROW_EXPR:
@@ -275,7 +281,10 @@ lvalue_kind (const_tree ref)
       /* We expect to see unlowered MODOP_EXPRs only during
 	 template processing.  */
       gcc_assert (processing_template_decl);
-      return clk_ordinary;
+      if (CLASS_TYPE_P (TREE_TYPE (TREE_OPERAND (ref, 0))))
+	goto default_;
+      else
+	return clk_ordinary;
 
     case MODIFY_EXPR:
     case TYPEID_EXPR:
@@ -404,6 +413,94 @@ bitfield_p (const_tree ref)
   return (lvalue_kind (ref) & clk_bitfield);
 }
 
+/* True if REF is a glvalue with a unique address, excluding mergeable glvalues
+   such as string constants.  */
+
+bool
+non_mergeable_glvalue_p (const_tree ref)
+{
+  auto kind = lvalue_kind (ref);
+  return (kind != clk_none
+	  && !(kind & (clk_class|clk_mergeable)));
+}
+
+/* C++-specific version of stabilize_reference for bit-fields and
+   DECL_PACKED fields.  We can't bind a reference to those.  */
+
+static tree
+cp_stabilize_bitfield_reference (tree ref)
+{
+  tree op1, op2, op3;
+  STRIP_ANY_LOCATION_WRAPPER (ref);
+  switch (TREE_CODE (ref))
+    {
+    case VAR_DECL:
+    case PARM_DECL:
+    case RESULT_DECL:
+    CASE_CONVERT:
+    case FLOAT_EXPR:
+    case FIX_TRUNC_EXPR:
+    case INDIRECT_REF:
+    case COMPONENT_REF:
+    case BIT_FIELD_REF:
+    case ARRAY_REF:
+    case ARRAY_RANGE_REF:
+    case ERROR_MARK:
+    case REALPART_EXPR:
+    case IMAGPART_EXPR:
+    default:
+      break;
+    case COMPOUND_EXPR:
+      op2 = cp_stabilize_bitfield_reference (TREE_OPERAND (ref, 1));
+      if (op2 == TREE_OPERAND (ref, 1))
+	return ref;
+      op1 = TREE_OPERAND (ref, 0);
+      if (TREE_SIDE_EFFECTS (op1))
+	{
+	  if (VOID_TYPE_P (TREE_TYPE (op1)))
+	    op1 = save_expr (op1);
+	  else
+	    {
+	      op1 = build2 (COMPOUND_EXPR, void_type_node, op1,
+			    void_node);
+	      op1 = save_expr (op1);
+	    }
+	}
+      return build2 (COMPOUND_EXPR, TREE_TYPE (op2), op1, op2);
+    case COND_EXPR:
+      op1 = TREE_OPERAND (ref, 0);
+      op2 = TREE_OPERAND (ref, 1);
+      op3 = TREE_OPERAND (ref, 2);
+      if (op2 && TREE_CODE (op2) != THROW_EXPR)
+	op2 = cp_stabilize_bitfield_reference (op2);
+      if (TREE_CODE (op3) != THROW_EXPR)
+	op3 = cp_stabilize_bitfield_reference (op3);
+      if (op2 == NULL_TREE)
+	op1 = cp_stabilize_bitfield_reference (op1);
+      if (op1 == TREE_OPERAND (ref, 0)
+	  && op2 == TREE_OPERAND (ref, 1)
+	  && op3 == TREE_OPERAND (ref, 2))
+	return ref;
+      if (op2 != NULL_TREE && TREE_SIDE_EFFECTS (op1))
+	op1 = save_expr (op1);
+      return build3 (COND_EXPR, TREE_TYPE (ref), op1, op2, op3);
+    case PREINCREMENT_EXPR:
+    case PREDECREMENT_EXPR:
+      op1 = cp_stabilize_bitfield_reference (TREE_OPERAND (ref, 0));
+      if (op1 == TREE_OPERAND (ref, 0))
+	return ref;
+      return build2 (COMPOUND_EXPR, TREE_TYPE (ref),
+		     build2 (TREE_CODE (ref), TREE_TYPE (ref), op1,
+			     TREE_OPERAND (ref, 0)), op1);
+    case PAREN_EXPR:
+      op1 = cp_stabilize_bitfield_reference (TREE_OPERAND (ref, 0));
+      if (op1 == TREE_OPERAND (ref, 0))
+	return ref;
+      return build1 (PAREN_EXPR, TREE_TYPE (ref), op1);
+    }
+  return stabilize_reference (ref);
+}
+
 /* C++-specific version of stabilize_reference.  */
 
 tree
@@ -435,6 +532,8 @@ cp_stabilize_reference (tree ref)
       cp_lvalue_kind kind = lvalue_kind (ref);
       if ((kind & ~clk_class) != clk_none)
 	{
+	  if (kind & (clk_bitfield | clk_packed))
+	    return cp_stabilize_bitfield_reference (ref);
 	  tree type = unlowered_expr_type (ref);
 	  bool rval = !!(kind & clk_rvalueref);
 	  type = cp_build_reference_type (type, rval);
@@ -1604,11 +1703,32 @@ strip_typedefs (tree t, bool *remove_attributes /* = NULL */,
   if (t == TYPE_CANONICAL (t))
     return t;
 
-  if (!(flags & STF_STRIP_DEPENDENT)
-      && dependent_alias_template_spec_p (t, nt_opaque))
-    /* DR 1558: However, if the template-id is dependent, subsequent
-       template argument substitution still applies to the template-id.  */
-    return t;
+  if (typedef_variant_p (t))
+    {
+      if ((flags & STF_USER_VISIBLE)
+	  && !user_facing_original_type_p (t))
+	return t;
+
+      if (alias_template_specialization_p (t, nt_opaque))
+	{
+	  if (dependent_alias_template_spec_p (t, nt_opaque)
+	      && (!(flags & STF_STRIP_DEPENDENT)
+		  || any_dependent_type_attributes_p (DECL_ATTRIBUTES
+						      (TYPE_NAME (t)))))
+	    /* DR 1558: However, if the template-id is dependent, subsequent
+	       template argument substitution still applies to the template-id.  */
+	    return t;
+	}
+      else
+	/* If T is a non-template alias or typedef, we can assume that
+	   instantiating its definition will hit any substitution failure,
+	   so we don't need to retain it here as well.  */
+	flags |= STF_STRIP_DEPENDENT;
+
+      result = strip_typedefs (DECL_ORIGINAL_TYPE (TYPE_NAME (t)),
+			       remove_attributes, flags);
+      goto stripped;
+    }
 
   switch (TREE_CODE (t))
     {
@@ -1802,23 +1922,9 @@ strip_typedefs (tree t, bool *remove_attributes /* = NULL */,
     }
 
   if (!result)
-    {
-      if (typedef_variant_p (t))
-	{
-	  if ((flags & STF_USER_VISIBLE)
-	      && !user_facing_original_type_p (t))
-	    return t;
-	  /* If T is a non-template alias or typedef, we can assume that
-	     instantiating its definition will hit any substitution failure,
-	     so we don't need to retain it here as well.  */
-	  if (!alias_template_specialization_p (t, nt_opaque))
-	    flags |= STF_STRIP_DEPENDENT;
-	  result = strip_typedefs (DECL_ORIGINAL_TYPE (TYPE_NAME (t)),
-				   remove_attributes, flags);
-	}
-      else
-	result = TYPE_MAIN_VARIANT (t);
-    }
+    result = TYPE_MAIN_VARIANT (t);
+
+stripped:
   /*gcc_assert (!typedef_variant_p (result)
 	      || dependent_alias_template_spec_p (result, nt_opaque)
 	      || ((flags & STF_USER_VISIBLE)
@@ -1998,11 +2104,8 @@ strip_typedefs_expr (tree t, bool *remove_attributes, unsigned int flags)
       }
 
     case LAMBDA_EXPR:
+    case STMT_EXPR:
       return t;
-
-    case STATEMENT_LIST:
-      error ("statement-expression in a constant expression");
-      return error_mark_node;
 
     default:
       break;
@@ -2693,6 +2796,15 @@ cxx_printable_name_internal (tree decl, int v, bool translate)
       /* yes, so return it.  */
       return print_ring[i];
 
+  const char *ret = lang_decl_name (decl, v, translate);
+
+  /* The lang_decl_name call could have called this function recursively,
+     so check again.  */
+  for (i = 0; i < PRINT_RING_SIZE; i++)
+    if (uid_ring[i] == DECL_UID (decl) && translate == trans_ring[i])
+      /* yes, so return it.  */
+      return print_ring[i];
+
   if (++ring_counter == PRINT_RING_SIZE)
     ring_counter = 0;
 
@@ -2712,7 +2824,7 @@ cxx_printable_name_internal (tree decl, int v, bool translate)
 
   free (print_ring[ring_counter]);
 
-  print_ring[ring_counter] = xstrdup (lang_decl_name (decl, v, translate));
+  print_ring[ring_counter] = xstrdup (ret);
   uid_ring[ring_counter] = DECL_UID (decl);
   trans_ring[ring_counter] = translate;
   return print_ring[ring_counter];
@@ -3013,15 +3125,7 @@ no_linkage_check (tree t, bool relaxed_p)
       /* Only treat unnamed types as having no linkage if they're at
 	 namespace scope.  This is core issue 966.  */
       if (TYPE_UNNAMED_P (t) && TYPE_NAMESPACE_SCOPE_P (t))
-	{
-	  if (relaxed_p
-	      && TREE_PUBLIC (CP_TYPE_CONTEXT (t))
-	      && module_maybe_has_cmi_p ())
-	    /* This type could possibly be accessed outside this TU.  */
-	    return NULL_TREE;
-	  else
-	    return t;
-	}
+	return t;
 
       for (r = CP_TYPE_CONTEXT (t); ; )
 	{
@@ -5685,6 +5789,7 @@ cp_walk_subtrees (tree *tp, int *walk_subtrees_p, walk_tree_fn func,
 		  && !TREE_STATIC (TREE_OPERAND (t, 0)))))
 	{
 	  tree decl = TREE_OPERAND (t, 0);
+	  WALK_SUBTREE (TREE_TYPE (decl));
 	  WALK_SUBTREE (DECL_INITIAL (decl));
 	  WALK_SUBTREE (DECL_SIZE (decl));
 	  WALK_SUBTREE (DECL_SIZE_UNIT (decl));
@@ -5733,6 +5838,15 @@ cp_walk_subtrees (tree *tp, int *walk_subtrees_p, walk_tree_fn func,
     case STATIC_ASSERT:
       WALK_SUBTREE (STATIC_ASSERT_CONDITION (t));
       WALK_SUBTREE (STATIC_ASSERT_MESSAGE (t));
+      break;
+
+    case INTEGER_TYPE:
+      if (processing_template_decl)
+	{
+	  /* Removed from walk_type_fields in r119481.  */
+	  WALK_SUBTREE (TYPE_MIN_VALUE (t));
+	  WALK_SUBTREE (TYPE_MAX_VALUE (t));
+	}
       break;
 
     default:
@@ -5949,7 +6063,11 @@ decl_storage_duration (tree decl)
    *INITP) an expression that will perform the pre-evaluation.  The
    value returned by this function is a side-effect free expression
    equivalent to the pre-evaluated expression.  Callers must ensure
-   that *INITP is evaluated before EXP.  */
+   that *INITP is evaluated before EXP.
+
+   Note that if EXPR is a glvalue, the return value is a glvalue denoting the
+   same address; this function does not guard against modification of the
+   stored value like save_expr or get_target_expr do.  */
 
 tree
 stabilize_expr (tree exp, tree* initp)
@@ -6350,11 +6468,11 @@ test_lvalue_kind ()
   tree string_lit = build_string (4, "foo");
   TREE_TYPE (string_lit) = char_array_type_node;
   string_lit = fix_string_type (string_lit);
-  ASSERT_EQ (clk_ordinary, lvalue_kind (string_lit));
+  ASSERT_EQ (clk_ordinary|clk_mergeable, lvalue_kind (string_lit));
 
   tree wrapped_string_lit = maybe_wrap_with_location (string_lit, loc);
   ASSERT_TRUE (location_wrapper_p (wrapped_string_lit));
-  ASSERT_EQ (clk_ordinary, lvalue_kind (wrapped_string_lit));
+  ASSERT_EQ (clk_ordinary|clk_mergeable, lvalue_kind (wrapped_string_lit));
 
   tree parm = build_decl (UNKNOWN_LOCATION, PARM_DECL,
 			  get_identifier ("some_parm"),

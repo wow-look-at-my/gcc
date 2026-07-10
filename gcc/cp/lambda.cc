@@ -58,7 +58,13 @@ build_lambda_object (tree lambda_expr)
   vec<constructor_elt, va_gc> *elts = NULL;
   tree node, expr, type;
 
-  if (processing_template_decl || lambda_expr == error_mark_node)
+  if (processing_template_decl && !in_template_context
+      && current_binding_level->requires_expression)
+    /* As in cp_parser_lambda_expression, don't get confused by
+       cp_parser_requires_expression setting processing_template_decl.  In that
+       case we want to return the result of finish_compound_literal, to avoid
+       tsubst_lambda_expr.  */;
+  else if (processing_template_decl || lambda_expr == error_mark_node)
     return lambda_expr;
 
   /* Make sure any error messages refer to the lambda-introducer.  */
@@ -223,7 +229,8 @@ lambda_capture_field_type (tree expr, bool explicit_init_p,
 	   outermost CV qualifiers of EXPR.  */
 	type = build_reference_type (type);
       if (uses_parameter_packs (expr))
-	/* Stick with 'auto' even if the type could be deduced.  */;
+	/* Stick with 'auto' even if the type could be deduced.  */
+	TEMPLATE_TYPE_PARAMETER_PACK (auto_node) = true;
       else
 	type = do_auto_deduction (type, expr, auto_node);
     }
@@ -949,9 +956,8 @@ maybe_resolve_dummy (tree object, bool add_capture_p)
 /* When parsing a generic lambda containing an argument-dependent
    member function call we defer overload resolution to instantiation
    time.  But we have to know now whether to capture this or not.
-   Do that if FNS contains any non-static fns.
-   The std doesn't anticipate this case, but I expect this to be the
-   outcome of discussion.  */
+   Do that if FNS contains any non-static fns as per
+   [expr.prim.lambda.capture]/7.1.  */
 
 void
 maybe_generic_this_capture (tree object, tree fns)
@@ -970,7 +976,7 @@ maybe_generic_this_capture (tree object, tree fns)
 	for (lkp_iterator iter (fns); iter; ++iter)
 	  if (((!id_expr && TREE_CODE (*iter) != USING_DECL)
 	       || TREE_CODE (*iter) == TEMPLATE_DECL)
-	      && DECL_IOBJ_MEMBER_FUNCTION_P (*iter))
+	      && DECL_OBJECT_MEMBER_FUNCTION_P (*iter))
 	    {
 	      /* Found a non-static member.  Capture this.  */
 	      lambda_expr_this_capture (lam, /*maybe*/-1);
@@ -996,12 +1002,9 @@ current_nonlambda_function (void)
 tree
 nonlambda_method_basetype (void)
 {
-  if (!current_class_ref)
-    return NULL_TREE;
-
   tree type = current_class_type;
   if (!type || !LAMBDA_TYPE_P (type))
-    return type;
+    return current_class_ref ? type : NULL_TREE;
 
   while (true)
     {

@@ -76,7 +76,8 @@ add_stmt_to_eh_lp_fn (struct function *ifun, gimple *t, int num)
   if (!get_eh_throw_stmt_table (ifun))
     set_eh_throw_stmt_table (ifun, hash_map<gimple *, int>::create_ggc (31));
 
-  gcc_assert (!get_eh_throw_stmt_table (ifun)->put (t, num));
+  bool existed = get_eh_throw_stmt_table (ifun)->put (t, num);
+  gcc_assert (!existed);
 }
 
 /* Add statement T in the current function (cfun) to EH landing pad NUM.  */
@@ -950,7 +951,7 @@ static inline geh_else *
 get_eh_else (gimple_seq finally)
 {
   gimple *x = gimple_seq_first_stmt (finally);
-  if (gimple_code (x) == GIMPLE_EH_ELSE)
+  if (x && gimple_code (x) == GIMPLE_EH_ELSE)
     {
       gcc_assert (gimple_seq_singleton_p (finally));
       return as_a <geh_else *> (x);
@@ -1024,8 +1025,9 @@ honor_protect_cleanup_actions (struct leh_state *outer_state,
 	 terminate before we get to it, so strip it away before adding the
 	 MUST_NOT_THROW filter.  */
       gimple_stmt_iterator gsi = gsi_start (finally);
-      gimple *x = gsi_stmt (gsi);
-      if (gimple_code (x) == GIMPLE_TRY
+      gimple *x = !gsi_end_p (gsi) ? gsi_stmt (gsi) : NULL;
+      if (x
+	  && gimple_code (x) == GIMPLE_TRY
 	  && gimple_try_kind (x) == GIMPLE_TRY_CATCH
 	  && gimple_try_catch_is_cleanup (x))
 	{
@@ -2731,11 +2733,16 @@ tree_could_trap_p (tree expr)
 	  if (TREE_CODE (base) == STRING_CST)
 	    return maybe_le (TREE_STRING_LENGTH (base), off);
 	  tree size = DECL_SIZE_UNIT (base);
+	  tree refsz = TYPE_SIZE_UNIT (TREE_TYPE (expr));
 	  if (size == NULL_TREE
+	      || refsz == NULL_TREE
 	      || !poly_int_tree_p (size)
-	      || maybe_le (wi::to_poly_offset (size), off))
+	      || !poly_int_tree_p (refsz)
+	      || maybe_le (wi::to_poly_offset (size), off)
+	      || maybe_gt (off + wi::to_poly_offset (refsz),
+			   wi::to_poly_offset (size)))
 	    return true;
-	  /* Now we are sure the first byte of the access is inside
+	  /* Now we are sure the whole base of the access is inside
 	     the object.  */
 	  return false;
 	}
@@ -3733,6 +3740,18 @@ sink_clobbers (basic_block bb,
     }
   if (first_sunk)
     {
+      /* If there isn't a single predecessor but no virtual PHI node
+	 create one and arrange for virtual operands to be renamed as
+	 we cannot be sure all incoming edges will updated from sinking
+	 something.  */
+      if (!vphi && !single_pred_p (succbb))
+	{
+	  vphi = create_phi_node (gimple_vop (cfun), succbb);
+	  FOR_EACH_EDGE (e, ei, succbb->preds)
+	    add_phi_arg (vphi, gimple_vop (cfun), e, UNKNOWN_LOCATION);
+	  mark_virtual_operands_for_renaming (cfun);
+	  todo |= TODO_update_ssa_only_virtuals;
+	}
       /* Adjust virtual operands if we sunk across a virtual PHI.  */
       if (vphi)
 	{
@@ -3751,14 +3770,6 @@ sink_clobbers (basic_block bb,
 	  SET_USE (PHI_ARG_DEF_PTR_FROM_EDGE (vphi, succe),
 		   gimple_vuse (last_sunk));
 	  SET_USE (gimple_vuse_op (last_sunk), phi_def);
-	}
-      /* If there isn't a single predecessor but no virtual PHI node
-         arrange for virtual operands to be renamed.  */
-      else if (!single_pred_p (succbb)
-	       && TREE_CODE (gimple_vuse (last_sunk)) == SSA_NAME)
-	{
-	  mark_virtual_operand_for_renaming (gimple_vuse (last_sunk));
-	  todo |= TODO_update_ssa_only_virtuals;
 	}
     }
 

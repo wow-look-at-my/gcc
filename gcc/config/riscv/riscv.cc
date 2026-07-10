@@ -681,6 +681,15 @@ riscv_min_arithmetic_precision (void)
   return 32;
 }
 
+/* Get the arch string from an options object.  */
+
+template <class T>
+static const char *
+get_arch_str (const T *opts)
+{
+  return opts->x_riscv_arch_string;
+}
+
 template <class T>
 static const char *
 get_tune_str (const T *opts)
@@ -1397,7 +1406,9 @@ riscv_valid_lo_sum_p (enum riscv_symbol_type sym_type, machine_mode mode,
       align = (SYMBOL_REF_DECL (x)
 	       ? DECL_ALIGN (SYMBOL_REF_DECL (x))
 	       : 1);
-      size = (SYMBOL_REF_DECL (x) && DECL_SIZE (SYMBOL_REF_DECL (x))
+      size = (SYMBOL_REF_DECL (x)
+	      && DECL_SIZE (SYMBOL_REF_DECL (x))
+	      && tree_fits_uhwi_p (DECL_SIZE (SYMBOL_REF_DECL (x)))
 	      ? tree_to_uhwi (DECL_SIZE (SYMBOL_REF_DECL (x)))
 	      : 2*BITS_PER_WORD);
     }
@@ -2239,14 +2250,12 @@ riscv_legitimize_tls_address (rtx loc)
     case TLS_MODEL_GLOBAL_DYNAMIC:
       if (TARGET_TLSDESC)
 	{
-	  static unsigned seqno;
 	  tp = gen_rtx_REG (Pmode, THREAD_POINTER_REGNUM);
 	  a0 = gen_rtx_REG (Pmode, GP_ARG_FIRST);
 	  dest = gen_reg_rtx (Pmode);
 
-	  emit_insn (gen_tlsdesc (Pmode, loc, GEN_INT (seqno)));
+	  emit_insn (gen_tlsdesc (Pmode, loc));
 	  emit_insn (gen_add3_insn (dest, a0, tp));
-	  seqno++;
 	}
       else
 	{
@@ -2414,7 +2423,7 @@ riscv_move_integer (rtx temp, rtx dest, HOST_WIDE_INT value,
   struct riscv_integer_op codes[RISCV_MAX_INTEGER_OPS];
   machine_mode mode;
   int i, num_ops;
-  rtx x;
+  rtx x = NULL_RTX;
 
   mode = GET_MODE (dest);
   /* We use the original mode for the riscv_build_integer call, because HImode
@@ -2786,6 +2795,45 @@ riscv_v_adjust_scalable_frame (rtx target, poly_int64 offset, bool epilogue)
   REG_NOTES (insn) = dwarf;
 }
 
+/* Take care below subreg const_poly_int move:
+
+   1. (set (subreg:DI (reg:TI 237) 8)
+	   (subreg:DI (const_poly_int:TI [4, 2]) 8))
+      =>
+      (set (subreg:DI (reg:TI 237) 8)
+	   (const_int 0)) */
+
+static bool
+riscv_legitimize_subreg_const_poly_move (machine_mode mode, rtx dest, rtx src)
+{
+  gcc_assert (SUBREG_P (src) && CONST_POLY_INT_P (SUBREG_REG (src)));
+  gcc_assert (SUBREG_BYTE (src).is_constant ());
+
+  int byte_offset = SUBREG_BYTE (src).to_constant ();
+  rtx const_poly = SUBREG_REG (src);
+  machine_mode subreg_mode = GET_MODE (const_poly);
+
+  if (subreg_mode != TImode) /* Only TImode is needed for now.  */
+    return false;
+
+  if (byte_offset == 8)
+    {
+      /* The const_poly_int cannot exceed int64, just set zero here.  */
+      emit_move_insn (dest, CONST0_RTX (mode));
+      return true;
+    }
+
+  /* The below transform will be covered in somewhere else.
+     Thus, ignore this here.
+     (set (subreg:DI (reg:TI 237) 0)
+	  (subreg:DI (const_poly_int:TI [4, 2]) 0))
+     =>
+     (set (subreg:DI (reg:TI 237) 0)
+	  (const_poly_int:DI [4, 2])) */
+
+  return false;
+}
+
 /* If (set DEST SRC) is not a valid move instruction, emit an equivalent
    sequence that is valid.  */
 
@@ -2839,6 +2887,11 @@ riscv_legitimize_move (machine_mode mode, rtx dest, rtx src)
 	}
       return true;
     }
+
+  if (SUBREG_P (src) && CONST_POLY_INT_P (SUBREG_REG (src))
+    && riscv_legitimize_subreg_const_poly_move (mode, dest, src))
+    return true;
+
   /* Expand
        (set (reg:DI target) (subreg:DI (reg:V8QI reg) 0))
      Expand this data movement instead of simply forbid it since
@@ -3154,7 +3207,7 @@ riscv_rtx_costs (rtx x, machine_mode mode, int outer_code, int opno ATTRIBUTE_UN
       if (outer_code == INSN
 	  && register_operand (SET_DEST (x), GET_MODE (SET_DEST (x))))
 	{
-	  riscv_rtx_costs (SET_SRC (x), mode, outer_code, opno, total, speed);
+	  riscv_rtx_costs (SET_SRC (x), mode, SET, opno, total, speed);
 	  return true;
 	}
 
@@ -3233,9 +3286,11 @@ riscv_rtx_costs (rtx x, machine_mode mode, int outer_code, int opno ATTRIBUTE_UN
 		    && XEXP (x, 2) == CONST0_RTX (GET_MODE (XEXP (x, 1))))
 		   || (GET_CODE (XEXP (x, 2)) == REG
 		       && XEXP (x, 1) == CONST0_RTX (GET_MODE (XEXP (x, 2))))
-		   || (GET_CODE (XEXP (x, 1)) == REG
+		   || (COMPARISON_P (XEXP (x, 0))
+		       && GET_CODE (XEXP (x, 1)) == REG
 		       && rtx_equal_p (XEXP (x, 1), XEXP (XEXP (x, 0), 0)))
-		   || (GET_CODE (XEXP (x, 1)) == REG
+		   || (COMPARISON_P (XEXP (x, 0))
+		       && GET_CODE (XEXP (x, 1)) == REG
 		       && rtx_equal_p (XEXP (x, 2), XEXP (XEXP (x, 0), 0)))))
 	{
 	  *total = COSTS_N_INSNS (1);
@@ -3543,7 +3598,7 @@ riscv_rtx_costs (rtx x, machine_mode mode, int outer_code, int opno ATTRIBUTE_UN
     case MULT:
       if (float_mode_p)
 	*total = tune_param->fp_mul[mode == DFmode];
-      else if (!TARGET_MUL)
+      else if (!(TARGET_MUL || TARGET_ZMMUL))
 	/* Estimate the cost of a library call.  */
 	*total = COSTS_N_INSNS (speed ? 32 : 6);
       else if (GET_MODE_SIZE (mode).to_constant () > UNITS_PER_WORD)
@@ -4684,8 +4739,9 @@ riscv_expand_conditional_move (rtx dest, rtx op, rtx cons, rtx alt)
       /* reg, reg  */
       else if (REG_P (cons) && REG_P (alt))
 	{
-	  if ((code == EQ && rtx_equal_p (cons, op0))
+	  if (((code == EQ && rtx_equal_p (cons, op0))
 	       || (code == NE && rtx_equal_p (alt, op0)))
+	      && op1 == CONST0_RTX (mode))
 	    {
 	      rtx cond = gen_rtx_fmt_ee (code, GET_MODE (op0), op0, op1);
 	      alt = force_reg (mode, alt);
@@ -6213,41 +6269,74 @@ riscv_print_operand (FILE *file, rtx op, int letter)
       fputs (GET_RTX_NAME (reverse_condition (code)), file);
       break;
 
-    case 'A': {
-      const enum memmodel model = memmodel_base (INTVAL (op));
-      if (riscv_memmodel_needs_amo_acquire (model)
-	  && riscv_memmodel_needs_amo_release (model))
-	fputs (".aqrl", file);
-      else if (riscv_memmodel_needs_amo_acquire (model))
-	fputs (".aq", file);
-      else if (riscv_memmodel_needs_amo_release (model))
-	fputs (".rl", file);
+    case 'A':
+      if (!CONST_INT_P (op))
+	output_operand_lossage ("invalid operand for '%%%c'", letter);
+      else
+	{
+	  const enum memmodel model = memmodel_base (INTVAL (op));
+	  if (riscv_memmodel_needs_amo_acquire (model)
+	      && riscv_memmodel_needs_amo_release (model))
+	    fputs (".aqrl", file);
+	  else if (riscv_memmodel_needs_amo_acquire (model))
+	    fputs (".aq", file);
+	  else if (riscv_memmodel_needs_amo_release (model))
+	    fputs (".rl", file);
+	}
       break;
-    }
 
-    case 'I': {
-      const enum memmodel model = memmodel_base (INTVAL (op));
-      if (TARGET_ZTSO && model != MEMMODEL_SEQ_CST)
-	/* LR ops only have an annotation for SEQ_CST in the Ztso mapping.  */
-	break;
-      else if (model == MEMMODEL_SEQ_CST)
-	fputs (".aqrl", file);
-      else if (riscv_memmodel_needs_amo_acquire (model))
-	fputs (".aq", file);
+    case 'I':
+      if (!CONST_INT_P (op))
+	output_operand_lossage ("invalid operand for '%%%c'", letter);
+      else
+	{
+	  const enum memmodel model = memmodel_base (INTVAL (op));
+	  if (TARGET_ZTSO && model != MEMMODEL_SEQ_CST)
+	    /* LR ops only have an annotation for SEQ_CST in the Ztso mapping.  */
+	    break;
+	  else if (model == MEMMODEL_SEQ_CST)
+	    fputs (".aqrl", file);
+	  else if (riscv_memmodel_needs_amo_acquire (model))
+	    fputs (".aq", file);
+	}
       break;
-    }
 
-    case 'J': {
-      const enum memmodel model = memmodel_base (INTVAL (op));
-      if (TARGET_ZTSO && model == MEMMODEL_SEQ_CST)
-	/* SC ops only have an annotation for SEQ_CST in the Ztso mapping.  */
-	fputs (".rl", file);
-      else if (TARGET_ZTSO)
-	break;
-      else if (riscv_memmodel_needs_amo_release (model))
-	fputs (".rl", file);
+    case 'J':
+      if (!CONST_INT_P (op))
+	output_operand_lossage ("invalid operand for '%%%c'", letter);
+      else
+	{
+	  const enum memmodel model = memmodel_base (INTVAL (op));
+	  if (TARGET_ZTSO && model == MEMMODEL_SEQ_CST)
+	    /* SC ops only have an annotation for SEQ_CST in the Ztso mapping.  */
+	    fputs (".rl", file);
+	  else if (TARGET_ZTSO)
+	    break;
+	  else if (riscv_memmodel_needs_amo_release (model))
+	    fputs (".rl", file);
+	}
       break;
-    }
+
+    case 'L':
+      {
+	const char *ntl_hint = NULL;
+	switch (INTVAL (op))
+	  {
+	  case 0:
+	    ntl_hint = "ntl.all";
+	    break;
+	  case 1:
+	    ntl_hint = "ntl.pall";
+	    break;
+	  case 2:
+	    ntl_hint = "ntl.p1";
+	    break;
+	  }
+
+      if (ntl_hint)
+	asm_fprintf (file, "%s\n\t", ntl_hint);
+      break;
+      }
 
     case 'i':
       if (code != REG)
@@ -6259,32 +6348,44 @@ riscv_print_operand (FILE *file, rtx op, int letter)
       break;
 
     case 'S':
-      {
-	rtx newop = GEN_INT (ctz_hwi (INTVAL (op)));
-	output_addr_const (file, newop);
-	break;
-      }
+      if (!CONST_INT_P (op))
+	output_operand_lossage ("invalid operand for '%%%c'", letter);
+      else
+	{
+	  rtx newop = GEN_INT (ctz_hwi (INTVAL (op)));
+	  output_addr_const (file, newop);
+	}
+      break;
     case 'T':
-      {
-	rtx newop = GEN_INT (ctz_hwi (~INTVAL (op)));
-	output_addr_const (file, newop);
-	break;
-      }
+      if (!CONST_INT_P (op))
+	output_operand_lossage ("invalid operand for '%%%c'", letter);
+      else
+	{
+	  rtx newop = GEN_INT (ctz_hwi (~INTVAL (op)));
+	  output_addr_const (file, newop);
+	}
+      break;
     case 'X':
-      {
-	int ival = INTVAL (op) + 1;
-	rtx newop = GEN_INT (ctz_hwi (ival) + 1);
-	output_addr_const (file, newop);
-	break;
-      }
+      if (!CONST_INT_P (op))
+	output_operand_lossage ("invalid operand for '%%%c'", letter);
+      else
+	{
+	  int ival = INTVAL (op) + 1;
+	  rtx newop = GEN_INT (ctz_hwi (ival) + 1);
+	  output_addr_const (file, newop);
+	}
+      break;
     case 'Y':
-      {
-	unsigned int imm = (UINTVAL (op) & 63);
-	gcc_assert (imm <= 63);
-	rtx newop = GEN_INT (imm);
-	output_addr_const (file, newop);
-	break;
-      }
+      if (!CONST_INT_P (op))
+	output_operand_lossage ("invalid operand for '%%%c'", letter);
+      else
+	{
+	  unsigned int imm = (UINTVAL (op) & 63);
+	  gcc_assert (imm <= 63);
+	  rtx newop = GEN_INT (imm);
+	  output_addr_const (file, newop);
+	}
+      break;
     default:
       switch (code)
 	{
@@ -7715,52 +7816,6 @@ riscv_adjust_libcall_cfi_epilogue ()
   return dwarf;
 }
 
-/* return true if popretz pattern can be matched.
-   set (reg 10 a0) (const_int 0)
-   use (reg 10 a0)
-   NOTE_INSN_EPILOGUE_BEG  */
-static rtx_insn *
-riscv_zcmp_can_use_popretz (void)
-{
-  rtx_insn *insn = NULL, *use = NULL, *clear = NULL;
-
-  /* sequence stack for NOTE_INSN_EPILOGUE_BEG*/
-  struct sequence_stack *outer_seq = get_current_sequence ()->next;
-  if (!outer_seq)
-    return NULL;
-  insn = outer_seq->first;
-  if (!insn || !NOTE_P (insn) || NOTE_KIND (insn) != NOTE_INSN_EPILOGUE_BEG)
-    return NULL;
-
-  /* sequence stack for the insn before NOTE_INSN_EPILOGUE_BEG*/
-  outer_seq = outer_seq->next;
-  if (outer_seq)
-    insn = outer_seq->last;
-
-  /* skip notes  */
-  while (insn && NOTE_P (insn))
-    {
-      insn = PREV_INSN (insn);
-    }
-  use = insn;
-
-  /* match use (reg 10 a0)  */
-  if (use == NULL || !INSN_P (use) || GET_CODE (PATTERN (use)) != USE
-      || !REG_P (XEXP (PATTERN (use), 0))
-      || REGNO (XEXP (PATTERN (use), 0)) != A0_REGNUM)
-    return NULL;
-
-  /* match set (reg 10 a0) (const_int 0 [0])  */
-  clear = PREV_INSN (use);
-  if (clear != NULL && INSN_P (clear) && GET_CODE (PATTERN (clear)) == SET
-      && REG_P (SET_DEST (PATTERN (clear)))
-      && REGNO (SET_DEST (PATTERN (clear))) == A0_REGNUM
-      && SET_SRC (PATTERN (clear)) == const0_rtx)
-    return clear;
-
-  return NULL;
-}
-
 static void
 riscv_gen_multi_pop_insn (bool use_multi_pop_normal, unsigned mask,
 			  unsigned multipop_size)
@@ -7771,13 +7826,6 @@ riscv_gen_multi_pop_insn (bool use_multi_pop_normal, unsigned mask,
   if (!use_multi_pop_normal)
     insn = emit_insn (
       riscv_gen_multi_push_pop_insn (POP_IDX, multipop_size, regs_count));
-  else if (rtx_insn *clear_a0_insn = riscv_zcmp_can_use_popretz ())
-    {
-      delete_insn (NEXT_INSN (clear_a0_insn));
-      delete_insn (clear_a0_insn);
-      insn = emit_jump_insn (
-	riscv_gen_multi_push_pop_insn (POPRETZ_IDX, multipop_size, regs_count));
-    }
   else
     insn = emit_jump_insn (
       riscv_gen_multi_push_pop_insn (POPRET_IDX, multipop_size, regs_count));
@@ -8969,17 +9017,16 @@ riscv_declare_function_name (FILE *stream, const char *name, tree fndecl)
     {
       fprintf (stream, "\t.option push\n");
 
-      std::string *target_name = riscv_func_target_get (fndecl);
-      std::string isa = target_name != NULL
-	? *target_name
-	: riscv_cmdline_subset_list ()->to_string (true);
-      fprintf (stream, "\t.option arch, %s\n", isa.c_str ());
-      riscv_func_target_remove_and_destory (fndecl);
-
       struct cl_target_option *local_cl_target =
 	TREE_TARGET_OPTION (DECL_FUNCTION_SPECIFIC_TARGET (fndecl));
       struct cl_target_option *global_cl_target =
 	TREE_TARGET_OPTION (target_option_default_node);
+
+      const char *local_arch_str = get_arch_str (local_cl_target);
+      const char *arch_str = local_arch_str != NULL
+	? local_arch_str
+	: riscv_arch_str (true).c_str ();
+      fprintf (stream, "\t.option arch, %s\n", arch_str);
       const char *local_tune_str = get_tune_str (local_cl_target);
       const char *global_tune_str = get_tune_str (global_cl_target);
       if (strcmp (local_tune_str, global_tune_str) != 0)
@@ -9210,6 +9257,11 @@ riscv_override_options_internal (struct gcc_options *opts)
   else if (!TARGET_MUL_OPTS_P (opts) && TARGET_DIV_OPTS_P (opts))
     error ("%<-mdiv%> requires %<-march%> to subsume the %<M%> extension");
 
+  /* We might use a multiplication to calculate the scalable vector length at
+     runtime.  Therefore, require the M extension.  */
+  if (TARGET_VECTOR && !TARGET_MUL)
+    sorry ("GCC's current %<V%> implementation requires the %<M%> extension");
+
   /* Likewise floating-point division and square root.  */
   if ((TARGET_HARD_FLOAT_OPTS_P (opts) || TARGET_ZFINX_OPTS_P (opts))
       && ((target_flags_explicit & MASK_FDIV) == 0))
@@ -9325,6 +9377,11 @@ riscv_option_override (void)
       else if (TARGET_64BIT && riscv_abi != ABI_LP64E)
 	error ("rv64e requires lp64e ABI");
     }
+
+  /* ILP32E does not support the 'd' extension.  */
+  if (riscv_abi == ABI_ILP32E && UNITS_PER_FP_REG > 4)
+    error ("ILP32E ABI does not support the %qc extension",
+	   UNITS_PER_FP_REG > 8 ? 'Q' : 'D');
 
   /* Zfinx require abi ilp32, ilp32e, lp64 or lp64e.  */
   if (TARGET_ZFINX
@@ -9841,6 +9898,17 @@ riscv_can_change_mode_class (machine_mode from, machine_mode to,
   if (reg_classes_intersect_p (V_REGS, rclass)
       && !ordered_p (GET_MODE_PRECISION (from), GET_MODE_PRECISION (to)))
     return false;
+
+  /* Subregs of modes larger than one vector are ambiguous.
+     A V4DImode with rv64gcv_zvl128b could, for example, span two registers/one
+     register group of two at VLEN = 128 or one register at VLEN >= 256 and
+     we cannot, statically, determine which part of it to extract.
+     Therefore prevent that.  */
+  if (reg_classes_intersect_p (V_REGS, rclass)
+      && riscv_v_ext_vls_mode_p (from)
+      && !ordered_p (BITS_PER_RISCV_VECTOR, GET_MODE_PRECISION (from)))
+      return false;
+
   return !reg_classes_intersect_p (FP_REGS, rclass);
 }
 
@@ -10238,12 +10306,12 @@ static unsigned int
 riscv_dwarf_poly_indeterminate_value (unsigned int i, unsigned int *factor,
 				      int *offset)
 {
-  /* Polynomial invariant 1 == (VLENB / riscv_bytes_per_vector_chunk) - 1.
+  /* Polynomial invariant 1 == (VLENB / BYTES_PER_RISCV_VECTOR) - 1.
      1. TARGET_MIN_VLEN == 32, polynomial invariant 1 == (VLENB / 4) - 1.
      2. TARGET_MIN_VLEN > 32, polynomial invariant 1 == (VLENB / 8) - 1.
   */
   gcc_assert (i == 1);
-  *factor = riscv_bytes_per_vector_chunk;
+  *factor = BYTES_PER_RISCV_VECTOR.coeffs[1];
   *offset = 1;
   return RISCV_DWARF_VLENB;
 }
@@ -10426,9 +10494,7 @@ riscv_lshift_subword (machine_mode mode, rtx value, rtx shift,
 		      rtx *shifted_value)
 {
   rtx value_reg = gen_reg_rtx (SImode);
-  emit_move_insn (value_reg, simplify_gen_subreg (SImode, value,
-						  mode, 0));
-
+  emit_move_insn (value_reg, gen_lowpart (SImode, value));
   emit_move_insn (*shifted_value, gen_rtx_ASHIFT (SImode, value_reg,
 						  gen_lowpart (QImode, shift)));
 }
@@ -10948,7 +11014,11 @@ riscv_preferred_else_value (unsigned ifn, tree vectype, unsigned int nops,
 			    tree *ops)
 {
   if (riscv_v_ext_mode_p (TYPE_MODE (vectype)))
-    return get_or_create_ssa_default_def (cfun, create_tmp_var (vectype));
+    {
+      tree tmp_var = create_tmp_var (vectype);
+      TREE_NO_WARNING (tmp_var) = 1;
+      return get_or_create_ssa_default_def (cfun, tmp_var);
+    }
 
   return default_preferred_else_value (ifn, vectype, nops, ops);
 }

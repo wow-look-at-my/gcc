@@ -3940,7 +3940,7 @@ if test x"${DEFAULT_LINKER+set}" = x"set"; then
     as_fn_error $? "cannot execute: $DEFAULT_LINKER: check --with-ld or env. var. DEFAULT_LINKER" "$LINENO" 5
   elif $DEFAULT_LINKER -v < /dev/null 2>&1 | grep GNU > /dev/null; then
     gnu_ld_flag=yes
-  elif $DEFAULT_LINKER -v < /dev/null 2>&1 | grep ld64- > /dev/null; then
+  elif $DEFAULT_LINKER -v < /dev/null 2>&1 | grep 'PROJECT:ld\(64\)*-' > /dev/null; then
     ld64_flag=yes
   fi
 
@@ -8232,7 +8232,13 @@ if test "${with_documentation_root_url+set}" = set; then :
       *)   as_fn_error $? "documentation root URL does not end with /" "$LINENO" 5 ;;
      esac
 else
-  DOCUMENTATION_ROOT_URL="https://gcc.gnu.org/onlinedocs/"
+
+     docroot_url_suffix=
+     case "$gcc_version" in
+       *.[123456].0) docroot_url_suffix="gcc-$gcc_version/";;
+       *.[123456].1) docroot_url_suffix="gcc-`echo $gcc_version | sed 's/1$/0/'`/";;
+     esac
+     DOCUMENTATION_ROOT_URL="https://gcc.gnu.org/onlinedocs/$docroot_url_suffix"
 
 fi
 
@@ -12776,6 +12782,42 @@ fi
 if test $ac_cv_have_decl_O_NONBLOCK = yes; then
 
 $as_echo "#define HOST_HAS_O_NONBLOCK 1" >>confdefs.h
+
+fi
+
+# Check if personality and ADDR_NO_RANDOMIZE are declared
+# in sys/personality.h
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for personality ADDR_NO_RANDOMIZE" >&5
+$as_echo_n "checking for personality ADDR_NO_RANDOMIZE... " >&6; }
+if ${ac_cv_personality_addr_no_randomize+:} false; then :
+  $as_echo_n "(cached) " >&6
+else
+
+cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+#include <sys/personality.h>
+int
+main ()
+{
+
+personality (personality (0xffffffffU) | ADDR_NO_RANDOMIZE);
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_cxx_try_compile "$LINENO"; then :
+  ac_cv_personality_addr_no_randomize=yes
+else
+  ac_cv_personality_addr_no_randomize=no
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
+fi
+{ $as_echo "$as_me:${as_lineno-$LINENO}: result: $ac_cv_personality_addr_no_randomize" >&5
+$as_echo "$ac_cv_personality_addr_no_randomize" >&6; }
+if test $ac_cv_personality_addr_no_randomize = yes; then
+
+$as_echo "#define HOST_HAS_PERSONALITY_ADDR_NO_RANDOMIZE 1" >>confdefs.h
 
 fi
 
@@ -21569,7 +21611,7 @@ else
   lt_dlunknown=0; lt_dlno_uscore=1; lt_dlneed_uscore=2
   lt_status=$lt_dlunknown
   cat > conftest.$ac_ext <<_LT_EOF
-#line 21572 "configure"
+#line 21614 "configure"
 #include "confdefs.h"
 
 #if HAVE_DLFCN_H
@@ -21675,7 +21717,7 @@ else
   lt_dlunknown=0; lt_dlno_uscore=1; lt_dlneed_uscore=2
   lt_status=$lt_dlunknown
   cat > conftest.$ac_ext <<_LT_EOF
-#line 21678 "configure"
+#line 21720 "configure"
 #include "confdefs.h"
 
 #if HAVE_DLFCN_H
@@ -30483,6 +30525,8 @@ $as_echo "#define MIPS_EXPLICIT_RELOCS MIPS_EXPLICIT_RELOCS_BASE" >>confdefs.h
 
 fi
 
+    else
+      gcc_cv_as_mips_explicit_relocs=yes
     fi
 
     if test x$gcc_cv_as_mips_explicit_relocs = xno; then \
@@ -32697,6 +32741,7 @@ if test x"$ld64_flag" = x"yes"; then
   # Set defaults for possibly untestable items.
   gcc_cv_ld64_export_dynamic=0
   gcc_cv_ld64_platform_version=0
+  gcc_cv_ld64_macos_version_min=0
   gcc_cv_ld64_demangle=0
 
   if test "$build" = "$host"; then
@@ -32729,14 +32774,16 @@ $as_echo "$gcc_cv_ld64_major" >&6; }
     fi
     if test "$gcc_cv_ld64_major" -ge 512; then
       gcc_cv_ld64_platform_version=1
+      gcc_cv_ld64_macos_version_min=1
     fi
   elif test -x "$gcc_cv_ld" -a "$darwin_try_test" -eq 1; then
     # If the version was not specified, try to find it.
     { $as_echo "$as_me:${as_lineno-$LINENO}: checking linker version" >&5
 $as_echo_n "checking linker version... " >&6; }
     if test x"${gcc_cv_ld64_version}" = x; then
-      gcc_cv_ld64_version=`$gcc_cv_ld -v 2>&1 | $EGREP 'ld64|dyld' \
-      | sed -e 's/.*ld64-//' -e 's/.*dyld-//'| awk '{print $1}'`
+      gcc_cv_ld64_version=`$gcc_cv_ld -v 2>&1 | $EGREP 'ld64|dyld|PROJECT:ld' \
+      | sed -e 's/.*ld64-//' -e 's/.*dyld-//' -e 's/.*PROJECT:ld-//' \
+      | awk '{print $1}'`
     fi
     { $as_echo "$as_me:${as_lineno-$LINENO}: result: $gcc_cv_ld64_version" >&5
 $as_echo "$gcc_cv_ld64_version" >&6; }
@@ -32767,6 +32814,15 @@ $as_echo_n "checking linker for -platform_version support... " >&6; }
     fi
     { $as_echo "$as_me:${as_lineno-$LINENO}: result: $gcc_cv_ld64_platform_version" >&5
 $as_echo "$gcc_cv_ld64_platform_version" >&6; }
+
+    { $as_echo "$as_me:${as_lineno-$LINENO}: checking linker for -macos_version_min" >&5
+$as_echo_n "checking linker for -macos_version_min... " >&6; }
+    gcc_cv_ld64_macos_version_min=1
+    if $gcc_cv_ld -macos_version_min 10.5 < /dev/null 2>&1 | grep 'unknown option' > /dev/null; then
+      gcc_cv_ld64_macos_version_min=0
+    fi
+    { $as_echo "$as_me:${as_lineno-$LINENO}: result: $gcc_cv_ld64_macos_version_min" >&5
+$as_echo "$gcc_cv_ld64_macos_version_min" >&6; }
   fi
 
   if test x"${gcc_cv_ld64_version}" != x; then
@@ -32792,6 +32848,12 @@ _ACEOF
 
 cat >>confdefs.h <<_ACEOF
 #define LD64_HAS_PLATFORM_VERSION $gcc_cv_ld64_platform_version
+_ACEOF
+
+
+
+cat >>confdefs.h <<_ACEOF
+#define LD64_HAS_MACOS_VERSION_MIN $gcc_cv_ld64_macos_version_min
 _ACEOF
 
 fi

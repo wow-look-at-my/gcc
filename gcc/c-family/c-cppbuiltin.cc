@@ -357,17 +357,8 @@ builtin_define_decimal_float_constants (const char *name_prefix,
 
   /* Compute the maximum representable value.  */
   sprintf (name, "__%s_MAX__", name_prefix);
-  p = buf;
-  for (digits = fmt->p; digits; digits--)
-    {
-      *p++ = '9';
-      if (digits == fmt->p)
-	*p++ = '.';
-    }
-  *p = 0;
-  /* fmt->p plus 1, to account for the decimal point and fmt->emax
-     minus 1 because the digits are nines, not 1.0.  */
-  sprintf (&buf[fmt->p + 1], "E%d%s", fmt->emax - 1, suffix);
+  get_max_float (fmt, buf, sizeof (buf) - strlen (suffix), false);
+  strcat (buf, suffix);
   builtin_define_with_value (name, buf, 0);
 
   /* Compute epsilon (the difference between 1 and least value greater
@@ -1061,7 +1052,8 @@ c_cpp_builtins (cpp_reader *pfile)
 	  cpp_define (pfile, "__cpp_conditional_explicit=201806L");
 	  cpp_define (pfile, "__cpp_consteval=202211L");
 	  cpp_define (pfile, "__cpp_constinit=201907L");
-	  cpp_define (pfile, "__cpp_deduction_guides=201907L");
+	  if (cxx_dialect <= cxx20)
+	    cpp_define (pfile, "__cpp_deduction_guides=201907L");
 	  cpp_define (pfile, "__cpp_nontype_template_args=201911L");
 	  cpp_define (pfile, "__cpp_nontype_template_parameter_class=201806L");
 	  cpp_define (pfile, "__cpp_impl_destroying_delete=201806L");
@@ -1078,6 +1070,7 @@ c_cpp_builtins (cpp_reader *pfile)
 	  cpp_define (pfile, "__cpp_auto_cast=202110L");
 	  if (cxx_dialect <= cxx23)
 	    cpp_define (pfile, "__cpp_constexpr=202211L");
+	  cpp_define (pfile, "__cpp_deduction_guides=202207L");
 	  cpp_define (pfile, "__cpp_multidimensional_subscript=202211L");
 	  cpp_define (pfile, "__cpp_named_character_escapes=202207L");
 	  cpp_define (pfile, "__cpp_static_call_operator=202207L");
@@ -1093,10 +1086,10 @@ c_cpp_builtins (cpp_reader *pfile)
 	}
       if (flag_concepts)
         {
-	  if (cxx_dialect >= cxx20 || !flag_concepts_ts)
-	    cpp_define (pfile, "__cpp_concepts=202002L");
-          else
+	  if (flag_concepts_ts && cxx_dialect < cxx20)
             cpp_define (pfile, "__cpp_concepts=201507L");
+	  else if (cxx_dialect > cxx14)
+	    cpp_define (pfile, "__cpp_concepts=202002L");
         }
       if (flag_contracts)
 	{

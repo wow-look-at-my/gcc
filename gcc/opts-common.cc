@@ -524,6 +524,7 @@ add_misspelling_candidates (auto_vec<char *> *candidates,
   for (unsigned i = 0; i < ARRAY_SIZE (option_map); i++)
     {
       const char *opt0 = option_map[i].opt0;
+      const char *opt1 = option_map[i].opt1;
       const char *new_prefix = option_map[i].new_prefix;
       size_t new_prefix_len = strlen (new_prefix);
 
@@ -532,8 +533,9 @@ add_misspelling_candidates (auto_vec<char *> *candidates,
 
       if (strncmp (opt_text, new_prefix, new_prefix_len) == 0)
 	{
-	  char *alternative = concat (opt0 + 1, opt_text + new_prefix_len,
-				      NULL);
+	  char *alternative
+	    = concat (opt0 + 1, opt1 ? " " : "", opt1 ? opt1 : "",
+		      opt_text + new_prefix_len, NULL);
 	  candidates->safe_push (alternative);
 	}
     }
@@ -1074,7 +1076,9 @@ decode_cmdline_options_to_array (unsigned int argc, const char **argv,
       /* Expand -fdiagnostics-plain-output to its constituents.  This needs
 	 to happen here so that prune_options can handle -fdiagnostics-color
 	 specially.  */
-      if (!strcmp (opt, "-fdiagnostics-plain-output"))
+      if (opt[0] == '-'
+	  && (opt[1] == '-' || opt[1] == 'f')
+	  && !strcmp (opt + 2, "diagnostics-plain-output"))
 	{
 	  /* If you have changed the default diagnostics output, and this new
 	     output is not appropriately "plain" (e.g., the change needs to be
@@ -1152,6 +1156,7 @@ prune_options (struct cl_decoded_option **decoded_options,
   unsigned int options_to_prepend = 0;
   unsigned int Wcomplain_wrong_lang_idx = 0;
   unsigned int fdiagnostics_color_idx = 0;
+  unsigned int fdiagnostics_urls_idx = 0;
 
   /* Remove arguments which are negated by others after them.  */
   new_decoded_options_count = 0;
@@ -1184,6 +1189,12 @@ prune_options (struct cl_decoded_option **decoded_options,
 	  if (fdiagnostics_color_idx == 0)
 	    ++options_to_prepend;
 	  fdiagnostics_color_idx = i;
+	  continue;
+	case OPT_fdiagnostics_urls_:
+	  gcc_checking_assert (i != 0);
+	  if (fdiagnostics_urls_idx == 0)
+	    ++options_to_prepend;
+	  fdiagnostics_urls_idx = i;
 	  continue;
 
 	default:
@@ -1246,6 +1257,12 @@ keep:
 	{
 	  new_decoded_options[argv_0 + options_prepended++]
 	    = old_decoded_options[fdiagnostics_color_idx];
+	  new_decoded_options_count++;
+	}
+      if (fdiagnostics_urls_idx != 0)
+	{
+	  new_decoded_options[argv_0 + options_prepended++]
+	    = old_decoded_options[fdiagnostics_urls_idx];
 	  new_decoded_options_count++;
 	}
       gcc_checking_assert (options_to_prepend == options_prepended);
@@ -2130,7 +2147,8 @@ jobserver_info::disconnect ()
 {
   if (!pipe_path.empty ())
     {
-      gcc_assert (close (pipefd) == 0);
+      int res = close (pipefd);
+      gcc_assert (res == 0);
       pipefd = -1;
     }
 }
@@ -2155,5 +2173,6 @@ jobserver_info::return_token ()
 {
   int fd = pipe_path.empty () ? wfd : pipefd;
   char c = 'G';
-  gcc_assert (write (fd, &c, 1) == 1);
+  int res = write (fd, &c, 1);
+  gcc_assert (res == 1);
 }

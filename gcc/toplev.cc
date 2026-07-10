@@ -49,6 +49,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "insn-attr.h"
 #include "output.h"
 #include "toplev.h"
+#include "compile-cache.h"
 #include "expr.h"
 #include "intl.h"
 #include "tree-diagnostic.h"
@@ -94,6 +95,10 @@ along with GCC; see the file COPYING3.  If not see
 #include "gcc-urlifier.h"
 
 #include "selftest.h"
+
+#ifdef HAVE_LIBGAS
+#include "gas-embed.h"		/* for -fintegrated-as (gas_assemble_buffer) */
+#endif
 
 #ifdef HAVE_isl
 #include <isl/version.h>
@@ -163,6 +168,23 @@ const char *user_label_prefix;
    and debugging dumps.  */
 
 FILE *asm_out_file;
+
+/* The integrated assembler (on by default, -fintegrated-as): cc1plus folds
+   the GNU assembler (libgas, gcc/gas-embed.h) into the compiler so a
+   compile-to-object is a single process.  When the output is a real object
+   file, asm_out_file is an open_memstream() handle and these capture the
+   buffer it writes into.  After fclose(asm_out_file) they hold the complete
+   assembly text, which is then handed to gas_assemble_buffer() to produce
+   the object file (or, for -S / -fno-integrated-as, written verbatim to the
+   text output and not assembled -- see the flag_asm_output_only fold in
+   process_options).  */
+static char *asm_mem_buf;
+static size_t asm_mem_size;
+/* True when asm_out_file is an open_memstream() handle (set in
+   init_asm_output).  Checked at finalize independently of asm_mem_buf, which
+   open_memstream only populates once the stream is flushed/closed.  */
+static bool asm_using_memstream;
+
 FILE *aux_info_file;
 FILE *callgraph_info_file = NULL;
 static bitmap callgraph_info_external_printed;
@@ -459,7 +481,10 @@ compile_file (void)
   /* Compilation is now finished except for writing
      what's left of the symbol table output.  */
 
-  if (flag_syntax_only || flag_wpa)
+  /* On a compilation-cache hit, the .s has already been written into
+     asm_out_file by compile_cache_try_serve() during parsing; skip the
+     back-end entirely.  */
+  if (flag_syntax_only || flag_wpa || compile_cache_hit_p ())
     return;
  
   /* Reset maximum_field_alignment, it can be adjusted by #pragma pack
@@ -704,9 +729,20 @@ init_asm_output (const char *name)
 	}
       if (!strcmp (asm_file_name, "-"))
 	asm_out_file = stdout;
-      else if (!canonical_filename_eq (asm_file_name, name)
-	       || !strcmp (asm_file_name, HOST_BIT_BUCKET))
+      else if (!strcmp (asm_file_name, HOST_BIT_BUCKET))
+	/* -fsyntax-only and friends: keep writing to the bit bucket; no
+	   object is produced and the integrated assembler is not invoked.  */
 	asm_out_file = fopen (asm_file_name, "w");
+      else if (!canonical_filename_eq (asm_file_name, name))
+	/* Real output.  Build the assembly into an in-memory buffer instead of
+	   writing it straight to a file.  At finalize() the buffer is either
+	   handed to the integrated assembler to produce the object file, or
+	   (when emitting assembly only, -S) written verbatim to asm_file_name.
+	   This is the seam that lets a compile-to-object run in one process.  */
+	{
+	  asm_out_file = open_memstream (&asm_mem_buf, &asm_mem_size);
+	  asm_using_memstream = true;
+	}
       else
 	/* Use UNKOWN_LOCATION to prevent gcc from printing the first
 	   line in the current file. */
@@ -1256,6 +1292,33 @@ process_options ()
 
   if (flag_short_enums == 2)
     flag_short_enums = targetm.default_short_enums ();
+
+#ifndef HAVE_LIBGAS
+  /* Built without the embedded assembler (not a combined tree, or a target
+     libgas does not support): the integrated assembler cannot run at all.
+     An explicit -fintegrated-as is a loud error; the silent default flips
+     to the classic external-as pipeline (the driver's invoke_as made the
+     same compile-time choice, so it already routed this compile through
+     `as`).  */
+  if (flag_integrated_as)
+    {
+      if (global_options_set.x_flag_integrated_as)
+	sorry ("%<-fintegrated-as%> is not supported by this configuration "
+	       "of the compiler (built without libgas)");
+      flag_integrated_as = 0;
+    }
+#endif
+
+  /* -fno-integrated-as: skip the in-process assembler and emit textual
+     assembly to the output file instead, exactly like -S / the PCH specs do
+     via -fasm-output-only -- reuse that internal flag so init_asm_output /
+     finalize need no third mode.  The driver's invoke_as pairs this with an
+     external `as` stage that turns the temporary .s into the real object
+     (and passes -fasm-output-only itself; this fold additionally covers a
+     bare cc1/cc1plus invocation, which then writes text to its -o just like
+     stock GCC did).  */
+  if (!flag_integrated_as)
+    flag_asm_output_only = 1;
 
   /* Set aux_base_name if not already set.  */
   if (aux_base_name)
@@ -2008,11 +2071,75 @@ finalize ()
 
   if (asm_out_file)
     {
+      bool used_memstream = asm_using_memstream;
       if (ferror (asm_out_file) != 0)
 	fatal_error (input_location, "error writing to %s: %m", asm_file_name);
+      /* For the integrated-assembler path asm_out_file is an open_memstream;
+	 closing it flushes the captured assembly text into asm_mem_buf and
+	 sets asm_mem_size to its length.  For the plain text-file path (stdout
+	 / bit bucket) this is just the normal close.  */
       if (fclose (asm_out_file) != 0)
 	fatal_error (input_location, "error closing %s: %m", asm_file_name);
       asm_out_file = NULL;
+
+      /* When the output was a real object file, init_asm_output captured the
+	 back-end's assembly into an in-memory stream instead of a text file.
+	 Now either write that text verbatim to the text output (-S, or the
+	 -fno-integrated-as pipeline, both folded into flag_asm_output_only)
+	 or assemble it in-process to the object, with no forked `as` and no
+	 temporary .s file.
+
+	 On a compilation-cache HIT none of this runs: the serve path already
+	 placed the cached .o at asm_file_name and closed the (empty) memstream,
+	 setting asm_out_file = NULL, so this whole block is skipped and
+	 compile_cache_store() below no-ops.  */
+      if (used_memstream)
+	{
+	  if (flag_asm_output_only)
+	    {
+	      /* The user asked for -S, or the external-assembler pipeline is
+		 in effect (-fno-integrated-as): emit the assembly text
+		 verbatim to the text output file and do not assemble it.  */
+	      FILE *sf = fopen (asm_file_name, "w");
+	      if (sf == NULL)
+		fatal_error (input_location,
+			     "cannot open %qs for writing: %m", asm_file_name);
+	      if (asm_mem_size != 0
+		  && fwrite (asm_mem_buf, 1, asm_mem_size, sf) != asm_mem_size)
+		fatal_error (input_location,
+			     "error writing to %s: %m", asm_file_name);
+	      if (fclose (sf) != 0)
+		fatal_error (input_location,
+			     "error closing %s: %m", asm_file_name);
+	    }
+	  else if (!seen_error ())
+	    {
+#ifdef HAVE_LIBGAS
+	      /* Compile-to-object: assemble the buffered text in-process,
+		 writing the object straight to asm_file_name (the .o path the
+		 driver handed us).  gas_assemble_buffer is the libgas entry
+		 point declared in gas-embed.h.  No forked `as`, no temporary
+		 .s file.  A broken TU (seen_error) is not fed to the
+		 assembler.  */
+	      int rc = gas_assemble_buffer (asm_mem_buf ? asm_mem_buf : "",
+					    asm_mem_size, asm_file_name);
+	      if (rc != 0)
+		fatal_error (input_location,
+			     "integrated assembler failed on %qs (code %d)",
+			     asm_file_name, rc);
+#else
+	      /* Unreachable: without libgas, process_options forced
+		 !flag_integrated_as and therefore flag_asm_output_only, so
+		 a real object request never lands in this branch.  */
+	      gcc_unreachable ();
+#endif
+	    }
+
+	  free (asm_mem_buf);
+	  asm_mem_buf = NULL;
+	  asm_mem_size = 0;
+	  asm_using_memstream = false;
+	}
     }
 
   if (stack_usage_file)
@@ -2161,6 +2288,11 @@ do_compile ()
       timevar_start (TV_PHASE_FINALIZE);
 
       finalize ();
+
+      /* If this was a cache miss, the back-end has now produced and
+	 finalize() has closed the .s file; publish it to the cache.  No-op
+	 on a hit, on error, or when caching is disabled.  */
+      compile_cache_store ();
 
       timevar_stop (TV_PHASE_FINALIZE);
     }
@@ -2374,6 +2506,7 @@ toplev::finalize (void)
   ira_costs_cc_finalize ();
   tree_cc_finalize ();
   reginfo_cc_finalize ();
+  varasm_cc_finalize ();
 
   /* save_decoded_options uses opts_obstack, so these must
      be cleaned up together.  */

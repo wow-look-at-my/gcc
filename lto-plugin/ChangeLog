@@ -1,3 +1,38 @@
+2026-06-26  Release Manager
+
+	* GCC 14.4.0 released.
+
+2025-05-23  Release Manager
+
+	* GCC 14.3.0 released.
+
+2024-09-04  H.J. Lu  <hjl.tools@gmail.com>
+
+	Backported from master:
+	2024-08-23  H.J. Lu  <hjl.tools@gmail.com>
+
+	PR lto/116361
+	* lto-plugin.c (claim_file_handler_v2): Don't check obj.found
+	for the offload section.
+
+2024-09-04  H.J. Lu  <hjl.tools@gmail.com>
+
+	Backported from master:
+	2024-08-22  H.J. Lu  <hjl.tools@gmail.com>
+
+	PR lto/116361
+	* lto-plugin.c (claim_file_handler_v2): Rename claimed to
+	can_be_claimed.  Include the LTO object only if it is known to
+	be included in link output.
+
+2024-08-01  Release Manager
+
+	* GCC 14.2.0 released.
+
+2024-05-07  Release Manager
+
+	* GCC 14.1.0 released.
+
 2023-10-22  Iain Sandoe  <iain@sandoe.co.uk>
 
 	* configure: Regenerate.

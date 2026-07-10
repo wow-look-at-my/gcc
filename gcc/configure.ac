@@ -358,7 +358,7 @@ if test x"${DEFAULT_LINKER+set}" = x"set"; then
     AC_MSG_ERROR([cannot execute: $DEFAULT_LINKER: check --with-ld or env. var. DEFAULT_LINKER])
   elif $DEFAULT_LINKER -v < /dev/null 2>&1 | grep GNU > /dev/null; then
     gnu_ld_flag=yes
-  elif $DEFAULT_LINKER -v < /dev/null 2>&1 | grep ld64- > /dev/null; then
+  elif $DEFAULT_LINKER -v < /dev/null 2>&1 | grep 'PROJECT:ld\(64\)*-' > /dev/null; then
     ld64_flag=yes
   fi
   AC_DEFINE_UNQUOTED(DEFAULT_LINKER,"$DEFAULT_LINKER",
@@ -1088,9 +1088,16 @@ AC_ARG_WITH(documentation-root-url,
       no)  AC_MSG_ERROR([documentation root URL not specified]) ;;
       */)  DOCUMENTATION_ROOT_URL="$withval" ;;
       *)   AC_MSG_ERROR([documentation root URL does not end with /]) ;;
-     esac],
-     DOCUMENTATION_ROOT_URL="https://gcc.gnu.org/onlinedocs/"
-)
+     esac],[
+     docroot_url_suffix=
+changequote(,)dnl
+     case "$gcc_version" in
+       *.[123456].0) docroot_url_suffix="gcc-$gcc_version/";;
+       *.[123456].1) docroot_url_suffix="gcc-`echo $gcc_version | sed 's/1$/0/'`/";;
+     esac
+changequote([,])dnl
+     DOCUMENTATION_ROOT_URL="https://gcc.gnu.org/onlinedocs/$docroot_url_suffix"
+])
 AC_DEFINE_UNQUOTED(DOCUMENTATION_ROOT_URL,"$DOCUMENTATION_ROOT_URL",
 	[Define to the root for documentation URLs.])
 
@@ -1751,6 +1758,21 @@ AC_CHECK_DECL(O_NONBLOCK,,,[#include <fcntl.h>])
 if test $ac_cv_have_decl_O_NONBLOCK = yes; then
   AC_DEFINE(HOST_HAS_O_NONBLOCK, 1,
   [Define if O_NONBLOCK supported by fcntl.])
+fi
+
+# Check if personality and ADDR_NO_RANDOMIZE are declared
+# in sys/personality.h
+AC_CACHE_CHECK(for personality ADDR_NO_RANDOMIZE,
+	       ac_cv_personality_addr_no_randomize, [
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <sys/personality.h>]], [[
+personality (personality (0xffffffffU) | ADDR_NO_RANDOMIZE);]])],
+[ac_cv_personality_addr_no_randomize=yes],
+[ac_cv_personality_addr_no_randomize=no])])
+if test $ac_cv_personality_addr_no_randomize = yes; then
+  AC_DEFINE(HOST_HAS_PERSONALITY_ADDR_NO_RANDOMIZE, 1,
+  [Define if personality and ADDR_NO_RANDOMIZE are declared in
+sys/personality.h.])
 fi
 
 
@@ -5297,6 +5319,8 @@ LCF0:
 [	lw $4,%gp_rel(foo)($4)],,
       [AC_DEFINE(MIPS_EXPLICIT_RELOCS, MIPS_EXPLICIT_RELOCS_BASE,
 		 [Define if assembler supports %reloc.])])
+    else
+      gcc_cv_as_mips_explicit_relocs=yes
     fi
 
     if test x$gcc_cv_as_mips_explicit_relocs = xno; then \
@@ -6406,6 +6430,7 @@ if test x"$ld64_flag" = x"yes"; then
   # Set defaults for possibly untestable items.
   gcc_cv_ld64_export_dynamic=0
   gcc_cv_ld64_platform_version=0
+  gcc_cv_ld64_macos_version_min=0
   gcc_cv_ld64_demangle=0
 
   if test "$build" = "$host"; then
@@ -6436,13 +6461,15 @@ if test x"$ld64_flag" = x"yes"; then
     fi
     if test "$gcc_cv_ld64_major" -ge 512; then
       gcc_cv_ld64_platform_version=1
+      gcc_cv_ld64_macos_version_min=1
     fi
   elif test -x "$gcc_cv_ld" -a "$darwin_try_test" -eq 1; then
     # If the version was not specified, try to find it.
     AC_MSG_CHECKING(linker version)
     if test x"${gcc_cv_ld64_version}" = x; then
-      gcc_cv_ld64_version=`$gcc_cv_ld -v 2>&1 | $EGREP 'ld64|dyld' \
-      | sed -e 's/.*ld64-//' -e 's/.*dyld-//'| awk '{print $1}'`
+      gcc_cv_ld64_version=`$gcc_cv_ld -v 2>&1 | $EGREP 'ld64|dyld|PROJECT:ld' \
+      | sed -e 's/.*ld64-//' -e 's/.*dyld-//' -e 's/.*PROJECT:ld-//' \
+      | awk '{print $1}'`
     fi
     AC_MSG_RESULT($gcc_cv_ld64_version)
 
@@ -6466,6 +6493,13 @@ if test x"$ld64_flag" = x"yes"; then
       gcc_cv_ld64_platform_version=0
     fi
     AC_MSG_RESULT($gcc_cv_ld64_platform_version)
+
+    AC_MSG_CHECKING(linker for -macos_version_min)
+    gcc_cv_ld64_macos_version_min=1
+    if $gcc_cv_ld -macos_version_min 10.5 < /dev/null 2>&1 | grep 'unknown option' > /dev/null; then
+      gcc_cv_ld64_macos_version_min=0
+    fi
+    AC_MSG_RESULT($gcc_cv_ld64_macos_version_min)
   fi
 
   if test x"${gcc_cv_ld64_version}" != x; then
@@ -6481,6 +6515,9 @@ if test x"$ld64_flag" = x"yes"; then
 
   AC_DEFINE_UNQUOTED(LD64_HAS_PLATFORM_VERSION, $gcc_cv_ld64_platform_version,
   [Define to 1 if ld64 supports '-platform_version'.])
+
+  AC_DEFINE_UNQUOTED(LD64_HAS_MACOS_VERSION_MIN, $gcc_cv_ld64_macos_version_min,
+  [Define to 1 if ld64 supports '-macos_version_min'.])
 fi
 
 if test x"$dsymutil_flag" = x"yes"; then

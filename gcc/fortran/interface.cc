@@ -452,11 +452,20 @@ gfc_match_end_interface (void)
 
     case INTERFACE_DTIO:
     case INTERFACE_GENERIC:
+      /* If a use-associated symbol is renamed, check the local_name.   */
+      const char *local_name = current_interface.sym->name;
+
+      if (current_interface.sym->attr.use_assoc
+	  && current_interface.sym->attr.use_rename
+	  && current_interface.sym->ns->use_stmts->rename
+	  && (current_interface.sym->ns->use_stmts->rename->local_name[0]
+	      != '\0'))
+	local_name = current_interface.sym->ns->use_stmts->rename->local_name;
+
       if (type != current_interface.type
-	  || strcmp (current_interface.sym->name, name) != 0)
+	  || strcmp (local_name, name) != 0)
 	{
-	  gfc_error ("Expecting %<END INTERFACE %s%> at %C",
-		     current_interface.sym->name);
+	  gfc_error ("Expecting %<END INTERFACE %s%> at %C", local_name);
 	  m = MATCH_ERROR;
 	}
 
@@ -3291,7 +3300,11 @@ gfc_compare_actual_formal (gfc_actual_arglist **ap, gfc_formal_arglist *formal,
 	  return false;
 	}
       else
-	a->associated_dummy = get_nonintrinsic_dummy_arg (f);
+	{
+	  if (a->associated_dummy)
+	    free (a->associated_dummy);
+	  a->associated_dummy = get_nonintrinsic_dummy_arg (f);
+	}
 
       if (a->expr == NULL)
 	{
@@ -3495,12 +3508,17 @@ gfc_compare_actual_formal (gfc_actual_arglist **ap, gfc_formal_arglist *formal,
 
      skip_size_check:
 
-      /* Satisfy F03:12.4.1.3 by ensuring that a procedure pointer actual
-         argument is provided for a procedure pointer formal argument.  */
+      /* Satisfy either: F03:12.4.1.3 by ensuring that a procedure pointer
+	 actual argument is provided for a procedure pointer formal argument;
+	 or: F08:12.5.2.9 (F18:15.5.2.10) by ensuring that the effective
+	 argument shall be an external, internal, module, or dummy procedure.
+	 The interfaces are checked elsewhere.  */
       if (f->sym->attr.proc_pointer
 	  && !((a->expr->expr_type == EXPR_VARIABLE
 		&& (a->expr->symtree->n.sym->attr.proc_pointer
 		    || gfc_is_proc_ptr_comp (a->expr)))
+	       || (a->expr->ts.type == BT_PROCEDURE
+		   && f->sym->ts.interface)
 	       || (a->expr->expr_type == EXPR_FUNCTION
 		   && is_procptr_result (a->expr))))
 	{
@@ -4612,6 +4630,13 @@ matching_typebound_op (gfc_expr** tb_base,
 		gfc_symbol* target;
 		gfc_actual_arglist* argcopy;
 		bool matches;
+
+		/* If expression matching comes here during parsing, eg. when
+		   parsing ASSOCIATE, generic TBPs have not yet been resolved
+		   and g->specific will not have been set. Wait for expression
+		   resolution by returning NULL.  */
+		if (!g->specific && !gfc_current_ns->resolved)
+		  return NULL;
 
 		gcc_assert (g->specific);
 		if (g->specific->error)

@@ -98,9 +98,7 @@ const mstring dtio_procs[] =
 
 /* This is to make sure the backend generates setup code in the correct
    order.  */
-
-static int next_dummy_order = 1;
-
+static int next_decl_order = 1;
 
 gfc_namespace *gfc_current_ns;
 gfc_namespace *gfc_global_ns_list;
@@ -407,18 +405,36 @@ gfc_check_function_type (gfc_namespace *ns)
 
 /******************** Symbol attribute stuff *********************/
 
+/* Older standards produced conflicts for some attributes that are allowed
+   in newer standards.  Check for the conflict and issue an error depending
+   on the standard in play.  */
+
+static bool
+conflict_std (int standard, const char *a1, const char *a2, const char *name,
+	      locus *where)
+{
+  if (name == NULL)
+    {
+      return gfc_notify_std (standard, "%s attribute conflicts "
+			     "with %s attribute at %L", a1, a2,
+			     where);
+    }
+  else
+    {
+      return gfc_notify_std (standard, "%s attribute conflicts "
+			     "with %s attribute in %qs at %L",
+			     a1, a2, name, where);
+    }
+}
+
 /* This is a generic conflict-checker.  We do this to avoid having a
    single conflict in two places.  */
 
 #define conf(a, b) if (attr->a && attr->b) { a1 = a; a2 = b; goto conflict; }
 #define conf2(a) if (attr->a) { a2 = a; goto conflict; }
-#define conf_std(a, b, std) if (attr->a && attr->b)\
-                              {\
-                                a1 = a;\
-                                a2 = b;\
-                                standard = std;\
-                                goto conflict_std;\
-                              }
+#define conf_std(a, b, std) if (attr->a && attr->b \
+				&& !conflict_std (std, a, b, name, where)) \
+				return false;
 
 bool
 gfc_check_conflict (symbol_attribute *attr, const char *name, locus *where)
@@ -451,7 +467,6 @@ gfc_check_conflict (symbol_attribute *attr, const char *name, locus *where)
 						"OACC DECLARE DEVICE_RESIDENT";
 
   const char *a1, *a2;
-  int standard;
 
   if (attr->artificial)
     return true;
@@ -460,20 +475,10 @@ gfc_check_conflict (symbol_attribute *attr, const char *name, locus *where)
     where = &gfc_current_locus;
 
   if (attr->pointer && attr->intent != INTENT_UNKNOWN)
-    {
-      a1 = pointer;
-      a2 = intent;
-      standard = GFC_STD_F2003;
-      goto conflict_std;
-    }
+    conf_std (pointer, intent, GFC_STD_F2003);
 
-  if (attr->in_namelist && (attr->allocatable || attr->pointer))
-    {
-      a1 = in_namelist;
-      a2 = attr->allocatable ? allocatable : pointer;
-      standard = GFC_STD_F2003;
-      goto conflict_std;
-    }
+  conf_std (in_namelist, allocatable, GFC_STD_F2003);
+  conf_std (in_namelist, pointer, GFC_STD_F2003);
 
   /* Check for attributes not allowed in a BLOCK DATA.  */
   if (gfc_current_state () == COMP_BLOCK_DATA)
@@ -922,20 +927,6 @@ conflict:
 	       a1, a2, name, where);
 
   return false;
-
-conflict_std:
-  if (name == NULL)
-    {
-      return gfc_notify_std (standard, "%s attribute conflicts "
-                             "with %s attribute at %L", a1, a2,
-                             where);
-    }
-  else
-    {
-      return gfc_notify_std (standard, "%s attribute conflicts "
-			     "with %s attribute in %qs at %L",
-                             a1, a2, name, where);
-    }
 }
 
 #undef conf
@@ -948,15 +939,13 @@ conflict_std:
 void
 gfc_set_sym_referenced (gfc_symbol *sym)
 {
-
   if (sym->attr.referenced)
     return;
 
   sym->attr.referenced = 1;
 
-  /* Remember which order dummy variables are accessed in.  */
-  if (sym->attr.dummy)
-    sym->dummy_order = next_dummy_order++;
+  /* Remember the declaration order.  */
+  sym->decl_order = next_decl_order++;
 }
 
 
@@ -2674,6 +2663,21 @@ gfc_find_component (gfc_symbol *sym, const char *name,
 /* Given a symbol, free all of the component structures and everything
    they point to.  */
 
+void
+gfc_free_component (gfc_component *p)
+{
+  gfc_free_array_spec (p->as);
+  gfc_free_expr (p->initializer);
+  if (p->kind_expr)
+    gfc_free_expr (p->kind_expr);
+  if (p->param_list)
+    gfc_free_actual_arglist (p->param_list);
+  free (p->tb);
+  p->tb = NULL;
+  free (p);
+}
+
+
 static void
 free_components (gfc_component *p)
 {
@@ -2682,16 +2686,7 @@ free_components (gfc_component *p)
   for (; p; p = q)
     {
       q = p->next;
-
-      gfc_free_array_spec (p->as);
-      gfc_free_expr (p->initializer);
-      if (p->kind_expr)
-	gfc_free_expr (p->kind_expr);
-      if (p->param_list)
-	gfc_free_actual_arglist (p->param_list);
-      free (p->tb);
-      p->tb = NULL;
-      free (p);
+      gfc_free_component (p);
     }
 }
 
@@ -3022,7 +3017,7 @@ gfc_new_symtree (gfc_symtree **root, const char *name)
 
 /* Delete a symbol from the tree.  Does not free the symbol itself!  */
 
-static void
+void
 gfc_delete_symtree (gfc_symtree **root, const char *name)
 {
   gfc_symtree st, *st0;
@@ -3179,6 +3174,57 @@ gfc_free_symbol (gfc_symbol *&sym)
 }
 
 
+/* Returns true if the symbol SYM has, through its FORMAL_NS field, a reference
+   to itself which should be eliminated for the symbol memory to be released
+   via normal reference counting.
+
+   The implementation is crucial as it controls the proper release of symbols,
+   especially (contained) procedure symbols, which can represent a lot of memory
+   through the namespace of their body.
+
+   We try to avoid freeing too much memory (causing dangling pointers), to not
+   leak too much (wasting memory), and to avoid expensive walks of the symbol
+   tree (which would be the correct way to check for a cycle).  */
+
+bool
+cyclic_reference_break_needed (gfc_symbol *sym)
+{
+  /* Normal symbols don't reference themselves.  */
+  if (sym->formal_ns == nullptr)
+    return false;
+
+  /* Procedures at the root of the file do have a self reference, but they don't
+     have a reference in a parent namespace preventing the release of the
+     procedure namespace, so they can use the normal reference counting.  */
+  if (sym->formal_ns == sym->ns)
+    return false;
+
+  /* If sym->refs == 1, we can use normal reference counting.  If sym->refs > 2,
+     the symbol won't be freed anyway, with or without cyclic reference.  */
+  if (sym->refs != 2)
+    return false;
+
+  /* Procedure symbols host-associated from a module in submodules are special,
+     because the namespace of the procedure block in the submodule is different
+     from the FORMAL_NS namespace generated by host-association.  So there are
+     two different namespaces representing the same procedure namespace.  As
+     FORMAL_NS comes from host-association, which only imports symbols visible
+     from the outside (dummy arguments basically), we can assume there is no
+     self reference through FORMAL_NS in that case.  */
+  if (sym->attr.host_assoc && sym->attr.used_in_submodule)
+    return false;
+
+  /* We can assume that contained procedures have cyclic references, because
+     the symbol of the procedure itself is accessible in the procedure body
+     namespace.  So we assume that symbols with a formal namespace different
+     from the declaration namespace and two references, one of which is about
+     to be removed, are procedures with just the self reference left.  At this
+     point, the symbol SYM matches that pattern, so we return true here to
+     permit the release of SYM.  */
+  return true;
+}
+
+
 /* Decrease the reference counter and free memory when we reach zero.
    Returns true if the symbol has been freed, false otherwise.  */
 
@@ -3188,8 +3234,7 @@ gfc_release_symbol (gfc_symbol *&sym)
   if (sym == NULL)
     return false;
 
-  if (sym->formal_ns != NULL && sym->refs == 2 && sym->formal_ns != sym->ns
-      && (!sym->attr.entry || !sym->module))
+  if (cyclic_reference_break_needed (sym))
     {
       /* As formal_ns contains a reference to sym, delete formal_ns just
 	 before the deletion of sym.  */
@@ -5417,7 +5462,16 @@ gfc_namespace *
 gfc_get_procedure_ns (gfc_symbol *sym)
 {
   if (sym->formal_ns
-      && sym->formal_ns->proc_name == sym)
+      && sym->formal_ns->proc_name == sym
+      /* For module procedures used in submodules, there are two namespaces.
+	 The one generated by the host association of the module is directly
+	 accessible through SYM->FORMAL_NS but doesn't have any parent set.
+	 The one generated by the parser is only accessible by walking the
+	 contained namespace but has its parent set.  Prefer the one generated
+	 by the parser below.  */
+      && !(sym->attr.used_in_submodule
+	   && sym->attr.contained
+	   && sym->formal_ns->parent == nullptr))
     return sym->formal_ns;
 
   /* The above should have worked in most cases.  If it hasn't, try some other
@@ -5431,6 +5485,10 @@ gfc_get_procedure_ns (gfc_symbol *sym)
     for (gfc_namespace *ns = sym->ns->contained; ns; ns = ns->sibling)
       if (ns->proc_name == sym)
 	return ns;
+
+  if (sym->formal_ns
+      && sym->formal_ns->proc_name == sym)
+    return sym->formal_ns;
 
   if (sym->formal)
     for (gfc_formal_arglist *f = sym->formal; f != nullptr; f = f->next)

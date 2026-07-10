@@ -2113,13 +2113,13 @@ gfc_match_varspec (gfc_expr *primary, int equiv_flag, bool sub_flag,
 
   inferred_type = IS_INFERRED_TYPE (primary);
 
-  /* SELECT TYPE and SELECT RANK temporaries within an ASSOCIATE block, whose
-     selector has not been parsed, can generate errors with array and component
-     refs.. Use 'inferred_type' as a flag to suppress these errors.  */
+  /* SELECT TYPE temporaries within an ASSOCIATE block, whose selector has not
+     been parsed, can generate errors with array refs.. The SELECT TYPE
+     namespace is marked with 'assoc_name_inferred'. During resolution, this is
+     detected and gfc_fixup_inferred_type_refs is called.  */
   if (!inferred_type
-      && (gfc_peek_ascii_char () == '(' && !sym->attr.dimension)
-      && !sym->attr.codimension
       && sym->attr.select_type_temporary
+      && sym->ns->assoc_name_inferred
       && !sym->attr.select_rank_temporary)
     inferred_type = true;
 
@@ -2765,6 +2765,7 @@ gfc_variable_attr (gfc_expr *expr, gfc_typespec *ts)
   gfc_symbol *sym;
   gfc_component *comp;
   bool has_inquiry_part;
+  bool has_substring_ref = false;
 
   if (expr->expr_type != EXPR_VARIABLE
       && expr->expr_type != EXPR_FUNCTION
@@ -2827,7 +2828,12 @@ gfc_variable_attr (gfc_expr *expr, gfc_typespec *ts)
 
   has_inquiry_part = false;
   for (ref = expr->ref; ref; ref = ref->next)
-    if (ref->type == REF_INQUIRY)
+    if (ref->type == REF_SUBSTRING)
+      {
+	has_substring_ref = true;
+	optional = false;
+      }
+    else if (ref->type == REF_INQUIRY)
       {
 	has_inquiry_part = true;
 	optional = false;
@@ -2875,19 +2881,20 @@ gfc_variable_attr (gfc_expr *expr, gfc_typespec *ts)
 	    *ts = comp->ts;
 	    /* Don't set the string length if a substring reference
 	       follows.  */
-	    if (ts->type == BT_CHARACTER
-		&& ref->next && ref->next->type == REF_SUBSTRING)
-		ts->u.cl = NULL;
+	    if (ts->type == BT_CHARACTER && has_substring_ref)
+	      ts->u.cl = NULL;
 	  }
 
 	if (comp->ts.type == BT_CLASS)
 	  {
+	    dimension = CLASS_DATA (comp)->attr.dimension;
 	    codimension = CLASS_DATA (comp)->attr.codimension;
 	    pointer = CLASS_DATA (comp)->attr.class_pointer;
 	    allocatable = CLASS_DATA (comp)->attr.allocatable;
 	  }
 	else
 	  {
+	    dimension = comp->attr.dimension;
 	    codimension = comp->attr.codimension;
 	    if (expr->ts.type == BT_CLASS && strcmp (comp->name, "_data") == 0)
 	      pointer = comp->attr.class_pointer;
@@ -3362,6 +3369,7 @@ gfc_convert_to_structure_constructor (gfc_expr *e, gfc_symbol *sym, gfc_expr **c
 	  && this_comp->ts.u.cl && this_comp->ts.u.cl->length
 	  && this_comp->ts.u.cl->length->expr_type == EXPR_CONSTANT
 	  && this_comp->ts.u.cl->length->ts.type == BT_INTEGER
+	  && actual->expr
 	  && actual->expr->ts.type == BT_CHARACTER
 	  && actual->expr->expr_type == EXPR_CONSTANT)
 	{
@@ -3426,27 +3434,27 @@ gfc_convert_to_structure_constructor (gfc_expr *e, gfc_symbol *sym, gfc_expr **c
 	  goto cleanup;
 	}
 
-          /* If not explicitly a parent constructor, gather up the components
-             and build one.  */
-          if (comp && comp == sym->components
-                && sym->attr.extension
-		&& comp_tail->val
-                && (!gfc_bt_struct (comp_tail->val->ts.type)
-                      ||
-                    comp_tail->val->ts.u.derived != this_comp->ts.u.derived))
-            {
-              bool m;
+	  /* If not explicitly a parent constructor, gather up the components
+	     and build one.  */
+	  if (comp && comp == sym->components
+	      && sym->attr.extension
+	      && comp_tail->val
+	      && (!gfc_bt_struct (comp_tail->val->ts.type)
+		  || comp_tail->val->ts.u.derived != this_comp->ts.u.derived))
+	    {
+	      bool m;
 	      gfc_actual_arglist *arg_null = NULL;
 
 	      actual->expr = comp_tail->val;
 	      comp_tail->val = NULL;
+#define shorter gfc_convert_to_structure_constructor
+	      m = shorter (NULL, comp->ts.u.derived, &comp_tail->val,
+			   comp->ts.u.derived->attr.zero_comp ? &arg_null :
+								&actual, true);
+#undef shorter
 
-              m = gfc_convert_to_structure_constructor (NULL,
-					comp->ts.u.derived, &comp_tail->val,
-					comp->ts.u.derived->attr.zero_comp
-					  ? &arg_null : &actual, true);
-              if (!m)
-                goto cleanup;
+	      if (!m)
+		goto cleanup;
 
 	      if (comp->ts.u.derived->attr.zero_comp)
 		{
@@ -3520,18 +3528,16 @@ gfc_convert_to_structure_constructor (gfc_expr *e, gfc_symbol *sym, gfc_expr **c
 
 
 match
-gfc_match_structure_constructor (gfc_symbol *sym, gfc_expr **result)
+gfc_match_structure_constructor (gfc_symbol *sym, gfc_symtree *symtree,
+				 gfc_expr **result)
 {
   match m;
   gfc_expr *e;
-  gfc_symtree *symtree;
   bool t = true;
 
-  gfc_get_ha_sym_tree (sym->name, &symtree);
-
   e = gfc_get_expr ();
-  e->symtree = symtree;
   e->expr_type = EXPR_FUNCTION;
+  e->symtree = symtree;
   e->where = gfc_current_locus;
 
   gcc_assert (gfc_fl_struct (sym->attr.flavor)

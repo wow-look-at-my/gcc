@@ -1,3 +1,239 @@
+2026-06-26  Release Manager
+
+	* GCC 14.4.0 released.
+
+2026-03-30  Patrick Palka  <ppalka@redhat.com>
+
+	Backported from master:
+	2026-02-02  Patrick Palka  <ppalka@redhat.com>
+
+	* c-cppbuiltin.cc (c_cpp_builtins): Bump __cpp_deduction_guides to
+	202207L for C++23 and later.
+
+2026-03-20  Richard Biener  <rguenther@suse.de>
+
+	Backported from master:
+	2025-12-18  Richard Biener  <rguenther@suse.de>
+
+	PR c/123156
+	* c-common.cc (c_build_shufflevector): Use ssizetype for the
+	permute vector element type.
+
+2026-03-15  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2025-11-25  Jakub Jelinek  <jakub@redhat.com>
+
+	PR middle-end/120052
+	* c-ubsan.cc (ubsan_instrument_bounds): For VLAs use
+	1 instead of 0 as first IFN_UBSAN_BOUNDS argument and only
+	use the addend without TYPE_MAX_VALUE (TYPE_DOMAIN (type))
+	in the 3rd argument.
+
+2026-03-15  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2025-11-25  Jakub Jelinek  <jakub@redhat.com>
+
+	PR middle-end/122624
+	* c-common.cc (c_common_get_alias_set): Fix up handling of
+	BITINT_TYPEs.  For unsigned _BitInt(1) always return -1.  For other
+	unsigned types set TYPE_ALIAS_SET to get_alias_set of corresponding
+	signed type and return that.  For signed types check if corresponding
+	unsigned type has TYPE_ALIAS_SET_KNOWN_P and if so copy its
+	TYPE_ALIAS_SET and return that.
+
+2026-03-14  Andrew Pinski  <andrew.pinski@oss.qualcomm.com>
+
+	Backported from master:
+	2026-02-12  Andrew Pinski  <andrew.pinski@oss.qualcomm.com>
+
+	PR c/105555
+	* c-common.cc (fold_offsetof): Handle REALPART_EXPR
+	and IMAGPART_EXPR.
+
+2025-10-14  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2025-10-09  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c/122188
+	* c-gimplify.cc (c_gimplify_expr): Also gimplify the second operand
+	before the COND_EXPR and use in COND_EXPR result of gimplification.
+
+2025-10-14  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2025-10-08  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c/122188
+	* c-gimplify.cc (c_gimplify_expr): Gimplify CALL_EXPR_ARG (*expr_p, 0)
+	instead of calling save_expr on it.
+
+2025-08-08  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2025-07-04  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c/120837
+	* c-common.cc (pointer_int_sum): Rewrite the intop PLUS_EXPR or
+	MINUS_EXPR optimization into extension of both intop operands,
+	their separate multiplication and then addition/subtraction followed
+	by rest of pointer_int_sum handling after the multiplication.
+
+2025-05-23  Release Manager
+
+	* GCC 14.3.0 released.
+
+2025-05-15  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2025-02-13  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c++/118822
+	* c-common.h (WHILE_COND_CLEANUP): Change description in comment.
+	(FOR_COND_CLEANUP): Likewise.
+	* c-gimplify.cc (genericize_c_loop): Adjust for COND_CLEANUP
+	being CLEANUP_STMT/TRY_FINALLY_EXPR trailing nesting depth
+	instead of actual cleanup.
+
+2025-05-15  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2025-02-07  Jakub Jelinek  <jakub@redhat.com>
+		    Jason Merrill  <jason@redhat.com>
+
+	PR c++/86769
+	* c-common.def (FOR_STMT): Add 2 operands and document them.
+	(WHILE_STMT): Likewise.
+	* c-common.h (WHILE_COND_PREP, WHILE_COND_CLEANUP): Define.
+	(FOR_COND_PREP, FOR_COND_CLEANUP): Define.
+	* c-gimplify.cc (genericize_c_loop): Add COND_PREP and COND_CLEANUP
+	arguments, handle them if they are non-NULL.
+	(genericize_for_stmt, genericize_while_stmt, genericize_do_stmt):
+	Adjust callers.
+
+2025-03-22  Martin Uecker  <uecker@tugraz.at>
+
+	Backported from master:
+	2024-10-31  Martin Uecker  <uecker@tugraz.at>
+
+	PR c/117145
+	PR c/117245
+	PR c/100420
+	* c-pretty-print.cc (c_pretty_printer::direct_abstract_declarator):
+	Detect arrays of unspecified size.
+
+2025-03-13  Eric Botcazou  <ebotcazou@adacore.com>
+
+	PR ada/119265
+	* c-ada-spec.cc (dump_ada_node) <INTEGER_TYPE>: Deal with typedefs
+	of unsigned __int128.
+
+2025-03-05  Marek Polacek  <polacek@redhat.com>
+
+	Backported from master:
+	2025-03-05  Marek Polacek  <polacek@redhat.com>
+
+	PR c++/115580
+	* c-common.cc (check_function_arguments): Return early if
+	c_inhibit_evaluation_warnings.
+
+2025-01-09  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2024-11-26  Jakub Jelinek  <jakub@redhat.com>
+
+	PR middle-end/43374
+	* c-cppbuiltin.cc (builtin_define_decimal_float_constants): Use
+	get_max_float.
+
+2025-01-09  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2024-11-22  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c/117641
+	* c-common.cc (sync_resolve_size): For size 16 with _BitInt
+	on targets where TImode isn't supported, use goto incompatible if
+	!fetch.
+
+2025-01-09  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2024-11-19  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c/117641
+	* c-common.cc (sync_resolve_size): For size == 16 fetch of
+	BITINT_TYPE if TImode isn't supported scalar mode diagnose
+	and return 0 if orig_format instead of returning 16.
+
+2024-10-23  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2024-10-22  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c/117230
+	* c-warn.cc (sizeof_pointer_memaccess_warning): Only compare
+	TYPE_PRECISION of TREE_TYPE (type) to precision of char if
+	TREE_TYPE (type) is integral type.
+
+2024-10-01  Jason Merrill  <jason@redhat.com>
+
+	* c-cppbuiltin.cc (c_cpp_builtins): Don't define __cpp_concepts
+	before C++17.
+
+2024-08-01  Release Manager
+
+	* GCC 14.2.0 released.
+
+2024-07-03  Lewis Hyatt  <lhyatt@gmail.com>
+
+	PR pch/115312
+	* c-opts.cc (c_common_init): Call c_init_preprocess() before
+	c_finish_options() so that a parser is available to process any
+	includes specified on the command line.
+
+2024-06-25  Andrew Pinski  <quic_apinski@quicinc.com>
+
+	Backported from master:
+	2024-06-25  Andrew Pinski  <quic_apinski@quicinc.com>
+
+	PR c++/115624
+	* c.opt (Wnrvo): Add Warning property.
+
+2024-06-17  Jakub Jelinek  <jakub@redhat.com>
+
+	Backported from master:
+	2024-06-17  Jakub Jelinek  <jakub@redhat.com>
+
+	PR c/115290
+	* c-warn.cc (do_warn_array_compare): Use %E rather than %D for
+	printing op0 and op1; if those operands aren't decls, also print
+	parens around them.
+
+2024-05-15  Richard Biener  <rguenther@suse.de>
+
+	Backported from master:
+	2024-05-07  Richard Biener  <rguenther@suse.de>
+
+	PR middle-end/114931
+	* c-common.cc (complete_array_type): Set TYPE_STRUCTURAL_EQUALITY_P
+	before probing with type_hash_canon.
+
+2024-05-07  Andrew Pinski  <quic_apinski@quicinc.com>
+
+	Backported from master:
+	2024-05-07  Andrew Pinski  <quic_apinski@quicinc.com>
+
+	PR c++/89224
+	* c-common.cc (convert_vector_to_array_for_subscript): Call build_qualified_type
+	for the inner type.
+
+2024-05-07  Release Manager
+
+	* GCC 14.1.0 released.
+
 2024-04-23  Jakub Jelinek  <jakub@redhat.com>
 
 	* c-attribs.cc (handle_objc_nullability_attribute): Spelling fix:

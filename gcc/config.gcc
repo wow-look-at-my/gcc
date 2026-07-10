@@ -394,6 +394,8 @@ bfin*-*)
 	;;
 bpf-*-*)
 	cpu_type=bpf
+	c_target_objs="bpf-c.o"
+	cxx_target_objs="bpf-c.o"
 	;;
 frv*)	cpu_type=frv
 	extra_options="${extra_options} g.opt"
@@ -532,7 +534,7 @@ powerpc*-*-*)
 	extra_headers="${extra_headers} ppu_intrinsics.h spu2vmx.h vec_types.h si2vmx.h"
 	extra_headers="${extra_headers} amo.h"
 	case x$with_cpu in
-	    xpowerpc64|xdefault64|x6[23]0|x970|xG5|xpower[3456789]|xpower10|xpower6x|xrs64a|xcell|xa2|xe500mc64|xe5500|xe6500)
+	    xpowerpc64|xdefault64|x6[23]0|x970|xG5|xpower[3456789]|xpower1[01]|xpower6x|xrs64a|xcell|xa2|xe500mc64|xe5500|xe6500)
 		cpu_is_64bit=yes
 		;;
 	esac
@@ -2564,8 +2566,8 @@ loongarch*-*-linux*)
 
 loongarch*-*-elf*)
 	tm_file="elfos.h newlib-stdint.h ${tm_file}"
-	tm_file="${tm_file} loongarch/elf.h loongarch/linux.h loongarch/loongarch-driver.h"
-	tmake_file="${tmake_file} loongarch/t-multilib loongarch/t-linux"
+	tm_file="${tm_file} loongarch/elf.h loongarch/loongarch-driver.h"
+	tmake_file="${tmake_file} loongarch/t-multilib"
 	gnu_ld=yes
 	gas=yes
 
@@ -4275,7 +4277,7 @@ case "${target}" in
 				  echo "Unknown extension used in --with-$which=$val" 1>&2
 				  exit 1
 				fi
-				ext_val=`echo $ext_val | sed -E -e 's/[a-z0-9]+//'`
+				ext_val=`echo $ext_val | sed -E -e 's/[a-z0-9-]+//'`
 			  done
 
 			  true
@@ -4570,7 +4572,7 @@ case "${target}" in
 		for which in arch tune; do
 			eval "val=\$with_$which"
 			case ${val} in
-			"" | fiji | gfx900 | gfx906 | gfx908 | gfx90a | gfx1030 | gfx1036 | gfx1100 | gfx1103)
+			"" | fiji | gfx900 | gfx906 | gfx908 | gfx90a | gfx90c | gfx1030 | gfx1036 | gfx1100 | gfx1103)
 				# OK
 				;;
 			*)
@@ -4586,7 +4588,7 @@ case "${target}" in
 			TM_MULTILIB_CONFIG=
 			;;
 		xdefault | xyes)
-			TM_MULTILIB_CONFIG=`echo "gfx900,gfx906,gfx908,gfx90a,gfx1030,gfx1036,gfx1100,gfx1103" | sed "s/${with_arch},\?//;s/,$//"`
+			TM_MULTILIB_CONFIG=`echo "gfx900,gfx906,gfx908,gfx90a,gfx90c,gfx1030,gfx1036,gfx1100,gfx1103" | sed "s/${with_arch},\?//;s/,$//"`
 			;;
 		*)
 			TM_MULTILIB_CONFIG="${with_multilib_list}"
@@ -5599,7 +5601,7 @@ case "${target}" in
 				eval "with_$which=405"
 				;;
 			"" | common | native \
-			| power[3456789] | power10 | power5+ | power6x \
+			| power[3456789] | power1[01] | power5+ | power6x \
 			| powerpc | powerpc64 | powerpc64le \
 			| rs64 \
 			| 401 | 403 | 405 | 405fp | 440 | 440fp | 464 | 464fp \

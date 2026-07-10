@@ -1388,10 +1388,10 @@ static const struct loongarch_builtin_description loongarch_builtins[] = {
   LSX_BUILTIN (vfrintrp_d, LARCH_V2DF_FTYPE_V2DF),
   LSX_BUILTIN (vfrintrm_s, LARCH_V4SF_FTYPE_V4SF),
   LSX_BUILTIN (vfrintrm_d, LARCH_V2DF_FTYPE_V2DF),
-  LSX_NO_TARGET_BUILTIN (vstelm_b, LARCH_VOID_FTYPE_V16QI_CVPOINTER_SI_UQI),
-  LSX_NO_TARGET_BUILTIN (vstelm_h, LARCH_VOID_FTYPE_V8HI_CVPOINTER_SI_UQI),
-  LSX_NO_TARGET_BUILTIN (vstelm_w, LARCH_VOID_FTYPE_V4SI_CVPOINTER_SI_UQI),
-  LSX_NO_TARGET_BUILTIN (vstelm_d, LARCH_VOID_FTYPE_V2DI_CVPOINTER_SI_UQI),
+  LSX_NO_TARGET_BUILTIN (vstelm_b, LARCH_VOID_FTYPE_V16QI_VPOINTER_SI_UQI),
+  LSX_NO_TARGET_BUILTIN (vstelm_h, LARCH_VOID_FTYPE_V8HI_VPOINTER_SI_UQI),
+  LSX_NO_TARGET_BUILTIN (vstelm_w, LARCH_VOID_FTYPE_V4SI_VPOINTER_SI_UQI),
+  LSX_NO_TARGET_BUILTIN (vstelm_d, LARCH_VOID_FTYPE_V2DI_VPOINTER_SI_UQI),
   LSX_BUILTIN (vaddwev_d_w, LARCH_V2DI_FTYPE_V4SI_V4SI),
   LSX_BUILTIN (vaddwev_w_h, LARCH_V4SI_FTYPE_V8HI_V8HI),
   LSX_BUILTIN (vaddwev_h_b, LARCH_V8HI_FTYPE_V16QI_V16QI),
@@ -1561,18 +1561,18 @@ static const struct loongarch_builtin_description loongarch_builtins[] = {
   LSX_BUILTIN (vssrarni_du_q, LARCH_UV2DI_FTYPE_UV2DI_V2DI_USI),
   LSX_BUILTIN (vpermi_w, LARCH_V4SI_FTYPE_V4SI_V4SI_USI),
   LSX_BUILTIN (vld, LARCH_V16QI_FTYPE_CVPOINTER_SI),
-  LSX_NO_TARGET_BUILTIN (vst, LARCH_VOID_FTYPE_V16QI_CVPOINTER_SI),
+  LSX_NO_TARGET_BUILTIN (vst, LARCH_VOID_FTYPE_V16QI_VPOINTER_SI),
   LSX_BUILTIN (vssrlrn_b_h, LARCH_V16QI_FTYPE_V8HI_V8HI),
   LSX_BUILTIN (vssrlrn_h_w, LARCH_V8HI_FTYPE_V4SI_V4SI),
   LSX_BUILTIN (vssrlrn_w_d, LARCH_V4SI_FTYPE_V2DI_V2DI),
   LSX_BUILTIN (vssrln_b_h, LARCH_V16QI_FTYPE_V8HI_V8HI),
   LSX_BUILTIN (vssrln_h_w, LARCH_V8HI_FTYPE_V4SI_V4SI),
   LSX_BUILTIN (vssrln_w_d, LARCH_V4SI_FTYPE_V2DI_V2DI),
-  LSX_BUILTIN (vorn_v, LARCH_V16QI_FTYPE_V16QI_V16QI),
+  LSX_BUILTIN (vorn_v, LARCH_UV16QI_FTYPE_UV16QI_UV16QI),
   LSX_BUILTIN (vldi, LARCH_V2DI_FTYPE_HI),
   LSX_BUILTIN (vshuf_b, LARCH_V16QI_FTYPE_V16QI_V16QI_V16QI),
   LSX_BUILTIN (vldx, LARCH_V16QI_FTYPE_CVPOINTER_DI),
-  LSX_NO_TARGET_BUILTIN (vstx, LARCH_VOID_FTYPE_V16QI_CVPOINTER_DI),
+  LSX_NO_TARGET_BUILTIN (vstx, LARCH_VOID_FTYPE_V16QI_VPOINTER_DI),
   LSX_BUILTIN (vextl_qu_du, LARCH_UV2DI_FTYPE_UV2DI),
 
   /* Built-in functions for LASX */
@@ -2101,11 +2101,11 @@ static const struct loongarch_builtin_description loongarch_builtins[] = {
   LASX_BUILTIN (xvfrintrm_s, LARCH_V8SF_FTYPE_V8SF),
   LASX_BUILTIN (xvfrintrm_d, LARCH_V4DF_FTYPE_V4DF),
   LASX_BUILTIN (xvld, LARCH_V32QI_FTYPE_CVPOINTER_SI),
-  LASX_NO_TARGET_BUILTIN (xvst, LARCH_VOID_FTYPE_V32QI_CVPOINTER_SI),
-  LASX_NO_TARGET_BUILTIN (xvstelm_b, LARCH_VOID_FTYPE_V32QI_CVPOINTER_SI_UQI),
-  LASX_NO_TARGET_BUILTIN (xvstelm_h, LARCH_VOID_FTYPE_V16HI_CVPOINTER_SI_UQI),
-  LASX_NO_TARGET_BUILTIN (xvstelm_w, LARCH_VOID_FTYPE_V8SI_CVPOINTER_SI_UQI),
-  LASX_NO_TARGET_BUILTIN (xvstelm_d, LARCH_VOID_FTYPE_V4DI_CVPOINTER_SI_UQI),
+  LASX_NO_TARGET_BUILTIN (xvst, LARCH_VOID_FTYPE_V32QI_VPOINTER_SI),
+  LASX_NO_TARGET_BUILTIN (xvstelm_b, LARCH_VOID_FTYPE_V32QI_VPOINTER_SI_UQI),
+  LASX_NO_TARGET_BUILTIN (xvstelm_h, LARCH_VOID_FTYPE_V16HI_VPOINTER_SI_UQI),
+  LASX_NO_TARGET_BUILTIN (xvstelm_w, LARCH_VOID_FTYPE_V8SI_VPOINTER_SI_UQI),
+  LASX_NO_TARGET_BUILTIN (xvstelm_d, LARCH_VOID_FTYPE_V4DI_VPOINTER_SI_UQI),
   LASX_BUILTIN (xvinsve0_w, LARCH_V8SI_FTYPE_V8SI_V8SI_UQI),
   LASX_BUILTIN (xvinsve0_d, LARCH_V4DI_FTYPE_V4DI_V4DI_UQI),
   LASX_BUILTIN (xvpickve_w, LARCH_V8SI_FTYPE_V8SI_UQI),
@@ -2118,10 +2118,10 @@ static const struct loongarch_builtin_description loongarch_builtins[] = {
   LASX_BUILTIN (xvssrln_b_h, LARCH_V32QI_FTYPE_V16HI_V16HI),
   LASX_BUILTIN (xvssrln_h_w, LARCH_V16HI_FTYPE_V8SI_V8SI),
   LASX_BUILTIN (xvssrln_w_d, LARCH_V8SI_FTYPE_V4DI_V4DI),
-  LASX_BUILTIN (xvorn_v, LARCH_V32QI_FTYPE_V32QI_V32QI),
+  LASX_BUILTIN (xvorn_v, LARCH_UV32QI_FTYPE_UV32QI_UV32QI),
   LASX_BUILTIN (xvldi, LARCH_V4DI_FTYPE_HI),
   LASX_BUILTIN (xvldx, LARCH_V32QI_FTYPE_CVPOINTER_DI),
-  LASX_NO_TARGET_BUILTIN (xvstx, LARCH_VOID_FTYPE_V32QI_CVPOINTER_DI),
+  LASX_NO_TARGET_BUILTIN (xvstx, LARCH_VOID_FTYPE_V32QI_VPOINTER_DI),
   LASX_BUILTIN (xvextl_qu_du, LARCH_UV4DI_FTYPE_UV4DI),
 
   /* LASX */
@@ -2371,11 +2371,25 @@ loongarch_build_cvpointer_type (void)
   return cache;
 }
 
+/* Return a type for 'volatile void *'.  */
+
+static tree
+loongarch_build_vpointer_type (void)
+{
+  static tree cache;
+
+  if (cache == NULL_TREE)
+    cache = build_pointer_type (build_qualified_type (void_type_node,
+						      TYPE_QUAL_VOLATILE));
+  return cache;
+}
+
 /* Source-level argument types.  */
 #define LARCH_ATYPE_VOID void_type_node
 #define LARCH_ATYPE_INT integer_type_node
 #define LARCH_ATYPE_POINTER ptr_type_node
 #define LARCH_ATYPE_CVPOINTER loongarch_build_cvpointer_type ()
+#define LARCH_ATYPE_VPOINTER loongarch_build_vpointer_type ()
 #define LARCH_ATYPE_BOOLEAN boolean_type_node
 /* Standard mode-based argument types.  */
 #define LARCH_ATYPE_QI intQI_type_node
@@ -3074,7 +3088,10 @@ loongarch_expand_builtin_lsx_test_branch (enum insn_code icode, tree exp)
     ops[1].value = force_reg (ops[1].mode, ops[1].value);
 
   if ((cbranch = maybe_gen_insn (icode, 3, ops)) == NULL_RTX)
-    error ("failed to expand built-in function");
+    {
+      error ("failed to expand built-in function");
+      return const0_rtx;
+    }
 
   cmp_result = gen_reg_rtx (SImode);
 
@@ -3114,7 +3131,7 @@ loongarch_expand_builtin (tree exp, rtx target, rtx subtarget ATTRIBUTE_UNUSED,
     {
       error_at (EXPR_LOCATION (exp),
 		"built-in function %qD is not enabled", fndecl);
-      return target;
+      return target ? target : const0_rtx;
     }
 
   switch (d->builtin_type)

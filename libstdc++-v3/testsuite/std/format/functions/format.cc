@@ -248,6 +248,24 @@ test_locale()
   s = std::format(cloc, "{:05L}", -1.0); // PR libstdc++/110968
   VERIFY( s == "-0001" );
 
+  // PR libstdc++/114863 grouping applied to nan and inf
+  double inf = std::numeric_limits<double>::infinity();
+  s = std::format(eloc, "{0:Le} {0:Lf} {0:Lg}", -inf);
+  VERIFY( s == "-inf -inf -inf" );
+  double nan = std::numeric_limits<double>::quiet_NaN();
+  s = std::format(eloc, "{0:Le} {0:Lf} {0:Lg}", -nan);
+  VERIFY( s == "-nan -nan -nan" );
+
+  // PR libstdc++/120548 format confuses a negative sign for a thousands digit
+  s = std::format(bloc, "{:L}", -123.45);
+  VERIFY( s == "-123.45" );
+  s = std::format(bloc, "{:-L}", -876543.21);
+  VERIFY( s == "-876,543.21" );
+  s = std::format(bloc, "{:+L}", 333.22);
+  VERIFY( s == "+333.22" );
+  s = std::format(bloc, "{: L}", 999.44);
+  VERIFY( s == " 999.44" );
+
   // Restore
   std::locale::global(cloc);
 }
@@ -358,6 +376,18 @@ test_wchar()
   // P2909R4 Fix formatting of code units as integers (Dude, where’s my char?)
   s = std::format(L"{:d} {:d}", wchar_t(-1), char(-1));
   VERIFY( s.find('-') == std::wstring::npos );
+
+  auto ws = std::format(L"{:L}", 0.5);
+  VERIFY( ws == L"0.5" );
+  // The default C locale.
+  std::locale cloc = std::locale::classic();
+  // PR libstdc++/119671 use-after-free formatting floating-point to wstring
+  ws = std::format(cloc, L"{:L}", 0.5);
+  VERIFY( ws == L"0.5" );
+  // A locale with no name, but with the same facets as the C locale.
+  std::locale locx(cloc, &std::use_facet<std::ctype<char>>(cloc));
+  ws = std::format(locx, L"{:L}", 0.5);
+  VERIFY( ws == L"0.5" );
 }
 
 void
@@ -489,9 +519,14 @@ test_unicode()
 {
   // Similar to sC example in test_std_examples, but not from the standard.
   // Verify that the character "🤡" has estimated field width 2,
-  // rather than estimated field width equal to strlen("🤡"), which would be 4.
+  // rather than estimated field width equal to strlen("🤡"), which would be 4,
+  // or just width 1 for single character.
   std::string sC = std::format("{:*<3}", "🤡");
   VERIFY( sC == "🤡*" );
+  std::wstring wsC = std::format(L"{:*<3}", L"🤡");
+  VERIFY( wsC == L"🤡*" );
+  wsC = std::format(L"{:*<3}", L'🤡');
+  VERIFY( wsC == L"🤡*" );
 
   // Verify that "£" has estimated field width 1, not strlen("£") == 2.
   std::string sL = std::format("{:*<3}", "£");

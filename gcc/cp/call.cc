@@ -4318,6 +4318,7 @@ maybe_init_list_as_array (tree elttype, tree init)
   /* Check with a stub expression to weed out special cases, and check whether
      we call the same function for direct-init as copy-list-init.  */
   conversion_obstack_sentinel cos;
+  init_elttype = cp_build_qualified_type (init_elttype, TYPE_QUAL_CONST);
   tree arg = build_stub_object (init_elttype);
   conversion *c = implicit_conversion (elttype, init_elttype, arg, false,
 				       LOOKUP_NORMAL, tf_none);
@@ -4325,6 +4326,19 @@ maybe_init_list_as_array (tree elttype, tree init)
     c = next_conversion (c);
   if (!c || c->kind != ck_user)
     return NULL_TREE;
+  /* Check that we actually can perform the conversion.  */
+  if (convert_like (c, arg, tf_none) == error_mark_node)
+    /* Let the normal code give the error.  */
+    return NULL_TREE;
+
+  /* A glvalue initializer might be significant to a reference constructor
+     or conversion operator.  */
+  if (!DECL_CONSTRUCTOR_P (c->cand->fn)
+      || (TYPE_REF_P (TREE_VALUE
+		      (FUNCTION_FIRST_USER_PARMTYPE (c->cand->fn)))))
+    for (auto &ce : CONSTRUCTOR_ELTS (init))
+      if (non_mergeable_glvalue_p (ce.value))
+	return NULL_TREE;
 
   tree first = CONSTRUCTOR_ELT (init, 0)->value;
   conversion *fc = implicit_conversion (elttype, init_elttype, first, false,
@@ -4357,7 +4371,6 @@ maybe_init_list_as_array (tree elttype, tree init)
   if (!is_xible (INIT_EXPR, elttype, copy_argtypes))
     return NULL_TREE;
 
-  init_elttype = cp_build_qualified_type (init_elttype, TYPE_QUAL_CONST);
   tree arr = build_array_of_n_type (init_elttype, CONSTRUCTOR_NELTS (init));
   arr = finish_compound_literal (arr, init, tf_none);
   DECL_MERGEABLE (TARGET_EXPR_SLOT (arr)) = true;
@@ -6742,7 +6755,8 @@ add_candidates (tree fns, tree first_arg, const vec<tree, va_gc> *args,
 
       if (cand->viable == -1
 	  && shortcut_bad_convs
-	  && missing_conversion_p (cand))
+	  && (missing_conversion_p (cand)
+	      || TREE_CODE (cand->fn) == TEMPLATE_DECL))
 	{
 	  /* This candidate has been tentatively marked non-strictly viable,
 	     and we didn't compute all argument conversions for it (having
@@ -8597,16 +8611,12 @@ convert_like_internal (conversion *convs, tree expr, tree fn, int argnum,
 	    && TYPE_HAS_DEFAULT_CONSTRUCTOR (totype)
 	    && !processing_template_decl)
 	  {
-	    bool direct = CONSTRUCTOR_IS_DIRECT_INIT (expr);
 	    if (abstract_virtuals_error (NULL_TREE, totype, complain))
 	      return error_mark_node;
 	    expr = build_value_init (totype, complain);
 	    expr = get_target_expr (expr, complain);
 	    if (expr != error_mark_node)
-	      {
-		TARGET_EXPR_LIST_INIT_P (expr) = true;
-		TARGET_EXPR_DIRECT_INIT_P (expr) = direct;
-	      }
+	      TARGET_EXPR_LIST_INIT_P (expr) = true;
 	    return expr;
 	  }
 
@@ -8680,16 +8690,7 @@ convert_like_internal (conversion *convs, tree expr, tree fn, int argnum,
 	unsigned len = CONSTRUCTOR_NELTS (expr);
 	tree array;
 
-	if (tree init = maybe_init_list_as_array (elttype, expr))
-	  {
-	    elttype = cp_build_qualified_type
-	      (elttype, cp_type_quals (elttype) | TYPE_QUAL_CONST);
-	    array = build_array_of_n_type (elttype, len);
-	    array = build_vec_init_expr (array, init, complain);
-	    array = get_target_expr (array);
-	    array = cp_build_addr_expr (array, complain);
-	  }
-	else if (len)
+	if (len)
 	  {
 	    tree val; unsigned ix;
 
@@ -9939,18 +9940,11 @@ build_over_call (struct z_candidate *cand, int flags, tsubst_flags_t complain)
 	current_function_returns_abnormally = 1;
       if (immediate_invocation_p (fn))
 	{
-	  tree obj_arg = NULL_TREE, exprimm = expr;
+	  tree obj_arg = NULL_TREE;
 	  if (DECL_CONSTRUCTOR_P (fn))
 	    obj_arg = first_arg;
-	  if (obj_arg
-	      && is_dummy_object (obj_arg)
-	      && !type_dependent_expression_p (obj_arg))
-	    {
-	      exprimm = build_cplus_new (DECL_CONTEXT (fn), expr, complain);
-	      obj_arg = NULL_TREE;
-	    }
 	  /* Look through *(const T *)&obj.  */
-	  else if (obj_arg && INDIRECT_REF_P (obj_arg))
+	  if (obj_arg && INDIRECT_REF_P (obj_arg))
 	    {
 	      tree addr = TREE_OPERAND (obj_arg, 0);
 	      STRIP_NOPS (addr);
@@ -9962,7 +9956,7 @@ build_over_call (struct z_candidate *cand, int flags, tsubst_flags_t complain)
 		    obj_arg = TREE_OPERAND (addr, 0);
 		}
 	    }
-	  fold_non_dependent_expr (exprimm, complain,
+	  fold_non_dependent_expr (expr, complain,
 				   /*manifestly_const_eval=*/true,
 				   obj_arg);
 	}
@@ -10518,10 +10512,8 @@ build_over_call (struct z_candidate *cand, int flags, tsubst_flags_t complain)
       if (is_really_empty_class (type, /*ignore_vptr*/true))
 	{
 	  /* Avoid copying empty classes, but ensure op= returns an lvalue even
-	     if the object argument isn't one. This isn't needed in other cases
-	     since MODIFY_EXPR is always considered an lvalue.  */
-	  to = cp_build_addr_expr (to, tf_none);
-	  to = cp_build_indirect_ref (input_location, to, RO_ARROW, complain);
+	     if the object argument isn't one.  */
+	  to = force_lvalue (to, complain);
 	  val = build2 (COMPOUND_EXPR, type, arg, to);
 	  suppress_warning (val, OPT_Wunused);
 	}
@@ -10542,6 +10534,9 @@ build_over_call (struct z_candidate *cand, int flags, tsubst_flags_t complain)
 	  tree array_type, alias_set;
 
 	  arg2 = TYPE_SIZE_UNIT (as_base);
+	  /* Ensure op= returns an lvalue even if the object argument isn't
+	     one.  */
+	  to = force_lvalue (to, complain);
 	  to = cp_stabilize_reference (to);
 	  arg0 = cp_build_addr_expr (to, complain);
 
@@ -11819,7 +11814,7 @@ build_new_method_call (tree instance, tree fns, vec<tree, va_gc> **args,
 			 fn);
 	    }
 
-	  if (TREE_CODE (TREE_TYPE (fn)) == METHOD_TYPE
+	  if (DECL_OBJECT_MEMBER_FUNCTION_P (fn)
 	      && !DECL_CONSTRUCTOR_P (fn)
 	      && is_dummy_object (instance))
 	    {
@@ -12825,6 +12820,14 @@ cand_parms_match (z_candidate *c1, z_candidate *c2, pmatch match_kind)
 	&& DECL_FUNCTION_MEMBER_P (fn2)))
     /* Early escape.  */;
 
+  else if ((DECL_INHERITED_CTOR (fn1) || DECL_INHERITED_CTOR (fn2))
+	   && (DECL_CONTEXT (strip_inheriting_ctors (fn1))
+	       != DECL_CONTEXT (strip_inheriting_ctors (fn2))))
+    /* This should really be checked for all member functions as per
+       CWG2789, but for GCC 14 we check this only for constructors since
+       without r15-3740 doing so would result in inconsistent handling
+       of object parameters (such as in concepts-memfun4.C).  */
+    return false;
   /* CWG2789 is not adequate, it should specify corresponding object
      parameters, not same typed object parameters.  */
   else if (!object_parms_correspond (c1, fn1, c2, fn2))
@@ -13225,10 +13228,35 @@ joust (struct z_candidate *cand1, struct z_candidate *cand2, bool warn,
   else if (cand2->rewritten ())
     return 1;
 
-  /* F1 is generated from a deduction-guide (13.3.1.8) and F2 is not */
   if (deduction_guide_p (cand1->fn))
     {
       gcc_assert (deduction_guide_p (cand2->fn));
+
+      /* F1 and F2 are generated from class template argument deduction for a
+	 class D, and F2 is generated from inheriting constructors from a base
+	 class of D while F1 is not, and for each explicit function argument,
+	 the corresponding parameters of F1 and F2 are either both ellipses or
+	 have the same type.  */
+      bool inherited1 = inherited_guide_p (cand1->fn);
+      bool inherited2 = inherited_guide_p (cand2->fn);
+      if (int diff = inherited2 - inherited1)
+	{
+	  for (i = 0; i < len; ++i)
+	    {
+	      conversion *t1 = cand1->convs[i + off1];
+	      conversion *t2 = cand2->convs[i + off2];
+	      /* ??? It seems the ellipses part of this tiebreaker isn't
+		 needed since a mismatch should have broken the tie earlier
+		 during ICS comparison.  */
+	      gcc_checking_assert (t1->ellipsis_p == t2->ellipsis_p);
+	      if (!same_type_p (t1->type, t2->type))
+		break;
+	    }
+	  if (i == len)
+	    return diff;
+	}
+
+      /* F1 is generated from a deduction-guide (13.3.1.8) and F2 is not */
       /* We distinguish between candidates from an explicit deduction guide and
 	 candidates built from a constructor based on DECL_ARTIFICIAL.  */
       int art1 = DECL_ARTIFICIAL (cand1->fn);
@@ -13488,7 +13516,8 @@ tourney (struct z_candidate *candidates, tsubst_flags_t complain)
 	{
 	  previous_worse_champ = nullptr;
 	  champ = &(*challenger)->next;
-	  if (!*champ || !(*champ)->viable)
+	  if (!*champ || !(*champ)->viable
+	      || (*champ)->viable < (*challenger)->viable)
 	    {
 	      champ = nullptr;
 	      break;
@@ -13627,11 +13656,6 @@ perform_implicit_conversion_flags (tree type, tree expr,
 {
   conversion *conv;
   location_t loc = cp_expr_loc_or_input_loc (expr);
-
-  if (TYPE_REF_P (type))
-    expr = mark_lvalue_use (expr);
-  else
-    expr = mark_rvalue_use (expr);
 
   if (error_operand_p (expr))
     return error_mark_node;
@@ -13800,6 +13824,9 @@ make_temporary_var_for_ref_to_temp (tree decl, tree type)
       tree name = mangle_ref_init_variable (decl);
       DECL_NAME (var) = name;
       SET_DECL_ASSEMBLER_NAME (var, name);
+
+      /* Set the context to make the variable mergeable in modules.  */
+      DECL_CONTEXT (var) = current_scope ();
     }
   else
     /* Create a new cleanup level if necessary.  */
@@ -13867,7 +13894,9 @@ set_up_extended_ref_temp (tree decl, tree expr, vec<tree, va_gc> **cleanups,
   init = cp_fully_fold (init);
   if (TREE_CONSTANT (init))
     {
-      if (literal_type_p (type) && CP_TYPE_CONST_NON_VOLATILE_P (type))
+      if (literal_type_p (type)
+	  && CP_TYPE_CONST_NON_VOLATILE_P (type)
+	  && !TYPE_HAS_MUTABLE_P (type))
 	{
 	  /* 5.19 says that a constant expression can include an
 	     lvalue-rvalue conversion applied to "a glvalue of literal type
@@ -14250,8 +14279,20 @@ do_warn_dangling_reference (tree expr, bool arg_p)
 	    /* Recurse to see if the argument is a temporary.  It could also
 	       be another call taking a temporary and returning it and
 	       initializing this reference parameter.  */
-	    if (do_warn_dangling_reference (arg, /*arg_p=*/true))
-	      return expr;
+	    if ((arg = do_warn_dangling_reference (arg, /*arg_p=*/true)))
+	      {
+		/* If we know the temporary could not bind to the return type,
+		   don't warn.  This is for scalars and empty classes only
+		   because for other classes we can't be sure we are not
+		   returning its sub-object.  */
+		if ((SCALAR_TYPE_P (TREE_TYPE (arg))
+		     || is_empty_class (TREE_TYPE (arg)))
+		    && TYPE_REF_P (rettype)
+		    && !reference_related_p (TREE_TYPE (rettype),
+					     TREE_TYPE (arg)))
+		  continue;
+		return expr;
+	      }
 	  /* Don't warn about member functions like:
 	      std::any a(...);
 	      S& s = a.emplace<S>({0}, 0);

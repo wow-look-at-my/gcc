@@ -159,29 +159,6 @@
 (define_register_constraint "vm" "TARGET_VECTOR ? VM_REGS : NO_REGS"
   "A vector mask register (if available).")
 
-;; These following constraints are used by RVV instructions with dest EEW > src EEW.
-;; RISC-V 'V' Spec 5.2. Vector Operands:
-;; The destination EEW is greater than the source EEW, the source EMUL is at least 1,
-;; and the overlap is in the highest-numbered part of the destination register group.
-;; (e.g., when LMUL=8, vzext.vf4 v0, v6 is legal, but a source of v0, v2, or v4 is not).
-(define_register_constraint "W21" "TARGET_VECTOR ? V_REGS : NO_REGS"
-  "A vector register has register number % 2 == 1." "regno % 2 == 1")
-
-(define_register_constraint "W42" "TARGET_VECTOR ? V_REGS : NO_REGS"
-  "A vector register has register number % 4 == 2." "regno % 4 == 2")
-
-(define_register_constraint "W84" "TARGET_VECTOR ? V_REGS : NO_REGS"
-  "A vector register has register number % 8 == 4." "regno % 8 == 4")
-
-(define_register_constraint "W41" "TARGET_VECTOR ? V_REGS : NO_REGS"
-  "A vector register has register number % 4 == 1." "regno % 4 == 1")
-
-(define_register_constraint "W81" "TARGET_VECTOR ? V_REGS : NO_REGS"
-  "A vector register has register number % 8 == 1." "regno % 8 == 1")
-
-(define_register_constraint "W82" "TARGET_VECTOR ? V_REGS : NO_REGS"
-  "A vector register has register number % 8 == 2." "regno % 8 == 2")
-
 ;; This constraint is used to match instruction "csrr %0, vlenb" which is generated in "mov<mode>".
 ;; VLENB is a run-time constant which represent the vector register length in bytes.
 ;; BYTES_PER_RISCV_VECTOR represent runtime invariant of vector register length in bytes.
@@ -210,6 +187,12 @@
   "A vector 5-bit unsigned immediate."
   (and (match_code "const_vector")
        (match_test "riscv_vector::const_vec_all_same_in_range_p (op, 0, 31)")))
+
+(define_constraint "vl"
+  "A uimm5 for Vector or zero for XTheadVector."
+  (and (match_code "const_int")
+       (ior (match_test "!TARGET_XTHEADVECTOR && satisfies_constraint_K (op)")
+	    (match_test "TARGET_XTHEADVECTOR && satisfies_constraint_J (op)"))))
 
 (define_constraint "Wc0"
   "@internal

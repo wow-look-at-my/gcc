@@ -435,6 +435,8 @@ rs6000_target_modify_macros (bool define_p, HOST_WIDE_INT flags)
     rs6000_define_or_undefine_macro (define_p, "_ARCH_PWR9");
   if ((flags & OPTION_MASK_POWER10) != 0)
     rs6000_define_or_undefine_macro (define_p, "_ARCH_PWR10");
+  if ((flags & OPTION_MASK_POWER11) != 0)
+    rs6000_define_or_undefine_macro (define_p, "_ARCH_PWR11");
   if ((flags & OPTION_MASK_SOFT_FLOAT) != 0)
     rs6000_define_or_undefine_macro (define_p, "_SOFT_FLOAT");
   if ((flags & OPTION_MASK_RECIP_PRECISION) != 0)
@@ -833,14 +835,40 @@ rs6000_builtin_type_compatible (tree parmtype, tree argtype)
   return lang_hooks.types_compatible_p (parmtype, argtype);
 }
 
-/* In addition to calling fold_convert for EXPR of type TYPE, also
+/* Return fold_convert (TYPE, EXPR) for C and convert (TYPE, EXPR)
+   for C++.  The latter is needed because resolve_overloaded_builtin
+   can be called when parsing templates too if they don't have type
+   dependent operands, but the nested trees might not be usable in
+   GENERIC folding.  */
+
+static tree
+c_fold_convert (tree type, tree expr)
+{
+  return c_dialect_cxx () ? convert (type, expr) : fold_convert (type, expr);
+}
+
+/* Similar wrapper for fold_build2_loc.  For C++ just call build2_loc.  */
+
+static tree
+c_fold_build2_loc (location_t loc, enum tree_code code, tree type, tree arg0,
+		   tree arg1)
+{
+  if (!c_dialect_cxx ())
+    return fold_build2_loc (loc, code, type, arg0, arg1);
+  else if (loc != UNKNOWN_LOCATION)
+    return build2_loc (loc, code, type, arg0, arg1);
+  else
+    return build2 (code, type, arg0, arg1);
+}
+
+/* In addition to calling c_fold_convert for EXPR of type TYPE, also
    call c_fully_fold to remove any C_MAYBE_CONST_EXPRs that could be
    hiding there (PR47197).  */
 
 static tree
 fully_fold_convert (tree type, tree expr)
 {
-  tree result = fold_convert (type, expr);
+  tree result = c_fold_convert (type, expr);
   bool maybe_const = true;
 
   if (!c_dialect_cxx ())
@@ -853,7 +881,7 @@ fully_fold_convert (tree type, tree expr)
    The overloaded builtin that matched the types and args is described
    by DESC.  The N arguments are given in ARGS, respectively.
 
-   Actually the only thing it does is calling fold_convert on ARGS, with
+   Actually the only thing it does is calling c_fold_convert on ARGS, with
    a small exception for vec_{all,any}_{ge,le} predicates. */
 
 static tree
@@ -889,8 +917,9 @@ altivec_build_resolved_builtin (tree *args, int n, tree fntype, tree ret_type,
       std::swap (args[1], args[2]);
       std::swap (arg_type[1], arg_type[2]);
 
-      args[0] = fold_build2 (BIT_XOR_EXPR, TREE_TYPE (args[0]), args[0],
-			     build_int_cst (NULL_TREE, 2));
+      args[0] = c_fold_build2_loc (UNKNOWN_LOCATION, BIT_XOR_EXPR,
+				   TREE_TYPE (args[0]), args[0],
+				   build_int_cst (NULL_TREE, 2));
     }
 
   for (int j = 0; j < n; j++)
@@ -921,7 +950,7 @@ altivec_build_resolved_builtin (tree *args, int n, tree fntype, tree ret_type,
     default:
       gcc_unreachable ();
     }
-  return fold_convert (ret_type, call);
+  return c_fold_convert (ret_type, call);
 }
 
 /* Enumeration of possible results from attempted overload resolution.
@@ -962,8 +991,8 @@ resolve_vec_mul (resolution *res, tree *args, tree *types, location_t loc)
     case E_TImode:
       /* For scalar types just use a multiply expression.  */
       *res = resolved;
-      return fold_build2_loc (loc, MULT_EXPR, types[0], args[0],
-			      fold_convert (types[0], args[1]));
+      return c_fold_build2_loc (loc, MULT_EXPR, types[0], args[0],
+				c_fold_convert (types[0], args[1]));
     case E_SFmode:
       {
 	/* For floats use the xvmulsp instruction directly.  */
@@ -1106,8 +1135,8 @@ resolve_vec_adde_sube (resolution *res, rs6000_gen_builtins fcode,
 							params);
 	tree const1 = build_int_cstu (TREE_TYPE (types[0]), 1);
 	tree ones_vector = build_vector_from_val (types[0], const1);
-	tree and_expr = fold_build2_loc (loc, BIT_AND_EXPR, types[0],
-					 args[2], ones_vector);
+	tree and_expr = c_fold_build2_loc (loc, BIT_AND_EXPR, types[0],
+					   args[2], ones_vector);
 	params = make_tree_vector ();
 	vec_safe_push (params, call);
 	vec_safe_push (params, and_expr);
@@ -1192,8 +1221,8 @@ resolve_vec_addec_subec (resolution *res, rs6000_gen_builtins fcode,
 							 params);
 	tree const1 = build_int_cstu (TREE_TYPE (types[0]), 1);
 	tree ones_vector = build_vector_from_val (types[0], const1);
-	tree and_expr = fold_build2_loc (loc, BIT_AND_EXPR, types[0],
-					 args[2], ones_vector);
+	tree and_expr = c_fold_build2_loc (loc, BIT_AND_EXPR, types[0],
+					   args[2], ones_vector);
 	params = make_tree_vector ();
 	vec_safe_push (params, call2);
 	vec_safe_push (params, and_expr);
@@ -1301,7 +1330,7 @@ resolve_vec_splats (resolution *res, rs6000_gen_builtins fcode,
       return error_mark_node;
     }
 
-  arg = save_expr (fold_convert (TREE_TYPE (type), arg));
+  arg = save_expr (c_fold_convert (TREE_TYPE (type), arg));
   vec<constructor_elt, va_gc> *vec;
   vec_alloc (vec, size);
 
@@ -1440,7 +1469,7 @@ resolve_vec_extract (resolution *res, vec<tree, va_gc> *arglist,
 	  tree result = build_call_expr (call, 2, arg1, arg2);
 	  /* Coerce the result to vector element type.  May be no-op.  */
 	  arg1_inner_type = TREE_TYPE (arg1_type);
-	  result = fold_convert (arg1_inner_type, result);
+	  result = c_fold_convert (arg1_inner_type, result);
 	  *res = resolved;
 	  return result;
 	}
@@ -1604,8 +1633,9 @@ resolve_vec_insert (resolution *res, vec<tree, va_gc> *arglist,
   if (TARGET_VSX)
     {
       stmt = build_array_ref (loc, stmt, arg2);
-      stmt = fold_build2 (MODIFY_EXPR, TREE_TYPE (arg0), stmt,
-			  convert (TREE_TYPE (stmt), arg0));
+      stmt = c_fold_build2_loc (UNKNOWN_LOCATION, MODIFY_EXPR,
+				TREE_TYPE (arg0), stmt,
+				convert (TREE_TYPE (stmt), arg0));
       stmt = build2 (COMPOUND_EXPR, arg1_type, stmt, decl);
     }
   else
@@ -1664,22 +1694,25 @@ resolve_vec_step (resolution *res, vec<tree, va_gc> *arglist, unsigned nargs)
    true.  If we don't match, return error_mark_node and leave
    UNSUPPORTED_BUILTIN alone.  */
 
-tree
-find_instance (bool *unsupported_builtin, ovlddata **instance,
+static tree
+find_instance (bool *unsupported_builtin, int *instance,
 	       rs6000_gen_builtins instance_code,
 	       rs6000_gen_builtins fcode,
 	       tree *types, tree *args, int nargs)
 {
-  while (*instance && (*instance)->bifid != instance_code)
-    *instance = (*instance)->next;
+  while (*instance != -1
+	 && rs6000_instance_info[*instance].bifid != instance_code)
+    *instance = rs6000_instance_info[*instance].next;
 
-  ovlddata *inst = *instance;
-  gcc_assert (inst != NULL);
+  int inst = *instance;
+  gcc_assert (inst != -1);
   /* It is possible for an instance to require a data type that isn't
-     defined on this target, in which case inst->fntype will be NULL.  */
-  if (!inst->fntype)
+     defined on this target, in which case rs6000_instance_info_fntype[inst]
+     will be NULL.  */
+  if (!rs6000_instance_info_fntype[inst])
     return error_mark_node;
-  tree fntype = rs6000_builtin_info[inst->bifid].fntype;
+  rs6000_gen_builtins bifid = rs6000_instance_info[inst].bifid;
+  tree fntype = rs6000_builtin_info_fntype[bifid];
   tree argtype = TYPE_ARG_TYPES (fntype);
   bool args_compatible = true;
 
@@ -1696,12 +1729,12 @@ find_instance (bool *unsupported_builtin, ovlddata **instance,
 
   if (args_compatible)
     {
-      if (rs6000_builtin_decl (inst->bifid, false) != error_mark_node
-	  && rs6000_builtin_is_supported (inst->bifid))
+      if (rs6000_builtin_decl (bifid, false) != error_mark_node
+	  && rs6000_builtin_is_supported (bifid))
 	{
-	  tree ret_type = TREE_TYPE (inst->fntype);
+	  tree ret_type = TREE_TYPE (rs6000_instance_info_fntype[inst]);
 	  return altivec_build_resolved_builtin (args, nargs, fntype, ret_type,
-						 inst->bifid, fcode);
+						 bifid, fcode);
 	}
       else
 	*unsupported_builtin = true;
@@ -1826,7 +1859,7 @@ altivec_resolve_overloaded_builtin (location_t loc, tree fndecl,
 		     "const");
 	  type = build_qualified_type (TREE_TYPE (type), 0);
 	  type = build_pointer_type (type);
-	  arg = fold_convert (type, arg);
+	  arg = c_fold_convert (type, arg);
 	}
 
       /* For RS6000_OVLD_VEC_LXVL, convert any const * to its non constant
@@ -1837,7 +1870,7 @@ altivec_resolve_overloaded_builtin (location_t loc, tree fndecl,
 	{
 	  type = build_qualified_type (TREE_TYPE (type), 0);
 	  type = build_pointer_type (type);
-	  arg = fold_convert (type, arg);
+	  arg = c_fold_convert (type, arg);
 	}
 
       args[n] = arg;
@@ -1884,11 +1917,11 @@ altivec_resolve_overloaded_builtin (location_t loc, tree fndecl,
   bool unsupported_builtin = false;
   rs6000_gen_builtins instance_code;
   bool supported = false;
-  ovlddata *instance = rs6000_overload_info[adj_fcode].first_instance;
-  gcc_assert (instance != NULL);
+  int instance = rs6000_overload_info[adj_fcode].first_instance;
+  gcc_assert (instance != -1);
 
   /* Functions with no arguments can have only one overloaded instance.  */
-  gcc_assert (nargs > 0 || !instance->next);
+  gcc_assert (nargs > 0 || rs6000_instance_info[instance].next == -1);
 
   /* Standard overload processing involves determining whether an instance
      exists that is type-compatible with the overloaded function call.  In
@@ -1989,16 +2022,18 @@ altivec_resolve_overloaded_builtin (location_t loc, tree fndecl,
       /* Standard overload processing.  Look for an instance with compatible
 	 parameter types.  If it is supported in the current context, resolve
 	 the overloaded call to that instance.  */
-      for (; instance != NULL; instance = instance->next)
+      for (; instance != -1; instance = rs6000_instance_info[instance].next)
 	{
+	  tree fntype = rs6000_instance_info_fntype[instance];
+	  rs6000_gen_builtins bifid = rs6000_instance_info[instance].bifid;
 	  /* It is possible for an instance to require a data type that isn't
-	     defined on this target, in which case instance->fntype will be
+	     defined on this target, in which case fntype will be
 	     NULL.  */
-	  if (!instance->fntype)
+	  if (!fntype)
 	    continue;
 
 	  bool mismatch = false;
-	  tree nextparm = TYPE_ARG_TYPES (instance->fntype);
+	  tree nextparm = TYPE_ARG_TYPES (fntype);
 
 	  for (unsigned int arg_i = 0;
 	       arg_i < nargs && nextparm != NULL;
@@ -2016,15 +2051,14 @@ altivec_resolve_overloaded_builtin (location_t loc, tree fndecl,
 	  if (mismatch)
 	    continue;
 
-	  supported = rs6000_builtin_is_supported (instance->bifid);
-	  if (rs6000_builtin_decl (instance->bifid, false) != error_mark_node
+	  supported = rs6000_builtin_is_supported (bifid);
+	  if (rs6000_builtin_decl (bifid, false) != error_mark_node
 	      && supported)
 	    {
-	      tree fntype = rs6000_builtin_info[instance->bifid].fntype;
-	      tree ret_type = TREE_TYPE (instance->fntype);
+	      tree ret_type = TREE_TYPE (fntype);
+	      fntype = rs6000_builtin_info_fntype[bifid];
 	      return altivec_build_resolved_builtin (args, nargs, fntype,
-						     ret_type, instance->bifid,
-						     fcode);
+						     ret_type, bifid, fcode);
 	    }
 	  else
 	    {
@@ -2041,12 +2075,12 @@ altivec_resolve_overloaded_builtin (location_t loc, tree fndecl,
 	{
 	  /* Indicate that the instantiation of the overloaded builtin
 	     name is not available with the target flags in effect.  */
-	  rs6000_gen_builtins fcode = (rs6000_gen_builtins) instance->bifid;
+	  rs6000_gen_builtins bifid = rs6000_instance_info[instance].bifid;
+	  rs6000_gen_builtins fcode = (rs6000_gen_builtins) bifid;
 	  rs6000_invalid_builtin (fcode);
 	  /* Provide clarity of the relationship between the overload
 	     and the instantiation.  */
-	  const char *internal_name
-	    = rs6000_builtin_info[instance->bifid].bifname;
+	  const char *internal_name = rs6000_builtin_info[bifid].bifname;
 	  rich_location richloc (line_table, input_location);
 	  inform (&richloc,
 		  "overloaded builtin %qs is implemented by builtin %qs",

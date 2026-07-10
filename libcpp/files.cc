@@ -28,6 +28,7 @@ along with this program; see the file COPYING3.  If not see
 #include "obstack.h"
 #include "hashtab.h"
 #include "md5.h"
+#include "sha1.h"
 #include <dirent.h>
 
 /* Variable length record files on VMS will have a stat size that includes
@@ -106,6 +107,13 @@ struct _cpp_file
   /* If BUFFER above contains the true contents of the file.  */
   bool buffer_valid : 1;
 
+  /* If CONTENT_SHA1 below holds a valid SHA-1 of the file's RAW on-disk
+     bytes (computed once in read_file_guts, before charset conversion).
+     The in-compiler compile cache consumes this stored digest so a cache
+     MISS need not re-open and re-read the include closure just to hash it
+     (see cpp_foreach_included_file).  */
+  bool content_sha1_valid : 1;
+
   /* If this file is implicitly preincluded.  */
   bool implicit_preinclude : 1;
 
@@ -115,6 +123,12 @@ struct _cpp_file
 
   /* > 0: Known C++ Module header unit, <0: known not.  ==0, unknown  */
   int header_unit : 2;
+
+  /* SHA-1 of the file's RAW on-disk bytes (the bytes read off disk, before
+     any input-charset conversion / BOM stripping / line cleaning), computed
+     once in read_file_guts.  Valid only when content_sha1_valid is set.
+     Zero-initialised by XCNEW in make_cpp_file.  */
+  unsigned char content_sha1[20];
 };
 
 /* A singly-linked list for all searches for a given file name, with
@@ -372,6 +386,182 @@ maybe_shorter_path (const char * file)
     }
 }
 
+/* Per-directory filename index.  States for cpp_dir::name_index_state.  */
+#define DIR_INDEX_UNBUILT	0	/* Not yet attempted.  */
+#define DIR_INDEX_OK		1	/* name_index is a usable hash set.  */
+#define DIR_INDEX_UNAVAILABLE	2	/* opendir/readdir failed; do not use.  */
+
+/* Lazily build DIR->name_index: an in-memory hash set of the top-level
+   entry names of the directory DIR->name, populated once via
+   opendir/readdir.  On success DIR->name_index_state becomes
+   DIR_INDEX_OK; if the directory cannot be read it becomes
+   DIR_INDEX_UNAVAILABLE and callers must fall back to a real open().
+
+   The set stores xstrdup'd copies of each d_name and is keyed using
+   filename_hash/filename_eq, which match the host filesystem's
+   case-sensitivity exactly the same way a real open() would (a plain
+   byte compare on Unix, case-insensitive on DOS-like systems).  This
+   guarantees the membership test agrees with open() on whether
+   DIR/name could exist.
+
+   Assumes the directory's contents do not change for the duration of
+   the translation unit -- the same assumption libcpp's existing
+   found-file (file_hash) and missing-file (nonexistent_file_hash)
+   caches already rely on.  */
+
+static void
+build_dir_name_index (cpp_dir *dir)
+{
+  DIR *d = opendir (dir->name[0] ? dir->name : ".");
+  if (d == NULL)
+    {
+      /* Unreadable directory (permissions, ENOENT, ENOTDIR, ...).
+	 Degrade gracefully: behave exactly as before by always
+	 issuing the real open().  */
+      dir->name_index_state = DIR_INDEX_UNAVAILABLE;
+      return;
+    }
+
+  htab_t index = htab_create_alloc (64, filename_hash, filename_eq,
+				    free, xcalloc, free);
+
+  struct dirent *e;
+  int read_errno;
+  for (;;)
+    {
+      /* readdir returns NULL both at end-of-directory and on error; the
+	 two are distinguished by errno, which it leaves untouched on a
+	 clean end.  Reset it before each call and re-read immediately so
+	 nothing in the loop body can clobber it.  */
+      errno = 0;
+      e = readdir (d);
+      read_errno = errno;
+      if (e == NULL)
+	break;
+
+      /* "." and ".." can never satisfy a single-component #include
+	 lookup, so there is no need to store them.  */
+      if (e->d_name[0] == '.'
+	  && (e->d_name[1] == '\0'
+	      || (e->d_name[1] == '.' && e->d_name[2] == '\0')))
+	continue;
+
+      void **slot = htab_find_slot_with_hash (index, e->d_name,
+					      filename_hash (e->d_name),
+					      INSERT);
+      if (*slot == NULL)
+	*slot = xstrdup (e->d_name);
+    }
+
+  if (read_errno != 0)
+    {
+      /* readdir failed partway through; we cannot trust the index to be
+	 complete, so discard it and fall back to real opens.  */
+      htab_delete (index);
+      closedir (d);
+      dir->name_index_state = DIR_INDEX_UNAVAILABLE;
+      return;
+    }
+
+  closedir (d);
+  dir->name_index = index;
+  dir->name_index_state = DIR_INDEX_OK;
+}
+
+/* Return true iff the single-component filename NAME is provably NOT a
+   direct entry of directory DIR, using DIR's lazily-built filename
+   index.  Returns false (meaning "do not skip the open") whenever the
+   index is unavailable or NAME might be present -- i.e. this only ever
+   reports a guaranteed miss, never a guaranteed hit, so a real open()
+   still runs in every case where the answer is not a certain absence.
+
+   The caller must ensure NAME contains no directory separator: readdir
+   only lists top-level entries, so a multi-component name such as
+   "QtCore/qobject.h" is never itself an entry.  Multi-component
+   lookups go through index_proves_absent below, which tests only the
+   leading component here.  */
+
+static bool
+name_absent_from_dir (cpp_dir *dir, const char *name)
+{
+  if (dir->name_index_state == DIR_INDEX_UNBUILT)
+    build_dir_name_index (dir);
+
+  if (dir->name_index_state != DIR_INDEX_OK)
+    return false;	/* Index unavailable: never skip the open.  */
+
+  htab_t index = (htab_t) dir->name_index;
+  if (htab_find_with_hash (index, name, filename_hash (name)) != NULL)
+    return false;	/* Present (or possibly present): must open.  */
+
+  return true;		/* Provably absent: safe to skip the open.  */
+}
+
+/* Return true iff opening the path DIR/FNAME (as built by
+   append_file_to_dir) is provably going to fail with ENOENT according
+   to DIR's filename index, so the open() can be skipped.
+
+   A single-component FNAME is a direct index membership test, exactly
+   as before.
+
+   For a multi-component FNAME such as "QtCore/qstring.h", path
+   resolution must first look up the LEADING component ("QtCore") as a
+   direct entry of DIR; if the index proves that entry does not exist,
+   open (DIR/FNAME) must fail with ENOENT no matter what the remaining
+   components are.  Only ABSENCE of the leading component is used:
+   when it is present -- as a subdirectory, a symlink to anything, or
+   even a plain file (the ENOTDIR case, which open_file already maps
+   to ENOENT) -- we return false and the real open() runs, letting the
+   OS resolve the tail exactly as before.  Deeper components are never
+   tested: readdir only enumerates top-level entries, and the first
+   component is where the systematic miss cost is.
+
+   Multi-component names containing "." or ".." or empty components
+   ("A/./B", "A/../B", "A//B", a trailing '/') always return false:
+   their resolution is not a plain top-level-entry lookup, so they
+   stay on the raw open() path.  */
+
+static bool
+index_proves_absent (cpp_dir *dir, const char *fname)
+{
+  const char *sep = strchr (fname, '/');
+  if (sep == NULL)
+    /* Single component: FNAME itself must be an entry of DIR.  */
+    return name_absent_from_dir (dir, fname);
+
+  /* Multi-component: only trust the leading-component test when every
+     component is a plain name.  */
+  const char *p = fname;
+  for (;;)
+    {
+      const char *q = strchr (p, '/');
+      size_t len = q ? (size_t) (q - p) : strlen (p);
+      if (len == 0
+	  || (p[0] == '.' && (len == 1 || (len == 2 && p[1] == '.'))))
+	return false;
+      if (q == NULL)
+	break;
+      p = q + 1;
+    }
+
+  /* NUL-terminate a copy of the leading component for the index
+     lookup.  Include-name components are short; spill to the heap
+     only for pathological lengths.  */
+  size_t comp_len = (size_t) (sep - fname);
+  char buf[64];
+  char *comp = buf;
+  if (comp_len >= sizeof buf)
+    comp = XNEWVEC (char, comp_len + 1);
+  memcpy (comp, fname, comp_len);
+  comp[comp_len] = '\0';
+
+  bool absent = name_absent_from_dir (dir, comp);
+
+  if (comp != buf)
+    free (comp);
+  return absent;
+}
+
 /* Try to open the path FILE->name appended to FILE->dir.  This is
    where remap and PCH intercept the file lookup process.  Return true
    if the file was found, whether or not the open was successful.
@@ -383,6 +573,12 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
 		  location_t loc)
 {
   char *path;
+  /* True only when PATH is exactly DIR/FILE->name as built by
+     append_file_to_dir, i.e. neither -fremap-file-name nor a DOS
+     name_map (dir->construct) rewrote it.  The per-directory name
+     index is keyed on plain top-level entry names, so it is only
+     valid for paths built by that plain route.  */
+  bool plain_path = false;
 
   if (CPP_OPTION (pfile, remap) && (path = remap_filename (pfile, file)))
     ;
@@ -390,7 +586,10 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
     if (file->dir->construct)
       path = file->dir->construct (file->name, file->dir);
     else
-      path = append_file_to_dir (file->name, file->dir);
+      {
+	path = append_file_to_dir (file->name, file->dir);
+	plain_path = true;
+      }
 
   if (path)
     {
@@ -398,14 +597,67 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
       char *copy;
       void **pp;
 
+      /* Before spending any per-candidate syscalls on DIR/name -- the
+	 canonicalization below is a full realpath() component walk (one
+	 readlink per path component), and the lookup ends in an open()
+	 -- consult the directory's filename index.  When the path is the
+	 plain DIR/name form and the index proves the lookup must fail --
+	 for a single-component name, the name is not an entry of the
+	 directory; for a multi-component name like "QtCore/qobject.h",
+	 its leading component is not an entry, so path resolution
+	 cannot even begin (see index_proves_absent) -- the open() is
+	 guaranteed to fail with ENOENT.  Skip it and record the miss
+	 exactly as the ENOENT path below would, so behaviour -- the set
+	 of headers found, diagnostics, and the nonexistent_file_hash
+	 bookkeeping -- is byte-for-byte identical to actually calling
+	 open().  Only the redundant failing syscalls disappear.
+
+	 The shortcut is confined to genuine directory-resident header
+	 lookups.  It must never fire for the pseudo-file paths that reach
+	 this code:
+	   - The empty file name is <stdin> (and the main input file "-"
+	     resolves to it); it is opened as fd 0 by open_file, is never a
+	     readdir entry, and must not be treated as "absent".
+	   - pfile->no_search_path is the synthetic directory used for the
+	     main file, -include of an absolute path, and preprocessed
+	     input.  Its name is "" so build_dir_name_index would index the
+	     current working directory, which has nothing to do with the
+	     file being opened.
+	 Requiring a non-empty single-component name and a real search
+	 directory keeps the optimization for the include-search case while
+	 falling through to open_file for every pseudo-file.  */
+      bool skip_open = (plain_path
+			&& file->name[0] != '\0'
+			&& file->dir != &pfile->no_search_path
+#ifdef HAVE_DOS_BASED_FILE_SYSTEM
+			/* Backslash-separated and drive-qualified names
+			   have DOS-specific resolution rules; keep them
+			   on the raw open() path.  */
+			&& strchr (file->name, '\\') == NULL
+			&& !HAS_DRIVE_SPEC (file->name)
+#endif
+			&& index_proves_absent (file->dir, file->name));
+
       /* We try to canonicalize system headers.  For DOS based file
        * system, we always try to shorten non-system headers, as DOS
-       * has a tighter constraint on max path length.  */
-      if ((CPP_OPTION (pfile, canonical_system_headers) && file->dir->sysp)
+       * has a tighter constraint on max path length.
+
+       * Skipped when the index has already proven the lookup must fail:
+       * lrealpath's result would be discarded anyway -- a miss resets
+       * file->path to file->name below, so the canonical spelling's only
+       * remaining use would be as the nonexistent_file_hash key, and
+       * recording the miss under the plain DIR/name spelling instead
+       * keys the cache on exactly the string a later probe of the same
+       * candidate rebuilds (append_file_to_dir is deterministic).  This
+       * is what makes provably-absent candidates cost zero syscalls
+       * rather than a full realpath() walk each.  (A path's resolution
+       * changing mid-compile is not a supported scenario.)  */
+      if (!skip_open
+	  && ((CPP_OPTION (pfile, canonical_system_headers) && file->dir->sysp)
 #ifdef HAVE_DOS_BASED_FILE_SYSTEM
-	  || !file->dir->sysp
+	      || !file->dir->sysp
 #endif
-	 )
+	     ))
 	{
 	  char * canonical_path = maybe_shorter_path (path);
 	  if (canonical_path)
@@ -428,10 +680,10 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
       if (pch_open_file (pfile, file, invalid_pch))
 	return true;
 
-      if (open_file (file))
+      if (!skip_open && open_file (file))
 	return true;
 
-      if (file->err_no != ENOENT)
+      if (!skip_open && file->err_no != ENOENT)
 	{
 	  open_file_failed (pfile, file, 0, loc);
 	  return true;
@@ -447,6 +699,8 @@ find_file_in_dir (cpp_reader *pfile, _cpp_file *file, bool *invalid_pch,
 				     copy, hv, INSERT);
       *pp = copy;
 
+      if (skip_open)
+	file->err_no = ENOENT;
       file->path = file->name;
     }
   else
@@ -763,6 +1017,31 @@ read_file_guts (cpp_reader *pfile, _cpp_file *file, location_t loc,
     cpp_error_at (pfile, CPP_DL_WARNING, loc,
 	       "%s is shorter than expected", file->path);
 
+  /* Hash the RAW on-disk bytes exactly once, here, before _cpp_convert_input
+     (which may free BUF and rewrite it in the source charset).  The in-
+     compiler compile cache consumes this stored digest instead of re-opening
+     and re-reading the whole include closure on a cache miss just to hash it
+     -- the compiler already read these exact bytes, so a miss does zero
+     redundant file I/O.  TOTAL is the meaningful byte count (BUF holds 16
+     extra padding bytes that are never hashed); a zero-byte file yields the
+     well-defined SHA-1 of the empty input, still a valid digest.
+
+     Gated on hash_file_contents: only a configured compile cache consumes
+     these digests, and hashing the whole closure unconditionally costs ~1.8%
+     of a -O0 compile for nothing when the cache is off.  Files read while
+     the option is off (or through the NULL-pfile path) simply never get a
+     stored digest, and cpp_foreach_included_file falls back to re-reading
+     them if a consumer does turn up.  */
+  if (pfile && CPP_OPTION (pfile, hash_file_contents))
+    {
+      struct sha1_ctx sctx;
+      sha1_init_ctx (&sctx);
+      if (total > 0)
+	sha1_process_bytes (buf, (size_t) total, &sctx);
+      sha1_finish_ctx (&sctx, file->content_sha1);
+      file->content_sha1_valid = true;
+    }
+
   file->buffer = _cpp_convert_input (pfile,
 				     input_charset,
 				     buf, size + 16, total,
@@ -972,7 +1251,6 @@ _cpp_stack_file (cpp_reader *pfile, _cpp_file *file, include_type type,
       /* Add the file to the dependencies on its first inclusion.  */
       if (CPP_OPTION (pfile, deps.style) > (sysp != 0)
 	  && !file->stack_count
-	  && file->path[0]
 	  && !(pfile->main_file == file
 	       && CPP_OPTION (pfile, deps.ignore_main_file)))
 	deps_add_dep (pfile->deps, file->path);
@@ -1005,6 +1283,7 @@ _cpp_stack_file (cpp_reader *pfile, _cpp_file *file, include_type type,
 		    && type < IT_DIRECTIVE_HWM
 		    && (pfile->line_table->highest_location
 			!= LINE_MAP_MAX_LOCATION - 1));
+
   if (decrement)
     pfile->line_table->highest_location--;
 
@@ -1466,6 +1745,22 @@ _cpp_init_files (cpp_reader *pfile)
 			      xmalloc, free);
 }
 
+/* Release the lazily-built filename indices for every directory in the
+   chain headed by DIR.  Safe to call on a NULL or partially-built
+   chain.  */
+
+static void
+free_dir_name_indices (cpp_dir *dir)
+{
+  for (; dir; dir = dir->next)
+    if (dir->name_index)
+      {
+	htab_delete ((htab_t) dir->name_index);
+	dir->name_index = NULL;
+	dir->name_index_state = DIR_INDEX_UNBUILT;
+      }
+}
+
 /* Finalize everything in this source file.  */
 void
 _cpp_cleanup_files (cpp_reader *pfile)
@@ -1476,6 +1771,23 @@ _cpp_cleanup_files (cpp_reader *pfile)
   obstack_free (&pfile->nonexistent_file_ob, 0);
   free_file_hash_entries (pfile);
   destroy_all_cpp_files (pfile);
+  /* The quote chain is the superset of the bracket chain, so freeing it
+     once covers both.  */
+  free_dir_name_indices (pfile->quote_include);
+
+  /* The recorded __has_include probes (see cpp_reader::hi_probes).  */
+  for (unsigned i = 0; i < pfile->hi_probe_count; i++)
+    {
+      struct cpp_hi_probe *p = &pfile->hi_probes[i];
+      free (p->name);
+      free (p->resolved);
+      for (unsigned k = 0; k < p->n_candidates; k++)
+	free (p->candidates[k]);
+      free (p->candidates);
+    }
+  free (pfile->hi_probes);
+  pfile->hi_probes = NULL;
+  pfile->hi_probe_count = pfile->hi_probe_cap = 0;
 }
 
 /* Make the parser forget about files it has seen.  This can be useful
@@ -1709,6 +2021,8 @@ cpp_set_include_chains (cpp_reader *pfile, cpp_dir *quote, cpp_dir *bracket,
   for (; quote; quote = quote->next)
     {
       quote->name_map = NULL;
+      quote->name_index = NULL;
+      quote->name_index_state = DIR_INDEX_UNBUILT;
       quote->len = strlen (quote->name);
       if (quote == bracket)
 	pfile->bracket_include = bracket;
@@ -2064,6 +2378,129 @@ _cpp_save_file_entries (cpp_reader *pfile, FILE *fp)
   return ret;
 }
 
+/* Invoke CB once for every file that was actually stacked for preprocessing
+   in this TU, passing the file's resolved path together with either its
+   precomputed raw-bytes SHA-1 (the common case) or its contents.  Mirrors the
+   walk/filter of _cpp_save_file_entries (skip files that were never stacked,
+   couldn't be read, or errored).
+
+   read_file_guts records a SHA-1 of each file's raw on-disk bytes
+   (content_sha1_valid) the first time the compiler reads the file.  When that
+   digest is present we hand it to CB and DO NOT touch the file again -- so a
+   consumer that only needs a content hash (the in-compiler compile cache) does
+   zero redundant I/O on a cache miss, even though preprocessing has long since
+   freed the in-memory buffer.  Only when no digest is available do we fall
+   back to the buffer (if still valid) or to re-opening and re-reading the file
+   (exactly as _cpp_save_file_entries does); in that fallback CONTENT_SHA1 is
+   NULL and CB hashes the bytes itself.
+
+   Stops early if CB returns false.  Returns false if a file lacked a digest
+   AND needed re-reading but could not be read, true otherwise.  */
+
+bool
+cpp_foreach_included_file (cpp_reader *pfile, cpp_included_file_cb cb,
+			   void *user)
+{
+  for (_cpp_file *f = pfile->all_files; f; f = f->next_file)
+    {
+      if (f->dont_read || f->err_no)
+	continue;
+      if (f->stack_count == 0)
+	continue;
+
+      const char *path = f->path ? f->path : f->name;
+
+      if (f->content_sha1_valid)
+	{
+	  /* Fast path: hand over the stored raw-bytes digest; no file I/O,
+	     no buffer needed.  SIZE is informational (the on-disk byte count
+	     recorded by stat); the digest is the load-bearing value.  */
+	  if (!cb (path, NULL, f->st.st_size, f->content_sha1, user))
+	    return true;
+	}
+      else if (f->buffer_valid)
+	{
+	  if (!cb (path, f->buffer, f->st.st_size, NULL, user))
+	    return true;
+	}
+      else
+	{
+	  /* No digest and the buffer was freed after preprocessing; re-read
+	     from disk, preserving f->fd exactly as _cpp_save_file_entries
+	     does.  This path is only reached for files that never went through
+	     read_file_guts (which always records the digest).  */
+	  int oldfd = f->fd;
+	  if (!open_file (f))
+	    {
+	      open_file_failed (pfile, f, 0, 0);
+	      return false;
+	    }
+
+	  size_t size = f->st.st_size;
+	  uchar *buf = XNEWVEC (uchar, size ? size : 1);
+	  FILE *ff = fdopen (f->fd, "rb");
+	  bool read_ok = false;
+	  if (ff)
+	    {
+	      size_t got = size ? fread (buf, 1, size, ff) : 0;
+	      read_ok = (got == size) && !ferror (ff);
+	      fclose (ff);
+	    }
+	  else
+	    close (f->fd);
+	  f->fd = oldfd;
+
+	  if (!read_ok)
+	    {
+	      free (buf);
+	      return false;
+	    }
+
+	  bool keep_going = cb (path, buf, size, NULL, user);
+	  free (buf);
+	  if (!keep_going)
+	    return true;
+	}
+    }
+  return true;
+}
+
+/* True if __has_include / __has_include_next was evaluated during this TU.  */
+
+bool
+cpp_used_has_include (cpp_reader *pfile)
+{
+  return pfile && pfile->used_has_include;
+}
+
+/* True if specifically __has_include_next was evaluated during this TU.  */
+
+bool
+cpp_used_has_include_next (cpp_reader *pfile)
+{
+  return pfile && pfile->used_has_include_next;
+}
+
+/* Walk every recorded __has_include / __has_include_next evaluation,
+   invoking CB for each until it returns false.  See cpplib.h.  */
+
+bool
+cpp_foreach_has_include_probe (cpp_reader *pfile,
+			       cpp_has_include_probe_cb cb, void *user)
+{
+  if (!pfile)
+    return true;
+  for (unsigned i = 0; i < pfile->hi_probe_count; i++)
+    {
+      const struct cpp_hi_probe *p = &pfile->hi_probes[i];
+      if (!cb (p->name, p->flags, p->resolved,
+	       const_cast<const char *const *> (p->candidates),
+	       p->n_candidates, user))
+	return false;
+    }
+  return true;
+}
+
 /* Read the pchf_data structure from F.  */
 
 bool
@@ -2158,6 +2595,133 @@ check_file_against_entries (cpp_reader *pfile ATTRIBUTE_UNUSED,
 		  pchf_compare) != NULL;
 }
 
+/* Record one evaluated __has_include / __has_include_next probe (see
+   cpp_reader::hi_probes and cpp_foreach_has_include_probe).  FNAME /
+   ANGLE_BRACKETS / TYPE identify the probe, START_DIR is the head of the
+   chain that was searched (NULL when there was none to search) and FILE is
+   _cpp_find_file's answer (NULL likewise).  Identical evaluations dedupe to
+   one record.  */
+static void
+record_has_include_probe (cpp_reader *pfile, const char *fname,
+			  int angle_brackets, enum include_type type,
+			  cpp_dir *start_dir, _cpp_file *file)
+{
+  bool found = file && file->err_no != ENOENT;
+  const char *resolved = (found && file->path) ? file->path : NULL;
+
+  unsigned flags = 0;
+  if (found)
+    flags |= CPP_HI_PROBE_FOUND;
+  if (angle_brackets)
+    flags |= CPP_HI_PROBE_BRACKET;
+  if (type == IT_INCLUDE_NEXT)
+    flags |= CPP_HI_PROBE_NEXT;
+
+  /* A probe is VERIFIABLE when a consumer can reproduce its search from the
+     record alone, with no include-stack context: the resolved path (if any)
+     still existing and every candidate below still absent then implies the
+     same result over the same chain.  That rules out __has_include_next (the
+     searched chain depends on where the probing file sits on the include
+     stack); -remap rewrites candidate paths in ways the plain joins below do
+     not reproduce.
+
+     Relative QUOTE-form probes are verifiable too, even though their search
+     starts at the probing file's own directory: the candidates below are
+     joined AT PROBE TIME against the exact chain cpp walked (the probing
+     file's directory included), so a consumer needs no include-stack
+     reconstruction -- and it only trusts the record when the rest of the
+     manifest entry matched, which pins the probing file itself (path and
+     content, hence its directory) and every search-path option value, i.e.
+     the whole chain.  This reaches far beyond quote-happy user code: glibc's
+     own bits/statx.h and bits/unistd_ext.h evaluate
+     __has_include ("linux/stat.h") / ("linux/close_range.h"), so every TU
+     touching <sys/stat.h> or <unistd.h> would otherwise lose its manifest.
+     A relative candidate join (from a relative includer path or search dir)
+     re-verifies against the consumer's cwd -- exactly the cwd whose
+     hypothetical compile a serve claims to reproduce, the same binding
+     relative header-record paths already have.  */
+  bool verifiable = (type != IT_INCLUDE_NEXT
+		     && !CPP_OPTION (pfile, remap)
+		     && (!found || (resolved != NULL && file->dir != NULL)));
+
+  /* The candidate paths the search proved absent: the plain DIR/FNAME joins
+     of every chain dir strictly before the one the file was found in (every
+     chain dir for a not-found probe).  cpp may canonicalize a candidate
+     before probing it (maybe_shorter_path), but the plain join resolves to
+     the same file, so an existence re-check against the join is faithful.  */
+  char **candidates = NULL;
+  unsigned n_candidates = 0;
+  if (verifiable)
+    {
+      cpp_dir *stop = found ? file->dir : NULL;
+      unsigned n = 0;
+      cpp_dir *d = start_dir;
+      for (; d && d != stop; d = d->next)
+	{
+	  if (d->construct)
+	    break;		/* header map: joins are not the probes */
+	  n++;
+	}
+      /* Bail if a constructed dir intervened, the found dir is itself
+	 constructed, or it was never reached walking from START_DIR (the
+	 answer then came from outside this chain).  */
+      if (d != stop || (found && file->dir->construct))
+	verifiable = false;
+      else if (n)
+	{
+	  candidates = XNEWVEC (char *, n);
+	  for (d = start_dir; d != stop; d = d->next)
+	    candidates[n_candidates++] = append_file_to_dir (fname, d);
+	}
+    }
+  if (verifiable)
+    flags |= CPP_HI_PROBE_VERIFIABLE;
+
+  /* Dedupe: an identical evaluation (same operand, same flags, same
+     resolution, same proved-absent candidates) is recorded once.  The
+     candidate lists are part of the identity: the same quote-form operand
+     probed from two different directories yields the same boolean and
+     resolution but DIFFERENT absence proofs, and dropping the second
+     record's candidates would let a file appearing in only that chain
+     change the second probe's resolution unnoticed.  Same-operand records
+     with DIFFERENT results stay separate; only position-dependent forms can
+     produce them, and those are unverifiable, so a consumer keys on them
+     without ever trying to re-verify both.  */
+  for (unsigned i = 0; i < pfile->hi_probe_count; i++)
+    {
+      const struct cpp_hi_probe *p = &pfile->hi_probes[i];
+      if (p->flags == flags
+	  && strcmp (p->name, fname) == 0
+	  && ((p->resolved == NULL) == (resolved == NULL))
+	  && (resolved == NULL || strcmp (p->resolved, resolved) == 0)
+	  && p->n_candidates == n_candidates)
+	{
+	  bool same = true;
+	  for (unsigned k = 0; same && k < n_candidates; k++)
+	    same = (strcmp (p->candidates[k], candidates[k]) == 0);
+	  if (!same)
+	    continue;
+	  for (unsigned k = 0; k < n_candidates; k++)
+	    free (candidates[k]);
+	  free (candidates);
+	  return;
+	}
+    }
+
+  if (pfile->hi_probe_count == pfile->hi_probe_cap)
+    {
+      pfile->hi_probe_cap = pfile->hi_probe_cap ? 2 * pfile->hi_probe_cap : 8;
+      pfile->hi_probes = XRESIZEVEC (struct cpp_hi_probe, pfile->hi_probes,
+				     pfile->hi_probe_cap);
+    }
+  struct cpp_hi_probe *p = &pfile->hi_probes[pfile->hi_probe_count++];
+  p->name = xstrdup (fname);
+  p->resolved = resolved ? xstrdup (resolved) : NULL;
+  p->candidates = candidates;
+  p->n_candidates = n_candidates;
+  p->flags = flags;
+}
+
 /* Return true if the file FNAME is found in the appropriate include file path
    as indicated by ANGLE_BRACKETS.  */
 
@@ -2168,9 +2732,15 @@ _cpp_has_header (cpp_reader *pfile, const char *fname, int angle_brackets,
   cpp_dir *start_dir = search_path_head (pfile, fname, angle_brackets, type,
 					 /* suppress_diagnostic = */ true);
   if (!start_dir)
-    return false;
+    {
+      record_has_include_probe (pfile, fname, angle_brackets, type,
+				NULL, NULL);
+      return false;
+    }
   _cpp_file *file = _cpp_find_file (pfile, fname, start_dir, angle_brackets,
 				    _cpp_FFK_HAS_INCLUDE, 0);
+  record_has_include_probe (pfile, fname, angle_brackets, type,
+			    start_dir, file);
   return file->err_no != ENOENT;
 }
 

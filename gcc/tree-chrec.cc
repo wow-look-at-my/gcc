@@ -1490,7 +1490,7 @@ convert_affine_scev (class loop *loop, tree type,
   new_step = *step;
   if (TYPE_PRECISION (step_type) > TYPE_PRECISION (ct) && TYPE_UNSIGNED (ct))
     {
-      tree signed_ct = build_nonstandard_integer_type (TYPE_PRECISION (ct), 0);
+      tree signed_ct = signed_type_for (ct);
       new_step = chrec_convert (signed_ct, new_step, at_stmt,
                                 use_overflow_semantics);
     }
@@ -1716,7 +1716,7 @@ eq_evolutions_p (const_tree chrec0, const_tree chrec1)
       || TREE_CODE (chrec0) != TREE_CODE (chrec1))
     return false;
 
-  if (chrec0 == chrec1)
+  if (operand_equal_p (chrec0, chrec1, 0))
     return true;
 
   if (! types_compatible_p (TREE_TYPE (chrec0), TREE_TYPE (chrec1)))
@@ -1743,7 +1743,7 @@ eq_evolutions_p (const_tree chrec0, const_tree chrec1)
 			      TREE_OPERAND (chrec1, 0));
 
     default:
-      return operand_equal_p (chrec0, chrec1, 0);
+      return false;
     }
 }
 
