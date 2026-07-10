@@ -1714,10 +1714,14 @@ cc_get_meta_xattr (const char *obj_path, size_t *len)
 
    Returns true on a served hit, false on miss/refusal (caller decides whether
    to install the back-end capture and fall through).  DEBUG_ACTION labels the
-   debug line ("hit" / "manifest-hit").  */
+   debug line ("hit" / "manifest-hit").  On a hit the object's stored
+   diagnostic counts are copied to *STORED_WARNINGS / *STORED_WERRORS when
+   non-NULL (the post-parse path forwards them to the on-hit manifest store,
+   mirroring the counts the miss-path store records).  */
 static bool
 cc_serve_from_bin (const char *ok_hex, bool require_no_fe_diag,
-		   const char *debug_action)
+		   const char *debug_action,
+		   uint32_t *stored_warnings, uint32_t *stored_werrors)
 {
   char *bin_path = cc_entry_path (ok_hex, /*make_dirs=*/false);
   char *obj_path = cc_object_sidecar_path (bin_path);
@@ -1795,12 +1799,21 @@ cc_serve_from_bin (const char *ok_hex, bool require_no_fe_diag,
       global_dc->diagnostic_count (DK_WARNING) += (int) warnings;
       global_dc->diagnostic_count (DK_WERROR) += (int) errors;
     }
+  if (stored_warnings)
+    *stored_warnings = warnings;
+  if (stored_werrors)
+    *stored_werrors = errors;
 
   free (meta);
   cc_hit = true;
   cc_debug_line (debug_action, ok_hex);
   return true;
 }
+
+/* Defined below with the rest of the store path; the post-parse serve calls
+   it to record the manifest on a deep hit.  */
+static void cc_store_manifest (uint32_t warnings, uint32_t werrors,
+			       const char *debug_action);
 
 bool
 compile_cache_try_serve (cpp_reader *pfile)
@@ -1838,8 +1851,30 @@ compile_cache_try_serve (cpp_reader *pfile)
   /* Try to serve by the object key OK.  Front-end diagnostics are allowed here
      (they re-emit on the re-parse that already happened), so pass
      require_no_fe_diag = false.  */
-  if (cc_serve_from_bin (cc_key_hex, /*require_no_fe_diag=*/false, "hit"))
-    return true;
+  uint32_t stored_warnings = 0, stored_werrors = 0;
+  if (cc_serve_from_bin (cc_key_hex, /*require_no_fe_diag=*/false, "hit",
+			 &stored_warnings, &stored_werrors))
+    {
+      /* A deep (post-parse) hit means the pre-parse manifest lookup could
+	 NOT serve this TU: no manifest under its MK, or no entry whose
+	 records still verify.  Store/refresh the manifest NOW from the
+	 metadata cc_compute_key just gathered (include closure + probes) --
+	 the exact material the miss-path store records -- so the NEXT
+	 compile serves pre-parse.  Without this, a TU whose first-ever
+	 compile object-hit a twin's store (parallel-populate race) never
+	 acquired a manifest at all and re-paid the full parse on EVERY warm
+	 build (measured: 4 llama.cpp TUs at ~2.5 s each, "manifest-miss,
+	 hit" forever).  ccache's equivalent (direct-mode manifest update
+	 after a preprocessed-mode hit) behaves the same way.  The counts
+	 are the object's stored ones, i.e. what the miss path passed;
+	 the skip-guards are the miss path's too: seen_error () mirrored
+	 here, MK validity + unverifiable-probe forms inside
+	 cc_store_manifest itself.  */
+      if (!seen_error ())
+	cc_store_manifest (stored_warnings, stored_werrors,
+			   "manifest-store-on-hit");
+      return true;
+    }
 
   /* MISS: install the back-end diagnostic capture so the store can record
      them, and fall through to the back-end.  */
@@ -1962,7 +1997,7 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
 	  char ok_hex[41];
 	  cc_hex (ent.ok_raw, ok_hex);
 	  if (cc_serve_from_bin (ok_hex, /*require_no_fe_diag=*/true,
-				 "manifest-hit"))
+				 "manifest-hit", NULL, NULL))
 	    {
 	      /* Complete the dependency info from the entry's records (the
 		 include closure).  The main file is already in the deps --
@@ -2461,9 +2496,12 @@ cc_write_compiler_id (void)
    manifest reader could short-circuit; the authoritative copy is in the
    object header).  Atomic publish.  No-op unless the manifest key is valid,
    and skipped entirely for TUs whose probes a pre-parse serve could not
-   re-verify (__has_include_next; unverifiable probe forms).  */
+   re-verify (__has_include_next; unverifiable probe forms).  DEBUG_ACTION
+   labels the success debug line: "manifest-store" from the miss path,
+   "manifest-store-on-hit" from the post-parse-hit path.  */
 static void
-cc_store_manifest (uint32_t warnings, uint32_t werrors)
+cc_store_manifest (uint32_t warnings, uint32_t werrors,
+		   const char *debug_action)
 {
   if (!cc_manifest_key_valid)
     return;
@@ -2757,7 +2795,7 @@ cc_store_manifest (uint32_t warnings, uint32_t werrors)
 	unlink (tmp);
       else
 	{
-	  cc_debug_line ("manifest-store", cc_manifest_key_hex);
+	  cc_debug_line (debug_action, cc_manifest_key_hex);
 	  /* B1: account the manifest write (delta vs the replaced file) in
 	     its shard and evict if over budget.  */
 	  cc_evict_note_store (cc_manifest_key_hex,
@@ -2875,7 +2913,7 @@ compile_cache_store (void)
       cc_debug_line ("store", cc_key_hex);
       /* Record/refresh the manifest entry so a future run of the SAME source
 	 can serve this object BEFORE parsing.  */
-      cc_store_manifest (warnings, errors);
+      cc_store_manifest (warnings, errors, "manifest-store");
       /* Publish the compiler-id sidecar so the DRIVER can form the same
 	 manifest key (it needs this compiler's checksum + lang name).  */
       cc_write_compiler_id ();
