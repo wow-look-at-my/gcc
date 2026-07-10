@@ -31,11 +31,16 @@ const config = {
   // The gcc wiki git repo exists (bootstrapped by hand), so pin it: a probe
   // failure should fail loudly rather than quietly fall back to a branch.
   storage: 'wiki',
-  // Epoch 2: prefix-map poisoning fix for the Release row's cache columns
-  // (epoch-1 llama-release warm=386s measured a full recompile) and the
-  // switch of the fork columns to the PGO dist -- every epoch-1 value is
-  // stale for one of those reasons, so invalidate them all.
-  epoch: 2,
+  // Epoch 3: the three measured warm-path fixes landed in the compiler (MK
+  // search-path normalization / ccache base_dir parity, manifest-store on a
+  // post-parse object hit, per-language compiler-id sidecars -- local llama
+  // Release warm: 18.1 s -> 5.7 s, manifestHit 420/420) and the legs now
+  // resolve the PGO dist for the pushed branch first, so the warm columns
+  // measure the fixed serve path. Epoch-2 numbers measured the old dist;
+  // invalidate them all.
+  // (Epoch 2, historical: prefix-map poisoning fix for the Release row's
+  // cache columns + the switch of the fork columns to the PGO dist.)
+  epoch: 3,
   unit: 's',
   // Cells are marked in-flight when their job STARTS (not when queued); a
   // leg is timeboxed to 60 min, so anything in-flight past 90 min is a
