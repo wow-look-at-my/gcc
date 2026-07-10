@@ -5953,19 +5953,15 @@ driver_cc_debug_p (void)
   return dbg == 1;
 }
 
-/* Read the cache's "compiler-id" sidecar (DIR/compiler-id), written by
-   cc1/cc1plus on a miss-store, into *CHECKSUM (16 bytes, caller-provided) and a
-   freshly xmalloc'd *LANG.  Returns true on success.  The sidecar lets the
-   driver form the manifest key without linking the compiler's checksum object
-   or knowing lang_hooks.name.  */
+/* Read one compiler-id sidecar file at PATH into *CHECKSUM (16 bytes,
+   caller-provided) and a freshly xmalloc'd *LANG.  Returns true on
+   success.  */
 static bool
-driver_read_compiler_id (const char *cache_dir, unsigned char checksum[16],
-			 char **lang)
+driver_read_compiler_id_file (const char *path, unsigned char checksum[16],
+			      char **lang)
 {
   *lang = NULL;
-  char *path = concat (cache_dir, "/", CC_COMPILER_ID_NAME, NULL);
   FILE *f = fopen (path, "rb");
-  free (path);
   if (!f)
     return false;
 
@@ -5994,6 +5990,36 @@ driver_read_compiler_id (const char *cache_dir, unsigned char checksum[16],
     ok = false;
   fclose (f);
   return ok && *lang;
+}
+
+/* Read the compiler-id sidecar for PROG (the program this command will
+   spawn: "cc1"/"cc1plus"), written by the compiler proper on a miss-store,
+   into *CHECKSUM (16 bytes, caller-provided) and a freshly xmalloc'd *LANG.
+   Returns true on success.  The sidecar lets the driver form the manifest
+   key without linking the compiler's checksum object or knowing
+   lang_hooks.name.
+
+   The per-language "DIR/compiler-id-<prog>" is preferred: cc1 and cc1plus
+   share one cache dir, and the legacy single "DIR/compiler-id" was
+   last-store-wins, which fed the driver the OTHER language's checksum+lang
+   for every TU of the losing language -- a wrong MK, so their no-spawn tier
+   never hit (measured: every C TU of a C++-heavy build re-spawned cc1 on
+   every warm build).  The legacy name remains a fallback for caches
+   populated before the split.  */
+static bool
+driver_read_compiler_id (const char *cache_dir, const char *prog,
+			 unsigned char checksum[16], char **lang)
+{
+  char *path = concat (cache_dir, "/", CC_COMPILER_ID_PREFIX, prog, NULL);
+  bool ok = driver_read_compiler_id_file (path, checksum, lang);
+  free (path);
+  if (ok)
+    return true;
+
+  path = concat (cache_dir, "/", CC_COMPILER_ID_NAME, NULL);
+  ok = driver_read_compiler_id_file (path, checksum, lang);
+  free (path);
+  return ok;
 }
 
 /* The cc1/cc1plus command line has just been assembled into ARGBUF (its [0] is
@@ -6188,7 +6214,7 @@ driver_try_serve_from_cache (void)
     {
       unsigned char checksum[16];
       char *lang = NULL;
-      if (driver_read_compiler_id (cache_dir, checksum, &lang))
+      if (driver_read_compiler_id (cache_dir, prog, checksum, &lang))
 	{
 	  char *cwd = getpwd ();
 	  cc_serve_ctx ctx;
@@ -6460,10 +6486,11 @@ driver_auto_pch_probe_inject (struct driver_apch_plan *plan)
 
   /* Compiler id (written by cc1plus on the first miss-store).  Without it we
      cannot key the entry; the very first compile into a cold cache proceeds
-     plain and the next one picks the feature up.  */
+     plain and the next one picks the feature up.  PROG is "cc1plus" here
+     (guarded above): auto-PCH is C++-only in v1.  */
   unsigned char checksum[16];
   char *lang = NULL;
-  if (!driver_read_compiler_id (cache_dir, checksum, &lang))
+  if (!driver_read_compiler_id (cache_dir, prog, checksum, &lang))
     {
       driver_apch_log ("off", "no compiler-id sidecar yet (cold cache)");
       free (decoded);

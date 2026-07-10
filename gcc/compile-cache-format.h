@@ -92,14 +92,28 @@ enum cc_meta_off
 #define CC_MANIFEST_VERSION    3u
 #define CC_MANIFEST_HEADER_SIZE  32u
 
-/* Compiler-id sidecar: a tiny file at "DIR/compiler-id" that cc1plus writes on
-   a miss-store so the driver can form the manifest key without linking the
+/* Compiler-id sidecar: a tiny file the compiler proper writes on a
+   miss-store so the driver can form the manifest key without linking the
    compiler's checksum object or knowing lang_hooks.name.  Layout: 8-byte magic
    + u16 version + u16 reserved + u8[16] executable_checksum + u32 lang_len +
-   lang bytes (no NUL).  */
+   lang bytes (no NUL).
+
+   The sidecar is PER LANGUAGE: "DIR/compiler-id-<prog>" where <prog> is the
+   compiler proper's own program name ("cc1", "cc1plus", ...) -- exactly the
+   token the driver knows when it assembles the command it is about to spawn.
+   cc1 and cc1plus share one cache dir, and the original single
+   "DIR/compiler-id" made the LAST-storing language win: the driver then
+   computed a wrong MK for every TU of the other language and its no-spawn
+   tier never hit (never a wrong serve -- MK folds checksum+lang, so a
+   mismatched id can only miss -- but every C TU of a C++-heavy build paid a
+   full cc1 exec on every warm build).  The legacy single name is still
+   WRITTEN (an older driver sharing the cache dir reads only it; tiny, and
+   last-language-wins is the status quo it already had) and still READ as a
+   fallback (a cache populated before the split holds only it).  */
 #define CC_COMPILER_ID_MAGIC    "CCCOMPID"	/* 8 bytes, no NUL stored */
 #define CC_COMPILER_ID_VERSION  1u
-#define CC_COMPILER_ID_NAME      "compiler-id"
+#define CC_COMPILER_ID_NAME     "compiler-id"	/* legacy single-file name */
+#define CC_COMPILER_ID_PREFIX   "compiler-id-"	/* + <prog>: per-language */
 
 /* Header flag bits (CC_OFF_FLAGS).  */
 #define CC_FLAG_HAD_FE_DIAG  0x1u	/* TU emitted front-end diagnostics. */

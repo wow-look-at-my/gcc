@@ -2428,35 +2428,12 @@ cc_write_atomic_readonly (const char *path, const unsigned char *bytes,
   return ok;
 }
 
-/* Write the cache's "compiler-id" sidecar (DIR/compiler-id) so the DRIVER can
-   form the manifest key without linking this compiler's checksum object or
-   knowing lang_hooks.name: it records executable_checksum + lang_hooks.name,
-   the two key components the driver cannot derive on its own.  Idempotent and
-   cheap; written on every miss-store (a recompiled compiler -> new checksum ->
-   the driver's MK changes in lockstep, so a stale id can never cause a wrong
-   hit -- it would simply differ from the object's stored checksum-keyed MK).
-   Atomic publish.  No-op on failure.  */
+/* Publish one compiler-id sidecar at PATH (atomic tmp+rename; no-op on
+   failure).  */
 static void
-cc_write_compiler_id (void)
+cc_write_compiler_id_file (const char *path, const unsigned char *buf,
+			   size_t total)
 {
-  if (!cc_dir || !cc_dir[0])
-    return;
-  cc_ensure_dir (cc_dir);
-
-  const char *lang = lang_hooks.name ? lang_hooks.name : "";
-  uint32_t llen = (uint32_t) strlen (lang);
-
-  size_t total = 8 + 2 + 2 + 16 + 4 + (size_t) llen;
-  unsigned char *buf = (unsigned char *) xmalloc (total);
-  memcpy (buf, CC_COMPILER_ID_MAGIC, CC_MAGIC_LEN);
-  cc_put_u16 (buf + 8, (uint16_t) CC_COMPILER_ID_VERSION);
-  cc_put_u16 (buf + 10, 0);
-  memcpy (buf + 12, executable_checksum, 16);
-  cc_put_u32 (buf + 28, llen);
-  if (llen)
-    memcpy (buf + 32, lang, llen);
-
-  char *path = concat (cc_dir, "/", CC_COMPILER_ID_NAME, NULL);
   char *tmp = concat (path, ".tmpXXXXXX", NULL);
   int fd = mkstemp (tmp);
   bool ok = (fd >= 0);
@@ -2479,9 +2456,56 @@ cc_write_compiler_id (void)
     }
   else if (fd >= 0)
     unlink (tmp);
-  free (buf);
   free (tmp);
+}
+
+/* Write the cache's compiler-id sidecars so the DRIVER can form the manifest
+   key without linking this compiler's checksum object or knowing
+   lang_hooks.name: they record executable_checksum + lang_hooks.name, the
+   two key components the driver cannot derive on its own.  Idempotent and
+   cheap; written on every miss-store (a recompiled compiler -> new checksum ->
+   the driver's MK changes in lockstep, so a stale id can never cause a wrong
+   hit -- it would simply differ from the object's stored checksum-keyed MK).
+
+   Two names are published (see compile-cache-format.h): the per-language
+   "DIR/compiler-id-<prog>" keyed by THIS compiler's program name (progname:
+   the lbasename of argv[0], "cc1"/"cc1plus"/... -- the very token the driver
+   matches when it intercepts the command), and the legacy single
+   "DIR/compiler-id" for older drivers sharing the cache dir.  Without the
+   split, C and C++ TUs in one cache fought over the single file and the
+   losing language's TUs never served at the driver tier.  */
+static void
+cc_write_compiler_id (void)
+{
+  if (!cc_dir || !cc_dir[0])
+    return;
+  cc_ensure_dir (cc_dir);
+
+  const char *lang = lang_hooks.name ? lang_hooks.name : "";
+  uint32_t llen = (uint32_t) strlen (lang);
+
+  size_t total = 8 + 2 + 2 + 16 + 4 + (size_t) llen;
+  unsigned char *buf = (unsigned char *) xmalloc (total);
+  memcpy (buf, CC_COMPILER_ID_MAGIC, CC_MAGIC_LEN);
+  cc_put_u16 (buf + 8, (uint16_t) CC_COMPILER_ID_VERSION);
+  cc_put_u16 (buf + 10, 0);
+  memcpy (buf + 12, executable_checksum, 16);
+  cc_put_u32 (buf + 28, llen);
+  if (llen)
+    memcpy (buf + 32, lang, llen);
+
+  if (progname && progname[0])
+    {
+      char *lpath = concat (cc_dir, "/", CC_COMPILER_ID_PREFIX, progname,
+			    NULL);
+      cc_write_compiler_id_file (lpath, buf, total);
+      free (lpath);
+    }
+
+  char *path = concat (cc_dir, "/", CC_COMPILER_ID_NAME, NULL);
+  cc_write_compiler_id_file (path, buf, total);
   free (path);
+  free (buf);
 }
 
 /* Append/refresh this TU's entry in the manifest object keyed by MK.  The
