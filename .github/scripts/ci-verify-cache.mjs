@@ -414,7 +414,12 @@ const o3 = path.join(work, 'a3.o');
   //                         index; has NO .o object. (A per-object .bin appears
   //                         ONLY on the xattr-unsupported fallback path, holding
   //                         the CC_META record; see metaOf below.)
-  //   compiler-id        -- the driver's pre-parse compiler-identity sidecar.
+  //   compiler-id-<prog> -- the driver's pre-parse compiler-identity sidecar
+  //                         for one compiler proper (cc1/cc1plus; the driver
+  //                         reads the one matching the command it assembled).
+  //   compiler-id        -- the legacy single-file sidecar, still written for
+  //                         older drivers sharing the cache dir (and read as
+  //                         the fallback for pre-split caches).
   const files = listFiles(cacheA);
   if (files.length === 0) {
     fail('check 7: no cache files found under ' + cacheA);
@@ -485,21 +490,25 @@ const o3 = path.join(work, 'a3.o');
     return null; // unreached
   }
 
+  const isIdFile = (f) => path.basename(f) === 'compiler-id' ||
+    path.basename(f).startsWith('compiler-id-');
   const binFiles = files.filter((f) => f.endsWith('.bin'));
   const oFiles = files.filter((f) => f.endsWith('.o'));
-  const idFiles = files.filter((f) => path.basename(f) === 'compiler-id');
+  const idFiles = files.filter(isIdFile);
   const unexpected = files.filter(
-    (f) => !f.endsWith('.bin') && !f.endsWith('.o') &&
-      path.basename(f) !== 'compiler-id');
+    (f) => !f.endsWith('.bin') && !f.endsWith('.o') && !isIdFile(f));
   if (unexpected.length) {
-    fail('check 7: found unexpected cache file(s) (not .bin/.o/compiler-id):\n  ' +
+    fail('check 7: found unexpected cache file(s) (not .bin/.o/compiler-id*):\n  ' +
       unexpected.join('\n  '));
   }
 
-  // The driver's compiler-id sidecar must exist.
-  if (idFiles.length !== 1) {
-    fail('check 7: expected exactly one compiler-id sidecar, got ' +
-      idFiles.length);
+  // The driver's compiler-id sidecars must exist: the per-language one for
+  // the (only) compiler that stored here (cc1 -- cacheA saw C compiles) plus
+  // the legacy single name kept for older drivers.
+  const idNames = idFiles.map((f) => path.basename(f)).sort();
+  if (idNames.join(',') !== 'compiler-id,compiler-id-cc1') {
+    fail('check 7: expected compiler-id + compiler-id-cc1 sidecars, got [' +
+      idNames.join(', ') + ']');
   }
 
   // Classify .bin files: manifests (CCMANIFS) vs per-object meta fallbacks
@@ -543,7 +552,8 @@ const o3 = path.join(work, 'a3.o');
 
   process.stdout.write(
     'check 7 OK: ' + objFiles.length + ' cache object(s) (.o) + ' +
-    manBins.length + ' manifest(s), compiler-id present; no legacy v2 .bin;\n' +
+    manBins.length + ' manifest(s), compiler-id + compiler-id-cc1 present; ' +
+    'no legacy v2 .bin;\n' +
     '           metadata via xattr=' + viaXattr + ' bin-fallback=' + viaBin +
     '\n' +
     '           sample ' + path.basename(sample.o) + ' [' + sample.via +
@@ -1984,6 +1994,243 @@ function sleepSecs(s) {
   process.stdout.write(
     'check 28 OK: duplicate -o compiles clean (last wins, first absent), ' +
     'stays integrated + cached, devnull-dump shape ok, link dedups too\n');
+}
+
+// ---- check 29: MK search-path normalization (ccache base_dir parity) ------
+// The 16-TU llama.cpp class: a TU whose -I points INSIDE the build dir
+// (cmake passes generated-header include dirs as absolute paths), no -g.
+// The absolute -I value used to fold into the manifest key raw, so a fresh
+// build dir re-keyed the TU: pre-parse manifest miss, full parse, post-parse
+// object hit (~2.5 s each; ~12.3 s of the 13.2 s fork-vs-ccache warm gap).
+// Search-path values inside the cwd now hash cwd-relative, so build dir B
+// manifest-hits the entry stored from build dir A -- while values OUTSIDE
+// the cwd still hash raw (the anti-shadowing bar is unchanged for
+// directories the build tree does not own).
+{
+  const dir = path.join(work, 'c29');
+  const srcDir = path.join(dir, 'src');
+  const dA = path.join(dir, 'dA');
+  const dB = path.join(dir, 'dB');
+  for (const d of [dir, srcDir, dA, dB]) fs.mkdirSync(d);
+  // Per-build-dir "generated" header, identical content in both build dirs
+  // (the same configure step produced it).
+  for (const d of [dA, dB]) {
+    fs.mkdirSync(path.join(d, 'gen'));
+    fs.writeFileSync(path.join(d, 'gen', 'conf.h'), '#define GENV 9\n');
+  }
+  const src = path.join(srcDir, 'm.cpp');
+  fs.writeFileSync(src,
+    '#include "conf.h"\nint c29_f(int x) { return x * GENV; }\n');
+  const cache = path.join(dir, 'cache');
+  fs.mkdirSync(cache);
+
+  const gpp = (cwd, inc, out) => spawnSync(
+    XGPP,
+    ['-O2', '-c', src, '-o', out, '-I' + inc,
+     '-fcompile-cache=' + cache, '-fintegrated-as', B],
+    { cwd, env: debugEnv, encoding: 'utf8' });
+
+  // (a) build dir A: cold miss + store, manifest recorded.
+  let r = gpp(dA, path.join(dA, 'gen'), path.join(dA, 'm.o'));
+  if (r.status !== 0) fail('check 29: dA compile failed\n' + r.stderr);
+  if (!/compile-cache: manifest-store /m.test(r.stderr))
+    fail('check 29: dA did not store a manifest\n' + r.stderr);
+
+  // (b) build dir B, fresh dir, same relative layout: the -I differs only
+  // in the build-dir prefix, which the MK relativizes away -> PRE-PARSE
+  // manifest hit (not a deep hit, not a recompile), byte-identical object.
+  r = gpp(dB, path.join(dB, 'gen'), path.join(dB, 'm.o'));
+  if (r.status !== 0) fail('check 29: dB compile failed\n' + r.stderr);
+  if (!/compile-cache: manifest-hit /m.test(r.stderr))
+    fail('check 29: cross-build-dir manifest hit missing (build-dir -I not ' +
+         'relativized in the MK?)\n' + r.stderr);
+  if (/compile-cache: (hit|miss) /m.test(r.stderr))
+    fail('check 29: dB compile fell past the pre-parse tier\n' + r.stderr);
+  if (!readObj(path.join(dA, 'm.o')).equals(readObj(path.join(dB, 'm.o'))))
+    fail('check 29: cross-build-dir served object is not byte-identical');
+
+  // (c) anti-shadowing preserved: the SAME header content reached via -I
+  // dirs OUTSIDE the build dir must still key by the raw absolute value --
+  // two different out-of-tree dirs may not share a manifest entry. (The
+  // object still deep-hits: the include closure content is identical, and
+  // OK deliberately drops search paths.)
+  const outX = path.join(dir, 'outX');
+  const outY = path.join(dir, 'outY');
+  for (const d of [outX, outY]) {
+    fs.mkdirSync(d);
+    fs.writeFileSync(path.join(d, 'conf.h'), '#define GENV 9\n');
+  }
+  r = gpp(dA, outX, path.join(dA, 'x.o'));
+  if (r.status !== 0) fail('check 29: outX compile failed\n' + r.stderr);
+  if (!/compile-cache: manifest-miss /m.test(r.stderr))
+    fail('check 29: out-of-tree -I outX must MISS the manifest tier (was ' +
+         'the value wrongly relativized?)\n' + r.stderr);
+  r = gpp(dA, outY, path.join(dA, 'y.o'));
+  if (r.status !== 0) fail('check 29: outY compile failed\n' + r.stderr);
+  if (!/compile-cache: manifest-miss /m.test(r.stderr))
+    fail('check 29: differing out-of-tree -I dirs must key apart\n' +
+         r.stderr);
+
+  process.stdout.write(
+    'check 29 OK: build-dir -I manifest-hits across build dirs ' +
+    '(byte-identical, pre-parse); out-of-tree -I values still key raw\n');
+}
+
+// ---- check 30: a deep hit stores the manifest (manifest-store-on-hit) -----
+// The 4-TU llama.cpp class (per-target get-model.cpp twins): a TU can
+// OBJECT-hit without a manifest ever existing under its own MK -- extra -I
+// dirs give it a distinct MK, while the include closure (and thus the
+// content-addressed object key) matches a twin that already stored. The
+// deep-hit path used to store nothing (compile_cache_store no-ops on
+// cc_hit), so such a TU re-paid the full parse on EVERY warm build. Now the
+// deep hit stores/refreshes the manifest from the just-computed closure and
+// the next compile serves pre-parse.
+{
+  const dir = path.join(work, 'c30');
+  fs.mkdirSync(dir);
+  const src = path.join(dir, 'gm.cpp');
+  fs.writeFileSync(src, 'int c30_f(int x) { return x - 3; }\n');
+  const cache = path.join(dir, 'cache');
+  fs.mkdirSync(cache);
+  // Exists but holds no headers: changes the MK (search-path VALUE) without
+  // changing the include closure -> the OK stays the twin's.
+  const extraInc = path.join(dir, 'extra-inc');
+  fs.mkdirSync(extraInc);
+
+  const gpp = (out, extra) => spawnSync(
+    XGPP,
+    ['-O2', '-c', src, '-o', out,
+     '-fcompile-cache=' + cache, '-fintegrated-as', B].concat(extra),
+    { cwd: dir, env: debugEnv, encoding: 'utf8' });
+
+  // (a) the "twin": plain compile, miss + store (+ manifest under ITS MK).
+  let r = gpp(path.join(dir, 'gm1.o'), []);
+  if (r.status !== 0) fail('check 30: twin compile failed\n' + r.stderr);
+  if (!/compile-cache: store /m.test(r.stderr))
+    fail('check 30: twin compile did not store\n' + r.stderr);
+
+  // (b) same TU + an extra empty -I: distinct MK (pre-parse manifest miss),
+  // same OK (post-parse deep hit) -- and the deep hit must now store the
+  // manifest under THIS MK.
+  r = gpp(path.join(dir, 'gm2.o'), ['-I' + extraInc]);
+  if (r.status !== 0) fail('check 30: deep-hit compile failed\n' + r.stderr);
+  if (!/compile-cache: manifest-miss /m.test(r.stderr))
+    fail('check 30: expected a manifest miss for the new MK\n' + r.stderr);
+  if (!/compile-cache: hit /m.test(r.stderr))
+    fail('check 30: expected a post-parse object hit\n' + r.stderr);
+  if (!/compile-cache: manifest-store-on-hit /m.test(r.stderr))
+    fail('check 30: deep hit did not store the manifest ' +
+         '(manifest-store-on-hit missing)\n' + r.stderr);
+  if (/compile-cache: (store|manifest-store) /m.test(r.stderr))
+    fail('check 30: deep hit must not re-store the object or take the ' +
+         'miss-path manifest store\n' + r.stderr);
+
+  // (c) the exact same command again: the manifest stored in (b) now serves
+  // PRE-PARSE -- no deep hit, no parse.
+  r = gpp(path.join(dir, 'gm3.o'), ['-I' + extraInc]);
+  if (r.status !== 0) fail('check 30: converged compile failed\n' + r.stderr);
+  if (!/compile-cache: manifest-hit /m.test(r.stderr))
+    fail('check 30: the on-hit-stored manifest did not serve pre-parse\n' +
+         r.stderr);
+  if (/compile-cache: (hit|miss) /m.test(r.stderr))
+    fail('check 30: converged compile still fell past the pre-parse tier\n' +
+         r.stderr);
+  const g1 = readObj(path.join(dir, 'gm1.o'));
+  if (!g1.equals(readObj(path.join(dir, 'gm2.o'))) ||
+      !g1.equals(readObj(path.join(dir, 'gm3.o'))))
+    fail('check 30: served objects are not byte-identical');
+
+  process.stdout.write(
+    'check 30 OK: deep hit stores the manifest (manifest-store-on-hit); ' +
+    'the next compile manifest-hits pre-parse; objects byte-identical\n');
+}
+
+// ---- check 31: per-language compiler-id -> C serves at the driver tier ----
+// cc1 and cc1plus share one cache dir, and the single compiler-id sidecar
+// was last-store-wins: after any C++ store the driver keyed C TUs with
+// cc1plus's checksum+lang -- wrong MK, no driver-tier serve, and every warm
+// C compile still spawned cc1 (all 11 C TUs of the llama.cpp warm build).
+// With per-language sidecars the driver reads compiler-id-cc1 for a cc1
+// command even when a C++ TU stored last. -v proves the no-spawn: the
+// driver prints every command it executes, so a served compile must show
+// the manifest-hit line and NO cc1/cc1plus invocation.
+{
+  const dir = path.join(work, 'c31');
+  fs.mkdirSync(dir);
+  const cSrc = path.join(dir, 'cf.c');
+  const cppSrc = path.join(dir, 'cxx.cpp');
+  fs.writeFileSync(cSrc, 'int c31_f(int x) { return x + 31; }\n');
+  fs.writeFileSync(cppSrc,
+    'template <typename T> T c31_t(T a) { return a * 2; }\n' +
+    'int c31_g(int x) { return c31_t(x); }\n');
+  const cache = path.join(dir, 'cache');
+  fs.mkdirSync(cache);
+
+  // Every compile in this check runs the IDENTICAL argv (including -v, which
+  // reaches the cc1 command line and folds into the key material like any
+  // other option) -- only then must the warm run's manifest key match the
+  // populate run's. -v makes the driver print every command it executes, so
+  // a served compile is proven spawn-free by the ABSENCE of the
+  // ".../cc1 -quiet ..." line (a path token ending in /cc1 or /cc1plus).
+  const vRun = (drv, s, o) => spawnSync(
+    drv,
+    ['-O2', '-c', s, '-o', o, '-fcompile-cache=' + cache,
+     '-fintegrated-as', '-v', B],
+    { cwd: dir, env: debugEnv, encoding: 'utf8' });
+  const spawnedCc1 = (t) => /\/cc1\s/.test(t);
+  const spawnedCc1plus = (t) => /\/cc1plus\s/.test(t);
+
+  // (a) populate: C first, C++ SECOND -- so the legacy single sidecar (still
+  // written for old drivers) ends up holding cc1plus's identity, the exact
+  // aliasing that used to break the C driver tier.
+  let r = vRun(XGCC, cSrc, path.join(dir, 'cf1.o'));
+  if (r.status !== 0) fail('check 31: C populate failed\n' + r.stderr);
+  if (!/compile-cache: store /m.test(r.stderr) ||
+      !/compile-cache: manifest-store /m.test(r.stderr))
+    fail('check 31: C populate did not store object + manifest\n' + r.stderr);
+  if (!spawnedCc1(r.stderr))
+    fail('check 31: sanity: the cold C compile must show the cc1 spawn ' +
+         'under -v (spawn detector broken?)\n' + r.stderr);
+  r = vRun(XGPP, cppSrc, path.join(dir, 'cxx1.o'));
+  if (r.status !== 0) fail('check 31: C++ populate failed\n' + r.stderr);
+  if (!/compile-cache: store /m.test(r.stderr))
+    fail('check 31: C++ populate did not store\n' + r.stderr);
+  if (!spawnedCc1plus(r.stderr))
+    fail('check 31: sanity: the cold C++ compile must show the cc1plus ' +
+         'spawn under -v\n' + r.stderr);
+  for (const id of ['compiler-id', 'compiler-id-cc1', 'compiler-id-cc1plus'])
+    if (!fs.existsSync(path.join(cache, id)))
+      fail('check 31: missing sidecar ' + id + ' after C + C++ stores');
+
+  // (b) warm C compile: pre-parse manifest hit AT THE DRIVER TIER -- no cc1
+  // exec, even though the legacy sidecar now names cc1plus.
+  r = vRun(XGCC, cSrc, path.join(dir, 'cf2.o'));
+  if (r.status !== 0) fail('check 31: warm C compile failed\n' + r.stderr);
+  if (!/compile-cache: manifest-hit /m.test(r.stderr))
+    fail('check 31: warm C compile did not manifest-hit (aliased ' +
+         'compiler-id? per-language sidecar not read?)\n' + r.stderr);
+  if (spawnedCc1(r.stderr))
+    fail('check 31: warm C compile still spawned cc1 (driver tier ' +
+         'declined)\n' + r.stderr);
+
+  // (c) and the C++ TU serves spawn-free at the driver tier too.
+  r = vRun(XGPP, cppSrc, path.join(dir, 'cxx2.o'));
+  if (r.status !== 0) fail('check 31: warm C++ compile failed\n' + r.stderr);
+  if (!/compile-cache: manifest-hit /m.test(r.stderr))
+    fail('check 31: warm C++ compile did not manifest-hit\n' + r.stderr);
+  if (spawnedCc1plus(r.stderr))
+    fail('check 31: warm C++ compile still spawned cc1plus\n' + r.stderr);
+
+  if (!readObj(path.join(dir, 'cf1.o'))
+        .equals(readObj(path.join(dir, 'cf2.o'))))
+    fail('check 31: driver-served C object is not byte-identical');
+  if (!readObj(path.join(dir, 'cxx1.o'))
+        .equals(readObj(path.join(dir, 'cxx2.o'))))
+    fail('check 31: driver-served C++ object is not byte-identical');
+
+  process.stdout.write(
+    'check 31 OK: per-language compiler-id sidecars; warm C and C++ TUs ' +
+    'serve at the driver tier with zero compiler-proper execs\n');
 }
 
 // ---- cleanup + success ---------------------------------------------------
