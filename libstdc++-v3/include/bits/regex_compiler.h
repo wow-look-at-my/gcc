@@ -1,6 +1,6 @@
 // class template regex -*- C++ -*-
 
-// Copyright (C) 2010-2022 Free Software Foundation, Inc.
+// Copyright (C) 2010-2024 Free Software Foundation, Inc.
 //
 // This file is part of the GNU ISO C++ Library.  This library is free
 // software; you can redistribute it and/or modify it under the
@@ -125,7 +125,7 @@ namespace __detail
       struct _BracketState
       {
 	enum class _Type : char { _None, _Char, _Class } _M_type = _Type::_None;
-	_CharT _M_char;
+	_CharT _M_char = _CharT();
 
 	void
 	set(_CharT __c) noexcept { _M_type = _Type::_Char; _M_char = __c; }
@@ -170,9 +170,9 @@ namespace __detail
       _StateSeqT
       _M_pop()
       {
-	auto ret = _M_stack.top();
+	auto __ret = _M_stack.top();
 	_M_stack.pop();
-	return ret;
+	return __ret;
       }
 
       static _FlagT
@@ -188,8 +188,11 @@ namespace __detail
 	  case grep:
 	  case egrep:
 	    return __f;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wswitch" // do not warn about non-enumerator
 	  case _FlagT(0):
 	    return __f | ECMAScript;
+#pragma GCC diagnostic pop
 	  default:
 	    std::__throw_regex_error(_S_grammar, "conflicting grammar options");
 	  }

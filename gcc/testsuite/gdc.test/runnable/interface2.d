@@ -1,11 +1,4 @@
 // PERMUTE_ARGS:
-/*
-TEST_OUTPUT:
----
-runnable/interface2.d(47): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/interface2.d(98): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
----
-*/
 
 extern(C) int printf(const char*, ...);
 
@@ -44,7 +37,7 @@ void test1()
     printf("cast(Bar)f = %p\n", b2);
     assert(b is b2);
 
-    delete f;
+    destroy(f);
 }
 
 /*******************************************************/
@@ -95,7 +88,7 @@ class E3 : D3, C3
 void test3()
 {
     C3 c = new E3();
-    delete c;
+    destroy(c);
 }
 
 
@@ -969,11 +962,11 @@ void test1747()
     assert(pia == pc + n);
 
     assert(id.mA() == 1);
-    assert(id.mB() == 2);   // OK <- NG (bugzilla 2013 case)
+    assert(id.mB() == 2);   // OK <- NG (https://issues.dlang.org/show_bug.cgi?id=2013 case)
     assert(id.mD() == 3);
 
     assert(ic.mA() == 1);
-    assert(ic.mB() == 2);   // OK <- NG (bugzilla 2013 case)
+    assert(ic.mB() == 2);   // OK <- NG (https://issues.dlang.org/show_bug.cgi?id=2013 case)
 
     assert(ib.mA() == 1);
     assert(ib.mB() == 2);   // OK <- NG

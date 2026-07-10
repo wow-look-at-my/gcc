@@ -3,7 +3,7 @@
  *
  * Specification: $(LINK2 https://dlang.org/spec/attribute.html#visibility_attributes, Visibility Attributes)
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/access.d, _access.d)
@@ -16,16 +16,13 @@ module dmd.access;
 import dmd.aggregate;
 import dmd.astenums;
 import dmd.dclass;
-import dmd.declaration;
 import dmd.dmodule;
 import dmd.dscope;
 import dmd.dstruct;
 import dmd.dsymbol;
 import dmd.errors;
 import dmd.expression;
-import dmd.func;
-import dmd.globals;
-import dmd.mtype;
+import dmd.location;
 import dmd.tokens;
 
 private enum LOG = false;
@@ -51,15 +48,7 @@ bool checkAccess(AggregateDeclaration ad, Loc loc, Scope* sc, Dsymbol smember)
 
     if (!symbolIsVisible(sc, smember))
     {
-        // when in @safe code or with -preview=dip1000
-        if (sc.flags & SCOPE.onlysafeaccess)
-        {
-            // if there is a func. ask for it's opinion of safety, and if it considers the access @safe accept it.
-            if (sc.func && !sc.func.setUnsafe())
-                return false;
-        }
-
-        ad.error(loc, "%s `%s` is not accessible%s", smember.kind(), smember.toChars(), (sc.flags & SCOPE.onlysafeaccess) ? " from `@safe` code".ptr : "".ptr);
+        error(loc, "%s `%s` %s `%s` is not accessible", ad.kind(), ad.toPrettyChars(), smember.kind(), smember.toChars());
         //printf("smember = %s %s, vis = %d, semanticRun = %d\n",
         //        smember.kind(), smember.toPrettyChars(), smember.visible() smember.semanticRun);
         return true;

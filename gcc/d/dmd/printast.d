@@ -1,7 +1,7 @@
 /**
  * Provides an AST printer for debugging.
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/printast.d, _printast.d)
@@ -14,6 +14,7 @@ module dmd.printast;
 import core.stdc.stdio;
 
 import dmd.expression;
+import dmd.ctfeexpr;
 import dmd.tokens;
 import dmd.visitor;
 import dmd.hdrgen;
@@ -38,7 +39,7 @@ extern (C++) final class PrintASTVisitor : Visitor
 
     int indent;
 
-    extern (D) this(int indent)
+    extern (D) this(int indent) scope @safe
     {
         this.indent = indent;
     }
@@ -63,7 +64,7 @@ extern (C++) final class PrintASTVisitor : Visitor
         import dmd.hdrgen : floatToBuffer;
         import dmd.common.outbuffer : OutBuffer;
         OutBuffer buf;
-        floatToBuffer(e.type, e.value, &buf, false);
+        floatToBuffer(e.type, e.value, buf, false);
         printf("Real %s %s\n", buf.peekChars(), e.type ? e.type.toChars() : "");
     }
 
@@ -119,6 +120,16 @@ extern (C++) final class PrintASTVisitor : Visitor
     override void visit(UnaExp e)
     {
         visit(cast(Expression)e);
+        printAST(e.e1, indent + 2);
+    }
+
+    override void visit(CastExp e)
+    {
+        printIndent(indent);
+        auto s = EXPtoString(e.op);
+        printf("%.*s %s\n", cast(int)s.length, s.ptr, e.type ? e.type.toChars() : "");
+        printIndent(indent + 2);
+        printf(".to: %s\n", e.to.toChars());
         printAST(e.e1, indent + 2);
     }
 
@@ -193,11 +204,43 @@ extern (C++) final class PrintASTVisitor : Visitor
         printf(".func: %s\n", e.func ? e.func.toChars() : "");
     }
 
+    override void visit(CompoundLiteralExp e)
+    {
+        visit(cast(Expression)e);
+        printIndent(indent + 2);
+        printf(".init: %s\n", e.initializer ? e.initializer.toChars() : "");
+    }
+
+    override void visit(ClassReferenceExp e)
+    {
+        visit(cast(Expression)e);
+        printIndent(indent + 2);
+        printf(".value: %s\n", e.value ? e.value.toChars() : "");
+        printAST(e.value, indent + 2);
+    }
+
+    override void visit(ArrayLiteralExp e)
+    {
+        visit(cast(Expression)e);
+        printIndent(indent + 2);
+        printf(".basis : %s\n", e.basis ? e.basis.toChars() : "");
+        if (e.elements)
+        {
+            printIndent(indent + 2);
+            printf("[");
+            foreach (i, element; (*e.elements)[])
+            {
+                if (i)
+                    printf(", ");
+                printf("%s", element.toChars());
+            }
+            printf("]\n");
+        }
+    }
+
     static void printIndent(int indent)
     {
         foreach (i; 0 .. indent)
             putc(' ', stdout);
     }
 }
-
-

@@ -1,6 +1,6 @@
 /* Basic IPA utilities for type inheritance graph construction and
    devirtualization.
-   Copyright (C) 2013-2022 Free Software Foundation, Inc.
+   Copyright (C) 2013-2024 Free Software Foundation, Inc.
    Contributed by Jan Hubicka
 
 This file is part of GCC.
@@ -120,9 +120,12 @@ along with GCC; see the file COPYING3.  If not see
 #include "print-tree.h"
 #include "calls.h"
 #include "ipa-utils.h"
+#include "gimple-iterator.h"
 #include "gimple-fold.h"
 #include "symbol-summary.h"
 #include "tree-vrp.h"
+#include "sreal.h"
+#include "ipa-cp.h"
 #include "ipa-prop.h"
 #include "ipa-fnsummary.h"
 #include "demangle.h"
@@ -282,6 +285,19 @@ type_possibly_instantiated_p (tree t)
     vtable = TREE_OPERAND (TREE_OPERAND (vtable, 0), 0);
   vnode = varpool_node::get (vtable);
   return vnode && vnode->definition;
+}
+
+/* Return true if T or type derived from T may have instance.  */
+
+static bool
+type_or_derived_type_possibly_instantiated_p (odr_type t)
+{
+  if (type_possibly_instantiated_p (t->type))
+    return true;
+  for (auto derived : t->derived_types)
+    if (type_or_derived_type_possibly_instantiated_p (derived))
+      return true;
+  return false;
 }
 
 /* Hash used to unify ODR types based on their mangled name and for anonymous
@@ -1207,6 +1223,9 @@ odr_types_equivalent_p (tree t1, tree t2, bool warn, bool *warned,
 			hash_set<type_pair> *visited,
 			location_t loc1, location_t loc2)
 {
+  /* If we are asked to warn, we need warned to keep track if warning was
+     output.  */
+  gcc_assert (!warn || warned);
   /* Check first for the obvious case of pointer identity.  */
   if (t1 == t2)
     return true;
@@ -1235,16 +1254,24 @@ odr_types_equivalent_p (tree t1, tree t2, bool warn, bool *warned,
   if (INTEGRAL_TYPE_P (t1)
       || SCALAR_FLOAT_TYPE_P (t1)
       || FIXED_POINT_TYPE_P (t1)
-      || TREE_CODE (t1) == VECTOR_TYPE
+      || VECTOR_TYPE_P (t1)
       || TREE_CODE (t1) == COMPLEX_TYPE
       || TREE_CODE (t1) == OFFSET_TYPE
       || POINTER_TYPE_P (t1))
     {
-      if (TYPE_PRECISION (t1) != TYPE_PRECISION (t2))
+      if (!VECTOR_TYPE_P (t1) && TYPE_PRECISION (t1) != TYPE_PRECISION (t2))
 	{
 	  warn_odr (t1, t2, NULL, NULL, warn, warned,
 		    G_("a type with different precision is defined "
 		       "in another translation unit"));
+	  return false;
+	}
+      if (VECTOR_TYPE_P (t1)
+	  && maybe_ne (TYPE_VECTOR_SUBPARTS (t1), TYPE_VECTOR_SUBPARTS (t2)))
+	{
+	  warn_odr (t1, t2, NULL, NULL, warn, warned,
+		    G_("a vector type with different number of elements "
+		       "is defined in another translation unit"));
 	  return false;
 	}
       if (TYPE_UNSIGNED (t1) != TYPE_UNSIGNED (t2))
@@ -1286,14 +1313,14 @@ odr_types_equivalent_p (tree t1, tree t2, bool warn, bool *warned,
 	      warn_odr (t1, t2, NULL, NULL, warn, warned,
 			G_("it is defined as a pointer to different type "
 			   "in another translation unit"));
-	      if (warn && warned)
+	      if (warn && *warned)
 	        warn_types_mismatch (TREE_TYPE (t1), TREE_TYPE (t2),
 				     loc1, loc2);
 	      return false;
 	    }
 	}
 
-      if ((TREE_CODE (t1) == VECTOR_TYPE || TREE_CODE (t1) == COMPLEX_TYPE)
+      if ((VECTOR_TYPE_P (t1) || TREE_CODE (t1) == COMPLEX_TYPE)
 	  && !odr_subtypes_equivalent_p (TREE_TYPE (t1), TREE_TYPE (t2),
 					 visited, loc1, loc2))
 	{
@@ -1301,7 +1328,7 @@ odr_types_equivalent_p (tree t1, tree t2, bool warn, bool *warned,
 	  warn_odr (t1, t2, NULL, NULL, warn, warned,
 		    G_("a different type is defined "
 		       "in another translation unit"));
-	  if (warn && warned)
+	  if (warn && *warned)
 	    warn_types_mismatch (TREE_TYPE (t1), TREE_TYPE (t2), loc1, loc2);
 	  return false;
 	}
@@ -1319,7 +1346,7 @@ odr_types_equivalent_p (tree t1, tree t2, bool warn, bool *warned,
 	    warn_odr (t1, t2, NULL, NULL, warn, warned,
 		      G_("a different type is defined in another "
 			 "translation unit"));
-	    if (warn && warned)
+	    if (warn && *warned)
 	      warn_types_mismatch (TREE_TYPE (t1), TREE_TYPE (t2), loc1, loc2);
 	  }
 	gcc_assert (TYPE_STRING_FLAG (t1) == TYPE_STRING_FLAG (t2));
@@ -1361,7 +1388,7 @@ odr_types_equivalent_p (tree t1, tree t2, bool warn, bool *warned,
 	  warn_odr (t1, t2, NULL, NULL, warn, warned,
 		    G_("has different return value "
 		       "in another translation unit"));
-	  if (warn && warned)
+	  if (warn && *warned)
 	    warn_types_mismatch (TREE_TYPE (t1), TREE_TYPE (t2), loc1, loc2);
 	  return false;
 	}
@@ -1384,7 +1411,7 @@ odr_types_equivalent_p (tree t1, tree t2, bool warn, bool *warned,
 		  warn_odr (t1, t2, NULL, NULL, warn, warned,
 			    G_("has different parameters in another "
 			       "translation unit"));
-		  if (warn && warned)
+		  if (warn && *warned)
 		    warn_types_mismatch (TREE_VALUE (parms1),
 					 TREE_VALUE (parms2), loc1, loc2);
 		  return false;
@@ -1470,7 +1497,7 @@ odr_types_equivalent_p (tree t1, tree t2, bool warn, bool *warned,
 		    warn_odr (t1, t2, f1, f2, warn, warned,
 			      G_("a field of same name but different type "
 				 "is defined in another translation unit"));
-		    if (warn && warned)
+		    if (warn && *warned)
 		      warn_types_mismatch (TREE_TYPE (f1), TREE_TYPE (f2), loc1, loc2);
 		    return false;
 		  }
@@ -3171,6 +3198,7 @@ possible_polymorphic_call_targets (tree otr_type,
     {
       odr_type speculative_outer_type;
       bool speculation_complete = true;
+      bool check_derived_types = false;
 
       /* First insert target from type itself and check if it may have
 	 derived types.  */
@@ -3189,8 +3217,12 @@ possible_polymorphic_call_targets (tree otr_type,
 	 to walk derivations.  */
       if (target && DECL_FINAL_P (target))
 	context.speculative_maybe_derived_type = false;
-      if (type_possibly_instantiated_p (speculative_outer_type->type))
-	maybe_record_node (nodes, target, &inserted, can_refer, &speculation_complete);
+      if (check_derived_types
+	  ? type_or_derived_type_possibly_instantiated_p
+		 (speculative_outer_type)
+	  : type_possibly_instantiated_p (speculative_outer_type->type))
+	maybe_record_node (nodes, target, &inserted, can_refer,
+			   &speculation_complete);
       if (binfo)
 	matched_vtables.add (BINFO_VTABLE (binfo));
 
@@ -3211,6 +3243,7 @@ possible_polymorphic_call_targets (tree otr_type,
 
   if (!speculative || !nodes.length ())
     {
+      bool check_derived_types = false;
       /* First see virtual method of type itself.  */
       binfo = get_binfo_at_offset (TYPE_BINFO (outer_type->type),
 				   context.offset, otr_type);
@@ -3228,16 +3261,18 @@ possible_polymorphic_call_targets (tree otr_type,
       if (target && DECL_CXX_DESTRUCTOR_P (target))
 	context.maybe_in_construction = false;
 
-      if (target)
+      /* In the case we get complete method, we don't need 
+	 to walk derivations.  */
+      if (target && DECL_FINAL_P (target))
 	{
-	  /* In the case we get complete method, we don't need 
-	     to walk derivations.  */
-	  if (DECL_FINAL_P (target))
-	    context.maybe_derived_type = false;
+	  check_derived_types = true;
+	  context.maybe_derived_type = false;
 	}
 
       /* If OUTER_TYPE is abstract, we know we are not seeing its instance.  */
-      if (type_possibly_instantiated_p (outer_type->type))
+      if (check_derived_types
+	  ? type_or_derived_type_possibly_instantiated_p (outer_type)
+	  : type_possibly_instantiated_p (outer_type->type))
 	maybe_record_node (nodes, target, &inserted, can_refer, &complete);
       else
 	skipped = true;
@@ -3449,8 +3484,10 @@ possible_polymorphic_call_target_p (tree otr_type,
   unsigned int i;
   bool final;
 
-  if (fndecl_built_in_p (n->decl, BUILT_IN_UNREACHABLE)
-      || fndecl_built_in_p (n->decl, BUILT_IN_TRAP))
+  if (fndecl_built_in_p (n->decl, BUILT_IN_NORMAL)
+      && (DECL_FUNCTION_CODE (n->decl) == BUILT_IN_UNREACHABLE
+	  || DECL_FUNCTION_CODE (n->decl) == BUILT_IN_TRAP
+	  || DECL_FUNCTION_CODE (n->decl) == BUILT_IN_UNREACHABLE_TRAP))
     return true;
 
   if (is_cxa_pure_virtual_p (n->decl))
@@ -3968,7 +4005,7 @@ public:
   {}
 
   /* opt_pass methods: */
-  virtual bool gate (function *)
+  bool gate (function *) final override
     {
       /* In LTO, always run the IPA passes and decide on function basis if the
 	 pass is enabled.  */
@@ -3981,7 +4018,7 @@ public:
 	      && optimize);
     }
 
-  virtual unsigned int execute (function *) { return ipa_devirt (); }
+  unsigned int execute (function *) final override { return ipa_devirt (); }
 
 }; // class pass_ipa_devirt
 
@@ -4120,7 +4157,7 @@ ipa_odr_read_section (struct lto_file_decl_data *file_data, const char *data,
   class data_in *data_in;
 
   lto_input_block ib ((const char *) data + main_offset, header->main_size,
-		      file_data->mode_table);
+		      file_data);
 
   data_in
     = lto_data_in_create (file_data, (const char *) data + string_offset,
@@ -4360,12 +4397,12 @@ public:
   {}
 
   /* opt_pass methods: */
-  virtual bool gate (function *)
+  bool gate (function *) final override
     {
       return (in_lto_p || flag_lto);
     }
 
-  virtual unsigned int execute (function *)
+  unsigned int execute (function *) final override
     {
       return 0;
     }

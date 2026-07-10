@@ -1,4 +1,4 @@
-.. Copyright (C) 2014-2022 Free Software Foundation, Inc.
+.. Copyright (C) 2014-2024 Free Software Foundation, Inc.
    Originally contributed by David Malcolm <dmalcolm@redhat.com>
 
    This is free software: you can redistribute it and/or modify it
@@ -24,7 +24,7 @@ Rvalues
 -------
 .. type:: gcc_jit_rvalue
 
-A :c:type:`gcc_jit_rvalue *` is an expression that can be computed.
+A :c:type:`gcc_jit_rvalue` is an expression that can be computed.
 
 It can be simple, e.g.:
 
@@ -60,7 +60,7 @@ Simple expressions
                                                    int value)
 
    Given a numeric type (integer or floating point), build an rvalue for
-   the given constant :c:type:`int` value.
+   the given constant :expr:`int` value.
 
 .. function:: gcc_jit_rvalue *\
               gcc_jit_context_new_rvalue_from_long (gcc_jit_context *ctxt, \
@@ -68,7 +68,7 @@ Simple expressions
                                                     long value)
 
    Given a numeric type (integer or floating point), build an rvalue for
-   the given constant :c:type:`long` value.
+   the given constant :expr:`long` value.
 
 .. function::  gcc_jit_rvalue *gcc_jit_context_zero (gcc_jit_context *ctxt, \
                                                      gcc_jit_type *numeric_type)
@@ -96,7 +96,7 @@ Simple expressions
                                                        double value)
 
    Given a numeric type (integer or floating point), build an rvalue for
-   the given constant :c:type:`double` value.
+   the given constant :expr:`double` value.
 
 .. function:: gcc_jit_rvalue *\
               gcc_jit_context_new_rvalue_from_ptr (gcc_jit_context *ctxt, \
@@ -126,6 +126,20 @@ Simple expressions
    underlying string, so it is valid to pass in a pointer to an on-stack
    buffer.
 
+.. function:: gcc_jit_rvalue *\
+              gcc_jit_context_new_sizeof (gcc_jit_context *ctxt, \
+                                          gcc_jit_type *type)
+
+   Generate an rvalue that is equal to the size of ``type``.
+
+   The parameter ``type`` must be non-NULL.
+
+   This is equivalent to this C code:
+
+   .. code-block:: c
+
+     sizeof (type)
+
 Constructor expressions
 ***********************
 
@@ -152,6 +166,7 @@ Constructor expressions
    their presence using:
 
    .. code-block:: c
+
      #ifdef LIBGCCJIT_HAVE_CTORS
 
 .. function:: gcc_jit_rvalue *\
@@ -186,6 +201,7 @@ Constructor expressions
    presence using:
 
    .. code-block:: c
+
      #ifdef LIBGCCJIT_HAVE_CTORS
 
 .. function:: gcc_jit_rvalue *\
@@ -194,7 +210,7 @@ Constructor expressions
 						      gcc_jit_type *type,\
 						      size_t num_values,\
 						      gcc_jit_field **fields,\
-						      gcc_jit_rvalue **value)
+						      gcc_jit_rvalue **values)
 
 
    Create a constructor for a struct as an rvalue.
@@ -222,7 +238,7 @@ Constructor expressions
    The fields in ``fields`` need to be the same objects that were used
    to create the struct.
 
-   Each value has to have have the same unqualified type as the field
+   Each value has to have the same unqualified type as the field
    it is applied to.
 
    A NULL value element  in ``values`` is a shorthand for zero initialization
@@ -235,6 +251,7 @@ Constructor expressions
    presence using:
 
    .. code-block:: c
+
      #ifdef LIBGCCJIT_HAVE_CTORS
 
 .. function:: gcc_jit_rvalue *\
@@ -265,6 +282,7 @@ Constructor expressions
    presence using:
 
    .. code-block:: c
+
      #ifdef LIBGCCJIT_HAVE_CTORS
 
 Vector expressions
@@ -305,18 +323,24 @@ Unary Operations
 
    The parameter ``result_type`` must be a numeric type.
 
-.. type:: enum gcc_jit_unary_op
+.. enum:: gcc_jit_unary_op
 
 The available unary operations are:
 
-==========================================  ============
-Unary Operation                             C equivalent
-==========================================  ============
-:c:macro:`GCC_JIT_UNARY_OP_MINUS`           `-(EXPR)`
-:c:macro:`GCC_JIT_UNARY_OP_BITWISE_NEGATE`  `~(EXPR)`
-:c:macro:`GCC_JIT_UNARY_OP_LOGICAL_NEGATE`  `!(EXPR)`
-:c:macro:`GCC_JIT_UNARY_OP_ABS`             `abs (EXPR)`
-==========================================  ============
+.. list-table::
+   :header-rows: 1
+
+   * - Unary Operation
+     - C equivalent
+
+   * - :c:macro:`GCC_JIT_UNARY_OP_MINUS`
+     - `-(EXPR)`
+   * - :c:macro:`GCC_JIT_UNARY_OP_BITWISE_NEGATE`
+     - `~(EXPR)`
+   * - :c:macro:`GCC_JIT_UNARY_OP_LOGICAL_NEGATE`
+     - `!(EXPR)`
+   * - :c:macro:`GCC_JIT_UNARY_OP_ABS`
+     - `abs (EXPR)`
 
 .. c:macro:: GCC_JIT_UNARY_OP_MINUS
 
@@ -372,26 +396,40 @@ Binary Operations
 
    The parameter ``result_type`` must be a numeric type.
 
-.. type:: enum gcc_jit_binary_op
+.. enum:: gcc_jit_binary_op
 
 The available binary operations are:
 
-========================================  ============
-Binary Operation                          C equivalent
-========================================  ============
-:c:macro:`GCC_JIT_BINARY_OP_PLUS`         `x + y`
-:c:macro:`GCC_JIT_BINARY_OP_MINUS`        `x - y`
-:c:macro:`GCC_JIT_BINARY_OP_MULT`         `x * y`
-:c:macro:`GCC_JIT_BINARY_OP_DIVIDE`       `x / y`
-:c:macro:`GCC_JIT_BINARY_OP_MODULO`       `x % y`
-:c:macro:`GCC_JIT_BINARY_OP_BITWISE_AND`  `x & y`
-:c:macro:`GCC_JIT_BINARY_OP_BITWISE_XOR`  `x ^ y`
-:c:macro:`GCC_JIT_BINARY_OP_BITWISE_OR`   `x | y`
-:c:macro:`GCC_JIT_BINARY_OP_LOGICAL_AND`  `x && y`
-:c:macro:`GCC_JIT_BINARY_OP_LOGICAL_OR`   `x || y`
-:c:macro:`GCC_JIT_BINARY_OP_LSHIFT`       `x << y`
-:c:macro:`GCC_JIT_BINARY_OP_RSHIFT`       `x >> y`
-========================================  ============
+.. list-table::
+   :header-rows: 1
+
+   * - Binary Operation
+     - C equivalent
+
+   * - :c:macro:`GCC_JIT_BINARY_OP_PLUS`
+     - `x + y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_MINUS`
+     - `x - y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_MULT`
+     - `x * y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_DIVIDE`
+     - `x / y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_MODULO`
+     - `x % y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_BITWISE_AND`
+     - `x & y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_BITWISE_XOR`
+     - `x ^ y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_BITWISE_OR`
+     - `x | y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_LOGICAL_AND`
+     - `x && y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_LOGICAL_OR`
+     - `x || y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_LSHIFT`
+     - `x << y`
+   * - :c:macro:`GCC_JIT_BINARY_OP_RSHIFT`
+     - `x >> y`
 
 .. c:macro:: GCC_JIT_BINARY_OP_PLUS
 
@@ -530,19 +568,26 @@ Comparisons
 
    Build a boolean rvalue out of the comparison of two other rvalues.
 
-.. type:: enum gcc_jit_comparison
+.. enum:: gcc_jit_comparison
 
-=======================================  ============
-Comparison                               C equivalent
-=======================================  ============
-:c:macro:`GCC_JIT_COMPARISON_EQ`         `x == y`
-:c:macro:`GCC_JIT_COMPARISON_NE`         `x != y`
-:c:macro:`GCC_JIT_COMPARISON_LT`         `x < y`
-:c:macro:`GCC_JIT_COMPARISON_LE`         `x <= y`
-:c:macro:`GCC_JIT_COMPARISON_GT`         `x > y`
-:c:macro:`GCC_JIT_COMPARISON_GE`         `x >= y`
-=======================================  ============
+.. list-table::
+   :header-rows: 1
 
+   * - Comparison
+     - C equivalent
+
+   * - :c:macro:`GCC_JIT_COMPARISON_EQ`
+     - `x == y`
+   * - :c:macro:`GCC_JIT_COMPARISON_NE`
+     - `x != y`
+   * - :c:macro:`GCC_JIT_COMPARISON_LT`
+     - `x < y`
+   * - :c:macro:`GCC_JIT_COMPARISON_LE`
+     - `x <= y`
+   * - :c:macro:`GCC_JIT_COMPARISON_GT`
+     - `x > y`
+   * - :c:macro:`GCC_JIT_COMPARISON_GE`
+     - `x >= y`
 
 Function calls
 **************
@@ -598,7 +643,7 @@ Function calls
               gcc_jit_rvalue_set_bool_require_tail_call (gcc_jit_rvalue *call,\
                                                          int require_tail_call)
 
-   Given an :c:type:`gcc_jit_rvalue *` for a call created through
+   Given an :c:type:`gcc_jit_rvalue` for a call created through
    :c:func:`gcc_jit_context_new_call` or
    :c:func:`gcc_jit_context_new_call_through_ptr`, mark/clear the
    call as needing tail-call optimization.  The optimizer will
@@ -649,6 +694,25 @@ Type-coercion
      * int <-> bool
      * P*  <-> Q*, for pointer types P and Q
 
+.. function:: gcc_jit_rvalue *\
+              gcc_jit_context_new_bitcast (gcc_jit_context *ctxt,\
+                                           gcc_jit_location *loc,\
+                                           gcc_jit_rvalue *rvalue,\
+                                           gcc_jit_type *type)
+
+   Given an rvalue of T, bitcast it to another type, meaning that this will
+   generate a new rvalue by interpreting the bits of ``rvalue`` to the layout
+   of ``type``.
+
+   The type of rvalue must be the same size as the size of ``type``.
+
+   This entrypoint was added in :ref:`LIBGCCJIT_ABI_21`; you can test for
+   its presence using
+
+   .. code-block:: c
+
+      #ifdef LIBGCCJIT_HAVE_gcc_jit_context_new_bitcast
+
 Lvalues
 -------
 
@@ -688,7 +752,7 @@ where the rvalue is computed by reading from the storage area.
 
    The "model" parameter determines the thread-local storage model of the "lvalue":
 
-   .. type:: enum gcc_jit_tls_model
+   .. enum:: gcc_jit_tls_model
 
    .. c:macro:: GCC_JIT_TLS_MODEL_NONE
 
@@ -717,8 +781,8 @@ where the rvalue is computed by reading from the storage area.
 
       #ifdef LIBGCCJIT_HAVE_gcc_jit_lvalue_set_tls_model
 
-.. function:: void
-              gcc_jit_lvalue_set_link_section (gcc_jit_lvalue *lvalue,
+.. function:: void\
+              gcc_jit_lvalue_set_link_section (gcc_jit_lvalue *lvalue,\
                                                const char *section_name)
 
    Set the link section of a variable.
@@ -737,6 +801,65 @@ where the rvalue is computed by reading from the storage area.
    .. code-block:: c
 
       #ifdef LIBGCCJIT_HAVE_gcc_jit_lvalue_set_link_section
+
+.. function:: void\
+              gcc_jit_lvalue_set_register_name (gcc_jit_lvalue *lvalue,\
+                                                const char *reg_name);
+
+   Set the register name of a variable.
+   The parameter ``reg_name`` must be non-NULL. Analogous to:
+
+   .. code-block:: c
+
+     register int variable asm ("r12");
+
+   in C.
+
+   This entrypoint was added in :ref:`LIBGCCJIT_ABI_22`; you can test for
+   its presence using
+
+   .. code-block:: c
+
+      #ifdef LIBGCCJIT_HAVE_gcc_jit_lvalue_set_register_name
+
+.. function:: void\
+              gcc_jit_lvalue_set_alignment (gcc_jit_lvalue *lvalue,\
+                                            unsigned bytes)
+
+   Set the alignment of a variable, in bytes.
+   Analogous to:
+
+   .. code-block:: c
+
+     int variable __attribute__((aligned (16)));
+
+   in C.
+
+   This entrypoint was added in :ref:`LIBGCCJIT_ABI_24`; you can test for
+   its presence using
+
+   .. code-block:: c
+
+      #ifdef LIBGCCJIT_HAVE_ALIGNMENT
+
+.. function:: unsigned\
+              gcc_jit_lvalue_get_alignment (gcc_jit_lvalue *lvalue)
+
+   Return the alignment of a variable set by ``gcc_jit_lvalue_set_alignment``.
+   Return 0 if the alignment was not set. Analogous to:
+
+   .. code-block:: c
+
+     _Alignof (variable)
+
+   in C.
+
+   This entrypoint was added in :ref:`LIBGCCJIT_ABI_24`; you can test for
+   its presence using
+
+   .. code-block:: c
+
+      #ifdef LIBGCCJIT_HAVE_ALIGNMENT
 
 Global variables
 ****************
@@ -759,7 +882,7 @@ Global variables
    The "kind" parameter determines the visibility of the "global" outside
    of the :c:type:`gcc_jit_result`:
 
-   .. type:: enum gcc_jit_global_kind
+   .. enum:: gcc_jit_global_kind
 
    .. c:macro:: GCC_JIT_GLOBAL_EXPORTED
 
@@ -803,14 +926,14 @@ Global variables
       #ifdef LIBGCCJIT_HAVE_gcc_jit_global_set_initializer
 
 .. function:: gcc_jit_lvalue *\
-	      gcc_jit_global_set_initializer_rvalue (gcc_jit_lvalue *global,
+	      gcc_jit_global_set_initializer_rvalue (gcc_jit_lvalue *global,\
 	                                             gcc_jit_rvalue *init_value)
 
    Set the initial value of a global with an rvalue.
 
    The rvalue needs to be a constant expression, e.g. no function calls.
 
-   The global can't have the ``kind`` :ref:`GCC_JIT_GLOBAL_IMPORTED`.
+   The global can't have the ``kind`` :c:macro:`GCC_JIT_GLOBAL_IMPORTED`.
 
    As a non-comprehensive example it is OK to do the equivalent of:
 
@@ -822,8 +945,9 @@ Global variables
        const int baz = 3; /* rvalue from gcc_jit_context_rvalue_from_int.  */
        int boz = baz; /* rvalue from gcc_jit_lvalue_as_rvalue.  */
 
-   Use together with :ref:`gcc_jit_context_new_constructor` to
-   initialize structs, unions and arrays.
+   Use together with :c:func:`gcc_jit_context_new_struct_constructor`,
+   :c:func:`gcc_jit_context_new_union_constructor`, :c:func:`gcc_jit_context_new_array_constructor`
+   to initialize structs, unions and arrays.
 
    On success, returns the ``global`` parameter unchanged. Otherwise, ``NULL``.
 
@@ -833,6 +957,23 @@ Global variables
    .. code-block:: c
 
       #ifdef LIBGCCJIT_HAVE_CTORS
+
+Variables
+*********
+
+.. function::  void\
+               gcc_jit_lvalue_add_string_attribute (gcc_jit_lvalue *variable,
+                                                    enum gcc_jit_variable_attribute attribute,
+                                                    const char *value)
+
+     Add an attribute ``attribute`` with value ``value`` to a variable ``variable``.
+
+   This entrypoint was added in :ref:`LIBGCCJIT_ABI_26`; you can test for
+   its presence using
+
+   .. code-block:: c
+
+      #ifdef LIBGCCJIT_HAVE_ATTRIBUTES
 
 Working with pointers, structs and unions
 -----------------------------------------

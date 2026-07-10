@@ -1,5 +1,5 @@
 /* Scheduler hooks for IA-32 which implement CPU specific logic.
-   Copyright (C) 1988-2022 Free Software Foundation, Inc.
+   Copyright (C) 1988-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -58,6 +58,7 @@ ix86_issue_rate (void)
     case PROCESSOR_K8:
     case PROCESSOR_AMDFAM10:
     case PROCESSOR_BTVER1:
+    case PROCESSOR_LUJIAZUI:
       return 3;
 
     case PROCESSOR_BDVER1:
@@ -67,14 +68,37 @@ ix86_issue_rate (void)
     case PROCESSOR_ZNVER1:
     case PROCESSOR_ZNVER2:
     case PROCESSOR_ZNVER3:
+    case PROCESSOR_ZNVER4:
     case PROCESSOR_CORE2:
     case PROCESSOR_NEHALEM:
     case PROCESSOR_SANDYBRIDGE:
     case PROCESSOR_HASWELL:
     case PROCESSOR_TREMONT:
+    case PROCESSOR_SKYLAKE:
+    case PROCESSOR_SKYLAKE_AVX512:
+    case PROCESSOR_CASCADELAKE:
+    case PROCESSOR_CANNONLAKE:
     case PROCESSOR_ALDERLAKE:
+    case PROCESSOR_YONGFENG:
     case PROCESSOR_GENERIC:
       return 4;
+
+    case PROCESSOR_ICELAKE_CLIENT:
+    case PROCESSOR_ICELAKE_SERVER:
+    case PROCESSOR_TIGERLAKE:
+    case PROCESSOR_COOPERLAKE:
+    case PROCESSOR_ROCKETLAKE:
+      return 5;
+
+    case PROCESSOR_SAPPHIRERAPIDS:
+    /* For znver5 decoder can handle 4 or 8 instructions per cycle,
+       op cache 12 instruction/cycle, dispatch 8 instructions
+       integer rename 8 instructions and Fp 6 instructions.
+
+       The scheduler, without understanding out of order nature of the CPU
+       is unlikely going to be able to fill all of these.  */
+    case PROCESSOR_ZNVER5:
+      return 6;
 
     default:
       return 1;
@@ -399,6 +423,8 @@ ix86_adjust_cost (rtx_insn *insn, int dep_type, rtx_insn *dep_insn, int cost,
     case PROCESSOR_ZNVER1:
     case PROCESSOR_ZNVER2:
     case PROCESSOR_ZNVER3:
+    case PROCESSOR_ZNVER4:
+    case PROCESSOR_ZNVER5:
       /* Stack engine allows to execute push&pop instructions in parall.  */
       if ((insn_type == TYPE_PUSH || insn_type == TYPE_POP)
 	  && (dep_insn_type == TYPE_PUSH || dep_insn_type == TYPE_POP))
@@ -415,6 +441,8 @@ ix86_adjust_cost (rtx_insn *insn, int dep_type, rtx_insn *dep_insn, int cost,
 	  enum attr_unit unit = get_attr_unit (insn);
 	  int loadcost;
 
+	  /* TODO: On znver5 complex addressing modes have
+	     greater latency.  */
 	  if (unit == UNIT_INTEGER || unit == UNIT_UNKNOWN)
 	    loadcost = 4;
 	  else
@@ -426,6 +454,31 @@ ix86_adjust_cost (rtx_insn *insn, int dep_type, rtx_insn *dep_insn, int cost,
 	    cost = 0;
 	}
       break;
+
+    case PROCESSOR_YONGFENG:
+      /* Stack engine allows to execute push&pop instructions in parallel.  */
+      if ((insn_type == TYPE_PUSH || insn_type == TYPE_POP)
+	  && (dep_insn_type == TYPE_PUSH || dep_insn_type == TYPE_POP))
+	return 0;
+      /* FALLTHRU */
+
+    case PROCESSOR_LUJIAZUI:
+      memory = get_attr_memory (insn);
+
+      /* Show ability of reorder buffer to hide latency of load by executing
+	  in parallel with previous instruction in case
+	  previous instruction is not needed to compute the address.  */
+      if ((memory == MEMORY_LOAD || memory == MEMORY_BOTH)
+	  && !ix86_agi_dependent (dep_insn, insn))
+	  {
+	    int loadcost = 4;
+
+	    if (cost >= loadcost)
+	      cost -= loadcost;
+	    else
+	      cost = 0;
+	  }
+       break;
 
     case PROCESSOR_CORE2:
     case PROCESSOR_NEHALEM:
@@ -520,6 +573,60 @@ ix86_macro_fusion_p ()
   return TARGET_FUSE_CMP_AND_BRANCH;
 }
 
+static bool
+ix86_fuse_mov_alu_p (rtx_insn *mov, rtx_insn *alu)
+{
+  /* Validate mov:
+      - It should be reg-reg move with opcode 0x89 or 0x8B.  */
+  rtx set1 = PATTERN (mov);
+  if (GET_CODE (set1) != SET
+      || !GENERAL_REG_P (SET_SRC (set1))
+      || !GENERAL_REG_P (SET_DEST (set1)))
+    return false;
+  rtx reg = SET_DEST (set1);
+  /*  - it should have 0x89 or 0x8B opcode.  */
+  if (!INTEGRAL_MODE_P (GET_MODE (reg))
+      || GET_MODE_SIZE (GET_MODE (reg)) < 2
+      || GET_MODE_SIZE (GET_MODE (reg)) > 8)
+    return false;
+  /* Validate ALU.  */
+  if (GET_CODE (PATTERN (alu)) != PARALLEL)
+    return false;
+  rtx set2 = XVECEXP (PATTERN (alu), 0, 0);
+  if (GET_CODE (set2) != SET)
+    return false;
+  /* Match one of:
+     ADD ADC AND XOR OR SUB SBB INC DEC NOT SAL SHL SHR SAR
+     We also may add insn attribute to handle some of sporadic
+     case we output those with different RTX expressions.  */
+
+  if (GET_CODE (SET_SRC (set2)) != PLUS
+      && GET_CODE (SET_SRC (set2)) != MINUS
+      && GET_CODE (SET_SRC (set2)) != XOR
+      && GET_CODE (SET_SRC (set2)) != AND
+      && GET_CODE (SET_SRC (set2)) != IOR
+      && GET_CODE (SET_SRC (set2)) != NOT
+      && GET_CODE (SET_SRC (set2)) != ASHIFT
+      && GET_CODE (SET_SRC (set2)) != ASHIFTRT
+      && GET_CODE (SET_SRC (set2)) != LSHIFTRT)
+    return false;
+  rtx op0 = XEXP (SET_SRC (set2), 0);
+  rtx op1 = GET_CODE (SET_SRC (set2)) != NOT ? XEXP (SET_SRC (set2), 1) : NULL;
+  /* One of operands should be register.  */
+  if (op1 && (!REG_P (op0) || REGNO (op0) != REGNO (reg)))
+    std::swap (op0, op1);
+  if (!REG_P (op0) || REGNO (op0) != REGNO (reg))
+    return false;
+  if (op1
+      && !REG_P (op1)
+      && !x86_64_immediate_operand (op1, VOIDmode))
+    return false;
+  /* Only one of two paramters must be move destination.  */
+  if (op1 && REG_P (op1) && REGNO (op1) == REGNO (reg))
+    return false;
+  return true;
+}
+
 /* Check whether current microarchitecture support macro fusion
    for insn pair "CONDGEN + CONDJMP". Refer to
    "Intel Architectures Optimization Reference Manual". */
@@ -527,6 +634,9 @@ ix86_macro_fusion_p ()
 bool
 ix86_macro_fusion_pair_p (rtx_insn *condgen, rtx_insn *condjmp)
 {
+  if (TARGET_FUSE_MOV_AND_ALU
+      && ix86_fuse_mov_alu_p (condgen, condjmp))
+    return true;
   rtx src, dest;
   enum rtx_code ccode;
   rtx compare_set = NULL_RTX, test_if, cond;

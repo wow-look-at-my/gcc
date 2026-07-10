@@ -1,5 +1,5 @@
 /* Part of CPP library.
-   Copyright (C) 1997-2022 Free Software Foundation, Inc.
+   Copyright (C) 1997-2024 Free Software Foundation, Inc.
 
 This program is free software; you can redistribute it and/or modify it
 under the terms of the GNU General Public License as published by the
@@ -24,6 +24,7 @@ along with this program; see the file COPYING3.  If not see
 
 #include "symtab.h"
 #include "cpplib.h"
+#include "rich-location.h"
 
 #if HAVE_ICONV
 #include <iconv.h>
@@ -406,6 +407,23 @@ struct def_pragma_macro {
   unsigned int is_builtin : 1;
 };
 
+/* One recorded __has_include / __has_include_next evaluation (see
+   cpp_reader::hi_probes).  All strings are xmalloc'd copies owned by the
+   record and freed by _cpp_cleanup_files.  FLAGS is a mask of the public
+   CPP_HI_PROBE_* bits (cpplib.h).  CANDIDATES are the fully joined paths the
+   search proved ABSENT, in search order: for a found probe the joins of the
+   chain dirs strictly before the directory the header was found in; for a
+   not-found probe the joins of every chain dir.  They are recorded only for
+   CPP_HI_PROBE_VERIFIABLE probes.  */
+struct cpp_hi_probe
+{
+  char *name;			/* operand spelling, post macro expansion */
+  char *resolved;		/* found: the resolved path, else NULL */
+  char **candidates;		/* paths probed and found absent */
+  unsigned n_candidates;
+  unsigned flags;		/* CPP_HI_PROBE_* */
+};
+
 /* A cpp_reader encapsulates the "state" of a pre-processor run.
    Applying cpp_get_token repeatedly yields a stream of pre-processor
    tokens.  Usually, there is only one cpp_reader object active.  */
@@ -457,6 +475,35 @@ struct cpp_reader
      are either about to expand a macro, or are actually expanding
      one.  */
   bool about_to_expand_macro_p;
+
+  /* True once __has_include / __has_include_next has been evaluated in this
+     translation unit (set even for probes short-circuited by skip_eval).  A
+     header probed by __has_include but never #include'd does not enter the
+     include closure (cpp_foreach_included_file skips files with stack_count
+     == 0), so the in-compiler cache cannot detect an absent->present flip of
+     such a probe from the closure alone; it uses the per-probe records below
+     instead (see cpp_foreach_has_include_probe).  Read via
+     cpp_used_has_include().  */
+  bool used_has_include;
+
+  /* Like used_has_include, but set only by __has_include_next.  Its result
+     depends on the include-stack position of the probing file, which the
+     in-compiler cache cannot re-verify outside a real preprocess, so it
+     disqualifies a TU from the cache's pre-parse manifest fast-path.  Read
+     via cpp_used_has_include_next().  */
+  bool used_has_include_next;
+
+  /* Every ACTUALLY EVALUATED __has_include / __has_include_next probe of
+     this translation unit (probes short-circuited by skip_eval are dead --
+     they cannot affect the preprocessed output -- and are not recorded),
+     deduplicated on identical (name, flags, resolved).  Recorded by
+     _cpp_has_header, walked via cpp_foreach_has_include_probe.  The
+     in-compiler cache folds the results into its keys and re-verifies the
+     verifiable ones (candidate paths still absent, resolved path still
+     present) when serving a warm object without preprocessing.  */
+  struct cpp_hi_probe *hi_probes;
+  unsigned hi_probe_count;
+  unsigned hi_probe_cap;
 
   /* Search paths for include files.  */
   struct cpp_dir *quote_include;	/* "" */
@@ -555,6 +602,9 @@ struct cpp_reader
   /* Identifier hash table.  */
   struct ht *hash_table;
 
+  /* Identifier ancillary data hash table.  */
+  struct ht *extra_hash_table;
+
   /* Expression parser stack.  */
   struct op *op_stack, *op_limit;
 
@@ -566,7 +616,7 @@ struct cpp_reader
   struct spec_nodes spec_nodes;
 
   /* Whether cpplib owns the hashtable.  */
-  bool our_hashtable;
+  bool our_hashtable, our_extra_hashtable;
 
   /* Traditional preprocessing output buffer (a logical line).  */
   struct
@@ -686,7 +736,7 @@ inline bool _cpp_maybe_notify_macro_use (cpp_reader *pfile, cpp_hashnode *node,
 }
 extern cpp_macro *_cpp_new_macro (cpp_reader *, cpp_macro_kind, void *);
 extern void _cpp_free_definition (cpp_hashnode *);
-extern bool _cpp_create_definition (cpp_reader *, cpp_hashnode *);
+extern bool _cpp_create_definition (cpp_reader *, cpp_hashnode *, location_t);
 extern void _cpp_pop_context (cpp_reader *);
 extern void _cpp_push_text_context (cpp_reader *, cpp_hashnode *,
 				    const unsigned char *, size_t);
@@ -704,7 +754,8 @@ extern void _cpp_push_token_context (cpp_reader *, cpp_hashnode *,
 extern void _cpp_backup_tokens_direct (cpp_reader *, unsigned int);
 
 /* In identifiers.cc */
-extern void _cpp_init_hashtable (cpp_reader *, cpp_hash_table *);
+extern void
+_cpp_init_hashtable (cpp_reader *, cpp_hash_table *, cpp_hash_table *);
 extern void _cpp_destroy_hashtable (cpp_reader *);
 
 /* In files.cc */
@@ -935,7 +986,7 @@ location_t linemap_add_macro_token (const line_map_macro *,
    LOCATION is the location of token that is part of the
    expansion-list of a macro expansion return the line number of the
    macro expansion point.  */
-int linemap_get_expansion_line (class line_maps *,
+int linemap_get_expansion_line (const line_maps *,
 				location_t);
 
 /* Return the path of the file corresponding to source code location
@@ -946,7 +997,7 @@ int linemap_get_expansion_line (class line_maps *,
    macro expansion point.
 
    SET is the line map set LOCATION comes from.  */
-const char* linemap_get_expansion_filename (class line_maps *,
+const char* linemap_get_expansion_filename (const line_maps *,
 					    location_t);
 
 /* A subclass of rich_location for emitting a diagnostic

@@ -1,6 +1,6 @@
 
 /* Compiler implementation of the D programming language
- * Copyright (C) 2013-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright (C) 2013-2024 by The D Language Foundation, All Rights Reserved
  * written by Iain Buclaw
  * https://www.digitalmars.com
  * Distributed under the Boost Software License, Version 1.0.
@@ -20,7 +20,6 @@ class ClassDeclaration;
 class Dsymbol;
 class Expression;
 class FuncDeclaration;
-class Parameter;
 class Statement;
 class Type;
 class TypeTuple;
@@ -71,7 +70,11 @@ struct TargetC
     };
 
     uint8_t crtDestructorsSupported; // Not all platforms support crt_destructor
+    uint8_t boolsize;            // size of a C '_Bool' type
+    uint8_t shortsize;           // size of a C 'short' or 'unsigned short' type
+    uint8_t intsize;             // size of a C 'int' or 'unsigned int' type
     uint8_t longsize;            // size of a C 'long' or 'unsigned long' type
+    uint8_t long_longsize;       // size of a C 'long long' or 'unsigned long long' type
     uint8_t long_doublesize;     // size of a C 'long double'
     uint8_t wchar_tsize;         // size of a C 'wchar_t' type
     Runtime runtime;
@@ -89,24 +92,25 @@ struct TargetCPP
         Microsoft,
         Sun
     };
-    bool reverseOverloads;    // with dmc and cl, overloaded functions are grouped and in reverse order
-    bool exceptions;          // set if catching C++ exceptions is supported
-    bool twoDtorInVtable;     // target C++ ABI puts deleting and non-deleting destructor into vtable
-    bool wrapDtorInExternD;   // set if C++ dtors require a D wrapper to be callable from runtime
+    d_bool reverseOverloads;    // with dmc and cl, overloaded functions are grouped and in reverse order
+    d_bool exceptions;          // set if catching C++ exceptions is supported
+    d_bool twoDtorInVtable;     // target C++ ABI puts deleting and non-deleting destructor into vtable
+    d_bool splitVBasetable;     // set if C++ ABI uses separate tables for virtual functions and virtual bases
+    d_bool wrapDtorInExternD;   // set if C++ dtors require a D wrapper to be callable from runtime
     Runtime runtime;
 
     const char *toMangle(Dsymbol *s);
     const char *typeInfoMangle(ClassDeclaration *cd);
     const char *thunkMangle(FuncDeclaration *fd, int offset);
     const char *typeMangle(Type *t);
-    Type *parameterType(Parameter *p);
+    Type *parameterType(Type *p);
     bool fundamentalType(const Type *t, bool& isFundamental);
     unsigned derivedClassOffset(ClassDeclaration *baseClass);
 };
 
 struct TargetObjC
 {
-    bool supported;     // set if compiler can interface with Objective-C
+    d_bool supported;     // set if compiler can interface with Objective-C
 };
 
 struct Target
@@ -152,15 +156,15 @@ struct Target
 
     DString architectureName;    // name of the platform architecture (e.g. X86_64)
     CPU cpu;                // CPU instruction set to target
-    bool is64bit;           // generate 64 bit code for x86_64; true by default for 64 bit dmd
-    bool isLP64;            // pointers are 64 bits
+    d_bool isX86_64;          // generate 64 bit code for x86_64; true by default for 64 bit dmd
+    d_bool isLP64;            // pointers are 64 bits
 
     // Environmental
     DString obj_ext;    /// extension for object files
     DString lib_ext;    /// extension for static library files
     DString dll_ext;    /// extension for dynamic library files
-    bool run_noext;     /// allow -run sources without extensions
-    bool mscoff;        /// for Win32: write COFF object files instead of OMF
+    d_bool run_noext;     /// allow -run sources without extensions
+    d_bool omfobj;        /// for Win32: write OMF object files instead of COFF
 
     template <typename T>
     struct FPTypeProperties
@@ -171,12 +175,12 @@ struct Target
         real_t infinity;
         real_t epsilon;
 
-        d_int64 dig;
-        d_int64 mant_dig;
-        d_int64 max_exp;
-        d_int64 min_exp;
-        d_int64 max_10_exp;
-        d_int64 min_10_exp;
+        int64_t dig;
+        int64_t mant_dig;
+        int64_t max_exp;
+        int64_t min_exp;
+        int64_t max_10_exp;
+        int64_t min_10_exp;
     };
 
     FPTypeProperties<float> FloatProperties;
@@ -190,7 +194,6 @@ private:
 public:
     void _init(const Param& params);
     // Type sizes and support.
-    void setTriple(const char* _triple);
     unsigned alignsize(Type *type);
     unsigned fieldalign(Type *type);
     Type *va_listType(const Loc &loc, Scope *sc);  // get type of va_list
@@ -200,11 +203,11 @@ public:
     LINK systemLinkage();
     TypeTuple *toArgTypes(Type *t);
     bool isReturnOnStack(TypeFunction *tf, bool needsThis);
-    d_uns64 parameterSize(const Loc& loc, Type *t);
     bool preferPassByRef(Type *t);
     Expression *getTargetInfo(const char* name, const Loc& loc);
     bool isCalleeDestroyingArgs(TypeFunction* tf);
     bool libraryObjectMonitors(FuncDeclaration *fd, Statement *fbody);
+    bool supportsLinkerDirective() const;
     void addPredefinedGlobalIdentifiers() const;
 };
 

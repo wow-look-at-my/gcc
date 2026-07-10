@@ -1,5 +1,5 @@
 /* Analysis of polymorphic call context.
-   Copyright (C) 2013-2022 Free Software Foundation, Inc.
+   Copyright (C) 2013-2024 Free Software Foundation, Inc.
    Contributed by Jan Hubicka
 
 This file is part of GCC.
@@ -766,7 +766,6 @@ ipa_polymorphic_call_context::set_by_invariant (tree cst,
   tree base;
 
   invalid = false;
-  off = 0;
   clear_outer_type (otr_type);
 
   if (TREE_CODE (cst) != ADDR_EXPR)
@@ -1598,7 +1597,7 @@ ipa_polymorphic_call_context::get_dynamic_type (tree instance,
   if (!maybe_in_construction && !maybe_derived_type)
     return false;
 
-  /* If we are in fact not looking at any object object or the instance is
+  /* If we are in fact not looking at any object or the instance is
      some placement new into a random load, give up straight away.  */
   if (TREE_CODE (instance) == MEM_REF)
     return false;

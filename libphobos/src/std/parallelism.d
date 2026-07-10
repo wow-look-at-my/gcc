@@ -418,8 +418,8 @@ Bugs:  Changes to `ref` and `out` arguments are not propagated to the
 */
 struct Task(alias fun, Args...)
 {
-    AbstractTask base = {runTask : &impl};
-    alias base this;
+    private AbstractTask base = {runTask : &impl};
+    private alias base this;
 
     private @property AbstractTask* basePtr()
     {
@@ -1039,6 +1039,11 @@ uint totalCPUsImpl() @nogc nothrow @trusted
         import core.sys.posix.unistd : _SC_NPROCESSORS_ONLN, sysconf;
         return cast(uint) sysconf(_SC_NPROCESSORS_ONLN);
     }
+    else version (Hurd)
+    {
+        import core.sys.posix.unistd : _SC_NPROCESSORS_ONLN, sysconf;
+        return cast(uint) sysconf(_SC_NPROCESSORS_ONLN);
+    }
     else
     {
         static assert(0, "Don't know how to get N CPUs on this OS.");
@@ -1503,7 +1508,7 @@ public:
 
         if (this.size == 0)
         {
-            return rangeLen;
+            return max(rangeLen, 1);
         }
 
         immutable size_t eightSize = 4 * (this.size + 1);
@@ -1576,7 +1581,7 @@ public:
     auto logs = new double[10_000_000];
 
     // Parallel foreach works with or without an index
-    // variable.  It can be iterate by ref if range.front
+    // variable.  It can iterate by ref if range.front
     // returns by ref.
 
     // Iterate over logs using work units of size 100.
@@ -3639,6 +3644,15 @@ ParallelForeach!R parallel(R)(R range, size_t workUnitSize)
     assert(arrIndex.sum == 10.iota.sum);
 }
 
+// https://issues.dlang.org/show_bug.cgi?id=22745
+@system unittest
+{
+    auto pool = new TaskPool(0);
+    int[] empty;
+    foreach (i; pool.parallel(empty)) {}
+    pool.finish();
+}
+
 // Thrown when a parallel foreach loop is broken from.
 class ParallelForeachError : Error
 {
@@ -4334,7 +4348,7 @@ version (StdUnittest)
 
     foreach (i, elem; logs)
     {
-        assert(isClose(elem, cast(double) log(i + 1)));
+        assert(isClose(elem, log(double(i + 1))));
     }
 
     assert(poolInstance.amap!"a * a"([1,2,3,4,5]) == [1,4,9,16,25]);

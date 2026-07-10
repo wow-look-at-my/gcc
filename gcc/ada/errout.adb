@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 B o d y                                  --
 --                                                                          --
---          Copyright (C) 1992-2022, Free Software Foundation, Inc.         --
+--          Copyright (C) 1992-2024, Free Software Foundation, Inc.         --
 --                                                                          --
 -- GNAT is free software;  you can  redistribute it  and/or modify it under --
 -- terms of the  GNU General Public License as published  by the Free Soft- --
@@ -50,8 +50,11 @@ with Sinfo.Nodes;    use Sinfo.Nodes;
 with Sinfo.Utils;    use Sinfo.Utils;
 with Snames;         use Snames;
 with Stand;          use Stand;
+with Stringt;        use Stringt;
 with Stylesw;        use Stylesw;
+with System.OS_Lib;
 with Uname;          use Uname;
+with Warnsw;
 
 package body Errout is
 
@@ -62,13 +65,6 @@ package body Errout is
 
    Finalize_Called : Boolean := False;
    --  Set True if the Finalize routine has been called
-
-   Record_Compilation_Errors : Boolean := False;
-   --  Record that a compilation error was witnessed during a given phase of
-   --  analysis for gnat2why. This is needed as Warning_Mode is modified twice
-   --  in gnat2why, hence Erroutc.Compilation_Errors can only return a suitable
-   --  value for each phase of analysis separately. This is updated at each
-   --  call to Compilation_Errors.
 
    Warn_On_Instance : Boolean;
    --  Flag set true for warning message to be posted on instance
@@ -144,6 +140,11 @@ package body Errout is
    --  indicates if there are errors attached to the line, which forces
    --  listing on, even in the presence of pragma List (Off).
 
+   function Paren_Required (N : Node_Id) return Boolean;
+   --  Subsidiary to First_Sloc and Last_Sloc. Returns True iff parentheses
+   --  around node N are required by the Ada syntax, e.g. when N is an
+   --  expression of a qualified expression.
+
    procedure Set_Msg_Insertion_Column;
    --  Handle column number insertion (@ insertion character)
 
@@ -183,6 +184,11 @@ package body Errout is
    procedure Set_Qualification (N : Nat; E : Entity_Id);
    --  Outputs up to N levels of qualification for the given entity. For
    --  example, the entity A.B.C.D will output B.C. if N = 2.
+
+   function Should_Ignore_Pragma_SPARK_Mode return Boolean;
+   --  Return whether pragma Ignore_Pragma (SPARK_Mode) was specified. This is
+   --  similar to Sem_Util.Should_Ignore_Pragma_Par but located here to avoid
+   --  problematic dependency on Sem_Util.
 
    function Special_Msg_Delete
      (Msg : String;
@@ -251,17 +257,8 @@ package body Errout is
    begin
       if not Finalize_Called then
          raise Program_Error;
-
-      --  Record that a compilation error was witnessed during a given phase of
-      --  analysis for gnat2why. This is needed as Warning_Mode is modified
-      --  twice in gnat2why, hence Erroutc.Compilation_Errors can only return a
-      --  suitable value for each phase of analysis separately.
-
       else
-         Record_Compilation_Errors :=
-           Record_Compilation_Errors or else Erroutc.Compilation_Errors;
-
-         return Record_Compilation_Errors;
+         return Erroutc.Compilation_Errors;
       end if;
    end Compilation_Errors;
 
@@ -896,12 +893,41 @@ package body Errout is
    -- Error_Msg_GNAT_Extension --
    ------------------------------
 
-   procedure Error_Msg_GNAT_Extension (Extension : String) is
-      Loc : constant Source_Ptr := Token_Ptr;
+   procedure Error_Msg_GNAT_Extension
+     (Extension : String;
+      Loc : Source_Ptr;
+      Is_Core_Extension : Boolean := False)
+   is
    begin
-      if not Extensions_Allowed then
-         Error_Msg (Extension & " is a 'G'N'A'T specific extension", Loc);
-         Error_Msg ("\unit must be compiled with -gnatX switch", Loc);
+      if (if Is_Core_Extension
+           then Core_Extensions_Allowed
+           else All_Extensions_Allowed)
+      then
+         return;
+      end if;
+
+      Error_Msg (Extension & " is a 'G'N'A'T-specific extension", Loc);
+
+      if No (Ada_Version_Pragma) then
+         if Is_Core_Extension then
+            Error_Msg
+              ("\unit must be compiled with -gnatX '[or -gnatX0'] " &
+               "or use pragma Extensions_Allowed (On) '[or All']", Loc);
+         else
+            Error_Msg
+              ("\unit must be compiled with -gnatX0 " &
+               "or use pragma Extensions_Allowed (All)", Loc);
+         end if;
+      else
+         Error_Msg_Sloc := Sloc (Ada_Version_Pragma);
+         Error_Msg ("\incompatible with Ada version set#", Loc);
+         if Is_Core_Extension then
+            Error_Msg
+              ("\must use pragma Extensions_Allowed (On) '[or All']", Loc);
+         else
+            Error_Msg
+              ("\must use pragma Extensions_Allowed (All)", Loc);
+         end if;
       end if;
    end Error_Msg_GNAT_Extension;
 
@@ -973,14 +999,14 @@ package body Errout is
          --  after fixing the error, the use clause no longer looks like it was
          --  unused.
 
-         Check_Unreferenced := False;
-         Check_Unreferenced_Formals := False;
+         Warnsw.Check_Unreferenced := False;
+         Warnsw.Check_Unreferenced_Formals := False;
       end Handle_Serious_Error;
 
    --  Start of processing for Error_Msg_Internal
 
    begin
-      --  Detect common mistake of prefixing or suffing the message with a
+      --  Detect common mistake of prefixing or suffixing the message with a
       --  space character.
 
       pragma Assert (Msg (Msg'First) /= ' ' and then Msg (Msg'Last) /= ' ');
@@ -1199,7 +1225,7 @@ package body Errout is
           Next                => No_Error_Msg,
           Prev                => No_Error_Msg,
           Sptr                => Span,
-          Optr                => Optr,
+          Optr                => Opan,
           Insertion_Sloc      => (if Has_Insertion_Line then Error_Msg_Sloc
                                   else No_Location),
           Sfile               => Get_Source_File_Index (Sptr),
@@ -1268,7 +1294,7 @@ package body Errout is
                        or else
                           (Sptr = Errors.Table (Last_Error_Msg).Sptr.Ptr
                              and then
-                               Optr > Errors.Table (Last_Error_Msg).Optr))
+                               Optr > Errors.Table (Last_Error_Msg).Optr.Ptr))
          then
             Prev_Msg := Last_Error_Msg;
             Next_Msg := No_Error_Msg;
@@ -1286,7 +1312,8 @@ package body Errout is
                then
                   exit when Sptr < Errors.Table (Next_Msg).Sptr.Ptr
                     or else (Sptr = Errors.Table (Next_Msg).Sptr.Ptr
-                              and then Optr < Errors.Table (Next_Msg).Optr);
+                              and then
+                             Optr < Errors.Table (Next_Msg).Optr.Ptr);
                end if;
 
                Prev_Msg := Next_Msg;
@@ -1424,6 +1451,24 @@ package body Errout is
          if Total_Errors_Detected = Maximum_Messages then
             raise Unrecoverable_Error;
          end if;
+      end if;
+
+      if Has_Error_Code then
+         declare
+            Msg : constant String :=
+              "\launch ""gnatprove --explain=[]"" for more information";
+         begin
+            Has_Double_Exclam := False;
+            Has_Error_Code := False;
+            Has_Insertion_Line := False;
+
+            Error_Msg_Internal
+              (Msg      => Msg,
+               Span     => Span,
+               Opan     => Opan,
+               Msg_Cont => True,
+               Node     => Node);
+         end;
       end if;
    end Error_Msg_Internal;
 
@@ -1665,8 +1710,8 @@ package body Errout is
                    (Warning_Specifically_Suppressed (CE.Sptr.Ptr, CE.Text, Tag)
                                                                 /= No_String
                       or else
-                    Warning_Specifically_Suppressed (CE.Optr, CE.Text, Tag) /=
-                                                                   No_String)
+                    Warning_Specifically_Suppressed (CE.Optr.Ptr, CE.Text, Tag)
+                                                                /= No_String)
             then
                Delete_Warning (Cur);
 
@@ -1747,6 +1792,24 @@ package body Errout is
          Loc   : constant Source_Ptr := Sloc (Norig);
 
       begin
+         --  ??? For assignments that require accessiblity checks, e.g.:
+         --
+         --    Y := Func (123);
+         --
+         --  the function call gets an extra actual parameter association with
+         --  Sloc of the assigned name "Y":
+         --
+         --    Y := Func (123, A8b => 2);
+         --
+         --  We can simply ignore those extra actual parameters when
+         --  determining the Sloc range of the "Func (123)" expression.
+
+         if Nkind (N) = N_Parameter_Association
+           and then Is_Accessibility_Actual (N)
+         then
+            return Skip;
+         end if;
+
          --  Check for earlier
 
          if Loc < Eloc
@@ -1829,11 +1892,12 @@ package body Errout is
    ----------------
 
    function First_Sloc (N : Node_Id) return Source_Ptr is
-      SI : constant Source_File_Index := Source_Index (Get_Source_Unit (N));
-      SF : constant Source_Ptr        := Source_First (SI);
-      SL : constant Source_Ptr        := Source_Last (SI);
-      F  : Node_Id;
-      S  : Source_Ptr;
+      SI  : constant Source_File_Index := Get_Source_File_Index (Sloc (N));
+      SF  : constant Source_Ptr        := Source_First (SI);
+      SL  : constant Source_Ptr        := Source_Last (SI);
+      Src : constant Source_Buffer_Ptr := Source_Text (SI);
+      F   : Node_Id;
+      S   : Source_Ptr;
 
    begin
       F := First_Node (N);
@@ -1852,6 +1916,12 @@ package body Errout is
       --  values), but this is only for an error message so it is good enough.
 
       Node_Loop : loop
+         --  Include parentheses around the top node, except when they are
+         --  required by the syntax of the parent node.
+
+         exit Node_Loop when F = N
+           and then Paren_Required (N);
+
          Paren_Loop : for J in 1 .. Paren_Count (F) loop
 
             --  We don't look more than 12 characters behind the current
@@ -1860,11 +1930,11 @@ package body Errout is
             Search_Loop : for K in 1 .. 12 loop
                exit Search_Loop when S = SF;
 
-               if Source_Text (SI) (S - 1) = '(' then
+               if Src (S - 1) = '(' then
                   S := S - 1;
                   exit Search_Loop;
 
-               elsif Source_Text (SI) (S - 1) <= ' ' then
+               elsif Src (S - 1) <= ' ' then
                   S := S - 1;
 
                else
@@ -1906,7 +1976,10 @@ package body Errout is
 
       --  Reset counts for warnings
 
-      Reset_Warnings;
+      Warnings_Treated_As_Errors := 0;
+      Warnings_Detected := 0;
+      Warning_Info_Messages := 0;
+      Warnings_As_Errors_Count := 0;
 
       --  Initialize warnings tables
 
@@ -1944,11 +2017,28 @@ package body Errout is
    ---------------
 
    function Last_Sloc (N : Node_Id) return Source_Ptr is
-      SI : constant Source_File_Index := Source_Index (Get_Source_Unit (N));
-      SF : constant Source_Ptr        := Source_First (SI);
-      SL : constant Source_Ptr        := Source_Last (SI);
-      F  : Node_Id;
-      S  : Source_Ptr;
+      procedure Skip_Char (S : in out Source_Ptr);
+      --  Skip one character of the source buffer at location S
+
+      ---------------
+      -- Skip_Char --
+      ---------------
+
+      procedure Skip_Char (S : in out Source_Ptr) is
+      begin
+         S := S + 1;
+      end Skip_Char;
+
+      --  Local variables
+
+      SI  : constant Source_File_Index := Get_Source_File_Index (Sloc (N));
+      SF  : constant Source_Ptr        := Source_First (SI);
+      SL  : constant Source_Ptr        := Source_Last (SI);
+      Src : constant Source_Buffer_Ptr := Source_Text (SI);
+      F   : Node_Id;
+      S   : Source_Ptr;
+
+   --  Start of processing for Last_Sloc
 
    begin
       F := Last_Node (N);
@@ -1958,21 +2048,182 @@ package body Errout is
          return S;
       end if;
 
-      --  Skip past an identifier
+      --  For string and character literals simply forward the sloc by their
+      --  length including the closing quotes. Perhaps we should do something
+      --  special for multibyte characters, but this code is only used to emit
+      --  error messages, so it is not worth the effort.
 
-      while S in SF .. SL - 1
-        and then Source_Text (SI) (S + 1)
-          in
-        '0' .. '9' | 'a' .. 'z' | 'A' .. 'Z' | '.' | '_'
-      loop
-         S := S + 1;
-      end loop;
+      case Nkind (F) is
+         when N_String_Literal =>
+            return S + Source_Ptr (String_Length (Strval (F))) + 1;
+
+         when N_Character_Literal =>
+            return S + 2;
+
+         --  Skip past integer literals, both decimal and based, integer and
+         --  real. We can't greedily accept all allowed character, because
+         --  we would consme too many of them in expressions like "123+ABC"
+         --  or "123..456", so we follow quite precisely the Ada grammar and
+         --  consume different characters depending on the context.
+
+         when N_Integer_Literal =>
+
+            --  Skip past the initial numeral, which either leads the decimal
+            --  literal or is the base of a based literal.
+
+            while S < SL
+              and then Src (S + 1) in '0' .. '9' | '_'
+            loop
+               Skip_Char (S);
+            end loop;
+
+            --  Skip past #based_numeral#, if present
+
+            if S < SL
+              and then Src (S + 1) = '#'
+            then
+               Skip_Char (S);
+
+               while S < SL
+                 and then
+                   Src (S + 1) in '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' | '_'
+               loop
+                  Skip_Char (S);
+               end loop;
+
+               if S < SL
+                 and then Src (S + 1) = '#'
+               then
+                  Skip_Char (S);
+               end if;
+            end if;
+
+            --  Skip past exponent, if present
+
+            if S < SL
+              and then Src (S + 1) in 'e' | 'E'
+            then
+               Skip_Char (S);
+
+               --  For positive exponents the plus sign is optional, but we
+               --  can simply skip past both plus and minus.
+
+               if S < SL
+                 and then Src (S + 1) in '+' | '-'
+               then
+                  Skip_Char (S);
+               end if;
+
+               --  Skip past the numeral part
+
+               while S < SL
+                 and then Src (S + 1) in '0' .. '9' | '_'
+               loop
+                  Skip_Char (S);
+               end loop;
+            end if;
+
+         when N_Real_Literal =>
+            --  Skip past the initial numeral, which either leads the decimal
+            --  literal or is the base of a based literal.
+
+            while S < SL
+              and then Src (S + 1) in '0' .. '9' | '_'
+            loop
+               Skip_Char (S);
+            end loop;
+
+            if S < SL then
+
+               --  Skip the dot and continue with a decimal literal
+
+               if Src (S + 1) = '.' then
+                  Skip_Char (S);
+
+                  while S < SL
+                    and then Src (S + 1) in '0' .. '9' | '_'
+                  loop
+                     Skip_Char (S);
+                  end loop;
+
+               --  Skip the hash and continue with a based literal
+
+               elsif Src (S + 1) = '#' then
+                  Skip_Char (S);
+
+                  while S < SL
+                    and then
+                      Src (S + 1) in '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' | '_'
+                  loop
+                     Skip_Char (S);
+                  end loop;
+
+                  if S < SL
+                    and then Src (S + 1) = '.'
+                  then
+                     Skip_Char (S);
+                  end if;
+
+                  while S < SL
+                    and then
+                      Src (S + 1) in '0' .. '9' | 'a' .. 'f' | 'A' .. 'F' | '_'
+                  loop
+                     Skip_Char (S);
+                  end loop;
+
+                  if S < SL
+                    and then Src (S + 1) = '#'
+                  then
+                     Skip_Char (S);
+                  end if;
+               end if;
+            end if;
+
+            --  Skip past exponent, if present
+
+            if S < SL
+              and then Src (S + 1) in 'e' | 'E'
+            then
+               Skip_Char (S);
+               --  For positive exponents the plus sign is optional, but we
+               --  can simply skip past both plus and minus.
+
+               if Src (S + 1) in '+' | '-' then
+                  Skip_Char (S);
+               end if;
+
+               --  Skip past the numeral part
+
+               while S < SL
+                 and then Src (S + 1) in '0' .. '9' | '_'
+               loop
+                  Skip_Char (S);
+               end loop;
+            end if;
+
+         --  For other nodes simply skip past a keyword/identifier
+
+         when others =>
+            while S in SF .. SL - 1
+              and then Src (S + 1)
+                in
+              '0' .. '9' | 'a' .. 'z' | 'A' .. 'Z' | '_'
+            loop
+               Skip_Char (S);
+            end loop;
+      end case;
 
       --  The following circuit attempts at crawling up the tree from the
       --  Last_Node, adjusting the Sloc value for any parentheses we know
       --  are present, similarly to what is done in First_Sloc.
 
       Node_Loop : loop
+         --  Include parentheses around the top node, except when they are
+         --  required by the syntax of the parent node.
+
+         exit Node_Loop when F = N
+           and then Paren_Required (N);
+
          Paren_Loop : for J in 1 .. Paren_Count (F) loop
 
             --  We don't look more than 12 characters after the current
@@ -1981,11 +2232,11 @@ package body Errout is
             Search_Loop : for K in 1 .. 12 loop
                exit Node_Loop when S = SL;
 
-               if Source_Text (SI) (S + 1) = ')' then
+               if Src (S + 1) = ')' then
                   S := S + 1;
                   exit Search_Loop;
 
-               elsif Source_Text (SI) (S + 1) <= ' ' then
+               elsif Src (S + 1) <= ' ' then
                   S := S + 1;
 
                else
@@ -2002,7 +2253,7 @@ package body Errout is
       --  Remove any trailing space
 
       while S in SF + 1 .. SL
-        and then Source_Text (SI) (S) = ' '
+        and then Src (S) = ' '
       loop
          S := S - 1;
       end loop;
@@ -2075,6 +2326,7 @@ package body Errout is
       --  Return True if E is a continuation message.
 
       procedure Write_JSON_Escaped_String (Str : String_Ptr);
+      procedure Write_JSON_Escaped_String (Str : String);
       --  Write each character of Str, taking care of preceding each quote and
       --  backslash with a backslash. Note that this escaping differs from what
       --  GCC does.
@@ -2088,11 +2340,14 @@ package body Errout is
       --  Write Sptr as a JSON location, an object containing a file attribute,
       --  a line number and a column number.
 
-      procedure Write_JSON_Span (Span : Source_Span);
-      --  Write Span as a JSON span, an object containing a "caret" attribute
-      --  whose value is the JSON location of Span.Ptr. If Span.First and
-      --  Span.Last are different from Span.Ptr, they will be printed as JSON
+      procedure Write_JSON_Span (Error : Error_Msg_Object);
+      --  Write Error as a JSON span, an object containing a "caret" attribute
+      --  whose value is the JSON location of Error.Sptr.Ptr. If Sptr.First and
+      --  Sptr.Last are different from Sptr.Ptr, they will be printed as JSON
       --  locations under the names "start" and "finish".
+      --  When Include_Subprogram_In_Messages is true (-gnatdJ) an additional,
+      --  non-standard, attribute named "subprogram" will be added, allowing
+      --  precisely identifying the subprogram surrounding the span.
 
       -----------------------
       --  Is_Continuation  --
@@ -2107,9 +2362,9 @@ package body Errout is
       -- Write_JSON_Escaped_String --
       -------------------------------
 
-      procedure Write_JSON_Escaped_String (Str : String_Ptr) is
+      procedure Write_JSON_Escaped_String (Str : String) is
       begin
-         for C of Str.all loop
+         for C of Str loop
             if C = '"' or else C = '\' then
                Write_Char ('\');
             end if;
@@ -2118,14 +2373,30 @@ package body Errout is
          end loop;
       end Write_JSON_Escaped_String;
 
+      -------------------------------
+      -- Write_JSON_Escaped_String --
+      -------------------------------
+
+      procedure Write_JSON_Escaped_String (Str : String_Ptr) is
+      begin
+         Write_JSON_Escaped_String (Str.all);
+      end Write_JSON_Escaped_String;
+
       -------------------------
       -- Write_JSON_Location --
       -------------------------
 
       procedure Write_JSON_Location (Sptr : Source_Ptr) is
+         Name : constant File_Name_Type :=
+           Full_Ref_Name (Get_Source_File_Index (Sptr));
       begin
          Write_Str ("{""file"":""");
-         Write_Name (Full_Ref_Name (Get_Source_File_Index (Sptr)));
+         if Full_Path_Name_For_Brief_Errors then
+            Write_JSON_Escaped_String
+              (System.OS_Lib.Normalize_Pathname (Get_Name_String (Name)));
+         else
+            Write_Name (Name);
+         end if;
          Write_Str (""",""line"":");
          Write_Int (Pos (Get_Physical_Line_Number (Sptr)));
          Write_Str (", ""column"":");
@@ -2137,7 +2408,8 @@ package body Errout is
       -- Write_JSON_Span --
       ---------------------
 
-      procedure Write_JSON_Span (Span : Source_Span) is
+      procedure Write_JSON_Span (Error : Error_Msg_Object) is
+         Span : constant Source_Span := Error.Sptr;
       begin
          Write_Str ("{""caret"":");
          Write_JSON_Location (Span.Ptr);
@@ -2152,6 +2424,12 @@ package body Errout is
             Write_JSON_Location (Span.Last);
          end if;
 
+         if Include_Subprogram_In_Messages then
+            Write_Str (",""subprogram"":""");
+            Write_JSON_Escaped_String (Subprogram_Name_Ptr (Error.Node));
+            Write_Str ("""");
+         end if;
+
          Write_Str ("}");
       end Write_JSON_Span;
 
@@ -2162,6 +2440,9 @@ package body Errout is
       Print_Continuations : constant Boolean := not Is_Continuation (E);
       --  Do not print continuations messages as children of the current
       --  message if the current message is a continuation message.
+
+      Option : constant String := Get_Warning_Option (E);
+      --  The option that triggered this message.
 
    --  Start of processing for Output_JSON_Message
 
@@ -2182,17 +2463,24 @@ package body Errout is
       --  Print message location
 
       Write_Str (",""locations"":[");
-      Write_JSON_Span (Errors.Table (E).Sptr);
+      Write_JSON_Span (Errors.Table (E));
 
-      if Errors.Table (E).Optr /= Errors.Table (E).Sptr.Ptr then
+      if Errors.Table (E).Optr.Ptr /= Errors.Table (E).Sptr.Ptr then
          Write_Str (",{""caret"":");
-         Write_JSON_Location (Errors.Table (E).Optr);
+         Write_JSON_Location (Errors.Table (E).Optr.Ptr);
          Write_Str ("}");
+      end if;
+
+      Write_Str ("]");
+
+      --  Print message option, if there is one
+      if Option /= "" then
+         Write_Str (",""option"":""" & Option & """");
       end if;
 
       --  Print message content
 
-      Write_Str ("],""message"":""");
+      Write_Str (",""message"":""");
       Write_JSON_Escaped_String (Errors.Table (E).Text);
       Write_Str ("""");
 
@@ -2797,16 +3085,19 @@ package body Errout is
 
             E := Errors.Table (E).Next;
 
-            --  Skip deleted messages.
-            --  Also skip continuation messages, as they have already been
-            --  printed along the message they're attached to.
+            while E /= No_Error_Msg loop
 
-            while E /= No_Error_Msg
-              and then not Errors.Table (E).Deleted
-              and then not Errors.Table (E).Msg_Cont
-            loop
-               Write_Char (',');
-               Output_JSON_Message (E);
+               --  Skip deleted messages.
+               --  Also skip continuation messages, as they have already been
+               --  printed along the message they're attached to.
+
+               if not Errors.Table (E).Deleted
+                 and then not Errors.Table (E).Msg_Cont
+               then
+                  Write_Char (',');
+                  Output_JSON_Message (E);
+               end if;
+
                E := Errors.Table (E).Next;
             end loop;
          end if;
@@ -2899,7 +3190,7 @@ package body Errout is
                            else SGR_Error);
                      begin
                         Write_Source_Code_Lines
-                          (Errors.Table (E).Sptr, SGR_Span);
+                          (Errors.Table (E).Optr, SGR_Span);
                      end;
                   end if;
                end if;
@@ -3240,6 +3531,23 @@ package body Errout is
       end if;
    end Output_Source_Line;
 
+   --------------------
+   -- Paren_Required --
+   --------------------
+
+   function Paren_Required (N : Node_Id) return Boolean is
+   begin
+      --  In a qualifed_expression the expression part needs to be enclosed in
+      --  parentheses.
+
+      if Nkind (Parent (N)) = N_Qualified_Expression then
+         return N = Expression (Parent (N));
+
+      else
+         return False;
+      end if;
+   end Paren_Required;
+
    -----------------------------
    -- Remove_Warning_Messages --
    -----------------------------
@@ -3274,7 +3582,7 @@ package body Errout is
 
                --  Don't remove if location does not match
 
-               and then Errors.Table (E).Optr = Loc
+               and then Errors.Table (E).Optr.Ptr = Loc
 
                --  Don't remove if not warning/info message. Note that we do
                --  not remove style messages here. They are warning messages
@@ -3294,6 +3602,17 @@ package body Errout is
 
                if Errors.Table (E).Info then
                   Warning_Info_Messages := Warning_Info_Messages - 1;
+               end if;
+
+               --  When warning about a runtime exception has been escalated
+               --  into error, the starting message has increased the total
+               --  errors counter, so here we decrease this counter.
+
+               if Errors.Table (E).Warn_Runtime_Raise
+                 and then not Errors.Table (E).Msg_Cont
+                 and then Warning_Mode = Treat_Run_Time_Warnings_As_Errors
+               then
+                  Total_Errors_Detected := Total_Errors_Detected - 1;
                end if;
 
                return True;
@@ -3330,23 +3649,13 @@ package body Errout is
             E := Errors.Table (E).Next;
          end loop;
 
+         --  Warnings may have been posted on subexpressions of original tree
+
          if Nkind (N) = N_Raise_Constraint_Error
            and then Is_Rewrite_Substitution (N)
            and then No (Condition (N))
          then
-            --  Warnings may have been posted on subexpressions of the original
-            --  tree. We place the original node back on the tree to remove
-            --  those warnings, whose sloc do not match those of any node in
-            --  the current tree. Given that we are in unreachable code, this
-            --  modification to the tree is harmless.
-
-            if Is_List_Member (N) then
-               Set_Condition (N, Original_Node (N));
-               Check_All_Warnings (Condition (N));
-            else
-               Rewrite (N, Original_Node (N));
-               Check_All_Warnings (N);
-            end if;
+            Check_All_Warnings (Original_Node (N));
          end if;
 
          return OK;
@@ -3369,18 +3678,6 @@ package body Errout is
          Next (Stat);
       end loop;
    end Remove_Warning_Messages;
-
-   --------------------
-   -- Reset_Warnings --
-   --------------------
-
-   procedure Reset_Warnings is
-   begin
-      Warnings_Treated_As_Errors := 0;
-      Warnings_Detected := 0;
-      Warning_Info_Messages := 0;
-      Warnings_As_Errors_Count := 0;
-   end Reset_Warnings;
 
    ----------------------
    -- Adjust_Name_Case --
@@ -3578,10 +3875,14 @@ package body Errout is
          end if;
       end if;
 
-      --  The following assignment ensures that a second ampersand insertion
-      --  character will correspond to the Error_Msg_Node_2 parameter.
+      --  The following assignment ensures that further ampersand insertion
+      --  characters will correspond to the Error_Msg_Node_# parameter.
 
       Error_Msg_Node_1 := Error_Msg_Node_2;
+      Error_Msg_Node_2 := Error_Msg_Node_3;
+      Error_Msg_Node_3 := Error_Msg_Node_4;
+      Error_Msg_Node_4 := Error_Msg_Node_5;
+      Error_Msg_Node_5 := Error_Msg_Node_6;
    end Set_Msg_Insertion_Node;
 
    --------------------------------------
@@ -3756,7 +4057,7 @@ package body Errout is
          Set_Msg_Str ("<error>");
 
       else
-         Get_Unit_Name_String (Error_Msg_Unit_1, Suffix);
+         Get_Unit_Name_String (Global_Name_Buffer, Error_Msg_Unit_1, Suffix);
          Set_Msg_Blank;
          Set_Msg_Quote;
          Set_Msg_Name_Buffer;
@@ -3872,7 +4173,7 @@ package body Errout is
       --  dealing with some cases of internal names).
 
       while Name_Len > 1 and then Name_Buffer (Name_Len) in 'A' .. 'Z' loop
-         Name_Len := Name_Len  - 1;
+         Name_Len := Name_Len - 1;
       end loop;
 
       --  If we have any of the names from standard that start with the
@@ -3927,7 +4228,8 @@ package body Errout is
             P := P + 1;
 
          elsif P < Text'Last and then Text (P + 1) = C
-           and then Text (P) in 'a' .. 'z' | '*' | '$'
+           and then Text (P) in 'a' .. 'z' | 'A' .. 'Z' |
+                                '0' .. '9' | '*' | '$'
          then
             P := P + 2;
 
@@ -4059,21 +4361,29 @@ package body Errout is
 
             when '[' =>
 
-               --  Switch the message from a warning to an error if the flag
-               --  -gnatwE is specified to treat run-time exception warnings
-               --  as errors.
+               --  "[]" (insertion of error code)
 
-               if Is_Warning_Msg
-                 and then Warning_Mode = Treat_Run_Time_Warnings_As_Errors
-               then
-                  Is_Warning_Msg   := False;
-                  Is_Runtime_Raise := True;
-               end if;
+               if P <= Text'Last and then Text (P) = ']' then
+                  P := P + 1;
+                  Set_Msg_Insertion_Code;
 
-               if Is_Warning_Msg then
-                  Set_Msg_Str ("will be raised at run time");
                else
-                  Set_Msg_Str ("would have been raised at run time");
+                  --  Switch the message from a warning to an error if the flag
+                  --  -gnatwE is specified to treat run-time exception warnings
+                  --  as errors.
+
+                  if Is_Warning_Msg
+                    and then Warning_Mode = Treat_Run_Time_Warnings_As_Errors
+                  then
+                     Is_Warning_Msg   := False;
+                     Is_Runtime_Raise := True;
+                  end if;
+
+                  if Is_Warning_Msg then
+                     Set_Msg_Str ("will be raised at run time");
+                  else
+                     Set_Msg_Str ("would have been raised at run time");
+                  end if;
                end if;
 
             --   ']' (may be/might have been raised at run time)
@@ -4154,6 +4464,15 @@ package body Errout is
       end if;
    end Set_Qualification;
 
+   -------------------------------------
+   -- Should_Ignore_Pragma_SPARK_Mode --
+   -------------------------------------
+
+   function Should_Ignore_Pragma_SPARK_Mode return Boolean is
+   begin
+      return Get_Name_Table_Boolean3 (Name_SPARK_Mode);
+   end Should_Ignore_Pragma_SPARK_Mode;
+
    ------------------------
    -- Special_Msg_Delete --
    ------------------------
@@ -4217,7 +4536,14 @@ package body Errout is
 
    procedure SPARK_Msg_N (Msg : String; N : Node_Or_Entity_Id) is
    begin
-      if SPARK_Mode /= Off then
+      --  If SPARK_Mode is Off, we do not report SPARK legality errors to give
+      --  the flexibility to opt out of SPARK checking completely. We do the
+      --  same if pragma Ignore_Pragma (SPARK_Mode) was specified, as a way
+      --  for tools to ignore SPARK checking even on SPARK code.
+
+      if SPARK_Mode /= Off
+        and then not Should_Ignore_Pragma_SPARK_Mode
+      then
          Error_Msg_N (Msg, N);
       end if;
    end SPARK_Msg_N;
@@ -4232,7 +4558,9 @@ package body Errout is
       E   : Node_Or_Entity_Id)
    is
    begin
-      if SPARK_Mode /= Off then
+      if SPARK_Mode /= Off
+        and then not Should_Ignore_Pragma_SPARK_Mode
+      then
          Error_Msg_NE (Msg, N, E);
       end if;
    end SPARK_Msg_NE;

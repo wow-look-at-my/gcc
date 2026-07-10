@@ -1,5 +1,5 @@
 /* Common hooks for IBM S/390 and zSeries.
-   Copyright (C) 1999-2022 Free Software Foundation, Inc.
+   Copyright (C) 1999-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -50,10 +50,10 @@ EXPORTED_CONST int processor_flags_table[] =
     /* z15 */    PF_IEEE_FLOAT | PF_ZARCH | PF_LONG_DISPLACEMENT
 		 | PF_EXTIMM | PF_DFP | PF_Z10 | PF_Z196 | PF_ZEC12 | PF_TX
 		 | PF_Z13 | PF_VX | PF_VXE | PF_Z14 | PF_VXE2 | PF_Z15,
-    /* arch14 */ PF_IEEE_FLOAT | PF_ZARCH | PF_LONG_DISPLACEMENT
+    /* z16 */    PF_IEEE_FLOAT | PF_ZARCH | PF_LONG_DISPLACEMENT
 		 | PF_EXTIMM | PF_DFP | PF_Z10 | PF_Z196 | PF_ZEC12 | PF_TX
 		 | PF_Z13 | PF_VX | PF_VXE | PF_Z14 | PF_VXE2 | PF_Z15
-		 | PF_NNPA | PF_ARCH14
+		 | PF_NNPA | PF_Z16
   };
 
 /* Change optimizations to be performed, depending on the
@@ -63,6 +63,11 @@ static const struct default_options s390_option_optimization_table[] =
   {
     /* Enable -fsched-pressure by default when optimizing.  */
     { OPT_LEVELS_1_PLUS, OPT_fsched_pressure, NULL, 1 },
+
+    /* Enable -munroll-only-small-loops with -funroll-loops to unroll small
+       loops at -O2 and above by default.  */
+    { OPT_LEVELS_2_PLUS_SPEED_ONLY, OPT_funroll_loops, NULL, 1 },
+    { OPT_LEVELS_2_PLUS_SPEED_ONLY, OPT_munroll_only_small_loops, NULL, 1 },
 
     /* ??? There are apparently still problems with -fcaller-saves.  */
     { OPT_LEVELS_ALL, OPT_fcaller_saves, NULL, 0 },

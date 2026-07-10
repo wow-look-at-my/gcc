@@ -1,5 +1,5 @@
 /* Subroutines used for code generation on the DEC Alpha.
-   Copyright (C) 1992-2022 Free Software Foundation, Inc.
+   Copyright (C) 1992-2024 Free Software Foundation, Inc.
    Contributed by Richard Kenner (kenner@vlsi1.ultra.nyu.edu)
 
 This file is part of GCC.
@@ -784,10 +784,10 @@ alpha_in_small_data_p (const_tree exp)
     return false;
 
   /* COMMON symbols are never small data.  */
-  if (TREE_CODE (exp) == VAR_DECL && DECL_COMMON (exp))
+  if (VAR_P (exp) && DECL_COMMON (exp))
     return false;
 
-  if (TREE_CODE (exp) == VAR_DECL && DECL_SECTION_NAME (exp))
+  if (VAR_P (exp) && DECL_SECTION_NAME (exp))
     {
       const char *section = DECL_SECTION_NAME (exp);
       if (strcmp (section, ".sdata") == 0
@@ -844,7 +844,8 @@ alpha_linkage_symbol_p (const char *symname)
    low-order three bits; this is an "unaligned" access.  */
 
 static bool
-alpha_legitimate_address_p (machine_mode mode, rtx x, bool strict)
+alpha_legitimate_address_p (machine_mode mode, rtx x, bool strict,
+			    code_helper = ERROR_MARK)
 {
   /* If this is an ldq_u type address, discard the outer AND.  */
   if (mode == DImode
@@ -2070,6 +2071,8 @@ static rtx
 alpha_emit_set_long_const (rtx target, HOST_WIDE_INT c1)
 {
   HOST_WIDE_INT d1, d2, d3, d4;
+  machine_mode mode = GET_MODE (target);
+  rtx orig_target = target;
 
   /* Decompose the entire word */
 
@@ -2081,6 +2084,9 @@ alpha_emit_set_long_const (rtx target, HOST_WIDE_INT c1)
   c1 -= d3;
   d4 = ((c1 & 0xffffffff) ^ 0x80000000) - 0x80000000;
   gcc_assert (c1 == d4);
+
+  if (mode != DImode)
+    target = gen_lowpart (DImode, target);
 
   /* Construct the high word */
   if (d4)
@@ -2101,7 +2107,7 @@ alpha_emit_set_long_const (rtx target, HOST_WIDE_INT c1)
   if (d1)
     emit_move_insn (target, gen_rtx_PLUS (DImode, target, GEN_INT (d1)));
 
-  return target;
+  return orig_target;
 }
 
 /* Given an integral CONST_INT or CONST_VECTOR, return the low 64 bits.  */
@@ -3814,6 +3820,12 @@ alpha_expand_block_move (rtx operands[])
           else if (a >= 16 && c % 2 == 0)
 	    src_align = 16;
 	}
+
+      if (MEM_P (orig_src) && MEM_ALIGN (orig_src) < src_align)
+	{
+	  orig_src = shallow_copy_rtx (orig_src);
+	  set_mem_align (orig_src, src_align);
+	}
     }
 
   tmp = XEXP (orig_dst, 0);
@@ -3834,6 +3846,12 @@ alpha_expand_block_move (rtx operands[])
 	    dst_align = 32;
           else if (a >= 16 && c % 2 == 0)
 	    dst_align = 16;
+	}
+
+      if (MEM_P (orig_dst) && MEM_ALIGN (orig_dst) < dst_align)
+	{
+	  orig_dst = shallow_copy_rtx (orig_dst);
+	  set_mem_align (orig_dst, dst_align);
 	}
     }
 
@@ -6084,8 +6102,10 @@ alpha_setup_incoming_varargs (cumulative_args_t pcum,
 {
   CUMULATIVE_ARGS cum = *get_cumulative_args (pcum);
 
-  /* Skip the current argument.  */
-  targetm.calls.function_arg_advance (pack_cumulative_args (&cum), arg);
+  if (!TYPE_NO_NAMED_ARGS_STDARG_P (TREE_TYPE (current_function_decl))
+      || arg.type != NULL_TREE)
+    /* Skip the current argument.  */
+    targetm.calls.function_arg_advance (pack_cumulative_args (&cum), arg);
 
 #if TARGET_ABI_OPEN_VMS
   /* For VMS, we allocate space for all 6 arg registers plus a count.
@@ -6252,7 +6272,7 @@ alpha_gimplify_va_arg_1 (tree type, tree base, tree offset,
 
       return build2 (COMPLEX_EXPR, type, real_temp, imag_part);
     }
-  else if (TREE_CODE (type) == REAL_TYPE)
+  else if (SCALAR_FLOAT_TYPE_P (type))
     {
       tree fpaddend, cond, fourtyeight;
 
@@ -7475,14 +7495,13 @@ common_object_handler (tree *node, tree name ATTRIBUTE_UNUSED,
   return NULL_TREE;
 }
 
-static const struct attribute_spec vms_attribute_table[] =
+TARGET_GNU_ATTRIBUTES (vms_attribute_table,
 {
   /* { name, min_len, max_len, decl_req, type_req, fn_type_req,
        affects_type_identity, handler, exclude } */
   { COMMON_OBJECT,   0, 1, true,  false, false, false, common_object_handler,
-    NULL },
-  { NULL,            0, 0, false, false, false, false, NULL, NULL }
-};
+    NULL }
+});
 
 void
 vms_output_aligned_decl_common(FILE *file, tree decl, const char *name,
@@ -7564,6 +7583,75 @@ alpha_does_function_need_gp (void)
   return 0;
 }
 
+/* Helper function for alpha_store_data_bypass_p, handle just a single SET
+   IN_SET.  */
+
+static bool
+alpha_store_data_bypass_p_1 (rtx_insn *out_insn, rtx in_set)
+{
+  if (!MEM_P (SET_DEST (in_set)))
+    return false;
+
+  rtx out_set = single_set (out_insn);
+  if (out_set)
+    return !reg_mentioned_p (SET_DEST (out_set), SET_DEST (in_set));
+
+  rtx out_pat = PATTERN (out_insn);
+  if (GET_CODE (out_pat) != PARALLEL)
+    return false;
+
+  for (int i = 0; i < XVECLEN (out_pat, 0); i++)
+    {
+      rtx out_exp = XVECEXP (out_pat, 0, i);
+
+      if (GET_CODE (out_exp) == CLOBBER || GET_CODE (out_exp) == USE
+	  || GET_CODE (out_exp) == TRAP_IF)
+	continue;
+
+      gcc_assert (GET_CODE (out_exp) == SET);
+
+      if (reg_mentioned_p (SET_DEST (out_exp), SET_DEST (in_set)))
+	return false;
+    }
+
+  return true;
+}
+
+/* True if the dependency between OUT_INSN and IN_INSN is on the store
+   data not the address operand(s) of the store.  IN_INSN and OUT_INSN
+   must be either a single_set or a PARALLEL with SETs inside.
+
+   This alpha-specific version of store_data_bypass_p ignores TRAP_IF
+   that would result in assertion failure (and internal compiler error)
+   in the generic store_data_bypass_p function.  */
+
+int
+alpha_store_data_bypass_p (rtx_insn *out_insn, rtx_insn *in_insn)
+{
+  rtx in_set = single_set (in_insn);
+  if (in_set)
+    return alpha_store_data_bypass_p_1 (out_insn, in_set);
+
+  rtx in_pat = PATTERN (in_insn);
+  if (GET_CODE (in_pat) != PARALLEL)
+    return false;
+
+  for (int i = 0; i < XVECLEN (in_pat, 0); i++)
+    {
+      rtx in_exp = XVECEXP (in_pat, 0, i);
+
+      if (GET_CODE (in_exp) == CLOBBER || GET_CODE (in_exp) == USE
+	  || GET_CODE (in_exp) == TRAP_IF)
+	continue;
+
+      gcc_assert (GET_CODE (in_exp) == SET);
+
+      if (!alpha_store_data_bypass_p_1 (out_insn, in_exp))
+	return false;
+    }
+
+  return true;
+}
 
 /* Helper function to set RTX_FRAME_RELATED_P on instructions, including
    sequences.  */
@@ -7911,8 +7999,7 @@ int num_source_filenames = 0;
 /* Output the textual info surrounding the prologue.  */
 
 void
-alpha_start_function (FILE *file, const char *fnname,
-		      tree decl ATTRIBUTE_UNUSED)
+alpha_start_function (FILE *file, const char *fnname, tree decl)
 {
   unsigned long imask, fmask;
   /* Complete stack size needed.  */
@@ -7977,7 +8064,7 @@ alpha_start_function (FILE *file, const char *fnname,
   if (TARGET_ABI_OPEN_VMS)
     strcat (entry_label, "..en");
 
-  ASM_OUTPUT_LABEL (file, entry_label);
+  ASM_OUTPUT_FUNCTION_LABEL (file, entry_label, decl);
   inside_function = TRUE;
 
   if (TARGET_ABI_OPEN_VMS)
@@ -8389,10 +8476,6 @@ alpha_output_mi_thunk_osf (FILE *file, tree thunk_fndecl ATTRIBUTE_UNUSED,
 }
 #endif /* TARGET_ABI_OSF */
 
-/* Debugging support.  */
-
-#include "gstab.h"
-
 /* Name of the file containing the current function.  */
 
 static const char *current_function_file = "";

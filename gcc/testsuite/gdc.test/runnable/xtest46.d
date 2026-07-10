@@ -10,24 +10,16 @@ int
 int(int i, long j = 7L)
 long
 C10390(C10390(C10390(<recursion>)))
-tuple(height)
-tuple(get, get)
-tuple(clear)
-tuple(draw, draw)
-runnable/xtest46.d(149): Deprecation: `opDot` is deprecated. Use `alias this`
-runnable/xtest46.d(151): Deprecation: `opDot` is deprecated. Use `alias this`
-runnable/xtest46.d(152): Deprecation: `opDot` is deprecated. Use `alias this`
-runnable/xtest46.d(154): Deprecation: `opDot` is deprecated. Use `alias this`
-runnable/xtest46.d(181): Deprecation: `opDot` is deprecated. Use `alias this`
-runnable/xtest46.d(183): Deprecation: `opDot` is deprecated. Use `alias this`
-runnable/xtest46.d(184): Deprecation: `opDot` is deprecated. Use `alias this`
-runnable/xtest46.d(186): Deprecation: `opDot` is deprecated. Use `alias this`
+AliasSeq!(height)
+AliasSeq!(get, get)
+AliasSeq!(clear)
+AliasSeq!(draw, draw)
 const(int)
 string[]
 double[]
 double[]
 {}
-tuple("m")
+AliasSeq!("m")
 true
 TFunction1: extern (C) void function()
 ---
@@ -137,10 +129,7 @@ struct T6
     S6 s;
     int b = 7;
 
-    S6* opDot() return
-    {
-        return &s;
-    }
+    alias s this;
 }
 
 void test6()
@@ -169,10 +158,7 @@ class C7
     S7 s;
     int b = 7;
 
-    S7* opDot()
-    {
-        return &s;
-    }
+    alias s this;
 }
 
 void test7()
@@ -193,7 +179,7 @@ void test7()
 
 void foo8(int n1 = __LINE__ + 0, int n2 = __LINE__, string s = __FILE__)
 {
-    assert(n1 < n2);
+    assert(n1 == n2);
     printf("n1 = %d, n2 = %d, s = %.*s\n", n1, n2, cast(int)s.length, s.ptr);
 }
 
@@ -206,7 +192,7 @@ void test8()
 
 void foo9(int n1 = __LINE__ + 0, int n2 = __LINE__, string s = __FILE__)()
 {
-    assert(n1 < n2);
+    assert(n1 == n2);
     printf("n1 = %d, n2 = %d, s = %.*s\n", n1, n2, cast(int)s.length, s.ptr);
 }
 
@@ -3830,8 +3816,8 @@ void test153()
 /***************************************************/
 // https://issues.dlang.org/show_bug.cgi?id=3632
 
-
-void test154() {
+void test154()
+{
     float f;
     assert(f is float.init);
     double d;
@@ -3842,6 +3828,87 @@ void test154() {
     assert(float.nan is float.nan);
     assert(double.nan is double.nan);
     assert(real.nan is real.nan);
+}
+
+/***************************************************/
+
+__gshared int global3632 = 1;
+
+void test3632()
+{
+    int test(T)()
+    {
+        static struct W
+        {
+            T f;
+            this(T g) { if (__ctfe || global3632) f = g; }
+        }
+        auto nan = W(T.nan);
+        auto nan2 = W(T.nan);
+        auto init = W(T.init);
+        auto init2 = W(T.init);
+        auto zero = W(cast(T)0);
+        auto zero2 = W(cast(T)0);
+        auto nzero2 = W(-cast(T)0);
+
+        // Struct equality
+        assert(!(nan == nan2));
+        assert(!(nan == init2));
+        assert(!(init == init2));
+        assert( (zero == zero2));
+        assert( (zero == nzero2));
+
+        // Float equality
+        assert(!(nan.f == nan2.f));
+        assert(!(nan.f == init2.f));
+        assert(!(init.f == init2.f));
+        assert( (zero.f == zero2.f));
+        assert( (zero.f == nzero2.f));
+
+        // Struct identity
+        assert( (nan is nan2));
+        assert( (nan is init2));
+        assert( (init is init2));
+        assert( (zero is zero2));
+        assert(!(zero is nzero2));
+
+        // Float identity
+        assert( (nan.f is nan2.f));
+        assert( (nan.f is init2.f));
+        assert( (init.f is init2.f));
+        assert( (zero.f is zero2.f));
+        assert(!(zero.f is nzero2.f));
+
+        // Struct !identity
+        assert(!(nan !is nan2));
+        assert( (nan  is init2));
+        assert(!(init !is init2));
+        assert(!(zero !is zero2));
+        assert( (zero !is nzero2));
+
+        // float !identity
+        assert(!(nan.f !is nan2.f));
+        assert( (nan.f is init2.f));
+        assert(!(init.f !is init2.f));
+        assert(!(zero.f !is zero2.f));
+        assert( (zero.f !is nzero2.f));
+
+        // .init identity
+        assert(W.init is W.init);
+
+        return 1;
+    }
+
+    auto rtF = test!float();
+    enum ctF = test!float();
+    auto rtD = test!double();
+    enum ctD = test!double();
+    auto rtR = test!real();
+    enum ctR = test!real();
+
+    assert(float.nan !is -float.nan);
+    assert(double.nan !is -double.nan);
+    assert(real.nan !is -real.nan);
 }
 
 /***************************************************/
@@ -4945,18 +5012,18 @@ void test6763()
 {
     int n;
 
-    f6763(0);   //With D2: Error: function main.f ((ref const const(int) _param_0)) is not callable using argument types (int)
+    f6763(0);   //With D2: Error: function main.f ((ref const const(int) __param_0)) is not callable using argument types (int)
     c6763(0);
     r6763(n);   static assert(__traits(compiles, r6763(0)));
     i6763(0);
     o6763(n);   static assert(!__traits(compiles, o6763(0)));
 
     // https://issues.dlang.org/show_bug.cgi?id=6755
-    static assert(typeof(f6763).stringof == "void(int _param_0)");
-    static assert(typeof(c6763).stringof == "void(const(int) _param_0)");
-    static assert(typeof(r6763).stringof == "void(ref int _param_0)");
-    static assert(typeof(i6763).stringof == "void(in int _param_0)");
-    static assert(typeof(o6763).stringof == "void(out int _param_0)");
+    static assert(typeof(f6763).stringof == "void(int __param_0)");
+    static assert(typeof(c6763).stringof == "void(const(int) __param_0)");
+    static assert(typeof(r6763).stringof == "void(ref int __param_0)");
+    static assert(typeof(i6763).stringof == "void(in int __param_0)");
+    static assert(typeof(o6763).stringof == "void(out int __param_0)");
 }
 
 /***************************************************/
@@ -5926,7 +5993,7 @@ void test7618(const int x = 1)
 {
     int func(ref int x) { return 1; }
     static assert(!__traits(compiles, func(x)));
-    // Error: function test.foo.func (ref int _param_0) is not callable using argument types (const(int))
+    // Error: function test.foo.func (ref int __param_0) is not callable using argument types (const(int))
 
     int delegate(ref int) dg = (ref int x) => 1;
     static assert(!__traits(compiles, dg(x)));
@@ -6096,14 +6163,6 @@ void test8064()
 
 void foo8220(int){}
 static assert(!__traits(compiles, foo8220(typeof(0)))); // fail
-
-/***************************************************/
-
-void func8105(in ref int x) { }
-
-void test8105()
-{
-}
 
 /***************************************************/
 
@@ -7973,6 +8032,29 @@ void test18232()
 }
 
 /***************************************************/
+// https://issues.dlang.org/show_bug.cgi?id=24332
+
+void test24332()
+{
+    class A {}
+    final class B : A {}
+
+    auto foo(A a) {
+        return cast(B) a;
+    }
+
+    auto a = new A();
+    auto n = cast(B) a;
+    assert(n is null);
+    auto b = cast(A) new B();
+    auto c = cast(B) b;
+    assert(c);
+    B e;
+    auto d = cast(B) cast(A) e;
+    assert(d is null);
+}
+
+/***************************************************/
 
 int main()
 {
@@ -8156,6 +8238,7 @@ int main()
     test155();
     test156();
     test658();
+    test3632();
     test4258();
     test4539();
     test4963();
@@ -8228,7 +8311,6 @@ int main()
     test12503();
     test8004();
     test8064();
-    test8105();
     test159();
     test12824();
     test8283();
@@ -8293,6 +8375,7 @@ int main()
     test17349();
     test17915();
     test18232();
+    test24332();
 
     printf("Success\n");
     return 0;

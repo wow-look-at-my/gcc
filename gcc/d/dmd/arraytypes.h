@@ -1,6 +1,6 @@
 
 /* Compiler implementation of the D programming language
- * Copyright (C) 2006-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright (C) 2006-2024 by The D Language Foundation, All Rights Reserved
  * written by Walter Bright
  * https://www.digitalmars.com
  * Distributed under the Boost Software License, Version 1.0.
@@ -67,4 +67,3 @@ typedef Array<struct Ensure> Ensures;
 typedef Array<struct Designator> Designators;
 
 typedef Array<struct DesigInit> DesigInits;
-

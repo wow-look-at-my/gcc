@@ -1,5 +1,5 @@
 /* Definitions of target machine for GNU compiler, for IBM S/390.
-   Copyright (C) 2000-2022 Free Software Foundation, Inc.
+   Copyright (C) 2000-2024 Free Software Foundation, Inc.
 
    Contributed by Hartmut Penner (hpenner@de.ibm.com)
 
@@ -49,7 +49,6 @@ extern void s390_function_profiler (FILE *, int);
 extern void s390_set_has_landing_pad_p (bool);
 extern bool s390_hard_regno_rename_ok (unsigned int, unsigned int);
 extern int s390_class_max_nregs (enum reg_class, machine_mode);
-extern bool s390_function_arg_vector (machine_mode, const_tree);
 extern bool s390_return_addr_from_memory(void);
 extern bool s390_fma_allowed_p (machine_mode);
 #if S390_USE_TARGET_ATTRIBUTE
@@ -107,8 +106,9 @@ extern void s390_reload_symref_address (rtx , rtx , rtx , bool);
 extern void s390_expand_plus_operand (rtx, rtx, rtx);
 extern void emit_symbolic_move (rtx *);
 extern void s390_load_address (rtx, rtx);
-extern bool s390_expand_cpymem (rtx, rtx, rtx);
-extern void s390_expand_setmem (rtx, rtx, rtx);
+extern bool s390_expand_cpymem (rtx, rtx, rtx, rtx, rtx);
+extern bool s390_expand_movmem (rtx, rtx, rtx, rtx, rtx);
+extern void s390_expand_setmem (rtx, rtx, rtx, rtx, rtx);
 extern bool s390_expand_cmpmem (rtx, rtx, rtx, rtx);
 extern void s390_expand_vec_strlen (rtx, rtx, rtx);
 extern void s390_expand_vec_movstr (rtx, rtx, rtx);
@@ -174,10 +174,6 @@ extern void s390_register_target_pragmas (void);
 
 /* Routines for s390-c.cc */
 extern bool s390_const_operand_ok (tree, int, int, tree);
-
-/* s390-d.cc routines */
-extern void s390_d_target_versions (void);
-extern void s390_d_register_target_info (void);
 
 /* Pass management.  */
 namespace gcc { class context; }

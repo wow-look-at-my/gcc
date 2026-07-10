@@ -677,7 +677,7 @@ if (isSomeString!(typeof(fmt)))
     import std.format : checkFormatException;
 
     alias e = checkFormatException!(fmt, Args);
-    static assert(!e, e.msg);
+    static assert(!e, e);
     return .formattedWrite(w, fmt, args);
 }
 
@@ -1309,4 +1309,24 @@ void formatValue(Writer, T, Char)(auto ref Writer w, auto ref T val, scope const
     S a;
     writer.formatValue(a, spec);
     assert(writer.data == "0");
+}
+
+// https://issues.dlang.org/show_bug.cgi?id=23400
+@safe pure unittest
+{
+    import std.range : nullSink;
+    import std.format.spec : singleSpec;
+
+    static struct S
+    {
+        // non-const opEquals method
+        bool opEquals(S rhs) { return false; }
+    }
+
+    enum E { a = S() }
+
+    E e;
+    auto writer = nullSink;
+    const spec = singleSpec("%s");
+    writer.formatValue(e, spec);
 }

@@ -1,8 +1,14 @@
-// { dg-options "-std=gnu++20" }
 // { dg-do compile { target c++20 } }
-// { dg-xfail-if "not supported" { debug_mode } }
+// { dg-add-options no_pch }
 
 #include <vector>
+
+#ifndef __cpp_lib_constexpr_vector
+# error "Feature test macro for constexpr vector is missing in <vector>"
+#elif __cpp_lib_constexpr_vector != 201907L
+# error "Feature test macro for constexpr vector has wrong value in <vector>"
+#endif
+
 #include <testsuite_hooks.h>
 #include <testsuite_iterators.h>
 

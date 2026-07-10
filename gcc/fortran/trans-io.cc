@@ -1,5 +1,5 @@
 /* IO Code translation/library interface
-   Copyright (C) 2002-2022 Free Software Foundation, Inc.
+   Copyright (C) 2002-2024 Free Software Foundation, Inc.
    Contributed by Paul Brook
 
 This file is part of GCC.
@@ -737,7 +737,6 @@ set_parameter_ref (stmtblock_t *block, stmtblock_t *postblock,
 static void
 gfc_convert_array_to_string (gfc_se * se, gfc_expr * e)
 {
-  tree size;
 
   if (e->rank == 0)
     {
@@ -755,12 +754,13 @@ gfc_convert_array_to_string (gfc_se * se, gfc_expr * e)
       array = sym->backend_decl;
       type = TREE_TYPE (array);
 
+      tree elts_count;
       if (GFC_ARRAY_TYPE_P (type))
-	size = GFC_TYPE_ARRAY_SIZE (type);
+	elts_count = GFC_TYPE_ARRAY_SIZE (type);
       else
 	{
 	  gcc_assert (GFC_DESCRIPTOR_TYPE_P (type));
-	  size = gfc_conv_array_stride (array, rank);
+	  tree stride = gfc_conv_array_stride (array, rank);
 	  tmp = fold_build2_loc (input_location, MINUS_EXPR,
 				 gfc_array_index_type,
 				 gfc_conv_array_ubound (array, rank),
@@ -768,23 +768,49 @@ gfc_convert_array_to_string (gfc_se * se, gfc_expr * e)
 	  tmp = fold_build2_loc (input_location, PLUS_EXPR,
 				 gfc_array_index_type, tmp,
 				 gfc_index_one_node);
+	  elts_count = fold_build2_loc (input_location, MULT_EXPR,
+					gfc_array_index_type, tmp, stride);
+	}
+      gcc_assert (elts_count);
+
+      tree elt_size = TYPE_SIZE_UNIT (gfc_get_element_type (type));
+      elt_size = fold_convert (gfc_array_index_type, elt_size);
+
+      tree size;
+      if (TREE_CODE (se->expr) == ARRAY_REF)
+	{
+	  tree index = TREE_OPERAND (se->expr, 1);
+	  index = fold_convert (gfc_array_index_type, index);
+
+	  elts_count = fold_build2_loc (input_location, MINUS_EXPR,
+					gfc_array_index_type,
+					elts_count, index);
+
 	  size = fold_build2_loc (input_location, MULT_EXPR,
-				  gfc_array_index_type, tmp, size);
+				  gfc_array_index_type, elts_count, elt_size);
+	}
+      else
+	{
+	  gcc_assert (INDIRECT_REF_P (se->expr));
+	  tree ptr = TREE_OPERAND (se->expr, 0);
+
+	  gcc_assert (TREE_CODE (ptr) == POINTER_PLUS_EXPR);
+	  tree offset = fold_convert_loc (input_location, gfc_array_index_type,
+					  TREE_OPERAND (ptr, 1));
+
+	  size = fold_build2_loc (input_location, MULT_EXPR,
+				  gfc_array_index_type, elts_count, elt_size);
+	  size = fold_build2_loc (input_location, MINUS_EXPR,
+				  gfc_array_index_type, size, offset);
 	}
       gcc_assert (size);
 
-      size = fold_build2_loc (input_location, MINUS_EXPR,
-			      gfc_array_index_type, size,
-			      TREE_OPERAND (se->expr, 1));
       se->expr = gfc_build_addr_expr (NULL_TREE, se->expr);
-      tmp = TYPE_SIZE_UNIT (gfc_get_element_type (type));
-      size = fold_build2_loc (input_location, MULT_EXPR,
-			      gfc_array_index_type, size,
-			      fold_convert (gfc_array_index_type, tmp));
       se->string_length = fold_convert (gfc_charlen_type_node, size);
       return;
     }
 
+  tree size;
   gfc_conv_array_parameter (se, e, true, NULL, NULL, &size);
   se->string_length = fold_convert (gfc_charlen_type_node, size);
 }
@@ -1666,8 +1692,11 @@ transfer_namelist_element (stmtblock_t * block, const char * var_name,
   gcc_assert (sym || c);
 
   /* Build the namelist object name.  */
-
-  string = gfc_build_cstring_const (var_name);
+  if (sym && !sym->attr.use_only && sym->attr.use_rename
+      && sym->ns->use_stmts->rename)
+    string = gfc_build_cstring_const (sym->ns->use_stmts->rename->local_name);
+  else
+    string = gfc_build_cstring_const (var_name);
   string = gfc_build_addr_expr (pchar_type_node, string);
 
   /* Build ts, as and data address using symbol or component.  */
@@ -2467,7 +2496,9 @@ transfer_expr (gfc_se * se, gfc_typespec * ts, tree addr_expr,
 
 		  if (c->attr.dimension)
 		    {
-		      tmp = transfer_array_component (tmp, c, & code->loc);
+		      tmp = transfer_array_component (tmp, c,
+						      code ? &code->loc
+						      : NULL);
 		      gfc_add_expr_to_block (&se->pre, tmp);
 		    }
 		  else
@@ -2594,11 +2625,39 @@ gfc_trans_transfer (gfc_code * code)
 	  gcc_assert (ref && ref->type == REF_ARRAY);
 	}
 
+      /* These expressions don't always have the dtype element length set
+	 correctly, rendering them useless for array transfer.  */
       if (expr->ts.type != BT_CLASS
 	 && expr->expr_type == EXPR_VARIABLE
-	 && gfc_expr_attr (expr).pointer)
+	 && ((expr->symtree->n.sym->ts.type == BT_DERIVED && expr->ts.deferred)
+	     || (expr->symtree->n.sym->assoc
+		 && expr->symtree->n.sym->assoc->variable)
+	     || gfc_expr_attr (expr).pointer
+	     || (expr->symtree->n.sym->attr.pointer
+		 && gfc_expr_attr (expr).target)))
 	goto scalarize;
 
+      /* With array-bounds checking enabled, force scalarization in some
+	 situations, e.g., when an array index depends on a function
+	 evaluation or an expression and possibly has side-effects.  */
+      if ((gfc_option.rtcheck & GFC_RTCHECK_BOUNDS)
+	  && ref
+	  && ref->u.ar.type == AR_SECTION)
+	{
+	  for (n = 0; n < ref->u.ar.dimen; n++)
+	    if (ref->u.ar.dimen_type[n] == DIMEN_ELEMENT
+		&& ref->u.ar.start[n])
+	      {
+		switch (ref->u.ar.start[n]->expr_type)
+		  {
+		  case EXPR_FUNCTION:
+		  case EXPR_OP:
+		    goto scalarize;
+		  default:
+		    break;
+		  }
+	      }
+	}
 
       if (!(gfc_bt_struct (expr->ts.type)
 	      || expr->ts.type == BT_CLASS)
@@ -2664,6 +2723,7 @@ scalarize:
 
   gfc_add_block_to_block (&body, &se.pre);
   gfc_add_block_to_block (&body, &se.post);
+  gfc_add_block_to_block (&body, &se.finalblock);
 
   if (se.ss == NULL)
     tmp = gfc_finish_block (&body);

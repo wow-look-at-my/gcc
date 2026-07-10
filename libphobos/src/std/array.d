@@ -117,7 +117,7 @@ if (isIterable!Range && !isAutodecodableString!Range && !isInfinite!Range)
     alias E = ForeachType!Range;
     static if (hasLength!Range)
     {
-        auto length = r.length;
+        const length = r.length;
         if (length == 0)
             return null;
 
@@ -126,12 +126,35 @@ if (isIterable!Range && !isAutodecodableString!Range && !isInfinite!Range)
         auto result = (() @trusted => uninitializedArray!(Unqual!E[])(length))();
 
         // Every element of the uninitialized array must be initialized
-        size_t i;
-        foreach (e; r)
+        size_t cnt; //Number of elements that have been initialized
+        try
         {
-            emplaceRef!E(result[i], e);
-            ++i;
+            foreach (e; r)
+            {
+                emplaceRef!E(result[cnt], e);
+                ++cnt;
+            }
+        } catch (Exception e)
+        {
+            //https://issues.dlang.org/show_bug.cgi?id=22185
+            //Make any uninitialized elements safely destructible.
+            foreach (ref elem; result[cnt..$])
+            {
+                import core.internal.lifetime : emplaceInitializer;
+                emplaceInitializer(elem);
+            }
+            throw e;
         }
+        /*
+            https://issues.dlang.org/show_bug.cgi?id=22673
+
+            We preallocated an array, we should ensure that enough range elements
+            were gathered such that every slot in the array is filled. If not, the GC
+            will collect the allocated array, leading to the `length - cnt` left over elements
+            being collected too - despite their contents having no guarantee of destructibility.
+         */
+        assert(length == cnt,
+               "Range .length property was not equal to the length yielded by the range before becoming empty");
         return (() @trusted => cast(E[]) result)();
     }
     else
@@ -146,8 +169,8 @@ if (isIterable!Range && !isAutodecodableString!Range && !isInfinite!Range)
 }
 
 /// ditto
-ForeachType!(PointerTarget!Range)[] array(Range)(Range r)
-if (isPointer!Range && isIterable!(PointerTarget!Range) && !isAutodecodableString!Range && !isInfinite!Range)
+ForeachType!(typeof((*Range).init))[] array(Range)(Range r)
+if (is(Range == U*, U) && isIterable!U && !isAutodecodableString!Range && !isInfinite!Range)
 {
     return array(*r);
 }
@@ -439,6 +462,91 @@ if (isAutodecodableString!String)
         assert(equal(r, [S(1), S(1)]));
     });
 }
+//https://issues.dlang.org/show_bug.cgi?id=22673
+@system unittest
+{
+    struct LyingRange
+    {
+        enum size_t length = 100;
+        enum theRealLength = 50;
+        size_t idx = 0;
+        bool empty()
+        {
+            return idx <= theRealLength;
+        }
+        void popFront()
+        {
+            ++idx;
+        }
+        size_t front()
+        {
+            return idx;
+        }
+    }
+    static assert(hasLength!LyingRange);
+    LyingRange rng;
+    import std.exception : assertThrown;
+    assertThrown!Error(array(rng));
+}
+//https://issues.dlang.org/show_bug.cgi?id=22185
+@system unittest
+{
+    import std.stdio;
+    static struct ThrowingCopy
+    {
+        int x = 420;
+        this(ref return scope ThrowingCopy rhs)
+        {
+            rhs.x = 420;
+            //
+            throw new Exception("This throws");
+        }
+        ~this()
+        {
+            /*
+                Any time this destructor runs, it should be running on "valid"
+                data. This is is mimicked by having a .init other than 0 (the value the memory
+                practically will be from the GC).
+            */
+            if (x != 420)
+            {
+                //This will only trigger during GC finalization so avoid writefln for now.
+                printf("Destructor failure in ThrowingCopy(%d) @ %p", x, &this);
+                assert(x == 420, "unittest destructor failed");
+            }
+        }
+    }
+    static struct LyingThrowingRange
+    {
+        enum size_t length = 100;
+        enum size_t evilRealLength = 50;
+        size_t idx;
+        ThrowingCopy front()
+        {
+            return ThrowingCopy(12);
+        }
+        bool empty()
+        {
+            return idx == evilRealLength;
+        }
+        void popFront()
+        {
+            ++idx;
+        }
+    }
+    static assert(hasLength!LyingThrowingRange);
+    import std.exception : assertThrown;
+    {
+        assertThrown(array(LyingThrowingRange()));
+    }
+    import core.memory : GC;
+    /*
+        Force a collection early. Doesn't always actually finalize the bad objects
+        but trying to collect soon after the allocation is thrown away means any potential failures
+        will happen earlier.
+    */
+    GC.collect();
+}
 
 /**
 Returns a newly allocated associative array from a range of key/value tuples
@@ -478,7 +586,7 @@ if (isInputRange!Range)
     static assert(isMutable!ValueType, "assocArray: value type must be mutable");
 
     ValueType[KeyType] aa;
-    foreach (t; r)
+    foreach (ref t; r)
         aa[t[0]] = t[1];
     return aa;
 }
@@ -939,6 +1047,11 @@ if (isDynamicArray!T && allSatisfy!(isIntegral, I))
 // from rt/lifetime.d
 private extern(C) void[] _d_newarrayU(const TypeInfo ti, size_t length) pure nothrow;
 
+// from rt/tracegc.d
+version (D_ProfileGC)
+private extern (C) void[] _d_newarrayUTrace(string file, size_t line,
+    string funcname, const scope TypeInfo ti, size_t length) pure nothrow;
+
 private auto arrayAllocImpl(bool minimallyInitialized, T, I...)(I sizes) nothrow
 {
     static assert(I.length <= nDimensions!T,
@@ -992,7 +1105,15 @@ private auto arrayAllocImpl(bool minimallyInitialized, T, I...)(I sizes) nothrow
               _d_newarrayU returns a void[], but with the length set according
               to E.sizeof.
             +/
-            *(cast(void[]*)&ret) = _d_newarrayU(typeid(E[]), size);
+            version (D_ProfileGC)
+            {
+                // FIXME: file, line, function should be propagated from the
+                // caller, not here.
+                *(cast(void[]*)&ret) = _d_newarrayUTrace(__FILE__, __LINE__,
+                    __FUNCTION__, typeid(E[]), size);
+            }
+            else
+                *(cast(void[]*)&ret) = _d_newarrayU(typeid(E[]), size);
             static if (minimallyInitialized && hasIndirections!E)
                 // _d_newarrayU would have asserted if the multiplication below
                 // had overflowed, so we don't have to check it again.
@@ -1080,7 +1201,7 @@ private auto arrayAllocImpl(bool minimallyInitialized, T, I...)(I sizes) nothrow
     auto a2 = minimallyInitializedArray!(S2[][])(2, 2);
     assert(a2);
     enum b2 = minimallyInitializedArray!(S2[][])(2, 2);
-    assert(b2);
+    assert(b2 !is null);
     static struct S3
     {
         //this() @disable;
@@ -1089,7 +1210,7 @@ private auto arrayAllocImpl(bool minimallyInitialized, T, I...)(I sizes) nothrow
     auto a3 = minimallyInitializedArray!(S3[][])(2, 2);
     assert(a3);
     enum b3 = minimallyInitializedArray!(S3[][])(2, 2);
-    assert(b3);
+    assert(b3 !is null);
 }
 
 /++
@@ -2173,22 +2294,6 @@ if (isInputRange!RoR &&
     }
 }
 
-// https://issues.dlang.org/show_bug.cgi?id=10895
-@safe unittest
-{
-    class A
-    {
-        string name;
-        alias name this;
-        this(string name) { this.name = name; }
-    }
-    auto a = [new A(`foo`)];
-    assert(a[0].length == 3);
-    auto temp = join(a, " ");
-    assert(a[0].length == 3);
-    assert(temp.length == 3);
-}
-
 // https://issues.dlang.org/show_bug.cgi?id=14230
 @safe unittest
 {
@@ -2460,33 +2565,8 @@ E[] replace(E, R1, R2)(E[] subject, R1 from, R2 to)
 if ((isForwardRange!R1 && isForwardRange!R2 && (hasLength!R2 || isSomeString!R2)) ||
     is(Unqual!E : Unqual!R1))
 {
-    import std.algorithm.searching : find;
-    import std.range : dropOne;
-
-    static if (isInputRange!R1)
-    {
-        if (from.empty) return subject;
-        alias rSave = a => a.save;
-    }
-    else
-    {
-        alias rSave = a => a;
-    }
-
-    auto balance = find(subject, rSave(from));
-    if (balance.empty)
-        return subject;
-
-    auto app = appender!(E[])();
-    app.put(subject[0 .. subject.length - balance.length]);
-    app.put(rSave(to));
-    // replacing an element in an array is different to a range replacement
-    static if (is(Unqual!E : Unqual!R1))
-        replaceInto(app, balance.dropOne, from, to);
-    else
-        replaceInto(app, balance[from.length .. $], from, to);
-
-    return app.data;
+    size_t changed = 0;
+    return replace(subject, from, to, changed);
 }
 
 ///
@@ -2540,6 +2620,68 @@ if ((isForwardRange!R1 && isForwardRange!R2 && (hasLength!R2 || isSomeString!R2)
 }
 
 /++
+    Replace occurrences of `from` with `to` in `subject` in a new array.
+    `changed` counts how many replacements took place.
+
+    Params:
+        subject = the array to scan
+        from = the item to replace
+        to = the item to replace all instances of `from` with
+        changed = the number of replacements
+
+    Returns:
+        A new array without changing the contents of `subject`, or the original
+        array if no match is found.
+ +/
+E[] replace(E, R1, R2)(E[] subject, R1 from, R2 to, ref size_t changed)
+if ((isForwardRange!R1 && isForwardRange!R2 && (hasLength!R2 || isSomeString!R2)) ||
+    is(Unqual!E : Unqual!R1))
+{
+    import std.algorithm.searching : find;
+    import std.range : dropOne;
+
+    static if (isInputRange!R1)
+    {
+        if (from.empty) return subject;
+        alias rSave = a => a.save;
+    }
+    else
+    {
+        alias rSave = a => a;
+    }
+
+    auto balance = find(subject, rSave(from));
+    if (balance.empty)
+        return subject;
+
+    auto app = appender!(E[])();
+    app.put(subject[0 .. subject.length - balance.length]);
+    app.put(rSave(to));
+    ++changed;
+    // replacing an element in an array is different to a range replacement
+    static if (is(Unqual!E : Unqual!R1))
+        replaceInto(app, balance.dropOne, from, to, changed);
+    else
+        replaceInto(app, balance[from.length .. $], from, to, changed);
+
+    return app.data;
+}
+
+///
+@safe unittest
+{
+    size_t changed = 0;
+    assert("Hello Wörld".replace("o Wö", "o Wo", changed) == "Hello World");
+    assert(changed == 1);
+
+    changed = 0;
+    assert("Hello Wörld".replace("l", "h", changed) == "Hehho Wörhd");
+    import std.stdio : writeln;
+    writeln(changed);
+    assert(changed == 3);
+}
+
+/++
     Replace occurrences of `from` with `to` in `subject` and output the result into
     `sink`.
 
@@ -2557,38 +2699,8 @@ if (isOutputRange!(Sink, E) &&
     ((isForwardRange!R1 && isForwardRange!R2 && (hasLength!R2 || isSomeString!R2)) ||
     is(Unqual!E : Unqual!R1)))
 {
-    import std.algorithm.searching : find;
-    import std.range : dropOne;
-
-    static if (isInputRange!R1)
-    {
-        if (from.empty)
-        {
-            sink.put(subject);
-            return;
-        }
-        alias rSave = a => a.save;
-    }
-    else
-    {
-        alias rSave = a => a;
-    }
-    for (;;)
-    {
-        auto balance = find(subject, rSave(from));
-        if (balance.empty)
-        {
-            sink.put(subject);
-            break;
-        }
-        sink.put(subject[0 .. subject.length - balance.length]);
-        sink.put(rSave(to));
-        // replacing an element in an array is different to a range replacement
-        static if (is(Unqual!E : Unqual!R1))
-            subject = balance.dropOne;
-        else
-            subject = balance[from.length .. $];
-    }
+    size_t changed = 0;
+    replaceInto(sink, subject, from, to, changed);
 }
 
 ///
@@ -2676,6 +2788,72 @@ if (isOutputRange!(Sink, E) &&
     auto sink2 = appender!(dchar[])();
     replaceInto(sink2, "äbö", 'ä', 'a');
     assert(sink2.data == "abö");
+}
+
+/++
+    Replace occurrences of `from` with `to` in `subject` and output the result into
+    `sink`. `changed` counts how many replacements took place.
+
+    Params:
+        sink = an $(REF_ALTTEXT output range, isOutputRange, std,range,primitives)
+        subject = the array to scan
+        from = the item to replace
+        to = the item to replace all instances of `from` with
+        changed = the number of replacements
+ +/
+void replaceInto(E, Sink, R1, R2)(Sink sink, E[] subject, R1 from, R2 to, ref size_t changed)
+if (isOutputRange!(Sink, E) &&
+    ((isForwardRange!R1 && isForwardRange!R2 && (hasLength!R2 || isSomeString!R2)) ||
+    is(Unqual!E : Unqual!R1)))
+{
+    import std.algorithm.searching : find;
+    import std.range : dropOne;
+
+    static if (isInputRange!R1)
+    {
+        if (from.empty)
+        {
+            sink.put(subject);
+            return;
+        }
+        alias rSave = a => a.save;
+    }
+    else
+    {
+        alias rSave = a => a;
+    }
+    for (;;)
+    {
+        auto balance = find(subject, rSave(from));
+        if (balance.empty)
+        {
+            sink.put(subject);
+            break;
+        }
+        sink.put(subject[0 .. subject.length - balance.length]);
+        sink.put(rSave(to));
+        ++changed;
+        // replacing an element in an array is different to a range replacement
+        static if (is(Unqual!E : Unqual!R1))
+            subject = balance.dropOne;
+        else
+            subject = balance[from.length .. $];
+    }
+}
+
+///
+@safe unittest
+{
+    auto arr = [1, 2, 3, 4, 5];
+    auto from = [2, 3];
+    auto to = [4, 6];
+    auto sink = appender!(int[])();
+
+    size_t changed = 0;
+    replaceInto(sink, arr, from, to, changed);
+
+    assert(sink.data == [1, 4, 6, 4, 5]);
+    assert(changed == 1);
 }
 
 /++
@@ -3295,7 +3473,8 @@ do
 Implements an output range that appends data to an array. This is
 recommended over $(D array ~= data) when appending many elements because it is more
 efficient. `Appender` maintains its own array metadata locally, so it can avoid
-global locking for each append where $(LREF capacity) is non-zero.
+the $(DDSUBLINK spec/arrays, capacity-reserve, performance hit of looking up slice `capacity`)
+for each append.
 
 Params:
     A = the array type to simulate.
@@ -3466,7 +3645,7 @@ if (isDynamicArray!A)
     private template canPutItem(U)
     {
         enum bool canPutItem =
-            isImplicitlyConvertible!(Unqual!U, Unqual!T) ||
+            is(Unqual!U : Unqual!T) ||
             isSomeChar!T && isSomeChar!U;
     }
     private template canPutConstRange(Range)
@@ -4255,8 +4434,8 @@ unittest
             return app[];
     }
 
-    class C {}
-    struct S { const(C) c; }
+    static class C {}
+    static struct S { const(C) c; }
     S[] s = [ S(new C) ];
 
     auto t = fastCopy(s); // Does not compile
@@ -4521,24 +4700,16 @@ unittest
 }
 
 /++
-Constructs a static array from `a`.
-The type of elements can be specified implicitly so that $(D [1, 2].staticArray) results in `int[2]`,
-or explicitly, e.g. $(D [1, 2].staticArray!float) returns `float[2]`.
-When `a` is a range whose length is not known at compile time, the number of elements must be
-given as template argument (e.g. `myrange.staticArray!2`).
-Size and type can be combined, if the source range elements are implicitly
-convertible to the requested element type (eg: `2.iota.staticArray!(long[2])`).
-When the range `a` is known at compile time, it can also be specified as a
-template argument to avoid having to specify the number of elements
-(e.g.: `staticArray!(2.iota)` or `staticArray!(double, 2.iota)`).
+Constructs a static array from a dynamic array whose length is known at compile-time.
+The element type can be inferred or specified explicitly:
+
+* $(D [1, 2].staticArray) returns `int[2]`
+* $(D [1, 2].staticArray!float) returns `float[2]`
 
 Note: `staticArray` returns by value, so expressions involving large arrays may be inefficient.
 
 Params:
-    a = The input elements. If there are less elements than the specified length of the static array,
-    the rest of it is default-initialized. If there are more than specified, the first elements
-    up to the specified length are used.
-    rangeLength = outputs the number of elements used from `a` to it. Optional.
+    a = The input array.
 
 Returns: A static array constructed from `a`.
 +/
@@ -4555,6 +4726,7 @@ nothrow pure @safe @nogc unittest
     assert(a == [0, 1]);
 }
 
+/// ditto
 pragma(inline, true) U[n] staticArray(U, T, size_t n)(auto ref T[n] a)
 if (!is(T == U) && is(T : U))
 {
@@ -4594,7 +4766,23 @@ nothrow pure @safe @nogc unittest
     [cast(byte) 1, cast(byte) 129].staticArray.checkStaticArray!byte([1, -127]);
 }
 
-/// ditto
+/**
+Constructs a static array from a range.
+When `a.length` is not known at compile time, the number of elements must be
+given as a template argument (e.g. `myrange.staticArray!2`).
+Size and type can be combined, if the source range elements are implicitly
+convertible to the requested element type (eg: `2.iota.staticArray!(long[2])`).
+
+When the range `a` is known at compile time, it can be given as a
+template argument to avoid having to specify the number of elements
+(e.g.: `staticArray!(2.iota)` or `staticArray!(double, 2.iota)`).
+
+Params:
+    a = The input range. If there are less elements than the specified length of the static array,
+    the rest of it is default-initialized. If there are more than specified, the first elements
+    up to the specified length are used.
+    rangeLength = Output for the number of elements used from `a`. Optional.
+*/
 auto staticArray(size_t n, T)(scope T a)
 if (isInputRange!T)
 {

@@ -1,7 +1,7 @@
 /**
  * A specialized associative array with string keys stored in a variable length structure.
  *
- * Copyright: Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright: Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:   Walter Bright, https://www.digitalmars.com
  * License:   $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:    $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/root/stringtable.d, root/_stringtable.d)
@@ -224,7 +224,7 @@ public:
     }
 
     /// ditto
-    extern(D) int opApply(scope int delegate(const(StringValue!T)*) nothrow dg) nothrow
+    int opApply(scope int delegate(const(StringValue!T)*) nothrow dg) nothrow
     {
         foreach (const se; table)
         {

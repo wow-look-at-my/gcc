@@ -1,5 +1,5 @@
 # Linker script for libgccjit.so
-#   Copyright (C) 2013-2022 Free Software Foundation, Inc.
+#   Copyright (C) 2013-2024 Free Software Foundation, Inc.
 #   Contributed by David Malcolm <dmalcolm@redhat.com>.
 #
 # This file is part of GCC.
@@ -238,8 +238,54 @@ LIBGCCJIT_ABI_18 {
 } LIBGCCJIT_ABI_17;
 
 LIBGCCJIT_ABI_19 {
+  global:
     gcc_jit_context_new_array_constructor;
     gcc_jit_context_new_struct_constructor;
     gcc_jit_context_new_union_constructor;
     gcc_jit_global_set_initializer_rvalue;
 } LIBGCCJIT_ABI_18;
+
+LIBGCCJIT_ABI_20 {
+  global:
+    gcc_jit_compatible_types;
+    gcc_jit_type_get_size;
+} LIBGCCJIT_ABI_19;
+
+LIBGCCJIT_ABI_21 {
+  global:
+    gcc_jit_context_new_bitcast;
+} LIBGCCJIT_ABI_20;
+
+LIBGCCJIT_ABI_22 {
+  global:
+    gcc_jit_lvalue_set_register_name;
+} LIBGCCJIT_ABI_21;
+
+LIBGCCJIT_ABI_23 {
+  global:
+    gcc_jit_context_set_bool_print_errors_to_stderr;
+} LIBGCCJIT_ABI_22;
+
+LIBGCCJIT_ABI_24 {
+  global:
+    gcc_jit_lvalue_set_alignment;
+    gcc_jit_lvalue_get_alignment;
+} LIBGCCJIT_ABI_23;
+
+LIBGCCJIT_ABI_25 {
+  global:
+    gcc_jit_type_get_restrict;
+} LIBGCCJIT_ABI_24;
+
+LIBGCCJIT_ABI_26 {
+  global:
+    gcc_jit_function_add_attribute;
+    gcc_jit_function_add_string_attribute;
+    gcc_jit_lvalue_add_string_attribute;
+    gcc_jit_function_add_integer_array_attribute;
+} LIBGCCJIT_ABI_25;
+
+LIBGCCJIT_ABI_27 {
+  global:
+    gcc_jit_context_new_sizeof;
+} LIBGCCJIT_ABI_26;

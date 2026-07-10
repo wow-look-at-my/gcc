@@ -819,11 +819,11 @@ func loadPackageData(ctx context.Context, path, parentPath, parentDir, parentRoo
 	}
 	r := resolvedImportCache.Do(importKey, func() any {
 		var r resolvedImport
-		if build.IsLocalImport(path) {
+		if cfg.ModulesEnabled {
+			r.dir, r.path, r.err = modload.Lookup(parentPath, parentIsStd, path)
+		} else if build.IsLocalImport(path) {
 			r.dir = filepath.Join(parentDir, path)
 			r.path = dirToImportPath(r.dir)
-		} else if cfg.ModulesEnabled {
-			r.dir, r.path, r.err = modload.Lookup(parentPath, parentIsStd, path)
 		} else if mode&ResolveImport != 0 {
 			// We do our own path resolution, because we want to
 			// find out the key to use in packageCache without the
@@ -1113,6 +1113,7 @@ func dirAndRoot(path string, dir, root string) (string, string) {
 	}
 
 	if !str.HasFilePathPrefix(dir, root) || len(dir) <= len(root) || dir[len(root)] != filepath.Separator || path != "command-line-arguments" && !build.IsLocalImport(path) && filepath.Join(root, path) != dir {
+		debug.PrintStack()
 		base.Fatalf("unexpected directory layout:\n"+
 			"	import path: %s\n"+
 			"	root: %s\n"+
@@ -1817,7 +1818,7 @@ func (p *Package) load(ctx context.Context, opts PackageOpts, path string, stk *
 		if p.UsesCgo() {
 			addImport("unsafe", true)
 		}
-		if p.UsesCgo() && (!p.Standard || !cgoExclude[p.ImportPath]) && cfg.BuildContext.Compiler != "gccgo" {
+		if p.UsesCgo() && (!p.Standard || !cgoExclude[p.ImportPath]) {
 			addImport("runtime/cgo", true)
 		}
 		if p.UsesCgo() && (!p.Standard || !cgoSyscallExclude[p.ImportPath]) {
@@ -1827,9 +1828,7 @@ func (p *Package) load(ctx context.Context, opts PackageOpts, path string, stk *
 		// SWIG adds imports of some standard packages.
 		if p.UsesSwig() {
 			addImport("unsafe", true)
-			if cfg.BuildContext.Compiler != "gccgo" {
-				addImport("runtime/cgo", true)
-			}
+			addImport("runtime/cgo", true)
 			addImport("syscall", true)
 			addImport("sync", true)
 
@@ -2235,13 +2234,17 @@ func (p *Package) setBuildInfo() {
 
 	var debugModFromModinfo func(*modinfo.ModulePublic) *debug.Module
 	debugModFromModinfo = func(mi *modinfo.ModulePublic) *debug.Module {
+		version := mi.Version
+		if version == "" {
+			version = "(devel)"
+		}
 		dm := &debug.Module{
 			Path:    mi.Path,
-			Version: mi.Version,
+			Version: version,
 		}
 		if mi.Replace != nil {
 			dm.Replace = debugModFromModinfo(mi.Replace)
-		} else {
+		} else if mi.Version != "" {
 			dm.Sum = modfetch.Sum(module.Version{Path: mi.Path, Version: mi.Version})
 		}
 		return dm
@@ -2424,12 +2427,7 @@ func (p *Package) setBuildInfo() {
 		appendSetting("vcs.modified", strconv.FormatBool(st.Uncommitted))
 	}
 
-	text, err := info.MarshalText()
-	if err != nil {
-		setPkgErrorf("error formatting build info: %v", err)
-		return
-	}
-	p.Internal.BuildInfo = string(text)
+	p.Internal.BuildInfo = info.String()
 }
 
 // SafeArg reports whether arg is a "safe" command-line argument,
@@ -2455,7 +2453,7 @@ func LinkerDeps(p *Package) []string {
 	deps := []string{"runtime"}
 
 	// External linking mode forces an import of runtime/cgo.
-	if externalLinkingForced(p) && cfg.BuildContext.Compiler != "gccgo" {
+	if externalLinkingForced(p) {
 		deps = append(deps, "runtime/cgo")
 	}
 	// On ARM with GOARM=5, it forces an import of math, for soft floating point.

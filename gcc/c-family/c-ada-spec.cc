@@ -1,6 +1,6 @@
 /* Print GENERIC declaration (functions, variables, types) trees coming from
    the C and C++ front-ends as well as macros in Ada syntax.
-   Copyright (C) 2010-2022 Free Software Foundation, Inc.
+   Copyright (C) 2010-2024 Free Software Foundation, Inc.
    Adapted from tree-pretty-print.cc by Arnaud Charlet  <charlet@adacore.com>
 
 This file is part of GCC.
@@ -1051,7 +1051,7 @@ has_static_fields (const_tree type)
     return false;
 
   for (tree fld = TYPE_FIELDS (type); fld; fld = TREE_CHAIN (fld))
-    if (TREE_CODE (fld) == VAR_DECL && DECL_NAME (fld))
+    if (VAR_P (fld) && DECL_NAME (fld))
       return true;
 
   return false;
@@ -1526,6 +1526,15 @@ dump_ada_import (pretty_printer *buffer, tree t, int spc)
 
   newline_and_indent (buffer, spc + 5);
 
+  tree sec = lookup_attribute ("section", DECL_ATTRIBUTES (t));
+  if (sec)
+    {
+      pp_string (buffer, "Linker_Section => \"");
+      pp_string (buffer, TREE_STRING_POINTER (TREE_VALUE (TREE_VALUE (sec))));
+      pp_string (buffer, "\", ");
+      newline_and_indent (buffer, spc + 5);
+    }
+
   pp_string (buffer, "External_Name => \"");
 
   if (is_stdcall)
@@ -1557,6 +1566,8 @@ check_type_name_conflict (pretty_printer *buffer, tree t)
 	s = "";
       else if (TREE_CODE (TYPE_NAME (tmp)) == IDENTIFIER_NODE)
 	s = IDENTIFIER_POINTER (TYPE_NAME (tmp));
+      else if (!DECL_NAME (TYPE_NAME (tmp)))
+	s = "";
       else
 	s = IDENTIFIER_POINTER (DECL_NAME (TYPE_NAME (tmp)));
 
@@ -1579,7 +1590,7 @@ dump_ada_function_declaration (pretty_printer *buffer, tree func,
   tree type = TREE_TYPE (func);
   tree arg = TYPE_ARG_TYPES (type);
   tree t;
-  char buf[17];
+  char buf[18];
   int num, num_args = 0, have_args = true, have_ellipsis = false;
 
   /* Compute number of arguments.  */
@@ -1841,7 +1852,8 @@ dump_template_types (pretty_printer *buffer, tree types, int spc)
       if (!dump_ada_node (buffer, elem, NULL_TREE, spc, false, true))
 	{
 	  pp_string (buffer, "unknown");
-	  pp_scalar (buffer, "%lu", (unsigned long) TREE_HASH (elem));
+	  pp_scalar (buffer, HOST_SIZE_T_PRINT_UNSIGNED,
+		     (fmt_size_t) TREE_HASH (elem));
 	}
     }
 }
@@ -2021,7 +2033,39 @@ dump_ada_enum_type (pretty_printer *buffer, tree node, tree type, int spc)
     }
 }
 
-/* Return true if NODE is the __float128/_Float128 type.  */
+/* Return true if NODE is the _Float32/_Float32x type.  */
+
+static bool
+is_float32 (tree node)
+{
+  if (!TYPE_NAME (node) || TREE_CODE (TYPE_NAME (node)) != TYPE_DECL)
+    return false;
+
+  tree name = DECL_NAME (TYPE_NAME (node));
+
+  if (IDENTIFIER_POINTER (name) [0] != '_')
+    return false;
+
+  return id_equal (name, "_Float32") || id_equal (name, "_Float32x");
+}
+
+/* Return true if NODE is the _Float64/_Float64x type.  */
+
+static bool
+is_float64 (tree node)
+{
+  if (!TYPE_NAME (node) || TREE_CODE (TYPE_NAME (node)) != TYPE_DECL)
+    return false;
+
+  tree name = DECL_NAME (TYPE_NAME (node));
+
+  if (IDENTIFIER_POINTER (name) [0] != '_')
+    return false;
+
+  return id_equal (name, "_Float64") || id_equal (name, "_Float64x");
+}
+
+/* Return true if NODE is the __float128/_Float128/_Float128x type.  */
 
 static bool
 is_float128 (tree node)
@@ -2034,7 +2078,9 @@ is_float128 (tree node)
   if (IDENTIFIER_POINTER (name) [0] != '_')
     return false;
 
-  return id_equal (name, "__float128") || id_equal (name, "_Float128");
+  return id_equal (name, "__float128")
+	 || id_equal (name, "_Float128")
+	 || id_equal (name, "_Float128x");
 }
 
 static bool bitfield_used = false;
@@ -2096,6 +2142,21 @@ dump_ada_node (pretty_printer *buffer, tree node, tree type, int spc,
 	  append_withs ("Interfaces.C.Extensions", false);
 	  pp_string (buffer, "Extensions.CFloat_128");
 	}
+      else if (TREE_TYPE (node) == float_type_node)
+	{
+	  append_withs ("Ada.Numerics.Complex_Types", false);
+	  pp_string (buffer, "Ada.Numerics.Complex_Types.Complex");
+	}
+      else if (TREE_TYPE (node) == double_type_node)
+	{
+	  append_withs ("Ada.Numerics.Long_Complex_Types", false);
+	  pp_string (buffer, "Ada.Numerics.Long_Complex_Types.Complex");
+	}
+      else if (TREE_TYPE (node) == long_double_type_node)
+	{
+	  append_withs ("Ada.Numerics.Long_Long_Complex_Types", false);
+	  pp_string (buffer, "Ada.Numerics.Long_Long_Complex_Types.Complex");
+	}
       else
 	pp_string (buffer, "<complex>");
       break;
@@ -2108,7 +2169,17 @@ dump_ada_node (pretty_printer *buffer, tree node, tree type, int spc,
       break;
 
     case REAL_TYPE:
-      if (is_float128 (node))
+      if (is_float32 (node))
+	{
+	  pp_string (buffer, "Float");
+	  break;
+	}
+      else if (is_float64 (node))
+	{
+	  pp_string (buffer, "Long_Float");
+	  break;
+	}
+      else if (is_float128 (node))
 	{
 	  append_withs ("Interfaces.C.Extensions", false);
 	  pp_string (buffer, "Extensions.Float_128");
@@ -2122,8 +2193,8 @@ dump_ada_node (pretty_printer *buffer, tree node, tree type, int spc,
     case BOOLEAN_TYPE:
       if (TYPE_NAME (node)
 	  && !(TREE_CODE (TYPE_NAME (node)) == TYPE_DECL
-	       && !strcmp (IDENTIFIER_POINTER (DECL_NAME (TYPE_NAME (node))),
-			   "__int128")))
+	       && !strncmp (IDENTIFIER_POINTER (DECL_NAME (TYPE_NAME (node))),
+			   "__int128", 8)))
 	{
 	  if (TREE_CODE (TYPE_NAME (node)) == IDENTIFIER_NODE)
 	    pp_ada_tree_identifier (buffer, TYPE_NAME (node), node,
@@ -2179,10 +2250,11 @@ dump_ada_node (pretty_printer *buffer, tree node, tree type, int spc,
 	}
       else
 	{
-	  const unsigned int quals = TYPE_QUALS (TREE_TYPE (node));
-	  bool is_access = false;
+	  tree ref_type = TREE_TYPE (node);
+	  const unsigned int quals = TYPE_QUALS (ref_type);
+	  bool is_access;
 
-	  if (VOID_TYPE_P (TREE_TYPE (node)))
+	  if (VOID_TYPE_P (ref_type))
 	    {
 	      if (!name_only)
 		pp_string (buffer, "new ");
@@ -2197,9 +2269,8 @@ dump_ada_node (pretty_printer *buffer, tree node, tree type, int spc,
 	  else
 	    {
 	      if (TREE_CODE (node) == POINTER_TYPE
-		  && TREE_CODE (TREE_TYPE (node)) == INTEGER_TYPE
-		  && id_equal (DECL_NAME (TYPE_NAME (TREE_TYPE (node))),
-			       "char"))
+		  && TREE_CODE (ref_type) == INTEGER_TYPE
+		  && id_equal (DECL_NAME (TYPE_NAME (ref_type)), "char"))
 		{
 		  if (!name_only)
 		    pp_string (buffer, "new ");
@@ -2214,28 +2285,11 @@ dump_ada_node (pretty_printer *buffer, tree node, tree type, int spc,
 		}
 	      else
 		{
-		  tree type_name = TYPE_NAME (TREE_TYPE (node));
-
-		  /* Generate "access <type>" instead of "access <subtype>"
-		     if the subtype comes from another file, because subtype
-		     declarations do not contribute to the limited view of a
-		     package and thus subtypes cannot be referenced through
-		     a limited_with clause.  */
-		  if (type_name
-		      && TREE_CODE (type_name) == TYPE_DECL
-		      && DECL_ORIGINAL_TYPE (type_name)
-		      && TYPE_NAME (DECL_ORIGINAL_TYPE (type_name)))
-		    {
-		      const expanded_location xloc
-			= expand_location (decl_sloc (type_name, false));
-		      if (xloc.line
-			  && xloc.file
-			  && xloc.file != current_source_file)
-			type_name = DECL_ORIGINAL_TYPE (type_name);
-		    }
+		  tree stub = TYPE_STUB_DECL (ref_type);
+		  tree type_name = TYPE_NAME (ref_type);
 
 		  /* For now, handle access-to-access as System.Address.  */
-		  if (TREE_CODE (TREE_TYPE (node)) == POINTER_TYPE)
+		  if (TREE_CODE (ref_type) == POINTER_TYPE)
 		    {
 		      if (package_prefix)
 			{
@@ -2250,8 +2304,11 @@ dump_ada_node (pretty_printer *buffer, tree node, tree type, int spc,
 		    }
 
 		  if (!package_prefix)
-		    pp_string (buffer, "access");
-		  else if (AGGREGATE_TYPE_P (TREE_TYPE (node)))
+		    {
+		      is_access = false;
+		      pp_string (buffer, "access");
+		    }
+		  else if (AGGREGATE_TYPE_P (ref_type))
 		    {
 		      if (!type || TREE_CODE (type) != FUNCTION_DECL)
 			{
@@ -2264,29 +2321,62 @@ dump_ada_node (pretty_printer *buffer, tree node, tree type, int spc,
 			    pp_string (buffer, "all ");
 			}
 		      else if (quals & TYPE_QUAL_CONST)
-			pp_string (buffer, "in ");
+			{
+			  is_access = false;
+			  pp_string (buffer, "in ");
+			}
 		      else
 			{
 			  is_access = true;
 			  pp_string (buffer, "access ");
-			  /* ??? should be configurable: access or in out.  */
 			}
 		    }
 		  else
 		    {
-		      is_access = true;
+		      /* We want to use regular with clauses for scalar types,
+			 as they are not involved in circular declarations.  */
+		      is_access = false;
 		      pp_string (buffer, "access ");
 
 		      if (!name_only)
 			pp_string (buffer, "all ");
 		    }
 
-		  if (RECORD_OR_UNION_TYPE_P (TREE_TYPE (node)) && type_name)
-		    dump_ada_node (buffer, type_name, TREE_TYPE (node), spc,
-				   is_access, true);
-		  else
-		    dump_ada_node (buffer, TREE_TYPE (node), TREE_TYPE (node),
-				   spc, false, true);
+		  /* If this is the anonymous original type of a typedef'ed
+		     type, then use the name of the latter.  */
+		  if (!type_name
+		      && stub
+		      && DECL_CHAIN (stub)
+		      && TREE_CODE (DECL_CHAIN (stub)) == TYPE_DECL
+		      && DECL_ORIGINAL_TYPE (DECL_CHAIN (stub)) == ref_type)
+		    ref_type = TREE_TYPE (DECL_CHAIN (stub));
+
+		  /* Generate "access <type>" instead of "access <subtype>"
+		     if the subtype comes from another file, because subtype
+		     declarations do not contribute to the limited view of a
+		     package and thus subtypes cannot be referenced through
+		     a limited_with clause.  */
+		  else if (is_access)
+		    while (type_name
+			   && TREE_CODE (type_name) == TYPE_DECL
+			   && DECL_ORIGINAL_TYPE (type_name)
+			   && TYPE_NAME (DECL_ORIGINAL_TYPE (type_name)))
+		      {
+			const expanded_location xloc
+			  = expand_location (decl_sloc (type_name, false));
+			if (xloc.line
+			    && xloc.file
+			    && xloc.file != current_source_file)
+			  {
+			    ref_type = DECL_ORIGINAL_TYPE (type_name);
+			    type_name = TYPE_NAME (ref_type);
+			  }
+			else
+			  break;
+		      }
+
+		  dump_ada_node (buffer, ref_type, ref_type, spc, is_access,
+				 true);
 		}
 	    }
 	}
@@ -2361,10 +2451,8 @@ dump_ada_node (pretty_printer *buffer, tree node, tree type, int spc,
 	      else
 		pp_string (buffer, "address");
 	    }
-	  break;
 	}
-
-      if (name_only)
+      else if (name_only)
 	dump_ada_decl_name (buffer, node, limited_access);
       else
 	{
@@ -3159,7 +3247,7 @@ dump_ada_declaration (pretty_printer *buffer, tree t, tree type, int spc)
       if (need_indent)
 	INDENT (spc);
 
-      if ((TREE_CODE (t) == FIELD_DECL || TREE_CODE (t) == VAR_DECL)
+      if ((TREE_CODE (t) == FIELD_DECL || VAR_P (t))
 	  && DECL_NAME (t))
 	check_type_name_conflict (buffer, t);
 
@@ -3377,7 +3465,7 @@ dump_ada_structure (pretty_printer *buffer, tree node, tree type, bool nested,
   /* Print the static fields of the structure, if any.  */
   for (tree tmp = TYPE_FIELDS (node); tmp; tmp = TREE_CHAIN (tmp))
     {
-      if (TREE_CODE (tmp) == VAR_DECL && DECL_NAME (tmp))
+      if (VAR_P (tmp) && DECL_NAME (tmp))
 	{
 	  if (need_semicolon)
 	    {

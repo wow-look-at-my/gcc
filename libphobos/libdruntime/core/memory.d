@@ -31,14 +31,14 @@
         $(LI Maintain another reference to that same data in another thread that the
         GC does know about.)
         $(LI Disable GC collection cycles while that thread is active with $(LREF disable)/$(LREF enable).)
-        $(LI Register the thread with the GC using $(REF thread_attachThis, core,thread)/$(REF thread_detachThis, core,thread).)
+        $(LI Register the thread with the GC using $(REF thread_attachThis, core,thread,osthread)/$(REF thread_detachThis, core,thread,threadbase).)
         )
    )
    )
  *
  * Notes_to_implementors:
  * $(UL
- * $(LI On POSIX systems, the signals SIGUSR1 and SIGUSR2 are reserved
+ * $(LI On POSIX systems, the signals `SIGRTMIN` and `SIGRTMIN + 1` are reserved
  *   by this module for use in the garbage collector implementation.
  *   Typically, they will be used to stop and resume other threads
  *   when performing a collection, but an implementation may choose
@@ -133,7 +133,7 @@ private
     }
 
     extern (C) BlkInfo_ gc_query(return scope void* p) pure nothrow;
-    extern (C) GC.Stats gc_stats ( ) nothrow @nogc;
+    extern (C) GC.Stats gc_stats ( ) @safe nothrow @nogc;
     extern (C) GC.ProfileStats gc_profileStats ( ) nothrow @nogc @safe;
 }
 
@@ -202,8 +202,8 @@ unittest
 // make it more difficult to call the function again, manually.
 private void initialize();
 pragma(crt_constructor)
-pragma(mangle, `_D` ~ initialize.mangleof)
-private extern (C) void initialize() @system
+pragma(mangle, initialize.mangleof)
+private extern (C) void _initialize() @system
 {
     version (Posix)
     {
@@ -266,11 +266,11 @@ extern(C):
 
     /**
      * Enables automatic garbage collection behavior if collections have
-     * previously been suspended by a call to disable.  This function is
-     * reentrant, and must be called once for every call to disable before
+     * previously been suspended by a call to `GC.disable()`.  This function is
+     * reentrant, and must be called once for every call to `GC.disable()` before
      * automatic collections are enabled.
      */
-    pragma(mangle, "gc_enable") static void enable() nothrow pure;
+    pragma(mangle, "gc_enable") static void enable() @safe nothrow pure;
 
 
     /**
@@ -278,9 +278,14 @@ extern(C):
      * process footprint.  Collections may continue to occur in instances
      * where the implementation deems necessary for correct program behavior,
      * such as during an out of memory condition.  This function is reentrant,
-     * but enable must be called once for each call to disable.
+     * but `GC.enable()` must be called once for each call to `GC.disable()`.
+     * Unlike the
+     * $(LINK2 https://dlang.org/spec/function.html#nogc-functions, `@nogc` attribute),
+     * `GC.disable()` halts
+     * collections across all threads, yet still allows GC allocations.
+     * Disabling collections eliminates GC pauses.
      */
-    pragma(mangle, "gc_disable") static void disable() nothrow pure;
+    pragma(mangle, "gc_disable") static void disable() @safe nothrow pure;
 
 
     /**
@@ -290,14 +295,14 @@ extern(C):
      * and then to reclaim free space.  This action may need to suspend all
      * running threads for at least part of the collection process.
      */
-    pragma(mangle, "gc_collect") static void collect() nothrow pure;
+    pragma(mangle, "gc_collect") static void collect() @safe nothrow pure;
 
     /**
      * Indicates that the managed memory space be minimized by returning free
      * physical memory to the operating system.  The amount of free memory
      * returned depends on the allocator design and on program behavior.
      */
-    pragma(mangle, "gc_minimize") static void minimize() nothrow pure;
+    pragma(mangle, "gc_minimize") static void minimize() @safe nothrow pure;
 
 extern(D):
 
@@ -459,8 +464,11 @@ extern(C):
      * Throws:
      *  OutOfMemoryError on allocation failure.
      */
-    pragma(mangle, "gc_malloc") static void* malloc(size_t sz, uint ba = 0, const scope TypeInfo ti = null) pure nothrow;
-
+    version (D_ProfileGC)
+        pragma(mangle, "gc_mallocTrace") static void* malloc(size_t sz, uint ba = 0, const scope TypeInfo ti = null,
+            string file = __FILE__, int line = __LINE__, string func = __FUNCTION__) pure nothrow;
+    else
+        pragma(mangle, "gc_malloc") static void* malloc(size_t sz, uint ba = 0, const scope TypeInfo ti = null) pure nothrow;
 
     /**
      * Requests an aligned block of managed memory from the garbage collector.
@@ -482,7 +490,11 @@ extern(C):
      * Throws:
      *  OutOfMemoryError on allocation failure.
      */
-    pragma(mangle, "gc_qalloc") static BlkInfo qalloc(size_t sz, uint ba = 0, const scope TypeInfo ti = null) pure nothrow;
+    version (D_ProfileGC)
+        pragma(mangle, "gc_qallocTrace") static BlkInfo qalloc(size_t sz, uint ba = 0, const scope TypeInfo ti = null,
+            string file = __FILE__, int line = __LINE__, string func = __FUNCTION__) pure nothrow;
+    else
+        pragma(mangle, "gc_qalloc") static BlkInfo qalloc(size_t sz, uint ba = 0, const scope TypeInfo ti = null) pure nothrow;
 
 
     /**
@@ -506,7 +518,11 @@ extern(C):
      * Throws:
      *  OutOfMemoryError on allocation failure.
      */
-    pragma(mangle, "gc_calloc") static void* calloc(size_t sz, uint ba = 0, const TypeInfo ti = null) pure nothrow;
+    version (D_ProfileGC)
+        pragma(mangle, "gc_callocTrace") static void* calloc(size_t sz, uint ba = 0, const TypeInfo ti = null,
+            string file = __FILE__, int line = __LINE__, string func = __FUNCTION__) pure nothrow;
+    else
+        pragma(mangle, "gc_calloc") static void* calloc(size_t sz, uint ba = 0, const TypeInfo ti = null) pure nothrow;
 
 
     /**
@@ -551,10 +567,15 @@ extern(C):
      * Throws:
      *  `OutOfMemoryError` on allocation failure.
      */
-    pragma(mangle, "gc_realloc") static void* realloc(return scope void* p, size_t sz, uint ba = 0, const TypeInfo ti = null) pure nothrow;
+    version (D_ProfileGC)
+        pragma(mangle, "gc_reallocTrace") static void* realloc(return scope void* p, size_t sz, uint ba = 0, const TypeInfo ti = null,
+            string file = __FILE__, int line = __LINE__, string func = __FUNCTION__) pure nothrow;
+    else
+        pragma(mangle, "gc_realloc") static void* realloc(return scope void* p, size_t sz, uint ba = 0, const TypeInfo ti = null) pure nothrow;
 
     // https://issues.dlang.org/show_bug.cgi?id=13111
     ///
+    version (OnlyLowMemUnittests) {} else // Test needs a lot of RAM
     unittest
     {
         enum size1 = 1 << 11 + 1; // page in large object pool
@@ -593,7 +614,12 @@ extern(C):
      *  as an indicator of success. $(LREF capacity) should be used to
      *  retrieve actual usable slice capacity.
      */
-    pragma(mangle, "gc_extend") static size_t extend(void* p, size_t mx, size_t sz, const TypeInfo ti = null) pure nothrow;
+    version (D_ProfileGC)
+        pragma(mangle, "gc_extendTrace") static size_t extend(void* p, size_t mx, size_t sz, const TypeInfo ti = null,
+            string file = __FILE__, int line = __LINE__, string func = __FUNCTION__) pure nothrow;
+    else
+        pragma(mangle, "gc_extend") static size_t extend(void* p, size_t mx, size_t sz, const TypeInfo ti = null) pure nothrow;
+
     /// Standard extending
     unittest
     {
@@ -746,7 +772,7 @@ extern(D):
      * Returns runtime stats for currently active GC implementation
      * See `core.memory.GC.Stats` for list of available metrics.
      */
-    static Stats stats() nothrow
+    static Stats stats() @safe nothrow @nogc
     {
         return gc_stats();
     }
@@ -1209,7 +1235,10 @@ void __delete(T)(ref T x) @system
     else static if (is(T == U*, U))
     {
         static if (is(U == struct))
-            _destructRecurse(*x);
+        {
+            if (x)
+                _destructRecurse(*x);
+        }
     }
     else static if (is(T : E[], E))
     {
@@ -1314,6 +1343,10 @@ unittest
     assert(a is null);
     assert(dtorCalled);
     assert(GC.addrOf(cast(void*) a) == null);
+
+    // https://issues.dlang.org/show_bug.cgi?id=22779
+    A *aptr;
+    __delete(aptr);
 }
 
 /// Deleting arrays

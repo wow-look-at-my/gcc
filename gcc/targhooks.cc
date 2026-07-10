@@ -1,5 +1,5 @@
 /* Default target hook functions.
-   Copyright (C) 2003-2022 Free Software Foundation, Inc.
+   Copyright (C) 2003-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -93,11 +93,14 @@ along with GCC; see the file COPYING3.  If not see
 #include "gimple.h"
 #include "cfgloop.h"
 #include "tree-vectorizer.h"
+#include "options.h"
+#include "case-cfn-macros.h"
 
 bool
 default_legitimate_address_p (machine_mode mode ATTRIBUTE_UNUSED,
 			      rtx addr ATTRIBUTE_UNUSED,
-			      bool strict ATTRIBUTE_UNUSED)
+			      bool strict ATTRIBUTE_UNUSED,
+			      code_helper ATTRIBUTE_UNUSED)
 {
 #ifdef GO_IF_LEGITIMATE_ADDRESS
   /* Defer to the old implementation using a goto.  */
@@ -324,6 +327,14 @@ default_cxx_get_cookie_size (tree type)
     cookie_size = type_align;
 
   return cookie_size;
+}
+
+/* Returns modified FUNCTION_TYPE for cdtor callabi.  */
+
+tree
+default_cxx_adjust_cdtor_callabi_fntype (tree fntype)
+{
+  return fntype;
 }
 
 /* Return true if a parameter must be passed by reference.  This version
@@ -751,6 +762,11 @@ default_builtin_reciprocal (tree)
   return NULL_TREE;
 }
 
+void
+default_emit_support_tinfos (emit_support_tinfos_callback)
+{
+}
+
 bool
 hook_bool_CUMULATIVE_ARGS_arg_info_false (cumulative_args_t,
 					  const function_arg_info &)
@@ -773,8 +789,18 @@ hook_int_CUMULATIVE_ARGS_arg_info_0 (cumulative_args_t,
 }
 
 void
+hook_void_CUMULATIVE_ARGS (cumulative_args_t)
+{
+}
+
+void
 hook_void_CUMULATIVE_ARGS_tree (cumulative_args_t ca ATTRIBUTE_UNUSED,
 				tree ATTRIBUTE_UNUSED)
+{
+}
+
+void
+hook_void_CUMULATIVE_ARGS_rtx_tree (cumulative_args_t, rtx, tree)
 {
 }
 
@@ -1017,6 +1043,45 @@ default_function_value_regno_p (const unsigned int regno ATTRIBUTE_UNUSED)
 #endif
 }
 
+/* Choose the mode and rtx to use to zero REGNO, storing tem in PMODE and
+   PREGNO_RTX and returning TRUE if successful, otherwise returning FALSE.  If
+   the natural mode for REGNO doesn't work, attempt to group it with subsequent
+   adjacent registers set in TOZERO.  */
+
+static inline bool
+zcur_select_mode_rtx (unsigned int regno, machine_mode *pmode,
+		      rtx *pregno_rtx, HARD_REG_SET tozero)
+{
+  rtx regno_rtx = regno_reg_rtx[regno];
+  machine_mode mode = GET_MODE (regno_rtx);
+
+  /* If the natural mode doesn't work, try some wider mode.  */
+  if (!targetm.hard_regno_mode_ok (regno, mode))
+    {
+      bool found = false;
+      for (int nregs = 2;
+	   !found && nregs <= hard_regno_max_nregs
+	     && regno + nregs <= FIRST_PSEUDO_REGISTER
+	     && TEST_HARD_REG_BIT (tozero,
+				   regno + nregs - 1);
+	   nregs++)
+	{
+	  mode = choose_hard_reg_mode (regno, nregs, 0);
+	  if (mode == E_VOIDmode)
+	    continue;
+	  gcc_checking_assert (targetm.hard_regno_mode_ok (regno, mode));
+	  regno_rtx = gen_rtx_REG (mode, regno);
+	  found = true;
+	}
+      if (!found)
+	return false;
+    }
+
+  *pmode = mode;
+  *pregno_rtx = regno_rtx;
+  return true;
+}
+
 /* The default hook for TARGET_ZERO_CALL_USED_REGS.  */
 
 HARD_REG_SET
@@ -1035,16 +1100,28 @@ default_zero_call_used_regs (HARD_REG_SET need_zeroed_hardregs)
     if (TEST_HARD_REG_BIT (need_zeroed_hardregs, regno))
       {
 	rtx_insn *last_insn = get_last_insn ();
-	machine_mode mode = GET_MODE (regno_reg_rtx[regno]);
+	rtx regno_rtx;
+	machine_mode mode;
+
+	if (!zcur_select_mode_rtx (regno, &mode, &regno_rtx,
+				   need_zeroed_hardregs))
+	  {
+	    SET_HARD_REG_BIT (failed, regno);
+	    continue;
+	  }
+
 	rtx zero = CONST0_RTX (mode);
-	rtx_insn *insn = emit_move_insn (regno_reg_rtx[regno], zero);
+	rtx_insn *insn = emit_move_insn (regno_rtx, zero);
 	if (!valid_insn_p (insn))
 	  {
 	    SET_HARD_REG_BIT (failed, regno);
 	    delete_insns_since (last_insn);
 	  }
 	else
-	  progress = true;
+	  {
+	    progress = true;
+	    regno += hard_regno_nregs (regno, mode) - 1;
+	  }
       }
 
   /* Now retry with copies from zeroed registers, as long as we've
@@ -1060,7 +1137,18 @@ default_zero_call_used_regs (HARD_REG_SET need_zeroed_hardregs)
       for (unsigned int regno = 0; regno < FIRST_PSEUDO_REGISTER; regno++)
 	if (TEST_HARD_REG_BIT (retrying, regno))
 	  {
-	    machine_mode mode = GET_MODE (regno_reg_rtx[regno]);
+	    rtx regno_rtx;
+	    machine_mode mode;
+
+	    /* This might select registers we've already zeroed.  If grouping
+	       with them is what it takes to get regno zeroed, so be it.  */
+	    if (!zcur_select_mode_rtx (regno, &mode, &regno_rtx,
+				       need_zeroed_hardregs))
+	      {
+		SET_HARD_REG_BIT (failed, regno);
+		continue;
+	      }
+
 	    bool success = false;
 	    /* Look for a source.  */
 	    for (unsigned int src = 0; src < FIRST_PSEUDO_REGISTER; src++)
@@ -1086,8 +1174,8 @@ default_zero_call_used_regs (HARD_REG_SET need_zeroed_hardregs)
 
 		/* SRC is usable, try to copy from it.  */
 		rtx_insn *last_insn = get_last_insn ();
-		rtx zsrc = gen_rtx_REG (mode, src);
-		rtx_insn *insn = emit_move_insn (regno_reg_rtx[regno], zsrc);
+		rtx src_rtx = gen_rtx_REG (mode, src);
+		rtx_insn *insn = emit_move_insn (regno_rtx, src_rtx);
 		if (!valid_insn_p (insn))
 		  /* It didn't work, remove any inserts.  We'll look
 		     for another SRC.  */
@@ -1100,13 +1188,16 @@ default_zero_call_used_regs (HARD_REG_SET need_zeroed_hardregs)
 		  }
 	      }
 
-	    /* If nothing worked for REGNO this round, marked it to be
+	    /* If nothing worked for REGNO this round, mark it to be
 	       retried if we get another round.  */
 	    if (!success)
 	      SET_HARD_REG_BIT (failed, regno);
 	    else
-	      /* Take note so as to enable another round if needed.  */
-	      progress = true;
+	      {
+		/* Take note so as to enable another round if needed.  */
+		progress = true;
+		regno += hard_regno_nregs (regno, mode) - 1;
+	      }
 	  }
     }
 
@@ -1116,9 +1207,21 @@ default_zero_call_used_regs (HARD_REG_SET need_zeroed_hardregs)
       static bool issued_error;
       if (!issued_error)
 	{
+	  const char *name = NULL;
+	  for (unsigned int i = 0; zero_call_used_regs_opts[i].name != NULL;
+	       ++i)
+	    if (flag_zero_call_used_regs == zero_call_used_regs_opts[i].flag)
+	      {
+		name = zero_call_used_regs_opts[i].name;
+		break;
+	      }
+
+	  if (!name)
+	    name = "";
+
 	  issued_error = true;
-	  sorry ("%qs not supported on this target",
-		 "-fzero-call-used-regs");
+	  sorry ("argument %qs is not supported for %qs on this target",
+		 name, "-fzero-call-used-regs");
 	}
     }
 
@@ -1327,6 +1430,26 @@ default_generate_pic_addr_diff_vec (void)
   return flag_pic;
 }
 
+/* Record an element in the table of global constructors.  SYMBOL is
+   a SYMBOL_REF of the function to be called; PRIORITY is a number
+   between 0 and MAX_INIT_PRIORITY.  */
+
+void
+default_asm_out_constructor (rtx symbol ATTRIBUTE_UNUSED,
+			     int priority ATTRIBUTE_UNUSED)
+{
+  sorry ("global constructors not supported on this target");
+}
+
+/* Likewise for global destructors.  */
+
+void
+default_asm_out_destructor (rtx symbol ATTRIBUTE_UNUSED,
+			    int priority ATTRIBUTE_UNUSED)
+{
+  sorry ("global destructors not supported on this target");
+}
+
 /* By default, do no modification. */
 tree default_mangle_decl_assembler_name (tree decl ATTRIBUTE_UNUSED,
 					 tree id)
@@ -1383,6 +1506,15 @@ poly_uint64
 default_preferred_vector_alignment (const_tree type)
 {
   return TYPE_ALIGN (type);
+}
+
+/* The default implementation of
+   TARGET_VECTORIZE_PREFERRED_DIV_AS_SHIFTS_OVER_MULT.  */
+
+bool
+default_preferred_div_as_shifts_over_mult (const_tree type)
+{
+  return !can_mult_highpart_p (TYPE_MODE (type), TYPE_UNSIGNED (type));
 }
 
 /* By default assume vectors of element TYPE require a multiple of the natural
@@ -1567,9 +1699,10 @@ target_default_pointer_address_modes_p (void)
 bool
 default_addr_space_legitimate_address_p (machine_mode mode, rtx mem,
 					 bool strict,
-					 addr_space_t as ATTRIBUTE_UNUSED)
+					 addr_space_t as ATTRIBUTE_UNUSED,
+					 code_helper code)
 {
-  return targetm.legitimate_address_p (mode, mem, strict);
+  return targetm.legitimate_address_p (mode, mem, strict, code);
 }
 
 /* Named address space version of LEGITIMIZE_ADDRESS.
@@ -1674,7 +1807,19 @@ default_target_option_valid_attribute_p (tree ARG_UNUSED (fndecl),
 					 int ARG_UNUSED (flags))
 {
   warning (OPT_Wattributes,
-	   "target attribute is not supported on this machine");
+	   "%<target%> attribute is not supported on this machine");
+
+  return false;
+}
+
+bool
+default_target_option_valid_version_attribute_p (tree ARG_UNUSED (fndecl),
+						 tree ARG_UNUSED (name),
+						 tree ARG_UNUSED (args),
+						 int ARG_UNUSED (flags))
+{
+  warning (OPT_Wattributes,
+	   "%<target_version%> attribute is not supported on this machine");
 
   return false;
 }
@@ -1776,6 +1921,95 @@ no_c99_libc_has_function (enum function_class fn_class ATTRIBUTE_UNUSED,
 			  tree type ATTRIBUTE_UNUSED)
 {
   return false;
+}
+
+/* Assume some c99 functions are present at the runtime including sincos.  */
+bool
+bsd_libc_has_function (enum function_class fn_class,
+		       tree type ATTRIBUTE_UNUSED)
+{
+  if (fn_class == function_c94
+      || fn_class == function_c99_misc
+      || fn_class == function_sincos)
+    return true;
+
+  return false;
+}
+
+/* By default, -fhardened will add -D_FORTIFY_SOURCE=2.  */
+
+unsigned
+default_fortify_source_default_level ()
+{
+  return 2;
+}
+
+unsigned
+default_libm_function_max_error (unsigned, machine_mode, bool)
+{
+  return ~0U;
+}
+
+unsigned
+glibc_linux_libm_function_max_error (unsigned cfn, machine_mode mode,
+				     bool boundary_p)
+{
+  /* Let's use
+     https://www.gnu.org/software/libc/manual/2.22/html_node/Errors-in-Math-Functions.html
+     https://www.gnu.org/software/libc/manual/html_node/Errors-in-Math-Functions.html
+     with usual values recorded here and significant outliers handled in
+     target CPU specific overriders.  The tables only record default
+     rounding to nearest, for -frounding-math let's add some extra ulps.
+     For boundary_p values (say finite results outside of [-1.,1.] for
+     sin/cos, or [-0.,+Inf] for sqrt etc. let's use custom random testers.  */
+  int rnd = flag_rounding_math ? 4 : 0;
+  bool sf = (REAL_MODE_FORMAT (mode) == &ieee_single_format
+	     || REAL_MODE_FORMAT (mode) == &mips_single_format
+	     || REAL_MODE_FORMAT (mode) == &motorola_single_format);
+  bool df = (REAL_MODE_FORMAT (mode) == &ieee_double_format
+	     || REAL_MODE_FORMAT (mode) == &mips_double_format
+	     || REAL_MODE_FORMAT (mode) == &motorola_double_format);
+  bool xf = (REAL_MODE_FORMAT (mode) == &ieee_extended_intel_96_format
+	     || REAL_MODE_FORMAT (mode) == &ieee_extended_intel_128_format
+	     || REAL_MODE_FORMAT (mode) == &ieee_extended_motorola_format);
+  bool tf = (REAL_MODE_FORMAT (mode) == &ieee_quad_format
+	     || REAL_MODE_FORMAT (mode) == &mips_quad_format);
+
+  switch (cfn)
+    {
+    CASE_CFN_SQRT:
+    CASE_CFN_SQRT_FN:
+      if (boundary_p)
+	/* https://gcc.gnu.org/pipermail/gcc-patches/2023-April/616595.html */
+	return 0;
+      if (sf || df || xf || tf)
+	return 0 + rnd;
+      break;
+    CASE_CFN_COS:
+    CASE_CFN_COS_FN:
+      /* cos is generally errors like sin, but far more arches have 2ulps
+	 for double.  */
+      if (!boundary_p && df)
+	return 2 + rnd;
+      gcc_fallthrough ();
+    CASE_CFN_SIN:
+    CASE_CFN_SIN_FN:
+      if (boundary_p)
+	/* According to
+	   https://sourceware.org/pipermail/gcc-patches/2023-April/616315.html
+	   seems default rounding sin/cos stay strictly in [-1.,1.] range,
+	   with rounding to infinity it can be 1ulp larger/smaller.  */
+	return flag_rounding_math ? 1 : 0;
+      if (sf || df)
+	return 1 + rnd;
+      if (xf || tf)
+	return 2 + rnd;
+      break;
+    default:
+      break;
+    }
+
+  return default_libm_function_max_error (cfn, mode, boundary_p);
 }
 
 tree
@@ -1900,15 +2134,17 @@ default_compare_by_pieces_branch_ratio (machine_mode)
   return 1;
 }
 
-/* Helper for default_print_patchable_function_entry and other
-   print_patchable_function_entry hook implementations.  */
+/* Write PATCH_AREA_SIZE NOPs into the asm outfile FILE around a function
+   entry.  If RECORD_P is true and the target supports named sections,
+   the location of the NOPs will be recorded in a special object section
+   called "__patchable_function_entries".  This routine may be called
+   twice per function to put NOPs before and after the function
+   entry.  */
 
 void
-default_print_patchable_function_entry_1 (FILE *file,
-					  unsigned HOST_WIDE_INT
-					  patch_area_size,
-					  bool record_p,
-					  unsigned int flags)
+default_print_patchable_function_entry (FILE *file,
+					unsigned HOST_WIDE_INT patch_area_size,
+					bool record_p)
 {
   const char *nop_templ = 0;
   int code_num;
@@ -1922,16 +2158,24 @@ default_print_patchable_function_entry_1 (FILE *file,
   if (record_p && targetm_common.have_named_sections)
     {
       char buf[256];
-      static int patch_area_number;
       section *previous_section = in_section;
       const char *asm_op = integer_asm_op (POINTER_SIZE_UNITS, false);
 
       gcc_assert (asm_op != NULL);
-      patch_area_number++;
-      ASM_GENERATE_INTERNAL_LABEL (buf, "LPFE", patch_area_number);
+      /* If SECTION_LINK_ORDER is supported, this internal label will
+	 be filled as the symbol for linked_to section.  */
+      ASM_GENERATE_INTERNAL_LABEL (buf, "LPFE", current_function_funcdef_no);
 
-      switch_to_section (get_section ("__patchable_function_entries",
-				      flags, current_function_decl));
+      unsigned int flags = SECTION_WRITE | SECTION_RELRO;
+      if (HAVE_GAS_SECTION_LINK_ORDER)
+	flags |= SECTION_LINK_ORDER;
+
+      section *sect = get_section ("__patchable_function_entries",
+				  flags, current_function_decl);
+      if (HAVE_COMDAT_GROUP && DECL_COMDAT_GROUP (current_function_decl))
+	switch_to_comdat_section (sect, current_function_decl);
+      else
+	switch_to_section (sect);
       assemble_align (POINTER_SIZE);
       fputs (asm_op, file);
       assemble_name_raw (file, buf);
@@ -1944,25 +2188,6 @@ default_print_patchable_function_entry_1 (FILE *file,
   unsigned i;
   for (i = 0; i < patch_area_size; ++i)
     output_asm_insn (nop_templ, NULL);
-}
-
-/* Write PATCH_AREA_SIZE NOPs into the asm outfile FILE around a function
-   entry.  If RECORD_P is true and the target supports named sections,
-   the location of the NOPs will be recorded in a special object section
-   called "__patchable_function_entries".  This routine may be called
-   twice per function to put NOPs before and after the function
-   entry.  */
-
-void
-default_print_patchable_function_entry (FILE *file,
-					unsigned HOST_WIDE_INT patch_area_size,
-					bool record_p)
-{
-  unsigned int flags = SECTION_WRITE | SECTION_RELRO;
-  if (HAVE_GAS_SECTION_LINK_ORDER)
-    flags |= SECTION_LINK_ORDER;
-  default_print_patchable_function_entry_1 (file, patch_area_size, record_p,
-					    flags);
 }
 
 bool
@@ -2410,6 +2635,14 @@ default_excess_precision (enum excess_precision_type ATTRIBUTE_UNUSED)
   return FLT_EVAL_METHOD_PROMOTE_TO_FLOAT;
 }
 
+/* Return true if _BitInt(N) is supported and fill details about it into
+   *INFO.  */
+bool
+default_bitint_type_info (int, struct bitint_info *)
+{
+  return false;
+}
+
 /* Default implementation for
   TARGET_STACK_CLASH_PROTECTION_ALLOCA_PROBE_RANGE.  */
 HOST_WIDE_INT
@@ -2581,13 +2814,6 @@ default_memtag_untagged_pointer (rtx tagged_pointer, rtx target)
 					   OPTAB_DIRECT);
   gcc_assert (untagged_base);
   return untagged_base;
-}
-
-/* The default implementation of TARGET_GCOV_TYPE_SIZE.  */
-HOST_WIDE_INT
-default_gcov_type_size (void)
-{
-  return TYPE_PRECISION (long_long_integer_type_node) > 32 ? 64 : 32;
 }
 
 #include "gt-targhooks.h"

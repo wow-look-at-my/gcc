@@ -15,5 +15,5 @@ long double foo()
 }
 
 
-/* { dg-final { scan-assembler-times "long\t-16843010" 5  { target { ! ia32 } } } } */
-/* { dg-final { scan-assembler-times "long\t-16843010" 3  { target { ia32 } } } } */
+/* { dg-final { scan-assembler-times "long\t-16843010" 5  { target { ! ia32 } } } } */
+/* { dg-final { scan-assembler-times "long\t-16843010" 3  { target { ia32 } } } } */

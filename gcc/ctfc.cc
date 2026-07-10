@@ -1,5 +1,5 @@
 /* Generate CTF.
-   Copyright (C) 2019-2022 Free Software Foundation, Inc.
+   Copyright (C) 2019-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -179,6 +179,40 @@ ctf_dvd_lookup (const ctf_container_ref ctfc, dw_die_ref die)
   return NULL;
 }
 
+/* Insert a dummy CTF variable into the list of variables to be ignored.  */
+
+static void
+ctf_dvd_ignore_insert (ctf_container_ref ctfc, ctf_dvdef_ref dvd)
+{
+  bool existed = false;
+  ctf_dvdef_ref entry = dvd;
+
+  ctf_dvdef_ref * item = ctfc->ctfc_ignore_vars->find_slot (entry, INSERT);
+  if (*item == NULL)
+     *item = dvd;
+  else
+    existed = true;
+  /* Duplicate variable records not expected to be inserted.  */
+  gcc_assert (!existed);
+}
+
+/* Lookup the dummy CTF variable given the DWARF die for the non-defining
+   decl to be ignored.  */
+
+bool
+ctf_dvd_ignore_lookup (const ctf_container_ref ctfc, dw_die_ref die)
+{
+  ctf_dvdef_t entry;
+  entry.dvd_key = die;
+
+  ctf_dvdef_ref * slot = ctfc->ctfc_ignore_vars->find_slot (&entry, NO_INSERT);
+
+  if (slot)
+    return true;
+
+  return false;
+}
+
 /* Append member definition to the list.  Member list is a singly-linked list
    with list start pointing to the head.  */
 
@@ -290,7 +324,7 @@ ctf_add_string (ctf_container_ref ctfc, const char * name,
   return ctfc_strtable_add_str (str_table, name, name_offset);
 }
 
-/* Add the compilation unit (CU) name string to the the CTF string table.  The
+/* Add the compilation unit (CU) name string to the CTF string table.  The
    CU name has a prepended pwd string if it is a relative path.  Also set the
    CU name offset in the CTF container.  */
 
@@ -543,7 +577,7 @@ ctf_add_array (ctf_container_ref ctfc, uint32_t flag, const ctf_arinfo_t * arp,
 
 ctf_id_t
 ctf_add_enum (ctf_container_ref ctfc, uint32_t flag, const char * name,
-	      HOST_WIDE_INT size, dw_die_ref die)
+	      HOST_WIDE_INT size, bool eunsigned, dw_die_ref die)
 {
   ctf_dtdef_ref dtd;
   ctf_id_t type;
@@ -570,6 +604,7 @@ ctf_add_enum (ctf_container_ref ctfc, uint32_t flag, const char * name,
   gcc_assert (size <= CTF_MAX_SIZE);
 
   dtd->dtd_data.ctti_size = size;
+  dtd->dtd_enum_unsigned = eunsigned;
 
   ctfc->ctfc_num_stypes++;
 
@@ -596,10 +631,12 @@ ctf_add_enumerator (ctf_container_ref ctfc, ctf_id_t enid, const char * name,
 
   gcc_assert (kind == CTF_K_ENUM && vlen < CTF_MAX_VLEN);
 
-  /* Enum value is of type HOST_WIDE_INT in the compiler, dmd_value is int32_t
-     on the other hand.  Check bounds and skip adding this enum value if out of
-     bounds.  */
-  if ((value > INT_MAX) || (value < INT_MIN))
+  /* Enum value is of type HOST_WIDE_INT in the compiler, CTF enumerators
+     values in ctf_enum_t is limited to int32_t, BTF supports signed and
+     unsigned enumerators values of 32 and 64 bits, for both debug formats
+     we use ctf_dmdef_t.dmd_value entry of HOST_WIDE_INT type. So check
+     CTF bounds and skip adding this enum value if out of bounds.  */
+  if (!btf_debuginfo_p() && ((value > INT_MAX) || (value < INT_MIN)))
     {
       /* FIXME - Note this TBD_CTF_REPRESENTATION_LIMIT.  */
       return (1);
@@ -666,9 +703,10 @@ ctf_add_member_offset (ctf_container_ref ctfc, dw_die_ref sou,
 
 int
 ctf_add_variable (ctf_container_ref ctfc, const char * name, ctf_id_t ref,
-		  dw_die_ref die, unsigned int external_vis)
+		  dw_die_ref die, unsigned int external_vis,
+		  dw_die_ref die_var_decl)
 {
-  ctf_dvdef_ref dvd;
+  ctf_dvdef_ref dvd, dvd_ignore;
 
   gcc_assert (name);
 
@@ -680,6 +718,24 @@ ctf_add_variable (ctf_container_ref ctfc, const char * name, ctf_id_t ref,
       dvd->dvd_name = ctf_add_string (ctfc, name, &(dvd->dvd_name_offset));
       dvd->dvd_visibility = external_vis;
       dvd->dvd_type = ref;
+
+      /* If DW_AT_specification attribute exists, keep track of it as this is
+	 the non-defining declaration corresponding to the variable.  We will
+	 skip emitting CTF variable for such incomplete, non-defining
+	 declarations.
+	 There could be some non-defining declarations, however, for which a
+	 defining declaration does not show up in the same CU.  For such
+	 cases, the compiler continues to emit CTF variable record as
+	 usual.  */
+      if (die_var_decl)
+	{
+	  dvd_ignore = ggc_cleared_alloc<ctf_dvdef_t> ();
+	  dvd_ignore->dvd_key = die_var_decl;
+	  /* It's alright to leave other fields as zero.  No valid CTF
+	     variable will be added for these DW_TAG_variable DIEs.  */
+	  ctf_dvd_ignore_insert (ctfc, dvd_ignore);
+	}
+
       ctf_dvd_insert (ctfc, dvd);
 
       if (strcmp (name, ""))
@@ -724,7 +780,7 @@ ctf_add_function_arg (ctf_container_ref ctfc, dw_die_ref func,
 ctf_id_t
 ctf_add_function (ctf_container_ref ctfc, uint32_t flag, const char * name,
 		  const ctf_funcinfo_t * ctc, dw_die_ref die,
-		  bool from_global_func)
+		  bool from_global_func, int linkage)
 {
   ctf_dtdef_ref dtd;
   ctf_id_t type;
@@ -738,6 +794,7 @@ ctf_add_function (ctf_container_ref ctfc, uint32_t flag, const char * name,
   type = ctf_add_generic (ctfc, flag, name, &dtd, die);
 
   dtd->from_global_func = from_global_func;
+  dtd->linkage = linkage;
   dtd->dtd_data.ctti_info = CTF_TYPE_INFO (CTF_K_FUNCTION, flag, vlen);
   /* Caller must make sure CTF types for ctc->ctc_return are already added.  */
   dtd->dtd_data.ctti_type = (uint32_t) ctc->ctc_return;
@@ -900,6 +957,8 @@ new_ctf_container (void)
     = hash_table<ctfc_dtd_hasher>::create_ggc (100);
   tu_ctfc->ctfc_vars
     = hash_table<ctfc_dvd_hasher>::create_ggc (100);
+  tu_ctfc->ctfc_ignore_vars
+    = hash_table<ctfc_dvd_hasher>::create_ggc (10);
 
   return tu_ctfc;
 }
@@ -951,6 +1010,9 @@ ctfc_delete_container (ctf_container_ref ctfc)
 
       ctfc->ctfc_vars->empty ();
       ctfc->ctfc_types = NULL;
+
+      ctfc->ctfc_ignore_vars->empty ();
+      ctfc->ctfc_ignore_vars = NULL;
 
       ctfc_delete_strtab (&ctfc->ctfc_strtable);
       ctfc_delete_strtab (&ctfc->ctfc_aux_strtable);

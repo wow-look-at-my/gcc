@@ -417,6 +417,7 @@ toolexeclibgounicode_DATA = \
 # Some internal packages are needed to bootstrap the gc toolchain.
 toolexeclibgointernaldir = $(toolexeclibgodir)/internal
 toolexeclibgointernal_DATA = \
+	internal/lazyregexp.gox \
 	internal/reflectlite.gox \
 	internal/unsafeheader.gox
 
@@ -462,9 +463,11 @@ runtime_files = \
 	runtime/go-memclr.c \
 	runtime/go-memmove.c \
 	runtime/go-memequal.c \
+	runtime/go-mmap.c \
 	runtime/go-nanotime.c \
 	runtime/go-now.c \
 	runtime/go-nosys.c \
+	runtime/go-strerror.c \
 	runtime/go-reflect-call.c \
 	runtime/go-setenv.c \
 	runtime/go-signal.c \
@@ -494,6 +497,10 @@ s-version: Makefile
 zgoarch.go: s-zgoarch; @true
 s-zgoarch: Makefile goarch.sh
 	rm -f zgoarch.go.tmp
+	if ! $(SHELL) $(srcdir)/goarch.sh $(GOARCH) family >/dev/null 2>/dev/null;  then \
+	  $(SHELL) $(srcdir)/goarch.sh $(GOARCH) family; \
+	  exit 1; \
+	fi
 	echo "package goarch" > zgoarch.go.tmp
 	echo >> zgoarch.go.tmp
 	echo 'const GOARCH = "'$(GOARCH)'"' >> zgoarch.go.tmp
@@ -568,6 +575,7 @@ s-goroot: Makefile
 	rm -f goroot.go.tmp
 	echo "package runtime" > goroot.go.tmp
 	echo 'var defaultGOROOT = `$(prefix)`' >> goroot.go.tmp
+	echo 'var buildVersion = `'`cat $(srcdir)/VERSION | sed 1q`' '`$(GOC) --version | sed 1q`'`' >> goroot.go.tmp
 	$(SHELL) $(srcdir)/mvifdiff.sh goroot.go.tmp goroot.go
 	$(STAMP) $@
 
@@ -817,6 +825,7 @@ libgo_go_objs = \
 	syscall/errno.lo \
 	syscall/signame.lo \
 	syscall/wait.lo \
+	runtime/internal/syscall/errno.lo \
 	os/dir_gccgo_c.lo \
 	$(golangorg_x_net_lif_lo) \
 	$(golangorg_x_net_route_lo) \
@@ -1180,6 +1189,11 @@ syscall/wait.lo: go/syscall/wait.c runtime.inc
 	@$(MKDIR_P) syscall
 	$(LTCOMPILE) -c -o $@ $(srcdir)/go/syscall/wait.c
 
+# Some runtime/internal/syscall functions are written in C.
+runtime/internal/syscall/errno.lo: go/runtime/internal/syscall/errno.c runtime.inc
+	@$(MKDIR_P) runtime/internal/syscall
+	$(LTCOMPILE) -c -o $@ $(srcdir)/go/runtime/internal/syscall/errno.c
+
 # An os function is written in C.
 os/dir_gccgo_c.lo: go/os/dir_gccgo_c.c runtime.inc
 	@$(MKDIR_P) os
@@ -1299,7 +1313,7 @@ check-tail: check-recursive check-multi
 	if test "$$untested" -ne "0"; then \
 	  echo "# of untested testcases		$$untested" >> libgo.sum; \
 	fi; \
-	echo `echo $(GOC) | sed -e 's/ .*//'`  `$(GOC) -v 2>&1 | grep " version" | sed -n -e 's/.* \(version.*$$\)/\1/p'` >> libgo.sum; \
+	echo `echo $(GOC) | sed -e 's/ .*//'`  `$(GOC) -v 2>&1 | grep " version" | sed -n -e 's/.* \(version.*\)$$/\1/p'` >> libgo.sum; \
 	echo >> libgo.log; \
 	echo "runtest completed at `date`" >> libgo.log; \
 	if test "$$fail" -ne "0"; then \

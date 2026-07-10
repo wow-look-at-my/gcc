@@ -1,5 +1,5 @@
 /* Assign reload pseudos.
-   Copyright (C) 2010-2022 Free Software Foundation, Inc.
+   Copyright (C) 2010-2024 Free Software Foundation, Inc.
    Contributed by Vladimir Makarov <vmakarov@redhat.com>.
 
 This file is part of GCC.
@@ -522,14 +522,15 @@ find_hard_regno_for_1 (int regno, int *cost, int try_only_hard_regno,
 	       r2 != NULL;
 	       r2 = r2->start_next)
 	    {
-	      if (r2->regno >= lra_constraint_new_regno_start
+	      if (live_pseudos_reg_renumber[r2->regno] < 0
+		  && r2->regno >= lra_constraint_new_regno_start
 		  && lra_reg_info[r2->regno].preferred_hard_regno1 >= 0
-		  && live_pseudos_reg_renumber[r2->regno] < 0
 		  && rclass_intersect_p[regno_allocno_class_array[r2->regno]])
 		sparseset_set_bit (conflict_reload_and_inheritance_pseudos,
 				   r2->regno);
-	      if (live_pseudos_reg_renumber[r2->regno] >= 0
-		  && rclass_intersect_p[regno_allocno_class_array[r2->regno]])
+	      else if (live_pseudos_reg_renumber[r2->regno] >= 0
+		       && rclass_intersect_p
+			    [regno_allocno_class_array[r2->regno]])
 		sparseset_set_bit (live_range_hard_reg_pseudos, r2->regno);
 	    }
 	}
@@ -948,7 +949,7 @@ spill_for (int regno, bitmap spilled_pseudo_bitmap, bool first_p)
     }
   best_hard_regno = -1;
   best_cost = INT_MAX;
-  best_static_p = TRUE;
+  best_static_p = true;
   best_insn_pseudos_num = INT_MAX;
   smallest_bad_spills_num = INT_MAX;
   rclass_size = ira_class_hard_regs_num[rclass];
@@ -1429,13 +1430,19 @@ assign_by_spills (void)
 	    hard_regno = spill_for (regno, &all_spilled_pseudos, iter == 1);
 	  if (hard_regno < 0)
 	    {
-	      if (reload_p) {
-		/* Put unassigned reload pseudo first in the
-		   array.  */
-		regno2 = sorted_pseudos[nfails];
-		sorted_pseudos[nfails++] = regno;
-		sorted_pseudos[i] = regno2;
-	      }
+	      if (reload_p)
+		{
+		  /* Put unassigned reload pseudo first in the array.  */
+		  regno2 = sorted_pseudos[nfails];
+		  sorted_pseudos[nfails++] = regno;
+		  sorted_pseudos[i] = regno2;
+		}
+	      else
+		{
+		  /* Consider all alternatives on the next constraint
+		     subpass.  */
+		  bitmap_set_bit (&all_spilled_pseudos, regno);
+		}
 	    }
 	  else
 	    {
@@ -1443,10 +1450,11 @@ assign_by_spills (void)
 		 pass.  Indicate that it is no longer spilled.  */
 	      bitmap_clear_bit (&all_spilled_pseudos, regno);
 	      assign_hard_regno (hard_regno, regno);
-	      if (! reload_p)
-		/* As non-reload pseudo assignment is changed we
-		   should reconsider insns referring for the
-		   pseudo.  */
+	      if (! reload_p || regno_allocno_class_array[regno] == ALL_REGS)
+		/* As non-reload pseudo assignment is changed we should
+		   reconsider insns referring for the pseudo.  Do the same if a
+		   reload pseudo did not refine its class which can happens
+		   when the pseudo occurs only in reload insns.  */
 		bitmap_set_bit (&changed_pseudo_bitmap, regno);
 	    }
 	}
@@ -1706,7 +1714,8 @@ find_reload_regno_insns (int regno, rtx_insn * &start, rtx_insn * &finish)
 {
   unsigned int uid;
   bitmap_iterator bi;
-  int n = 0;
+  int insns_num = 0;
+  bool clobber_p = false;
   rtx_insn *prev_insn, *next_insn;
   rtx_insn *start_insn = NULL, *first_insn = NULL, *second_insn = NULL;
   
@@ -1714,28 +1723,33 @@ find_reload_regno_insns (int regno, rtx_insn * &start, rtx_insn * &finish)
     {
       if (start_insn == NULL)
 	start_insn = lra_insn_recog_data[uid]->insn;
-      n++;
+      if (GET_CODE (PATTERN (lra_insn_recog_data[uid]->insn)) == CLOBBER)
+	clobber_p = true;
+      else
+	insns_num++;
     }
-  /* For reload pseudo we should have at most 3 insns referring for
+  /* For reload pseudo we should have at most 3 insns besides clobber referring for
      it: input/output reload insns and the original insn.  */
-  if (n > 3)
+  if (insns_num > 3)
     return false;
-  if (n > 1)
+  if (clobber_p)
+    insns_num++;
+  if (insns_num > 1)
     {
       for (prev_insn = PREV_INSN (start_insn),
 	     next_insn = NEXT_INSN (start_insn);
-	   n != 1 && (prev_insn != NULL || next_insn != NULL); )
+	   insns_num != 1 && (prev_insn != NULL
+			      || (next_insn != NULL && second_insn == NULL)); )
 	{
-	  if (prev_insn != NULL && first_insn == NULL)
+	  if (prev_insn != NULL)
 	    {
-	      if (! bitmap_bit_p (&lra_reg_info[regno].insn_bitmap,
-				  INSN_UID (prev_insn)))
-		prev_insn = PREV_INSN (prev_insn);
-	      else
+	      if (bitmap_bit_p (&lra_reg_info[regno].insn_bitmap,
+				INSN_UID (prev_insn)))
 		{
 		  first_insn = prev_insn;
-		  n--;
+		  insns_num--;
 		}
+		prev_insn = PREV_INSN (prev_insn);
 	    }
 	  if (next_insn != NULL && second_insn == NULL)
 	    {
@@ -1745,11 +1759,11 @@ find_reload_regno_insns (int regno, rtx_insn * &start, rtx_insn * &finish)
 	      else
 		{
 		  second_insn = next_insn;
-		  n--;
+		  insns_num--;
 		}
 	    }
 	}
-      if (n > 1)
+      if (insns_num > 1)
 	return false;
     }
   start = first_insn != NULL ? first_insn : start_insn;
@@ -1774,8 +1788,8 @@ lra_split_hard_reg_for (void)
      iterations.  Either it's an asm and something is wrong with the
      constraints, or we have run out of spill registers; error out in
      either case.  */
-  bool asm_p = false;
-  bitmap_head failed_reload_insns, failed_reload_pseudos;
+  bool asm_p = false, spill_p = false;
+  bitmap_head failed_reload_insns, failed_reload_pseudos, over_split_insns;
   
   if (lra_dump_file != NULL)
     fprintf (lra_dump_file,
@@ -1786,6 +1800,7 @@ lra_split_hard_reg_for (void)
   bitmap_ior (&non_reload_pseudos, &lra_inheritance_pseudos, &lra_split_regs);
   bitmap_ior_into (&non_reload_pseudos, &lra_subreg_reload_pseudos);
   bitmap_ior_into (&non_reload_pseudos, &lra_optional_reload_pseudos);
+  bitmap_initialize (&over_split_insns, &reg_obstack);
   for (i = lra_constraint_new_regno_start; i < max_regno; i++)
     if (reg_renumber[i] < 0 && lra_reg_info[i].nrefs != 0
 	&& (rclass = lra_get_allocno_class (i)) != NO_REGS
@@ -1793,14 +1808,42 @@ lra_split_hard_reg_for (void)
       {
 	if (! find_reload_regno_insns (i, first, last))
 	  continue;
-	if (BLOCK_FOR_INSN (first) == BLOCK_FOR_INSN (last)
-	    && spill_hard_reg_in_range (i, rclass, first, last))
+	if (BLOCK_FOR_INSN (first) == BLOCK_FOR_INSN (last))
 	  {
-	    bitmap_clear (&failed_reload_pseudos);
-	    return true;
+	    /* Check that we are not trying to split over the same insn
+	       requiring reloads to avoid splitting the same hard reg twice or
+	       more.  If we need several hard regs splitting over the same insn
+	       it can be finished on the next iterations.
+
+	       The following loop iteration number is small as we split hard
+	       reg in a very small range.  */
+	    for (insn = first;
+		 insn != NEXT_INSN (last);
+		 insn = NEXT_INSN (insn))
+	      if (bitmap_bit_p (&over_split_insns, INSN_UID (insn)))
+		break;
+	    if (insn != NEXT_INSN (last)
+		|| !spill_hard_reg_in_range (i, rclass, first, last))
+	      {
+		bitmap_set_bit (&failed_reload_pseudos, i);
+	      }
+	    else
+	      {
+		for (insn = first;
+		     insn != NEXT_INSN (last);
+		     insn = NEXT_INSN (insn))
+		  bitmap_set_bit (&over_split_insns, INSN_UID (insn));
+		spill_p = true;
+	      }
 	  }
-	bitmap_set_bit (&failed_reload_pseudos, i);
       }
+  bitmap_clear (&over_split_insns);
+  if (spill_p)
+    {
+      bitmap_clear (&failed_reload_pseudos);
+      lra_dump_insns_if_possible ("changed func after splitting hard regs");
+      return true;
+    }
   bitmap_clear (&non_reload_pseudos);
   bitmap_initialize (&failed_reload_insns, &reg_obstack);
   EXECUTE_IF_SET_IN_BITMAP (&failed_reload_pseudos, 0, u, bi)
@@ -1816,20 +1859,8 @@ lra_split_hard_reg_for (void)
       insn = lra_insn_recog_data[u]->insn;
       if (asm_noperands (PATTERN (insn)) >= 0)
 	{
-	  lra_asm_error_p = asm_p = true;
-	  error_for_asm (insn,
-			 "%<asm%> operand has impossible constraints");
-	  /* Avoid further trouble with this insn.  */
-	  if (JUMP_P (insn))
-	    {
-	      ira_nullify_asm_goto (insn);
-	      lra_update_insn_regno_info (insn);
-	    }
-	  else
-	    {
-	      PATTERN (insn) = gen_rtx_USE (VOIDmode, const0_rtx);
-	      lra_set_insn_deleted (insn);
-	    }
+	  asm_p = true;
+	  lra_asm_insn_error (insn);
 	}
       else if (!asm_p)
 	{

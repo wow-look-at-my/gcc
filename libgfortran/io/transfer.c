@@ -1,4 +1,4 @@
-/* Copyright (C) 2002-2022 Free Software Foundation, Inc.
+/* Copyright (C) 2002-2024 Free Software Foundation, Inc.
    Contributed by Andy Vaught
    Namelist transfer functions contributed by Paul Thomas
    F2003 I/O support contributed by Jerry DeLisle
@@ -1092,17 +1092,17 @@ unformatted_read (st_parameter_dt *dtp, bt type,
 
   if (type == BT_CLASS)
     {
-	  int unit = dtp->u.p.current_unit->unit_number;
+	  GFC_INTEGER_4 unit = dtp->u.p.current_unit->unit_number;
 	  char tmp_iomsg[IOMSG_LEN] = "";
 	  char *child_iomsg;
 	  gfc_charlen_type child_iomsg_len;
-	  int noiostat;
-	  int *child_iostat = NULL;
+	  GFC_INTEGER_4 noiostat;
+	  GFC_INTEGER_4 *child_iostat = NULL;
 
 	  /* Set iostat, intent(out).  */
 	  noiostat = 0;
-	  child_iostat = (dtp->common.flags & IOPARM_HAS_IOSTAT) ?
-			  dtp->common.iostat : &noiostat;
+	  child_iostat = ((dtp->common.flags & IOPARM_HAS_IOSTAT)
+			  ? dtp->common.iostat : &noiostat);
 
 	  /* Set iomsg, intent(inout).  */
 	  if (dtp->common.flags & IOPARM_HAS_IOMSG)
@@ -1119,8 +1119,22 @@ unformatted_read (st_parameter_dt *dtp, bt type,
 	  /* Call the user defined unformatted READ procedure.  */
 	  dtp->u.p.current_unit->child_dtio++;
 	  dtp->u.p.ufdtio_ptr (dest, &unit, child_iostat, child_iomsg,
-			      child_iomsg_len);
+			       child_iomsg_len);
+	  dtp->u.p.child_saved_iostat = *child_iostat;
 	  dtp->u.p.current_unit->child_dtio--;
+
+	  if ((dtp->u.p.child_saved_iostat != 0) &&
+	      !(dtp->common.flags & IOPARM_HAS_IOMSG) &&
+	      !(dtp->common.flags & IOPARM_HAS_IOSTAT))
+	    {
+	      char message[IOMSG_LEN + 1];
+	      child_iomsg_len = string_len_trim (IOMSG_LEN, child_iomsg);
+	      fstrcpy (message, child_iomsg_len, child_iomsg, child_iomsg_len);
+	      message[child_iomsg_len] = '\0';
+	      generate_error (&dtp->common, dtp->u.p.child_saved_iostat,
+			      message);
+	    }
+
 	  return;
     }
 
@@ -1222,17 +1236,17 @@ unformatted_write (st_parameter_dt *dtp, bt type,
 
   if (type == BT_CLASS)
     {
-	  int unit = dtp->u.p.current_unit->unit_number;
+	  GFC_INTEGER_4 unit = dtp->u.p.current_unit->unit_number;
 	  char tmp_iomsg[IOMSG_LEN] = "";
 	  char *child_iomsg;
 	  gfc_charlen_type child_iomsg_len;
-	  int noiostat;
-	  int *child_iostat = NULL;
+	  GFC_INTEGER_4 noiostat;
+	  GFC_INTEGER_4 *child_iostat = NULL;
 
 	  /* Set iostat, intent(out).  */
 	  noiostat = 0;
-	  child_iostat = (dtp->common.flags & IOPARM_HAS_IOSTAT) ?
-			  dtp->common.iostat : &noiostat;
+	  child_iostat = ((dtp->common.flags & IOPARM_HAS_IOSTAT)
+			  ? dtp->common.iostat : &noiostat);
 
 	  /* Set iomsg, intent(inout).  */
 	  if (dtp->common.flags & IOPARM_HAS_IOMSG)
@@ -1249,8 +1263,21 @@ unformatted_write (st_parameter_dt *dtp, bt type,
 	  /* Call the user defined unformatted WRITE procedure.  */
 	  dtp->u.p.current_unit->child_dtio++;
 	  dtp->u.p.ufdtio_ptr (source, &unit, child_iostat, child_iomsg,
-			      child_iomsg_len);
+			       child_iomsg_len);
+	  dtp->u.p.child_saved_iostat = *child_iostat;
 	  dtp->u.p.current_unit->child_dtio--;
+
+	  if ((dtp->u.p.child_saved_iostat != 0) &&
+	      !(dtp->common.flags & IOPARM_HAS_IOMSG) &&
+	      !(dtp->common.flags & IOPARM_HAS_IOSTAT))
+	    {
+	      char message[IOMSG_LEN + 1];
+	      child_iomsg_len = string_len_trim (IOMSG_LEN, child_iomsg);
+	      fstrcpy (message, child_iomsg_len, child_iomsg, child_iomsg_len);
+	      message[child_iomsg_len] = '\0';
+	      generate_error (&dtp->common, dtp->u.p.child_saved_iostat,
+			      message);
+	    }
 	  return;
     }
 
@@ -1614,6 +1641,10 @@ formatted_transfer_scalar_read (st_parameter_dt *dtp, bt type, void *p, int kind
 	  if (!(compile_options.allow_std & GFC_STD_F2008)
               && require_type (dtp, BT_INTEGER, type, f))
 	    return;
+#ifdef HAVE_GFC_REAL_17
+	  if (type == BT_REAL && kind == 17)
+	    kind = 16;
+#endif
 	  read_radix (dtp, f, p, kind, 2);
 	  break;
 
@@ -1626,6 +1657,10 @@ formatted_transfer_scalar_read (st_parameter_dt *dtp, bt type, void *p, int kind
 	  if (!(compile_options.allow_std & GFC_STD_F2008)
               && require_type (dtp, BT_INTEGER, type, f))
 	    return;
+#ifdef HAVE_GFC_REAL_17
+	  if (type == BT_REAL && kind == 17)
+	    kind = 16;
+#endif
 	  read_radix (dtp, f, p, kind, 8);
 	  break;
 
@@ -1638,6 +1673,10 @@ formatted_transfer_scalar_read (st_parameter_dt *dtp, bt type, void *p, int kind
 	  if (!(compile_options.allow_std & GFC_STD_F2008)
               && require_type (dtp, BT_INTEGER, type, f))
 	    return;
+#ifdef HAVE_GFC_REAL_17
+	  if (type == BT_REAL && kind == 17)
+	    kind = 16;
+#endif
 	  read_radix (dtp, f, p, kind, 16);
 	  break;
 
@@ -1676,13 +1715,13 @@ formatted_transfer_scalar_read (st_parameter_dt *dtp, bt type, void *p, int kind
 	    return;
 	  if (require_type (dtp, BT_CLASS, type, f))
 	    return;
-	  int unit = dtp->u.p.current_unit->unit_number;
+	  GFC_INTEGER_4 unit = dtp->u.p.current_unit->unit_number;
 	  char dt[] = "DT";
 	  char tmp_iomsg[IOMSG_LEN] = "";
 	  char *child_iomsg;
 	  gfc_charlen_type child_iomsg_len;
-	  int noiostat;
-	  int *child_iostat = NULL;
+	  GFC_INTEGER_4 noiostat;
+	  GFC_INTEGER_4 *child_iostat = NULL;
 	  char *iotype;
 	  gfc_charlen_type iotype_len = f->u.udf.string_len;
 
@@ -1697,8 +1736,8 @@ formatted_transfer_scalar_read (st_parameter_dt *dtp, bt type, void *p, int kind
 
 	  /* Set iostat, intent(out).  */
 	  noiostat = 0;
-	  child_iostat = (dtp->common.flags & IOPARM_HAS_IOSTAT) ?
-			  dtp->common.iostat : &noiostat;
+	  child_iostat = ((dtp->common.flags & IOPARM_HAS_IOSTAT)
+			  ? dtp->common.iostat : &noiostat);
 
 	  /* Set iomsg, intent(inout).  */
 	  if (dtp->common.flags & IOPARM_HAS_IOMSG)
@@ -1718,7 +1757,20 @@ formatted_transfer_scalar_read (st_parameter_dt *dtp, bt type, void *p, int kind
 	  dtp->u.p.fdtio_ptr (p, &unit, iotype, f->u.udf.vlist,
 			      child_iostat, child_iomsg,
 			      iotype_len, child_iomsg_len);
+	  dtp->u.p.child_saved_iostat = *child_iostat;
 	  dtp->u.p.current_unit->child_dtio--;
+
+	  if ((dtp->u.p.child_saved_iostat != 0) &&
+	      !(dtp->common.flags & IOPARM_HAS_IOMSG) &&
+	      !(dtp->common.flags & IOPARM_HAS_IOSTAT))
+	    {
+	      char message[IOMSG_LEN + 1];
+	      child_iomsg_len = string_len_trim (IOMSG_LEN, child_iomsg);
+	      fstrcpy (message, child_iomsg_len, child_iomsg, child_iomsg_len);
+	      message[child_iomsg_len] = '\0';
+	      generate_error (&dtp->common, dtp->u.p.child_saved_iostat,
+			      message);
+	    }
 
 	  if (f->u.udf.string_len != 0)
 	    free (iotype);
@@ -2060,11 +2112,11 @@ formatted_transfer_scalar_write (st_parameter_dt *dtp, bt type, void *p, int kin
 	  dtp->u.p.skips = dtp->u.p.pending_spaces = 0;
 	}
 
-      bytes_used = dtp->u.p.current_unit->recl
-		   - dtp->u.p.current_unit->bytes_left;
-
       if (is_stream_io(dtp))
-	bytes_used = 0;
+	bytes_used = dtp->u.p.current_unit->fbuf->act;
+      else
+	bytes_used = dtp->u.p.current_unit->recl
+		    - dtp->u.p.current_unit->bytes_left;
 
       switch (t)
 	{
@@ -2085,6 +2137,10 @@ formatted_transfer_scalar_write (st_parameter_dt *dtp, bt type, void *p, int kin
 	  if (!(compile_options.allow_std & GFC_STD_F2008)
               && require_type (dtp, BT_INTEGER, type, f))
 	    return;
+#ifdef HAVE_GFC_REAL_17
+	  if (type == BT_REAL && kind == 17)
+	    kind = 16;
+#endif
 	  write_b (dtp, f, p, kind);
 	  break;
 
@@ -2097,6 +2153,10 @@ formatted_transfer_scalar_write (st_parameter_dt *dtp, bt type, void *p, int kin
 	  if (!(compile_options.allow_std & GFC_STD_F2008)
               && require_type (dtp, BT_INTEGER, type, f))
 	    return;
+#ifdef HAVE_GFC_REAL_17
+	  if (type == BT_REAL && kind == 17)
+	    kind = 16;
+#endif
 	  write_o (dtp, f, p, kind);
 	  break;
 
@@ -2109,6 +2169,10 @@ formatted_transfer_scalar_write (st_parameter_dt *dtp, bt type, void *p, int kin
 	  if (!(compile_options.allow_std & GFC_STD_F2008)
               && require_type (dtp, BT_INTEGER, type, f))
 	    return;
+#ifdef HAVE_GFC_REAL_17
+	  if (type == BT_REAL && kind == 17)
+	    kind = 16;
+#endif
 	  write_z (dtp, f, p, kind);
 	  break;
 
@@ -2145,13 +2209,13 @@ formatted_transfer_scalar_write (st_parameter_dt *dtp, bt type, void *p, int kin
 	case FMT_DT:
 	  if (n == 0)
 	    goto need_data;
-	  int unit = dtp->u.p.current_unit->unit_number;
+	  GFC_INTEGER_4 unit = dtp->u.p.current_unit->unit_number;
 	  char dt[] = "DT";
 	  char tmp_iomsg[IOMSG_LEN] = "";
 	  char *child_iomsg;
 	  gfc_charlen_type child_iomsg_len;
-	  int noiostat;
-	  int *child_iostat = NULL;
+	  GFC_INTEGER_4 noiostat;
+	  GFC_INTEGER_4 *child_iostat = NULL;
 	  char *iotype;
 	  gfc_charlen_type iotype_len = f->u.udf.string_len;
 
@@ -2166,8 +2230,8 @@ formatted_transfer_scalar_write (st_parameter_dt *dtp, bt type, void *p, int kin
 
 	  /* Set iostat, intent(out).  */
 	  noiostat = 0;
-	  child_iostat = (dtp->common.flags & IOPARM_HAS_IOSTAT) ?
-			  dtp->common.iostat : &noiostat;
+	  child_iostat = ((dtp->common.flags & IOPARM_HAS_IOSTAT)
+			  ? dtp->common.iostat : &noiostat);
 
 	  /* Set iomsg, intent(inout).  */
 	  if (dtp->common.flags & IOPARM_HAS_IOMSG)
@@ -2190,7 +2254,20 @@ formatted_transfer_scalar_write (st_parameter_dt *dtp, bt type, void *p, int kin
 	  dtp->u.p.fdtio_ptr (p, &unit, iotype, f->u.udf.vlist,
 			      child_iostat, child_iomsg,
 			      iotype_len, child_iomsg_len);
+	  dtp->u.p.child_saved_iostat = *child_iostat;
 	  dtp->u.p.current_unit->child_dtio--;
+
+	  if ((dtp->u.p.child_saved_iostat != 0) &&
+	      !(dtp->common.flags & IOPARM_HAS_IOMSG) &&
+	      !(dtp->common.flags & IOPARM_HAS_IOSTAT))
+	    {
+	      char message[IOMSG_LEN + 1];
+	      child_iomsg_len = string_len_trim (IOMSG_LEN, child_iomsg);
+	      fstrcpy (message, child_iomsg_len, child_iomsg, child_iomsg_len);
+	      message[child_iomsg_len] = '\0';
+	      generate_error (&dtp->common, dtp->u.p.child_saved_iostat,
+			      message);
+	    }
 
 	  if (f->u.udf.string_len != 0)
 	    free (iotype);
@@ -2428,7 +2505,11 @@ formatted_transfer_scalar_write (st_parameter_dt *dtp, bt type, void *p, int kin
 	  p = ((char *) p) + size;
 	}
 
-      pos = dtp->u.p.current_unit->recl - dtp->u.p.current_unit->bytes_left;
+      if (is_stream_io(dtp))
+	pos = dtp->u.p.current_unit->fbuf->act;
+      else
+	pos = dtp->u.p.current_unit->recl - dtp->u.p.current_unit->bytes_left;
+
       dtp->u.p.max_pos = (dtp->u.p.max_pos > pos) ? dtp->u.p.max_pos : pos;
     }
 
@@ -4498,8 +4579,7 @@ st_read_done_worker (st_parameter_dt *dtp, bool unlock)
 	    {
 	      free (dtp->u.p.current_unit->filename);
 	      dtp->u.p.current_unit->filename = NULL;
-	      if (dtp->u.p.current_unit->ls)
-		free (dtp->u.p.current_unit->ls);
+	      free (dtp->u.p.current_unit->ls);
 	      dtp->u.p.current_unit->ls = NULL;
 	    }
 	  free_newunit = true;
@@ -4515,9 +4595,9 @@ st_read_done_worker (st_parameter_dt *dtp, bool unlock)
    if (free_newunit)
      {
        /* Avoid inverse lock issues by placing after unlock_unit.  */
-       LOCK (&unit_lock);
+       WRLOCK (&unit_rwlock);
        newunit_free (dtp->common.unit);
-       UNLOCK (&unit_lock);
+       RWUNLOCK (&unit_rwlock);
      }
 }
 
@@ -4529,7 +4609,7 @@ st_read_done (st_parameter_dt *dtp)
       if (dtp->u.p.current_unit->au)
 	{
 	  if (dtp->common.flags & IOPARM_DT_HAS_ID)
-	    *dtp->id = enqueue_done_id (dtp->u.p.current_unit->au, AIO_READ_DONE);  
+	    *dtp->id = enqueue_done_id (dtp->u.p.current_unit->au, AIO_READ_DONE);
 	  else
 	    {
 	      if (dtp->u.p.async)
@@ -4595,8 +4675,7 @@ st_write_done_worker (st_parameter_dt *dtp, bool unlock)
 	    {
 	      free (dtp->u.p.current_unit->filename);
 	      dtp->u.p.current_unit->filename = NULL;
-	      if (dtp->u.p.current_unit->ls)
-		free (dtp->u.p.current_unit->ls);
+	      free (dtp->u.p.current_unit->ls);
 	      dtp->u.p.current_unit->ls = NULL;
 	    }
 	  free_newunit = true;
@@ -4612,9 +4691,9 @@ st_write_done_worker (st_parameter_dt *dtp, bool unlock)
    if (free_newunit)
      {
        /* Avoid inverse lock issues by placing after unlock_unit.  */
-       LOCK (&unit_lock);
+       WRLOCK (&unit_rwlock);
        newunit_free (dtp->common.unit);
-       UNLOCK (&unit_lock);
+       RWUNLOCK (&unit_rwlock);
      }
 }
 

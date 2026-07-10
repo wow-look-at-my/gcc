@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 B o d y                                  --
 --                                                                          --
---           Copyright (C) 2020-2022, Free Software Foundation, Inc.        --
+--           Copyright (C) 2020-2024, Free Software Foundation, Inc.        --
 --                                                                          --
 -- GNAT is free software;  you can  redistribute it  and/or modify it under --
 -- terms of the  GNU General Public License as published  by the Free Soft- --
@@ -50,7 +50,7 @@ package body Sinfo.Utils is
 
    --  Either way, gnat1 will stop when node 12345 is created, or certain other
    --  interesting operations are performed, such as Rewrite. To see exactly
-   --  which operations, search for "pragma Debug" below.
+   --  which operations, search for "New_Node_Debugging_Output" in Atree.
 
    --  The second method is much faster if the amount of Ada code being
    --  compiled is large.
@@ -191,7 +191,7 @@ package body Sinfo.Utils is
    function End_Location (N : Node_Id) return Source_Ptr is
       L : constant Valid_Uint := End_Span (N);
    begin
-      return Source_Ptr (Int (Sloc (N)) + UI_To_Int (L));
+      return Sloc (N) + Source_Ptr (UI_To_Int (L));
    end End_Location;
 
    --------------------
@@ -214,7 +214,7 @@ package body Sinfo.Utils is
    procedure Set_End_Location (N : Node_Id; S : Source_Ptr) is
    begin
       Set_End_Span (N,
-        UI_From_Int (Int (S) - Int (Sloc (N))));
+        UI_From_Int (Int (S - Sloc (N))));
    end Set_End_Location;
 
    --------------------------

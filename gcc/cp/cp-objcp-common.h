@@ -1,5 +1,5 @@
 /* Language hooks common to C++ and ObjC++ front ends.
-   Copyright (C) 2004-2022 Free Software Foundation, Inc.
+   Copyright (C) 2004-2024 Free Software Foundation, Inc.
    Contributed by Ziemowit Laski  <zlaski@apple.com>
 
 This file is part of GCC.
@@ -24,16 +24,17 @@ along with GCC; see the file COPYING3.  If not see
 /* In cp/objcp-common.c, cp/cp-lang.cc and objcp/objcp-lang.cc.  */
 
 extern tree cp_get_debug_type (const_tree);
-extern tree objcp_tsubst_copy_and_build (tree, tree, tsubst_flags_t,
-					 tree, bool);
+extern tree objcp_tsubst_expr (tree, tree, tsubst_flags_t, tree);
 
 extern int cp_decl_dwarf_attribute (const_tree, int);
 extern int cp_type_dwarf_attribute (const_tree, int);
 extern void cp_common_init_ts (void);
 extern tree cp_unit_size_without_reusable_padding (tree);
+extern tree cp_classtype_as_base (const_tree);
 extern tree cp_get_global_decls ();
 extern tree cp_pushdecl (tree);
 extern void cp_register_dumps (gcc::dump_manager *);
+extern void cp_register_features ();
 extern bool cp_handle_option (size_t, const char *, HOST_WIDE_INT, int,
 			      location_t, const struct cl_option_handlers *);
 extern tree cxx_make_type_hook			(tree_code);
@@ -122,13 +123,16 @@ extern tree cxx_simulate_record_decl (location_t, const char *,
 #undef LANG_HOOKS_FINALIZE_EARLY_DEBUG
 #define LANG_HOOKS_FINALIZE_EARLY_DEBUG c_common_finalize_early_debug
 
-/* Attribute hooks.  */
-#undef LANG_HOOKS_COMMON_ATTRIBUTE_TABLE
-#define LANG_HOOKS_COMMON_ATTRIBUTE_TABLE c_common_attribute_table
-#undef LANG_HOOKS_FORMAT_ATTRIBUTE_TABLE
-#define LANG_HOOKS_FORMAT_ATTRIBUTE_TABLE c_common_format_attribute_table
+static const scoped_attribute_specs *const cp_objcp_attribute_table[] =
+{
+  &std_attribute_table,
+  &cxx_gnu_attribute_table,
+  &c_common_gnu_attribute_table,
+  &c_common_format_attribute_table
+};
+
 #undef LANG_HOOKS_ATTRIBUTE_TABLE
-#define LANG_HOOKS_ATTRIBUTE_TABLE cxx_attribute_table
+#define LANG_HOOKS_ATTRIBUTE_TABLE cp_objcp_attribute_table
 
 #undef LANG_HOOKS_TREE_INLINING_VAR_MOD_TYPE_P
 #define LANG_HOOKS_TREE_INLINING_VAR_MOD_TYPE_P cp_var_mod_type_p
@@ -167,6 +171,8 @@ extern tree cxx_simulate_record_decl (location_t, const char *,
 #define LANG_HOOKS_TYPE_DWARF_ATTRIBUTE cp_type_dwarf_attribute
 #undef LANG_HOOKS_UNIT_SIZE_WITHOUT_REUSABLE_PADDING
 #define LANG_HOOKS_UNIT_SIZE_WITHOUT_REUSABLE_PADDING cp_unit_size_without_reusable_padding
+#undef LANG_HOOKS_CLASSTYPE_AS_BASE
+#define LANG_HOOKS_CLASSTYPE_AS_BASE cp_classtype_as_base
 
 #undef LANG_HOOKS_OMP_PREDETERMINED_SHARING
 #define LANG_HOOKS_OMP_PREDETERMINED_SHARING cxx_omp_predetermined_sharing
@@ -184,8 +190,6 @@ extern tree cxx_simulate_record_decl (location_t, const char *,
 #define LANG_HOOKS_OMP_FINISH_CLAUSE cxx_omp_finish_clause
 #undef LANG_HOOKS_OMP_PRIVATIZE_BY_REFERENCE
 #define LANG_HOOKS_OMP_PRIVATIZE_BY_REFERENCE cxx_omp_privatize_by_reference
-#undef LANG_HOOKS_OMP_MAPPABLE_TYPE
-#define LANG_HOOKS_OMP_MAPPABLE_TYPE cp_omp_mappable_type
 #undef LANG_HOOKS_OMP_DISREGARD_VALUE_EXPR
 #define LANG_HOOKS_OMP_DISREGARD_VALUE_EXPR cxx_omp_disregard_value_expr
 

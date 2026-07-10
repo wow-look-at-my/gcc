@@ -26,7 +26,7 @@ extern (C++, "std")
     struct nothrow_t {}
 
     ///
-    enum align_val_t : size_t { defaultAlignment = __STDCPP_DEFAULT_NEW_ALIGNMENT__ };
+    enum align_val_t : size_t { defaultAlignment = __STDCPP_DEFAULT_NEW_ALIGNMENT__ }
 
     ///
     class bad_alloc : exception
@@ -59,6 +59,8 @@ T cpp_new(T, Args...)(auto ref Args args) if (is(T == class))
 ///
 void cpp_delete(T)(T* ptr) if (!is(T == class))
 {
+    if (ptr is null)
+        return;
     destroy!false(*ptr);
     __cpp_delete(ptr);
 }
@@ -66,6 +68,8 @@ void cpp_delete(T)(T* ptr) if (!is(T == class))
 ///
 void cpp_delete(T)(T instance) if (is(T == class))
 {
+    if (instance is null)
+        return;
     destroy!false(instance);
     __cpp_delete(cast(void*) instance);
 }

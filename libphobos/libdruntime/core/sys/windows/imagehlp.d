@@ -9,7 +9,6 @@
  */
 module core.sys.windows.imagehlp;
 version (Windows):
-@system:
 
 version (ANSI) {} else version = Unicode;
 
@@ -276,7 +275,7 @@ struct IMAGEHLP_DUPLICATE_SYMBOL {
 }
 alias IMAGEHLP_DUPLICATE_SYMBOL* PIMAGEHLP_DUPLICATE_SYMBOL;
 
-mixin DECLARE_HANDLE!("DIGEST_HANDLE");
+alias DIGEST_HANDLE = HANDLE;
 
 extern (Windows) {
     alias BOOL function(IMAGEHLP_STATUS_REASON, LPSTR, LPSTR, ULONG_PTR, ULONG_PTR)

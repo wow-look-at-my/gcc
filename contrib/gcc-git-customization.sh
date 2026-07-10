@@ -7,7 +7,7 @@ ask () {
     question=$1
     default=$2
     var=$3
-    echo -n $question "["$default"]? "
+    printf "%s [%s]? " "$question" "$default"
     read answer
     if [ "x$answer" = "x" ]
     then
@@ -30,6 +30,11 @@ git config alias.gcc-backport '!f() { "`git rev-parse --show-toplevel`/contrib/g
 git config alias.gcc-fix-changelog '!f() { "`git rev-parse --show-toplevel`/contrib/git-fix-changelog.py" $@; } ; f'
 git config alias.gcc-mklog '!f() { "`git rev-parse --show-toplevel`/contrib/mklog.py" $@; } ; f'
 git config alias.gcc-commit-mklog '!f() { "`git rev-parse --show-toplevel`/contrib/git-commit-mklog.py" "$@"; }; f'
+git config alias.gcc-style '!f() {
+    check=`git rev-parse --show-toplevel`/contrib/check_GNU_style.py;
+    arg=; if [ $# -ge 1 ] && [ "$1" != "-f" ]; then arg="$1"; shift;
+    elif [ $# -eq 3 ]; then arg="$3"; set -- "$1" "$2"; fi
+    git show $arg | $check "$@" -; }; f'
 
 # Make diff on MD files use "(define" as a function marker.
 # Use this in conjunction with a .gitattributes file containing
@@ -46,7 +51,11 @@ set_email=$(git config --get "user.email")
 if [ "x$set_user" = "x" ]
 then
     # Try to guess the user's name by looking it up in the password file
-    new_user=$(getent passwd $(whoami) | awk -F: '{ print $5 }')
+    if type getent >/dev/null 2>&1; then
+      new_user=$(getent passwd $(whoami) | awk -F: '{ print $5 }')
+    elif [ $(uname -s) = Darwin ]; then
+      new_user=$(id -F 2>/dev/null)
+    fi
     if [ "x$new_user" = "x" ]
     then
        new_user="(no default)"
@@ -110,7 +119,7 @@ then
 	# This is a pure guess, but for many people it might be OK.
 	remote_id=$(whoami)
     else
-	remote_id=$(echo $url | sed -r "s|^.*ssh://(.+)@gcc.gnu.org.*$|\1|")
+	remote_id=$(echo $url | sed 's|^.*ssh://\(..*\)@gcc.gnu.org.*$|\1|')
 	if [ x$remote_id = x$url ]
 	then
 	    remote_id=$(whoami)
@@ -118,7 +127,7 @@ then
     fi
 fi
 
-ask "Account name on gcc.gnu.org (for your personal branches area)" $remote_id remote_id
+ask "Account name on gcc.gnu.org (for your personal branches area)" "$remote_id" remote_id
 git config "gcc-config.user" "$remote_id"
 
 old_pfx=$(git config --get "gcc-config.userpfx")
@@ -135,16 +144,20 @@ git config "gcc-config.userpfx" "$new_pfx"
 echo
 ask "Install prepare-commit-msg git hook for 'git commit-mklog' alias" yes dohook
 if [ "x$dohook" = xyes ]; then
-    hookdir=`git rev-parse --git-path hooks`
-    if [ -f "$hookdir/prepare-commit-msg" ]; then
-	echo " Moving existing prepare-commit-msg hook to prepare-commit-msg.bak"
-	mv "$hookdir/prepare-commit-msg" "$hookdir/prepare-commit-msg.bak"
+    hookdir=`git rev-parse --git-path hooks 2>/dev/null`
+    if [ $? -eq 0 ]; then
+	if [ -f "$hookdir/prepare-commit-msg" ]; then
+	    echo " Moving existing prepare-commit-msg hook to prepare-commit-msg.bak"
+	    mv "$hookdir/prepare-commit-msg" "$hookdir/prepare-commit-msg.bak"
+	fi
+	install -c "`git rev-parse --show-toplevel`/contrib/prepare-commit-msg" "$hookdir"
+    else
+	echo " `git --version` is too old, cannot find hooks dir"
     fi
-    install -c "`git rev-parse --show-toplevel`/contrib/prepare-commit-msg" "$hookdir"
 fi
 
 # Scan the existing settings to see if there are any we need to rewrite.
-vendors=$(git config --get-all "remote.${upstream}.fetch" "refs/vendors/" | sed -r "s:.*refs/vendors/([^/]+)/.*:\1:" | sort | uniq)
+vendors=$(git config --get-all "remote.${upstream}.fetch" "refs/vendors/" | sed 's:.*refs/vendors/\([^/][^/]*\)/.*:\1:' | sort | uniq)
 url=$(git config --get "remote.${upstream}.url")
 pushurl=$(git config --get "remote.${upstream}.pushurl")
 for v in $vendors

@@ -86,12 +86,11 @@ fail_compilation/shared.d(2148): Error: direct access to shared `*c` is not allo
 fail_compilation/shared.d(2154): Error: direct access to shared `*c.c1` is not allowed, see `core.atomic`
 fail_compilation/shared.d(2160): Error: direct access to shared `*c.c1.c1` is not allowed, see `core.atomic`
 fail_compilation/shared.d(2181): Error: direct access to shared `k` is not allowed, see `core.atomic`
-fail_compilation/shared.d(2187): Error: direct access to shared `k.k2.k1` is not allowed, see `core.atomic`
+fail_compilation/shared.d(2187): Error: direct access to shared `k.k2.k1.value` is not allowed, see `core.atomic`
 fail_compilation/shared.d(2194): Error: direct access to shared `(new shared(K2)).k1` is not allowed, see `core.atomic`
 fail_compilation/shared.d(2202): Error: direct access to shared `c` is not allowed, see `core.atomic`
 fail_compilation/shared.d(2206): Error: function `shared.test_inference_2` function returns `shared` but cannot be inferred `ref`
 fail_compilation/shared.d(2208): Error: returning `c` escapes a reference to parameter `c`
-fail_compilation/shared.d(2208):        perhaps annotate the parameter with `return`
 fail_compilation/shared.d(2214): Error: function `shared.test_inference_3` function returns `shared` but cannot be inferred `ref`
 fail_compilation/shared.d(2216):        return value `getSharedObject()` is not an lvalue
 fail_compilation/shared.d(2222): Error: direct access to shared `a` is not allowed, see `core.atomic`
@@ -100,6 +99,7 @@ fail_compilation/shared.d(2222):        cannot implicitly convert `a` of type `s
 fail_compilation/shared.d(2222): Error: cannot implicitly convert expression `a` of type `shared(const(Object))` to `object.Object`
 ---
  */
+
 #line 2100
 // Derived from https://issues.dlang.org/show_bug.cgi?id=20908
 ref shared(int) test20908()
@@ -224,4 +224,57 @@ auto ref test_inference_3()
 auto ref Object test_inference_4(const return shared ref Object a)
 {
     return a;
+}
+
+// https://issues.dlang.org/show_bug.cgi?id=23226
+// Allow accessing non-shared `this`
+struct BitRange
+{
+    int bits;
+    void f()
+    {
+        this.bits++;
+    }
+}
+
+/*
+TEST_OUTPUT:
+---
+fail_compilation/shared.d(3004): Error: cast from `void*` to `shared(int*)` not allowed in safe code
+fail_compilation/shared.d(3005): Error: cast from `void*` to `shared(const(int*))` not allowed in safe code
+fail_compilation/shared.d(3008): Error: cast from `shared(void*)` to `int*` not allowed in safe code
+fail_compilation/shared.d(3009): Error: cast from `shared(void*)` to `shared(const(int*))` not allowed in safe code
+---
+*/
+
+#line 3000
+
+void test_casting_safe() @safe
+{
+    void *p;
+    auto t1 = cast(shared(int*))p;
+    auto t2 = cast(const(shared(int*)))p;
+
+    shared void* s;
+    auto x1 = cast(int*)s;
+    auto x2 = cast(const(shared(int*)))s;
+}
+
+#line 3100
+
+// https://issues.dlang.org/show_bug.cgi?id=23783
+
+/*
+TEST_OUTPUT:
+---
+fail_compilation/shared.d(3114): Error: direct access to shared `x` is not allowed, see `core.atomic`
+fail_compilation/shared.d(3115): Error: direct access to shared `x` is not allowed, see `core.atomic`
+---
+*/
+
+void test23783()
+{
+    shared int x = 3;
+    assert(x == 3);
+    bool b = x == 3;
 }

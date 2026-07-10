@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 S p e c                                  --
 --                                                                          --
---          Copyright (C) 1992-2022, Free Software Foundation, Inc.         --
+--          Copyright (C) 1992-2024, Free Software Foundation, Inc.         --
 --                                                                          --
 -- This specification is derived from the Ada Reference Manual for use with --
 -- GNAT. The copyright notice above, and the license provisions that follow --
@@ -47,7 +47,10 @@ with Ada.Strings.Maps; use type Ada.Strings.Maps.Character_Mapping_Function;
 with Ada.Strings.Superbounded;
 with Ada.Strings.Search;
 
-package Ada.Strings.Bounded with SPARK_Mode is
+package Ada.Strings.Bounded with
+  SPARK_Mode,
+  Always_Terminates
+is
    pragma Preelaborate;
 
    generic
@@ -56,7 +59,8 @@ package Ada.Strings.Bounded with SPARK_Mode is
 
    package Generic_Bounded_Length with SPARK_Mode,
      Initial_Condition => Length (Null_Bounded_String) = 0,
-     Abstract_State    => null
+     Abstract_State    => null,
+     Always_Terminates
    is
       --  Preconditions in this unit are meant for analysis only, not for
       --  run-time checking, so that the expected exceptions are raised. This
@@ -1339,6 +1343,9 @@ package Ada.Strings.Bounded with SPARK_Mode is
             (for all K in 1 .. Length (Source) =>
                Element (Translate'Result, K) = Mapping (Element (Source, K))),
         Global => null;
+      pragma Annotate (GNATprove, False_Positive,
+                       "call via access-to-subprogram",
+                       "function Mapping must always terminate");
 
       procedure Translate
         (Source  : in out Bounded_String;
@@ -1350,6 +1357,9 @@ package Ada.Strings.Bounded with SPARK_Mode is
             (for all K in 1 .. Length (Source) =>
                Element (Source, K) = Mapping (Element (Source'Old, K))),
         Global => null;
+      pragma Annotate (GNATprove, False_Positive,
+                       "call via access-to-subprogram",
+                       "function Mapping must always terminate");
 
       ---------------------------------------
       -- String Transformation Subprograms --
@@ -1898,7 +1908,7 @@ package Ada.Strings.Bounded with SPARK_Mode is
                --  some characters of Source are remaining at the left.
 
                and then
-                 (if New_Item'Length > Max_Length then
+                 (if New_Item'Length >= Max_Length then
 
                     --  New_Item covers all Max_Length characters
 
@@ -1984,7 +1994,7 @@ package Ada.Strings.Bounded with SPARK_Mode is
                --  some characters of Source are remaining at the left.
 
                and then
-                 (if New_Item'Length > Max_Length then
+                 (if New_Item'Length >= Max_Length then
 
                     --  New_Item covers all Max_Length characters
 

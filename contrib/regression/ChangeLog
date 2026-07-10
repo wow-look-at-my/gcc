@@ -1,3 +1,36 @@
+2026-06-26  Release Manager
+
+	* GCC 14.4.0 released.
+
+2025-05-23  Release Manager
+
+	* GCC 14.3.0 released.
+
+2024-08-01  Release Manager
+
+	* GCC 14.2.0 released.
+
+2024-05-07  Release Manager
+
+	* GCC 14.1.0 released.
+
+2023-11-23  Hans-Peter Nilsson  <hp@axis.com>
+
+	* btest-gcc.sh (--handle-xpass-as-fail): New option.
+
+2023-11-23  Hans-Peter Nilsson  <hp@axis.com>
+
+	* btest-gcc.sh (Option handling): Break out shifts from each
+	option alternative.
+
+2023-11-23  Hans-Peter Nilsson  <hp@axis.com>
+
+	* btest-gcc.sh (Option handling): Handle multiple options.
+
+2023-02-16  Hans-Peter Nilsson  <hp@axis.com>
+
+	* objs-gcc.sh: Only bootstrap if source-directory contains gcc.
+
 2012-08-26  Hans-Peter Nilsson  <hp@axis.com>
 
 	* btest-gcc.sh (TESTLOGS): Make gfortran.sum optional.

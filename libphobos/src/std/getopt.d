@@ -438,7 +438,7 @@ GetoptResult getopt(T...)(ref string[] args, T opts)
 }
 
 ///
-@system unittest
+@safe unittest
 {
     auto args = ["prog", "--foo", "-b"];
 
@@ -558,7 +558,7 @@ private template optionValidator(A...)
     import std.format : format;
 
     enum fmt = "getopt validator: %s (at position %d)";
-    enum isReceiver(T) = isPointer!T || (is(T == function)) || (is(T == delegate));
+    enum isReceiver(T) = is(T == U*, U) || (is(T == function)) || (is(T == delegate));
     enum isOptionStr(T) = isSomeString!T || isSomeChar!T;
 
     auto validator()
@@ -685,6 +685,7 @@ private void getoptImpl(T...)(ref string[] args, ref configuration cfg,
 
     import std.algorithm.mutation : remove;
     import std.conv : to;
+    import std.uni : toLower;
     static if (opts.length)
     {
         static if (is(typeof(opts[0]) : config))
@@ -708,7 +709,10 @@ private void getoptImpl(T...)(ref string[] args, ref configuration cfg,
 
             if (optionHelp.optLong.length)
             {
-                assert(optionHelp.optLong !in visitedLongOpts,
+                auto name = optionHelp.optLong;
+                if (!cfg.caseSensitive)
+                    name = name.toLower();
+                assert(name !in visitedLongOpts,
                     "Long option " ~ optionHelp.optLong ~ " is multiply defined");
 
                 visitedLongOpts[optionHelp.optLong] = [];
@@ -716,7 +720,10 @@ private void getoptImpl(T...)(ref string[] args, ref configuration cfg,
 
             if (optionHelp.optShort.length)
             {
-                assert(optionHelp.optShort !in visitedShortOpts,
+                auto name = optionHelp.optShort;
+                if (!cfg.caseSensitive)
+                    name = name.toLower();
+                assert(name !in visitedShortOpts,
                     "Short option " ~ optionHelp.optShort
                     ~ " is multiply defined");
 
@@ -1646,11 +1653,13 @@ Params:
     text = The text to printed at the beginning of the help output.
     opt = The `Option` extracted from the `getopt` parameter.
 */
-void defaultGetoptPrinter(string text, Option[] opt)
+void defaultGetoptPrinter(string text, Option[] opt) @safe
 {
     import std.stdio : stdout;
+    // stdout global __gshared is trusted with a locked text writer
+    auto w = (() @trusted => stdout.lockingTextWriter())();
 
-    defaultGetoptFormatter(stdout.lockingTextWriter(), text, opt);
+    defaultGetoptFormatter(w, text, opt);
 }
 
 /** This function writes the passed text and `Option` into an output range
@@ -1777,6 +1786,14 @@ void defaultGetoptFormatter(Output)(Output output, string text, Option[] opt, st
     assertThrown!AssertError(getopt(args, "abc", &abc, "abc", &abc));
     assertThrown!AssertError(getopt(args, "abc|a", &abc, "def|a", &def));
     assertNotThrown!AssertError(getopt(args, "abc", &abc, "def", &def));
+
+    // https://issues.dlang.org/show_bug.cgi?id=23940
+    assertThrown!AssertError(getopt(args,
+            "abc", &abc, "ABC", &def));
+    assertThrown!AssertError(getopt(args, config.caseInsensitive,
+            "abc", &abc, "ABC", &def));
+    assertNotThrown!AssertError(getopt(args, config.caseSensitive,
+            "abc", &abc, "ABC", &def));
 }
 
 // https://issues.dlang.org/show_bug.cgi?id=17327 repeated option use
@@ -1833,7 +1850,7 @@ void defaultGetoptFormatter(Output)(Output output, string text, Option[] opt, st
     assert(flag);
 }
 
-@safe unittest  // Delegates as callbacks
+@system unittest  // Delegates as callbacks
 {
     alias TwoArgOptionHandler = void delegate(string option, string value) @safe;
 

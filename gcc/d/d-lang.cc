@@ -1,5 +1,5 @@
 /* d-lang.cc -- Language-dependent hooks for D.
-   Copyright (C) 2006-2022 Free Software Foundation, Inc.
+   Copyright (C) 2006-2024 Free Software Foundation, Inc.
 
 GCC is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "dmd/cond.h"
 #include "dmd/declaration.h"
 #include "dmd/doc.h"
+#include "dmd/dsymbol.h"
 #include "dmd/errors.h"
 #include "dmd/expression.h"
 #include "dmd/hdrgen.h"
@@ -32,8 +33,8 @@ along with GCC; see the file COPYING3.  If not see
 #include "dmd/mangle.h"
 #include "dmd/module.h"
 #include "dmd/mtype.h"
-#include "dmd/root/file.h"
 #include "dmd/target.h"
+#include "dmd/template.h"
 
 #include "opts.h"
 #include "alias.h"
@@ -293,9 +294,8 @@ d_init_options (unsigned int, cl_decoded_option *decoded_options)
   /* Set default values.  */
   global._init ();
 
-  global.vendor = lang_hooks.name;
+  global.compileEnv.vendor = lang_hooks.name;
   global.params.argv0 = xstrdup (decoded_options[0].arg);
-  global.params.errorLimit = flag_max_errors;
 
   /* Default extern(C++) mangling to C++17.  */
   global.params.cplusplus = CppStdRevisionCpp17;
@@ -303,10 +303,8 @@ d_init_options (unsigned int, cl_decoded_option *decoded_options)
   /* Warnings and deprecations are disabled by default.  */
   global.params.useDeprecated = DIAGNOSTICinform;
   global.params.warnings = DIAGNOSTICoff;
-  global.params.messageStyle = MESSAGESTYLEgnu;
-
-  global.params.imppath = d_gc_malloc<Strings> ();
-  global.params.fileImppath = d_gc_malloc<Strings> ();
+  global.params.v.errorLimit = flag_max_errors;
+  global.params.v.messageStyle = MessageStyle::gnu;
 
   /* Extra GDC-specific options.  */
   d_option.fonly = NULL;
@@ -456,21 +454,9 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       break;
 
     case OPT_fdebug_:
-      if (ISDIGIT (arg[0]))
-	{
-	  int level = integral_argument (arg);
-	  if (level != -1)
-	    {
-	      global.params.debuglevel = level;
-	      break;
-	    }
-	}
-
       if (Identifier::isValidIdentifier (CONST_CAST (char *, arg)))
 	{
-	  if (!global.params.debugids)
-	    global.params.debugids = d_gc_malloc<Strings> ();
-	  global.params.debugids->push (arg);
+	  DebugCondition::addGlobalIdent (arg);
 	  break;
 	}
 
@@ -478,21 +464,21 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       break;
 
     case OPT_fdoc:
-      global.params.doDocComments = value;
+      global.params.ddoc.doOutput = value;
       break;
 
     case OPT_fdoc_dir_:
-      global.params.doDocComments = true;
-      global.params.docdir = arg;
+      global.params.ddoc.doOutput = true;
+      global.params.ddoc.dir = arg;
       break;
 
     case OPT_fdoc_file_:
-      global.params.doDocComments = true;
-      global.params.docname = arg;
+      global.params.ddoc.doOutput = true;
+      global.params.ddoc.name = arg;
       break;
 
     case OPT_fdoc_inc_:
-      global.params.ddocfiles.push (arg);
+      global.params.ddoc.files.push (arg);
       break;
 
     case OPT_fdruntime:
@@ -500,13 +486,12 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       break;
 
     case OPT_fdump_c___spec_:
-      if (global.params.doCxxHdrGeneration == CxxHeaderMode::none)
-	global.params.doCxxHdrGeneration = CxxHeaderMode::silent;
-      global.params.cxxhdrname = arg;
+      global.params.cxxhdr.doOutput = true;
+      global.params.cxxhdr.name = arg;
       break;
 
     case OPT_fdump_c___spec_verbose:
-      global.params.doCxxHdrGeneration = CxxHeaderMode::verbose;
+      global.params.cxxhdr.fullOutput = true;
       break;
 
     case OPT_fdump_d_original:
@@ -569,19 +554,23 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
 
     case OPT_fpreview_all:
       global.params.ehnogc = value;
-      global.params.useDIP25 = FeatureState::enabled;
       global.params.useDIP1000 = FeatureState::enabled;
       global.params.useDIP1021 = value;
+      global.params.bitfields = value;
       global.params.dtorFields = FeatureState::enabled;
-      global.params.fieldwise = value;
+      global.params.fieldwise = FeatureState::enabled;
       global.params.fixAliasThis = value;
       global.params.previewIn = value;
       global.params.fix16997 = value;
-      global.params.markdown = value;
-      global.params.noSharedAccess = value;
-      global.params.rvalueRefParam = value;
+      global.params.noSharedAccess = FeatureState::enabled;
+      global.params.rvalueRefParam = FeatureState::enabled;
       global.params.inclusiveInContracts = value;
-      global.params.shortenedMethods = value;
+      global.params.systemVariables = FeatureState::enabled;
+      global.params.fixImmutableConv = value;
+      break;
+
+    case OPT_fpreview_bitfields:
+      global.params.bitfields = value;
       break;
 
     case OPT_fpreview_dip1000:
@@ -596,20 +585,20 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       global.params.useDIP1021 = value;
       break;
 
-    case OPT_fpreview_dip25:
-      global.params.useDIP25 = FeatureState::enabled;
-      break;
-
     case OPT_fpreview_dtorfields:
       global.params.dtorFields = FeatureState::enabled;
       break;
 
     case OPT_fpreview_fieldwise:
-      global.params.fieldwise = value;
+      global.params.fieldwise = FeatureState::enabled;
       break;
 
     case OPT_fpreview_fixaliasthis:
       global.params.fixAliasThis = value;
+      break;
+
+    case OPT_fpreview_fiximmutableconv:
+      global.params.fixImmutableConv = value;
       break;
 
     case OPT_fpreview_in:
@@ -621,15 +610,15 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       break;
 
     case OPT_fpreview_nosharedaccess:
-      global.params.noSharedAccess = value;
+      global.params.noSharedAccess = FeatureState::enabled;
       break;
 
     case OPT_fpreview_rvaluerefparam:
-      global.params.rvalueRefParam = value;
+      global.params.rvalueRefParam = FeatureState::enabled;
       break;
 
-    case OPT_fpreview_shortenedmethods:
-      global.params.shortenedMethods = value;
+    case OPT_fpreview_systemvariables:
+      global.params.systemVariables = FeatureState::enabled;
       break;
 
     case OPT_frelease:
@@ -637,14 +626,13 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       break;
 
     case OPT_frevert_all:
-      global.params.useDIP25 = FeatureState::disabled;
+      global.params.useDIP1000 = FeatureState::disabled;
       global.params.dtorFields = FeatureState::disabled;
       global.params.fix16997 = !value;
-      global.params.markdown = !value;
       break;
 
-    case OPT_frevert_dip25:
-      global.params.useDIP25 = FeatureState::disabled;
+    case OPT_frevert_dip1000:
+      global.params.useDIP1000 = FeatureState::disabled;
       break;
 
     case OPT_frevert_dtorfields:
@@ -655,17 +643,14 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       global.params.fix16997 = !value;
       break;
 
-    case OPT_frevert_markdown:
-      global.params.markdown = !value;
-      break;
-
     case OPT_frtti:
       global.params.useTypeInfo = value;
       break;
 
     case OPT_fsave_mixins_:
-      global.params.mixinFile = arg;
-      global.params.mixinOut = d_gc_malloc<OutBuffer> ();
+      global.params.mixinOut.doOutput = true;
+      global.params.mixinOut.name = arg;
+      global.params.mixinOut.buffer = d_gc_malloc<OutBuffer> ();
       break;
 
     case OPT_fswitch_errors:
@@ -673,35 +658,30 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       break;
 
     case OPT_ftransition_all:
-      global.params.vfield = value;
-      global.params.vgc = value;
-      global.params.vin = value;
-      global.params.vmarkdown= value;
-      global.params.vtls = value;
+      global.params.v.field = value;
+      global.params.v.gc = value;
+      global.params.v.vin = value;
+      global.params.v.tls = value;
       break;
 
     case OPT_ftransition_field:
-      global.params.vfield = value;
+      global.params.v.field = value;
       break;
 
     case OPT_ftransition_in:
-      global.params.vin = value;
+      global.params.v.vin = value;
       break;
 
     case OPT_ftransition_nogc:
-      global.params.vgc = value;
-      break;
-
-    case OPT_ftransition_vmarkdown:
-      global.params.vmarkdown = value;
+      global.params.v.gc = value;
       break;
 
     case OPT_ftransition_templates:
-      global.params.vtemplates = value;
+      global.params.v.templates = value;
       break;
 
     case OPT_ftransition_tls:
-      global.params.vtls = value;
+      global.params.v.tls = value;
       break;
 
     case OPT_funittest:
@@ -709,21 +689,9 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       break;
 
     case OPT_fversion_:
-      if (ISDIGIT (arg[0]))
-	{
-	  int level = integral_argument (arg);
-	  if (level != -1)
-	    {
-	      global.params.versionlevel = level;
-	      break;
-	    }
-	}
-
       if (Identifier::isValidIdentifier (CONST_CAST (char *, arg)))
 	{
-	  if (!global.params.versionids)
-	    global.params.versionids = d_gc_malloc<Strings> ();
-	  global.params.versionids->push (arg);
+	  VersionCondition::addGlobalIdent (arg);
 	  break;
 	}
 
@@ -731,17 +699,17 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       break;
 
     case OPT_H:
-      global.params.doHdrGeneration = true;
+      global.params.dihdr.doOutput = true;
       break;
 
     case OPT_Hd:
-      global.params.doHdrGeneration = true;
-      global.params.hdrdir = arg;
+      global.params.dihdr.doOutput = true;
+      global.params.dihdr.dir = arg;
       break;
 
     case OPT_Hf:
-      global.params.doHdrGeneration = true;
-      global.params.hdrname = arg;
+      global.params.dihdr.doOutput = true;
+      global.params.dihdr.name = arg;
       break;
 
     case OPT_imultilib:
@@ -753,11 +721,11 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       break;
 
     case OPT_I:
-      global.params.imppath->push (arg);
+      global.params.imppath.push (arg);
       break;
 
     case OPT_J:
-      global.params.fileImppath->push (arg);
+      global.params.fileImppath.push (arg);
       break;
 
     case OPT_MM:
@@ -799,7 +767,7 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
       break;
 
     case OPT_v:
-      global.params.verbose = value;
+      global.params.v.verbose = value;
       break;
 
     case OPT_Wall:
@@ -818,15 +786,15 @@ d_handle_option (size_t scode, const char *arg, HOST_WIDE_INT value,
 
     case OPT_Wspeculative:
       if (value)
-	global.params.showGaggedErrors = 1;
+	global.params.v.showGaggedErrors = 1;
       break;
 
     case OPT_Xf:
-      global.params.jsonfilename = arg;
+      global.params.json.name = arg;
       /* Fall through.  */
 
     case OPT_X:
-      global.params.doJsonGeneration = true;
+      global.params.json.doOutput = true;
       break;
 
     default:
@@ -899,27 +867,34 @@ d_post_options (const char ** fn)
 	? CHECKENABLEoff : CHECKENABLEon;
     }
 
+  /* When not linking against D runtime, turn off all code generation that
+     would otherwise reference it.  */
   if (global.params.betterC)
     {
       if (!OPTION_SET_P (flag_moduleinfo))
 	global.params.useModuleInfo = false;
 
+      /* Ensure that the front-end options are in sync with the `-frtti' and
+	 `-fexceptions' flags.  */
       if (!OPTION_SET_P (flag_rtti))
-	global.params.useTypeInfo = false;
+	{
+	  global.params.useTypeInfo = false;
+	  flag_rtti = false;
+	}
 
       if (!OPTION_SET_P (flag_exceptions))
-	global.params.useExceptions = false;
+	{
+	  global.params.useExceptions = false;
+	  flag_exceptions = false;
+	}
 
+      global.params.useGC = false;
       global.params.checkAction = CHECKACTION_C;
     }
 
   /* Enabling DIP1021 implies DIP1000.  */
   if (global.params.useDIP1021)
     global.params.useDIP1000 = FeatureState::enabled;
-
-  /* Enabling DIP1000 implies DIP25.  */
-  if (global.params.useDIP1000 == FeatureState::enabled)
-    global.params.useDIP25 = FeatureState::enabled;
 
   /* Keep in sync with existing -fbounds-check flag.  */
   flag_bounds_check = (global.params.useArrayBounds == CHECKENABLEon);
@@ -935,44 +910,30 @@ d_post_options (const char ** fn)
       && global.params.warnings == DIAGNOSTICerror)
     global.params.useDeprecated = DIAGNOSTICerror;
 
-  /* Make -fmax-errors visible to frontend's diagnostic machinery.  */
-  if (OPTION_SET_P (flag_max_errors))
-    global.params.errorLimit = flag_max_errors;
-
   if (flag_excess_precision == EXCESS_PRECISION_DEFAULT)
     flag_excess_precision = EXCESS_PRECISION_STANDARD;
 
-  global.params.symdebug = write_symbols != NO_DEBUG;
   global.params.useInline = flag_inline_functions;
-  global.params.showColumns = flag_show_column;
-  global.params.printErrorContext = flag_diagnostics_show_caret;
+
+  /* Make -fmax-errors visible to frontend's diagnostic machinery.  */
+  if (OPTION_SET_P (flag_max_errors))
+    global.params.v.errorLimit = flag_max_errors;
+
+  global.params.v.showColumns = flag_show_column;
+  global.params.v.printErrorContext = flag_diagnostics_show_caret;
+
+  /* Keep the front-end location type in sync with params.  */
+  Loc::set (global.params.v.showColumns, global.params.v.messageStyle);
 
   if (global.params.useInline)
-    global.params.hdrStripPlainFunctions = false;
+    global.params.dihdr.fullOutput = true;
 
   global.params.obj = !flag_syntax_only;
 
-  /* Has no effect yet.  */
-  global.params.pic = flag_pic != 0;
-
-  /* Add in versions given on the command line.  */
-  if (global.params.versionids)
-    {
-      for (size_t i = 0; i < global.params.versionids->length; i++)
-	{
-	  const char *s = (*global.params.versionids)[i];
-	  VersionCondition::addGlobalIdent (s);
-	}
-    }
-
-  if (global.params.debugids)
-    {
-      for (size_t i = 0; i < global.params.debugids->length; i++)
-	{
-	  const char *s = (*global.params.debugids)[i];
-	  DebugCondition::addGlobalIdent (s);
-	}
-    }
+  /* The front-end parser only has access to `compileEnv', synchronize its
+     fields with params.  */
+  global.compileEnv.previewIn = global.params.previewIn;
+  global.compileEnv.ddocOutput = global.params.ddoc.doOutput;
 
   if (warn_return_type == -1)
     warn_return_type = 0;
@@ -990,32 +951,115 @@ d_add_builtin_module (Module *m)
   builtin_modules.push (m);
 }
 
+/* Writes to FILENAME.  DATA is the full content of the file to be written.  */
+
+static void
+d_write_file (const char *filename, const char *data)
+{
+  FILE *stream;
+
+  if (filename && (filename[0] != '-' || filename[1] != '\0'))
+    stream = fopen (filename, "w");
+  else
+    stream = stdout;
+
+  if (!stream)
+    {
+      error ("unable to open %s for writing: %m", filename);
+      return;
+    }
+
+  fprintf (stream, "%s", data);
+
+  if (stream != stdout && (ferror (stream) || fclose (stream)))
+    error ("writing output file %s: %m", filename);
+}
+
+/* Read ddoc macro files named by the DDOCFILES, then write the concatenated
+   the contents into DDOCBUF.  */
+
+static void
+d_read_ddoc_files (Strings &ddocfiles, OutBuffer &ddocbuf)
+{
+  if (ddocbuf.length ())
+    return;
+
+  for (size_t i = 0; i < ddocfiles.length; i++)
+    {
+      int fd = open (ddocfiles[i], O_RDONLY);
+      bool ok = false;
+      struct stat buf;
+
+      if (fd == -1 || fstat (fd, &buf))
+	{
+	  error ("unable to open %s for reading: %m", ddocfiles[i]);
+	  continue;
+	}
+
+      /* Check we've not been given a directory, or a file bigger than 4GB.  */
+      if (S_ISDIR (buf.st_mode))
+	errno = ENOENT;
+      else if (buf.st_size != unsigned (buf.st_size))
+	errno = EMFILE;
+      else
+	{
+	  unsigned size = unsigned (buf.st_size);
+	  char *buffer = (char *) xmalloc (size);
+
+	  if (read (fd, buffer, size) == ssize_t (size))
+	    {
+	      ddocbuf.write (buffer, size);
+	      ok = true;
+	    }
+
+	  free (buffer);
+	}
+
+      close (fd);
+      if (!ok)
+	fatal_error (input_location, "reading ddoc file %s: %m", ddocfiles[i]);
+    }
+}
+
+static void
+d_generate_ddoc_file (Module *m, OutBuffer &ddocbuf)
+{
+  input_location = make_location_t (m->loc);
+
+  d_read_ddoc_files (global.params.ddoc.files, ddocbuf);
+
+  OutBuffer ddocbuf_out;
+  dmd::gendocfile (m, ddocbuf.peekChars (), ddocbuf.length (), global.datetime,
+		   global.errorSink, ddocbuf_out);
+
+  d_write_file (m->docfile.toChars (), ddocbuf_out.peekChars ());
+}
+
 /* Implements the lang_hooks.parse_file routine for language D.  */
 
 static void
 d_parse_file (void)
 {
-  if (global.params.verbose)
+  if (global.params.v.verbose)
     {
+      /* Dump information about the D compiler and language version.  */
       message ("binary    %s", global.params.argv0.ptr);
       message ("version   %s", global.versionChars ());
 
-      if (global.versionids)
+      /* Dump all predefined version identifiers.  */
+      obstack buffer;
+      gcc_obstack_init (&buffer);
+      obstack_grow (&buffer, "predefs  ", 9);
+      for (size_t i = 0; i < global.versionids.length; i++)
 	{
-	  obstack buffer;
-	  gcc_obstack_init (&buffer);
-	  obstack_grow (&buffer, "predefs  ", 9);
-	  for (size_t i = 0; i < global.versionids->length; i++)
-	    {
-	      Identifier *id = (*global.versionids)[i];
-	      const char *str = id->toChars ();
-	      obstack_1grow (&buffer, ' ');
-	      obstack_grow (&buffer, str, strlen (str));
-	    }
-
-	  obstack_1grow (&buffer, '\0');
-	  message ("%s", (char *) obstack_finish (&buffer));
+	  Identifier *id = global.versionids[i];
+	  const char *str = id->toChars ();
+	  obstack_1grow (&buffer, ' ');
+	  obstack_grow (&buffer, str, strlen (str));
 	}
+
+      obstack_1grow (&buffer, '\0');
+      message ("%s", (char *) obstack_finish (&buffer));
     }
 
   /* Start the main input file, if the debug writer wants it.  */
@@ -1025,6 +1069,9 @@ d_parse_file (void)
   /* Create Module's for all sources we will load.  */
   Modules modules;
   modules.reserve (num_in_fnames);
+
+  /* Buffer for contents of .ddoc files.  */
+  OutBuffer ddocbuf;
 
   /* In this mode, the first file name is supposed to be a duplicate
      of one of the input files.  */
@@ -1063,15 +1110,18 @@ d_parse_file (void)
 	  /* Handling stdin, generate a unique name for the module.  */
 	  Module *m = Module::create (in_fnames[i],
 				      Identifier::idPool ("__stdin"),
-				      global.params.doDocComments,
-				      global.params.doHdrGeneration);
+				      global.params.ddoc.doOutput,
+				      global.params.dihdr.doOutput);
 	  modules.push (m);
+
+	  /* Zero the padding past the end of the buffer so the D lexer has a
+	     sentinel.  The lexer only reads up to 4 bytes at a time.  */
+	  memset (buffer + len, '\0', 16);
 
 	  /* Overwrite the source file for the module, the one created by
 	     Module::create would have a forced a `.d' suffix.  */
-	  m->srcBuffer = FileBuffer::create ();
-	  m->srcBuffer->data.length = len;
-	  m->srcBuffer->data.ptr = buffer;
+	  m->src.length = len;
+	  m->src.ptr = buffer;
 	}
       else
 	{
@@ -1080,8 +1130,8 @@ d_parse_file (void)
 	  const char *name = FileName::removeExt (basename);
 
 	  Module *m = Module::create (in_fnames[i], Identifier::idPool (name),
-				      global.params.doDocComments,
-				      global.params.doHdrGeneration);
+				      global.params.ddoc.doOutput,
+				      global.params.dihdr.doOutput);
 	  modules.push (m);
 	  FileName::free (name);
 	}
@@ -1099,7 +1149,7 @@ d_parse_file (void)
     {
       Module *m = modules[i];
 
-      if (global.params.verbose)
+      if (global.params.v.verbose)
 	message ("parse     %s", m->toChars ());
 
       if (!Module::rootModule)
@@ -1108,9 +1158,10 @@ d_parse_file (void)
       m->importedFrom = m;
       m->parse ();
 
-      if (m->isDocFile)
+      if (m->filetype == FileType::ddoc)
 	{
-	  gendocfile (m);
+	  d_generate_ddoc_file (m, ddocbuf);
+
 	  /* Remove M from list of modules.  */
 	  modules.remove (i);
 	  i--;
@@ -1138,7 +1189,7 @@ d_parse_file (void)
   if (global.errors)
     goto had_errors;
 
-  if (global.params.doHdrGeneration)
+  if (global.params.dihdr.doOutput)
     {
       /* Generate 'header' import files.  Since 'header' import files must be
 	 independent of command line switches and what else is imported, they
@@ -1146,13 +1197,16 @@ d_parse_file (void)
       for (size_t i = 0; i < modules.length; i++)
 	{
 	  Module *m = modules[i];
-	  if (m->isHdrFile || (d_option.fonly && m != Module::rootModule))
+	  if (m->filetype == FileType::dhdr
+	      || (d_option.fonly && m != Module::rootModule))
 	    continue;
 
-	  if (global.params.verbose)
+	  if (global.params.v.verbose)
 	    message ("import    %s", m->toChars ());
 
-	  genhdrfile (m);
+	  OutBuffer buf;
+	  dmd::genhdrfile (m, global.params.dihdr.fullOutput, buf);
+	  d_write_file (m->hdrfile.toChars (), buf.peekChars ());
 	}
 
       dump_headers = true;
@@ -1166,10 +1220,10 @@ d_parse_file (void)
     {
       Module *m = modules[i];
 
-      if (global.params.verbose)
+      if (global.params.v.verbose)
 	message ("importall %s", m->toChars ());
 
-      m->importAll (NULL);
+      dmd::importAll (m, NULL);
     }
 
   if (global.errors)
@@ -1190,14 +1244,13 @@ d_parse_file (void)
 	  continue;
 	}
 
-      if (global.params.verbose)
+      if (global.params.v.verbose)
 	message ("semantic  %s", m->toChars ());
 
-      dsymbolSemantic (m, NULL);
+      dmd::dsymbolSemantic (m, NULL);
     }
 
   /* Do deferred semantic analysis.  */
-  Module::dprogress = 1;
   Module::runDeferredSemantic ();
 
   if (Module::deferred.length)
@@ -1222,10 +1275,10 @@ d_parse_file (void)
     {
       Module *m = modules[i];
 
-      if (global.params.verbose)
+      if (global.params.v.verbose)
 	message ("semantic2 %s", m->toChars ());
 
-      semantic2 (m, NULL);
+      dmd::semantic2 (m, NULL);
     }
 
   Module::runDeferredSemantic2 ();
@@ -1238,10 +1291,10 @@ d_parse_file (void)
     {
       Module *m = modules[i];
 
-      if (global.params.verbose)
+      if (global.params.v.verbose)
 	message ("semantic3 %s", m->toChars ());
 
-      semantic3 (m, NULL);
+      dmd::semantic3 (m, NULL);
     }
 
   Module::runDeferredSemantic3 ();
@@ -1265,7 +1318,7 @@ d_parse_file (void)
       /* Declare the name of the root module as the first global name in order
 	 to make the middle-end fully deterministic.  */
       OutBuffer buf;
-      mangleToBuffer (Module::rootModule, &buf);
+      dmd::mangleToBuffer (Module::rootModule, buf);
       first_global_object_name = buf.extractChars ();
     }
 
@@ -1273,8 +1326,6 @@ d_parse_file (void)
   if (d_option.deps)
     {
       obstack buffer;
-      FILE *deps_stream;
-
       gcc_obstack_init (&buffer);
 
       for (size_t i = 0; i < modules.length; i++)
@@ -1284,66 +1335,31 @@ d_parse_file (void)
       if (d_option.deps_filename_user)
 	d_option.deps_filename = d_option.deps_filename_user;
 
-      if (d_option.deps_filename)
-	{
-	  deps_stream = fopen (d_option.deps_filename, "w");
-	  if (!deps_stream)
-	    {
-	      fatal_error (input_location, "opening dependency file %s: %m",
-			   d_option.deps_filename);
-	      goto had_errors;
-	    }
-	}
-      else
-	deps_stream = stdout;
+      d_write_file (d_option.deps_filename,
+		    (char *) obstack_finish (&buffer));
+    }
 
-      fprintf (deps_stream, "%s", (char *) obstack_finish (&buffer));
-
-      if (deps_stream != stdout
-	  && (ferror (deps_stream) || fclose (deps_stream)))
-	{
-	  fatal_error (input_location, "closing dependency file %s: %m",
-		       d_option.deps_filename);
-	}
+  if (global.params.v.templates)
+    {
+      dmd::printTemplateStats (global.params.v.templatesListInstances,
+			       global.errorSink);
     }
 
   /* Generate JSON files.  */
-  if (global.params.doJsonGeneration)
+  if (global.params.json.doOutput)
     {
       OutBuffer buf;
-      json_generate (&buf, &modules);
-
-      const char *name = global.params.jsonfilename.ptr;
-      FILE *json_stream;
-
-      if (name && (name[0] != '-' || name[1] != '\0'))
-	{
-	  const char *nameext
-	    = FileName::defaultExt (name, json_ext.ptr);
-	  json_stream = fopen (nameext, "w");
-	  if (!json_stream)
-	    {
-	      fatal_error (input_location, "opening json file %s: %m", nameext);
-	      goto had_errors;
-	    }
-	}
-      else
-	json_stream = stdout;
-
-      fprintf (json_stream, "%s", buf.peekChars ());
-
-      if (json_stream != stdout
-	  && (ferror (json_stream) || fclose (json_stream)))
-	fatal_error (input_location, "closing json file %s: %m", name);
+      dmd::json_generate (modules, buf);
+      d_write_file (global.params.json.name.ptr, buf.peekChars ());
     }
 
   /* Generate Ddoc files.  */
-  if (global.params.doDocComments && !global.errors && !errorcount)
+  if (global.params.ddoc.doOutput && !global.errors && !errorcount)
     {
       for (size_t i = 0; i < modules.length; i++)
 	{
 	  Module *m = modules[i];
-	  gendocfile (m);
+	  d_generate_ddoc_file (m, ddocbuf);
 	}
     }
 
@@ -1356,14 +1372,14 @@ d_parse_file (void)
 	  OutBuffer buf;
 	  buf.doindent = 1;
 
-	  moduleToBuffer (&buf, m);
+	  dmd::moduleToBuffer (buf, true, m);
 	  message ("%s", buf.peekChars ());
 	}
     }
 
   /* Generate C++ header files.  */
-  if (global.params.doCxxHdrGeneration != CxxHeaderMode::none)
-    genCppHdrFiles (modules);
+  if (global.params.cxxhdr.doOutput)
+    dmd::genCppHdrFiles (modules);
 
   if (global.errors)
     goto had_errors;
@@ -1374,11 +1390,11 @@ d_parse_file (void)
 
       /* Skip generating code for header files, or when the module wasn't
 	 specified by `-fonly=`.  */
-      if ((m->isHdrFile && m != main_module)
+      if ((m->filetype == FileType::dhdr && m != main_module)
 	  || (d_option.fonly && m != Module::rootModule))
 	continue;
 
-      if (global.params.verbose)
+      if (global.params.v.verbose)
 	message ("code      %s", m->toChars ());
 
       if (!flag_syntax_only)
@@ -1395,24 +1411,10 @@ d_parse_file (void)
   errorcount += (global.errors + global.warnings);
 
   /* We want to write the mixin expansion file also on error.  */
-  if (global.params.mixinOut)
+  if (global.params.mixinOut.doOutput)
     {
-      FILE *mixin_stream = fopen (global.params.mixinFile, "w");
-
-      if (mixin_stream)
-	{
-	  OutBuffer *buf = global.params.mixinOut;
-	  fprintf (mixin_stream, "%s", buf->peekChars ());
-
-	  if (ferror (mixin_stream) || fclose (mixin_stream))
-	    fatal_error (input_location, "closing mixin file %s: %m",
-			 global.params.mixinFile);
-	}
-      else
-	{
-	  fatal_error (input_location, "opening mixin file %s: %m",
-		       global.params.mixinFile);
-	}
+      d_write_file (global.params.mixinOut.name.ptr,
+		    global.params.mixinOut.buffer->peekChars ());
     }
 
   /* Remove generated .di files on error.  */
@@ -1421,7 +1423,8 @@ d_parse_file (void)
       for (size_t i = 0; i < modules.length; i++)
 	{
 	  Module *m = modules[i];
-	  if (m->isHdrFile || (d_option.fonly && m != Module::rootModule))
+	  if (m->filetype == FileType::dhdr
+	      || (d_option.fonly && m != Module::rootModule))
 	    continue;
 
 	  remove (m->hdrfile.toChars ());
@@ -1549,7 +1552,7 @@ d_type_promotes_to (tree type)
   /* Promotions are only applied on unnamed function arguments for declarations
      with `extern(C)' or `extern(C++)' linkage.  */
   if (cfun && DECL_LANG_FRONTEND (cfun->decl)
-      && DECL_LANG_FRONTEND (cfun->decl)->linkage != LINK::d)
+      && DECL_LANG_FRONTEND (cfun->decl)->resolvedLinkage () != LINK::d)
     {
       /* In [type/integer-promotions], integer promotions are conversions of the
 	 following types:
@@ -1915,6 +1918,21 @@ d_enum_underlying_base_type (const_tree type)
   return TREE_TYPE (type);
 }
 
+/* Get a value for the SARIF v2.1.0 "artifact.sourceLanguage" property,
+   based on the list in SARIF v2.1.0 Appendix J.  */
+
+static const char *
+d_get_sarif_source_language (const char *)
+{
+  return "d";
+}
+
+const scoped_attribute_specs *const d_langhook_attribute_table[] =
+{
+  &d_langhook_gnu_attribute_table,
+  &d_langhook_common_attribute_table,
+};
+
 /* Definitions for our language-specific hooks.  */
 
 #undef LANG_HOOKS_NAME
@@ -1926,7 +1944,6 @@ d_enum_underlying_base_type (const_tree type)
 #undef LANG_HOOKS_HANDLE_OPTION
 #undef LANG_HOOKS_POST_OPTIONS
 #undef LANG_HOOKS_PARSE_FILE
-#undef LANG_HOOKS_COMMON_ATTRIBUTE_TABLE
 #undef LANG_HOOKS_ATTRIBUTE_TABLE
 #undef LANG_HOOKS_GET_ALIAS_SET
 #undef LANG_HOOKS_TYPES_COMPATIBLE_P
@@ -1948,6 +1965,7 @@ d_enum_underlying_base_type (const_tree type)
 #undef LANG_HOOKS_TYPE_FOR_MODE
 #undef LANG_HOOKS_TYPE_FOR_SIZE
 #undef LANG_HOOKS_TYPE_PROMOTES_TO
+#undef LANG_HOOKS_GET_SARIF_SOURCE_LANGUAGE
 
 #define LANG_HOOKS_NAME			    "GNU D"
 #define LANG_HOOKS_INIT			    d_init
@@ -1958,7 +1976,6 @@ d_enum_underlying_base_type (const_tree type)
 #define LANG_HOOKS_HANDLE_OPTION	    d_handle_option
 #define LANG_HOOKS_POST_OPTIONS		    d_post_options
 #define LANG_HOOKS_PARSE_FILE		    d_parse_file
-#define LANG_HOOKS_COMMON_ATTRIBUTE_TABLE   d_langhook_common_attribute_table
 #define LANG_HOOKS_ATTRIBUTE_TABLE	    d_langhook_attribute_table
 #define LANG_HOOKS_GET_ALIAS_SET	    d_get_alias_set
 #define LANG_HOOKS_TYPES_COMPATIBLE_P	    d_types_compatible_p
@@ -1980,6 +1997,7 @@ d_enum_underlying_base_type (const_tree type)
 #define LANG_HOOKS_TYPE_FOR_MODE	    d_type_for_mode
 #define LANG_HOOKS_TYPE_FOR_SIZE	    d_type_for_size
 #define LANG_HOOKS_TYPE_PROMOTES_TO	    d_type_promotes_to
+#define LANG_HOOKS_GET_SARIF_SOURCE_LANGUAGE d_get_sarif_source_language
 
 struct lang_hooks lang_hooks = LANG_HOOKS_INITIALIZER;
 

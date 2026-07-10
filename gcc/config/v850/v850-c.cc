@@ -1,5 +1,5 @@
 /* v850 specific, C compiler specific functions.
-   Copyright (C) 2000-2022 Free Software Foundation, Inc.
+   Copyright (C) 2000-2024 Free Software Foundation, Inc.
    Contributed by Jeff Law (law@cygnus.com).
 
 This file is part of GCC.
@@ -64,7 +64,7 @@ static int
 pop_data_area (v850_data_area data_area)
 {
   if (data_area_stack == NULL)
-    warning (OPT_Wpragmas, "%<#pragma%> GHS endXXXX found without "
+    warning (OPT_Wpragmas, "%<#pragma%> GHS endXXX found without "
 	     "previous startXXX");
   else if (data_area != data_area_stack->data_area)
     warning (OPT_Wpragmas, "%<#pragma%> GHS endXXX does not match "

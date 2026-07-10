@@ -2,7 +2,7 @@
  * Miscellaneous declarations, including typedef, alias, variable declarations including the
  * implicit this declaration, type tuples, ClassInfo, ModuleInfo and various TypeInfos.
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/declaration.d, _declaration.d)
@@ -16,7 +16,6 @@ import core.stdc.stdio;
 import dmd.aggregate;
 import dmd.arraytypes;
 import dmd.astenums;
-import dmd.attrib;
 import dmd.ctorflow;
 import dmd.dclass;
 import dmd.delegatize;
@@ -29,18 +28,24 @@ import dmd.errors;
 import dmd.expression;
 import dmd.func;
 import dmd.globals;
+import dmd.gluelayer;
 import dmd.id;
 import dmd.identifier;
 import dmd.init;
 import dmd.initsem;
 import dmd.intrange;
+import dmd.location;
 import dmd.mtype;
 import dmd.common.outbuffer;
-import dmd.root.rootobject;
+import dmd.rootobject;
 import dmd.target;
 import dmd.tokens;
 import dmd.typesem;
 import dmd.visitor;
+
+version (IN_GCC) {}
+else version (IN_LLVM) {}
+else version = MARS;
 
 /************************************
  * Check to see the aggregate type is nested and its context pointer is
@@ -65,7 +70,7 @@ bool checkFrameAccess(Loc loc, Scope* sc, AggregateDeclaration ad, size_t iStart
     }
 
     bool result = false;
-    for (size_t i = iStart; i < ad.fields.dim; i++)
+    for (size_t i = iStart; i < ad.fields.length; i++)
     {
         VarDeclaration vd = ad.fields[i];
         Type tb = vd.type.baseElemOf();
@@ -80,6 +85,9 @@ bool checkFrameAccess(Loc loc, Scope* sc, AggregateDeclaration ad, size_t iStart
 /***********************************************
  * Mark variable v as modified if it is inside a constructor that var
  * is a field in.
+ * Also used to allow immutable globals to be initialized inside a static constructor.
+ * Returns:
+ *    true if it's an initialization of v
  */
 bool modifyFieldVar(Loc loc, Scope* sc, VarDeclaration var, Expression e1)
 {
@@ -92,7 +100,7 @@ bool modifyFieldVar(Loc loc, Scope* sc, VarDeclaration var, Expression e1)
             fd = s.isFuncDeclaration();
         if (fd &&
             ((fd.isCtorDeclaration() && var.isField()) ||
-             (fd.isStaticCtorDeclaration() && !var.isField())) &&
+             ((fd.isStaticCtorDeclaration() || fd.isCrtCtor) && !var.isField())) &&
             fd.toParentDecl() == var.toParent2() &&
             (!e1 || e1.op == EXP.this_))
         {
@@ -179,6 +187,15 @@ bool modifyFieldVar(Loc loc, Scope* sc, VarDeclaration var, Expression e1)
                     MODtoChars(var.type.mod), var.kind(), var.toChars());
                 errorSupplemental(loc, "Use `shared static this` instead.");
             }
+            else if (fd.isStaticCtorDeclaration() && !fd.isSharedStaticCtorDeclaration() &&
+                    var.type.isConst())
+            {
+                // @@@DEPRECATED_2.116@@@
+                // Turn this into an error, merging with the branch above
+                .deprecation(loc, "%s %s `%s` initialization is not allowed in `static this`",
+                    MODtoChars(var.type.mod), var.kind(), var.toChars());
+                deprecationSupplemental(loc, "Use `shared static this` instead.");
+            }
             return result;
         }
         else
@@ -196,7 +213,7 @@ bool modifyFieldVar(Loc loc, Scope* sc, VarDeclaration var, Expression e1)
 
 /******************************************
  */
-extern (C++) void ObjectNotFound(Identifier id)
+void ObjectNotFound(Identifier id)
 {
     error(Loc.initial, "`%s` not found. object.d may be incorrectly installed or corrupt.", id.toChars());
     fatal();
@@ -220,23 +237,25 @@ extern (C++) abstract class Declaration : Dsymbol
     Type originalType;  // before semantic analysis
     StorageClass storage_class = STC.undefined_;
     Visibility visibility;
-    LINK linkage = LINK.default_;
+    LINK _linkage = LINK.default_; // may be `LINK.system`; use `resolvedLinkage()` to resolve it
     short inuse;          // used to detect cycles
 
     ubyte adFlags;         // control re-assignment of AliasDeclaration (put here for packing reasons)
       enum wasRead    = 1; // set if AliasDeclaration was read
       enum ignoreRead = 2; // ignore any reads of AliasDeclaration
+      enum nounderscore = 4; // don't prepend _ to mangled name
+      enum hidden       = 8; // don't print this in .di files
 
     // overridden symbol with pragma(mangle, "...")
     const(char)[] mangleOverride;
 
-    final extern (D) this(Identifier ident)
+    final extern (D) this(Identifier ident) @safe
     {
         super(ident);
         visibility = Visibility(Visibility.Kind.undefined);
     }
 
-    final extern (D) this(const ref Loc loc, Identifier ident)
+    final extern (D) this(const ref Loc loc, Identifier ident) @safe
     {
         super(loc, ident);
         visibility = Visibility(Visibility.Kind.undefined);
@@ -247,7 +266,7 @@ extern (C++) abstract class Declaration : Dsymbol
         return "declaration";
     }
 
-    override final d_uns64 size(const ref Loc loc)
+    override final uinteger_t size(const ref Loc loc)
     {
         assert(type);
         const sz = type.size();
@@ -289,11 +308,11 @@ extern (C++) abstract class Declaration : Dsymbol
                  * postblit. Print the first field that has
                  * a disabled postblit.
                  */
-                if (postblit.generated)
+                if (postblit.isGenerated())
                 {
                     auto sd = p.isStructDeclaration();
                     assert(sd);
-                    for (size_t i = 0; i < sd.fields.dim; i++)
+                    for (size_t i = 0; i < sd.fields.length; i++)
                     {
                         auto structField = sd.fields[i];
                         if (structField.overlapped)
@@ -306,12 +325,12 @@ extern (C++) abstract class Declaration : Dsymbol
                             continue;
                         if (sdv.postblit.isDisabled())
                         {
-                            p.error(loc, "is not copyable because field `%s` is not copyable", structField.toChars());
+                            .error(loc, "%s `%s` is not copyable because field `%s` is not copyable", p.kind, p.toPrettyChars, structField.toChars());
                             return true;
                         }
                     }
                 }
-                p.error(loc, "is not copyable because it has a disabled postblit");
+                .error(loc, "%s `%s` is not copyable because it has a disabled postblit", p.kind, p.toPrettyChars);
                 return true;
             }
         }
@@ -331,13 +350,13 @@ extern (C++) abstract class Declaration : Dsymbol
 
         if (auto ctor = isCtorDeclaration())
         {
-            if (ctor.isCpCtor && ctor.generated)
+            if (ctor.isCpCtor && ctor.isGenerated())
             {
-                .error(loc, "Generating an `inout` copy constructor for `struct %s` failed, therefore instances of it are uncopyable", parent.toPrettyChars());
+                .error(loc, "generating an `inout` copy constructor for `struct %s` failed, therefore instances of it are uncopyable", parent.toPrettyChars());
                 return true;
             }
         }
-        error(loc, "cannot be used because it is annotated with `@disable`");
+        .error(loc, "%s `%s` cannot be used because it is annotated with `@disable`", kind, toPrettyChars);
         return true;
     }
 
@@ -368,7 +387,7 @@ extern (C++) abstract class Declaration : Dsymbol
                 {
                     const(char)* s = isParameter() && parent.ident != Id.ensure ? "parameter" : "result";
                     if (!(flag & ModifyFlags.noError))
-                        error(loc, "cannot modify %s `%s` in contract", s, toChars());
+                        error(loc, "%s `%s` cannot modify %s `%s` in contract", kind, toPrettyChars, s, toChars());
                     return Modifiable.initialization; // do not report type related errors
                 }
             }
@@ -376,13 +395,13 @@ extern (C++) abstract class Declaration : Dsymbol
 
         if (e1 && e1.op == EXP.this_ && isField())
         {
-            VarDeclaration vthis = (cast(ThisExp)e1).var;
+            VarDeclaration vthis = e1.isThisExp().var;
             for (Scope* scx = sc; scx; scx = scx.enclosing)
             {
                 if (scx.func == vthis.parent && (scx.flags & SCOPE.contract))
                 {
                     if (!(flag & ModifyFlags.noError))
-                        error(loc, "cannot modify parameter `this` in contract");
+                        error(loc, "%s `%s` cannot modify parameter `this` in contract", kind, toPrettyChars);
                     return Modifiable.initialization; // do not report type related errors
                 }
             }
@@ -400,21 +419,15 @@ extern (C++) abstract class Declaration : Dsymbol
         return Modifiable.yes;
     }
 
-    override final Dsymbol search(const ref Loc loc, Identifier ident, int flags = SearchLocalsOnly)
-    {
-        Dsymbol s = Dsymbol.search(loc, ident, flags);
-        if (!s && type)
-        {
-            s = type.toDsymbol(_scope);
-            if (s)
-                s = s.search(loc, ident, flags);
-        }
-        return s;
-    }
-
     final bool isStatic() const pure nothrow @nogc @safe
     {
         return (storage_class & STC.static_) != 0;
+    }
+
+    /// Returns the linkage, resolving the target-specific `System` one.
+    final LINK resolvedLinkage() const
+    {
+        return _linkage == LINK.system ? target.systemLinkage() : _linkage;
     }
 
     bool isDelete()
@@ -470,6 +483,11 @@ extern (C++) abstract class Declaration : Dsymbol
     final bool isScope() const pure nothrow @nogc @safe
     {
         return (storage_class & STC.scope_) != 0;
+    }
+
+    final bool isReturn() const pure nothrow @nogc @safe
+    {
+        return (storage_class & STC.return_) != 0;
     }
 
     final bool isSynchronized() const pure nothrow @nogc @safe
@@ -533,6 +551,11 @@ extern (C++) abstract class Declaration : Dsymbol
         return (storage_class & STC.future) != 0;
     }
 
+    final extern(D) bool isSystem() const pure nothrow @nogc @safe
+    {
+        return (storage_class & STC.system) != 0;
+    }
+
     override final Visibility visible() pure nothrow @nogc @safe
     {
         return visibility;
@@ -554,10 +577,11 @@ extern (C++) abstract class Declaration : Dsymbol
 extern (C++) final class TupleDeclaration : Declaration
 {
     Objects* objects;
-    bool isexp;             // true: expression tuple
     TypeTuple tupletype;    // !=null if this is a type tuple
+    bool isexp;             // true: expression tuple
+    bool building;          // it's growing in AliasAssign semantic
 
-    extern (D) this(const ref Loc loc, Identifier ident, Objects* objects)
+    extern (D) this(const ref Loc loc, Identifier ident, Objects* objects) @safe
     {
         super(loc, ident);
         this.objects = objects;
@@ -570,7 +594,7 @@ extern (C++) final class TupleDeclaration : Declaration
 
     override const(char)* kind() const
     {
-        return "tuple";
+        return "sequence";
     }
 
     override Type getType()
@@ -579,16 +603,16 @@ extern (C++) final class TupleDeclaration : Declaration
          */
 
         //printf("TupleDeclaration::getType() %s\n", toChars());
-        if (isexp)
+        if (isexp || building)
             return null;
         if (!tupletype)
         {
             /* It's only a type tuple if all the Object's are types
              */
-            for (size_t i = 0; i < objects.dim; i++)
+            for (size_t i = 0; i < objects.length; i++)
             {
                 RootObject o = (*objects)[i];
-                if (o.dyncast() != DYNCAST.type)
+                if (!o.isType())
                 {
                     //printf("\tnot[%d], %p, %d\n", i, o, o.dyncast());
                     return null;
@@ -598,24 +622,22 @@ extern (C++) final class TupleDeclaration : Declaration
             /* We know it's a type tuple, so build the TypeTuple
              */
             Types* types = cast(Types*)objects;
-            auto args = new Parameters(objects.dim);
+            auto args = new Parameters(objects.length);
             OutBuffer buf;
             int hasdeco = 1;
-            for (size_t i = 0; i < types.dim; i++)
+            for (size_t i = 0; i < types.length; i++)
             {
                 Type t = (*types)[i];
                 //printf("type = %s\n", t.toChars());
                 version (none)
                 {
                     buf.printf("_%s_%d", ident.toChars(), i);
-                    const len = buf.offset;
-                    const name = buf.extractSlice().ptr;
-                    auto id = Identifier.idPool(name, len);
-                    auto arg = new Parameter(STC.in_, t, id, null);
+                    auto id = Identifier.idPool(buf.extractSlice());
+                    auto arg = new Parameter(Loc.initial, STC.in_, t, id, null);
                 }
                 else
                 {
-                    auto arg = new Parameter(0, t, null, null, null);
+                    auto arg = new Parameter(Loc.initial, 0, t, null, null, null);
                 }
                 (*args)[i] = arg;
                 if (!t.deco)
@@ -632,7 +654,7 @@ extern (C++) final class TupleDeclaration : Declaration
     override Dsymbol toAlias2()
     {
         //printf("TupleDeclaration::toAlias2() '%s' objects = %s\n", toChars(), objects.toChars());
-        for (size_t i = 0; i < objects.dim; i++)
+        for (size_t i = 0; i < objects.length; i++)
         {
             RootObject o = (*objects)[i];
             if (Dsymbol s = isDsymbol(o))
@@ -647,24 +669,46 @@ extern (C++) final class TupleDeclaration : Declaration
     override bool needThis()
     {
         //printf("TupleDeclaration::needThis(%s)\n", toChars());
-        for (size_t i = 0; i < objects.dim; i++)
+        return isexp ? foreachVar((s) { return s.needThis(); }) != 0 : false;
+    }
+
+    /***********************************************************
+     * Calls dg(Dsymbol) for each Dsymbol, which should be a VarDeclaration
+     * inside VarExp (isexp == true).
+     * Params:
+     *    dg = delegate to call for each Dsymbol
+     */
+    extern (D) void foreachVar(scope void delegate(Dsymbol) dg)
+    {
+        assert(isexp);
+        foreach (o; *objects)
         {
-            RootObject o = (*objects)[i];
-            if (o.dyncast() == DYNCAST.expression)
-            {
-                Expression e = cast(Expression)o;
-                if (e.op == EXP.dSymbol)
-                {
-                    DsymbolExp ve = cast(DsymbolExp)e;
-                    Declaration d = ve.s.isDeclaration();
-                    if (d && d.needThis())
-                    {
-                        return true;
-                    }
-                }
-            }
+            if (auto e = o.isExpression())
+                if (auto ve = e.isVarExp())
+                    dg(ve.var);
         }
-        return false;
+    }
+
+    /***********************************************************
+     * Calls dg(Dsymbol) for each Dsymbol, which should be a VarDeclaration
+     * inside VarExp (isexp == true).
+     * If dg returns !=0, stops and returns that value else returns 0.
+     * Params:
+     *    dg = delegate to call for each Dsymbol
+     * Returns:
+     *    last value returned by dg()
+     */
+    extern (D) int foreachVar(scope int delegate(Dsymbol) dg)
+    {
+        assert(isexp);
+        foreach (o; *objects)
+        {
+            if (auto e = o.isExpression())
+                if (auto ve = e.isVarExp())
+                    if(auto ret = dg(ve.var))
+                        return ret;
+        }
+        return 0;
     }
 
     override inout(TupleDeclaration) isTupleDeclaration() inout
@@ -679,32 +723,34 @@ extern (C++) final class TupleDeclaration : Declaration
 }
 
 /***********************************************************
+ * https://dlang.org/spec/declaration.html#AliasDeclaration
  */
 extern (C++) final class AliasDeclaration : Declaration
 {
-    Dsymbol aliassym;
+    Dsymbol aliassym;   // alias ident = aliassym;
+
     Dsymbol overnext;   // next in overload list
     Dsymbol _import;    // !=null if unresolved internal alias for selective import
 
-    extern (D) this(const ref Loc loc, Identifier ident, Type type)
+    extern (D) this(const ref Loc loc, Identifier ident, Type type) @safe
     {
         super(loc, ident);
-        //printf("AliasDeclaration(id = '%s', type = %p)\n", id.toChars(), type);
+        //printf("AliasDeclaration(id = '%s', type = %p)\n", ident.toChars(), type);
         //printf("type = '%s'\n", type.toChars());
         this.type = type;
         assert(type);
     }
 
-    extern (D) this(const ref Loc loc, Identifier ident, Dsymbol s)
+    extern (D) this(const ref Loc loc, Identifier ident, Dsymbol s) @safe
     {
         super(loc, ident);
-        //printf("AliasDeclaration(id = '%s', s = %p)\n", id.toChars(), s);
+        //printf("AliasDeclaration(id = '%s', s = %p)\n", ident.toChars(), s);
         assert(s != this);
         this.aliassym = s;
         assert(s);
     }
 
-    static AliasDeclaration create(const ref Loc loc, Identifier id, Type type)
+    static AliasDeclaration create(const ref Loc loc, Identifier id, Type type) @safe
     {
         return new AliasDeclaration(loc, id, type);
     }
@@ -746,7 +792,22 @@ extern (C++) final class AliasDeclaration : Declaration
              * is not overloadable.
              */
             if (type)
-                return false;
+            {
+                /*
+                    If type has been resolved already we could
+                    still be inserting an alias from an import.
+
+                    If we are handling an alias then pretend
+                    it was inserting and return true, if not then
+                    false since we didn't even pretend to insert something.
+                */
+                return this._import && this.equals(s);
+            }
+
+            // https://issues.dlang.org/show_bug.cgi?id=23865
+            // only insert if the symbol can be part of a set
+            const s1 = s.toAlias();
+            const isInsertCandidate = s1.isFuncDeclaration() || s1.isOverDeclaration() || s1.isTemplateDeclaration();
 
             /* When s is added in member scope by static if, mixin("code") or others,
              * aliassym is determined already. See the case in: test/compilable/test61.d
@@ -762,7 +823,8 @@ extern (C++) final class AliasDeclaration : Declaration
                 fa.visibility = visibility;
                 fa.parent = parent;
                 aliassym = fa;
-                return aliassym.overloadInsert(s);
+                if (isInsertCandidate)
+                    return aliassym.overloadInsert(s);
             }
             if (auto td = sa.isTemplateDeclaration())
             {
@@ -770,7 +832,8 @@ extern (C++) final class AliasDeclaration : Declaration
                 od.visibility = visibility;
                 od.parent = parent;
                 aliassym = od;
-                return aliassym.overloadInsert(s);
+                if (isInsertCandidate)
+                    return aliassym.overloadInsert(s);
             }
             if (auto od = sa.isOverDeclaration())
             {
@@ -781,7 +844,8 @@ extern (C++) final class AliasDeclaration : Declaration
                     od.parent = parent;
                     aliassym = od;
                 }
-                return od.overloadInsert(s);
+                if (isInsertCandidate)
+                    return od.overloadInsert(s);
             }
             if (auto os = sa.isOverloadSet())
             {
@@ -807,8 +871,11 @@ extern (C++) final class AliasDeclaration : Declaration
                     os.parent = parent;
                     aliassym = os;
                 }
-                os.push(s);
-                return true;
+                if (isInsertCandidate)
+                {
+                    os.push(s);
+                    return true;
+                }
             }
             return false;
         }
@@ -876,7 +943,7 @@ extern (C++) final class AliasDeclaration : Declaration
         }
         if (inuse)
         {
-            error("recursive alias declaration");
+            .error(loc, "%s `%s` recursive alias declaration", kind, toPrettyChars);
 
         Lerr:
             // Avoid breaking "recursive alias" state during errors gagged
@@ -898,6 +965,19 @@ extern (C++) final class AliasDeclaration : Declaration
         }
         else
         {
+            // stop AliasAssign tuple building
+            if (aliassym)
+            {
+                if (auto td = aliassym.isTupleDeclaration())
+                {
+                    if (td.building)
+                    {
+                        td.building = false;
+                        semanticRun = PASS.semanticdone;
+                        return td;
+                    }
+                }
+            }
             if (_import && _import._scope)
             {
                 /* If this is an internal alias for selective/renamed import,
@@ -921,7 +1001,7 @@ extern (C++) final class AliasDeclaration : Declaration
     {
         if (inuse)
         {
-            error("recursive alias declaration");
+            .error(loc, "%s `%s` recursive alias declaration", kind, toPrettyChars);
             return this;
         }
         inuse = 1;
@@ -962,7 +1042,7 @@ extern (C++) final class OverDeclaration : Declaration
     Dsymbol overnext;   // next in overload list
     Dsymbol aliassym;
 
-    extern (D) this(Identifier ident, Dsymbol s)
+    extern (D) this(Identifier ident, Dsymbol s) @safe
     {
         super(ident);
         this.aliassym = s;
@@ -1039,16 +1119,15 @@ extern (C++) class VarDeclaration : Declaration
 {
     Initializer _init;
     FuncDeclarations nestedrefs;    // referenced by these lexically nested functions
-    Dsymbol aliassym;               // if redone as alias to another symbol
+    TupleDeclaration aliasTuple;    // when `this` is really a tuple of declarations
     VarDeclaration lastVar;         // Linked list of variables for goto-skips-init detection
     Expression edtor;               // if !=null, does the destruction of the variable
     IntRange* range;                // if !=null, the variable is known to be within the range
-    VarDeclarations* maybes;        // STC.maybescope variables that are assigned to this STC.maybescope variable
+    VarDeclarations* maybes;        // maybeScope variables that are assigned to this maybeScope variable
 
     uint endlinnum;                 // line number of end of scope that this var lives in
     uint offset;
     uint sequenceNumber;            // order the variables are declared
-    __gshared uint nextSequenceNumber;   // the counter for sequenceNumber
     structalign_t alignment;
 
     // When interpreting, these point to the value (NULL if value not determinable)
@@ -1056,25 +1135,43 @@ extern (C++) class VarDeclaration : Declaration
     enum AdrOnStackNone = ~0u;
     uint ctfeAdrOnStack;
 
-    bool isargptr;                  // if parameter that _argptr points to
-    bool ctorinit;                  // it has been initialized in a ctor
-    bool iscatchvar;                // this is the exception object variable in catch() clause
-    bool isowner;                   // this is an Owner, despite it being `scope`
-    bool setInCtorOnly;             // field can only be set in a constructor, as it is const or immutable
+    // `bool` fields that are compacted into bit fields in a string mixin
+    private extern (D) static struct BitFields
+    {
+        bool isargptr;          /// if parameter that _argptr points to
+        bool ctorinit;          /// it has been initialized in a ctor
+        bool iscatchvar;        /// this is the exception object variable in catch() clause
+        bool isowner;           /// this is an Owner, despite it being `scope`
+        bool setInCtorOnly;     /// field can only be set in a constructor, as it is const or immutable
 
-    // Both these mean the var is not rebindable once assigned,
-    // and the destructor gets run when it goes out of scope
-    bool onstack;                   // it is a class that was allocated on the stack
-    bool mynew;                     // it is a class new'd with custom operator new
+        /// It is a class that was allocated on the stack
+        ///
+        /// This means the var is not rebindable once assigned,
+        /// and the destructor gets run when it goes out of scope
+        bool onstack;
 
-    byte canassign;                  // it can be assigned to
-    bool overlapped;                // if it is a field and has overlapping
-    bool overlapUnsafe;             // if it is an overlapping field and the overlaps are unsafe
-    bool doNotInferScope;           // do not infer 'scope' for this variable
-    bool doNotInferReturn;          // do not infer 'return' for this variable
+        bool overlapped;        /// if it is a field and has overlapping
+        bool overlapUnsafe;     /// if it is an overlapping field and the overlaps are unsafe
+        bool maybeScope;        /// allow inferring 'scope' for this variable
+        bool doNotInferReturn;  /// do not infer 'return' for this variable
+
+        bool isArgDtorVar;      /// temporary created to handle scope destruction of a function argument
+        bool isCmacro;          /// it is a C macro turned into a C declaration
+        bool dllImport;         /// __declspec(dllimport)
+        bool dllExport;         /// __declspec(dllexport)
+        version (MARS)
+        {
+            bool inClosure;         /// is inserted into a GC allocated closure
+            bool inAlignSection;    /// is inserted into an aligned section on stack
+        }
+        bool systemInferred;    /// @system was inferred from initializer
+    }
+
+    import dmd.common.bitfields : generateBitFields;
+    mixin(generateBitFields!(BitFields, uint));
+
+    byte canassign;                 // it can be assigned to
     ubyte isdataseg;                // private data for isDataseg 0 unset, 1 true, 2 false
-
-    bool isArgDtorVar;              // temporary created to handle scope destruction of a function argument
 
     final extern (D) this(const ref Loc loc, Type type, Identifier ident, Initializer _init, StorageClass storage_class = STC.undefined_)
     in
@@ -1099,7 +1196,6 @@ extern (C++) class VarDeclaration : Declaration
         this._init = _init;
         ctfeAdrOnStack = AdrOnStackNone;
         this.storage_class = storage_class;
-        sequenceNumber = ++nextSequenceNumber;
     }
 
     static VarDeclaration create(const ref Loc loc, Type type, Identifier ident, Initializer _init, StorageClass storage_class = STC.undefined_)
@@ -1116,98 +1212,6 @@ extern (C++) class VarDeclaration : Declaration
         return v;
     }
 
-    override void setFieldOffset(AggregateDeclaration ad, ref FieldState fieldState, bool isunion)
-    {
-        //printf("VarDeclaration::setFieldOffset(ad = %s) %s\n", ad.toChars(), toChars());
-
-        if (aliassym)
-        {
-            // If this variable was really a tuple, set the offsets for the tuple fields
-            TupleDeclaration v2 = aliassym.isTupleDeclaration();
-            assert(v2);
-            for (size_t i = 0; i < v2.objects.dim; i++)
-            {
-                RootObject o = (*v2.objects)[i];
-                assert(o.dyncast() == DYNCAST.expression);
-                Expression e = cast(Expression)o;
-                assert(e.op == EXP.dSymbol);
-                DsymbolExp se = cast(DsymbolExp)e;
-                se.s.setFieldOffset(ad, fieldState, isunion);
-            }
-            return;
-        }
-
-        if (!isField())
-            return;
-        assert(!(storage_class & (STC.static_ | STC.extern_ | STC.parameter | STC.tls)));
-
-        //printf("+VarDeclaration::setFieldOffset(ad = %s) %s\n", ad.toChars(), toChars());
-
-        /* Fields that are tuples appear both as part of TupleDeclarations and
-         * as members. That means ignore them if they are already a field.
-         */
-        if (offset)
-        {
-            // already a field
-            fieldState.offset = ad.structsize; // https://issues.dlang.org/show_bug.cgi?id=13613
-            return;
-        }
-        for (size_t i = 0; i < ad.fields.dim; i++)
-        {
-            if (ad.fields[i] == this)
-            {
-                // already a field
-                fieldState.offset = ad.structsize; // https://issues.dlang.org/show_bug.cgi?id=13613
-                return;
-            }
-        }
-
-        // Check for forward referenced types which will fail the size() call
-        Type t = type.toBasetype();
-        if (storage_class & STC.ref_)
-        {
-            // References are the size of a pointer
-            t = Type.tvoidptr;
-        }
-        Type tv = t.baseElemOf();
-        if (tv.ty == Tstruct)
-        {
-            auto ts = cast(TypeStruct)tv;
-            assert(ts.sym != ad);   // already checked in ad.determineFields()
-            if (!ts.sym.determineSize(loc))
-            {
-                type = Type.terror;
-                errors = true;
-                return;
-            }
-        }
-
-        // List in ad.fields. Even if the type is error, it's necessary to avoid
-        // pointless error diagnostic "more initializers than fields" on struct literal.
-        ad.fields.push(this);
-
-        if (t.ty == Terror)
-            return;
-
-        /* If coming after a bit field in progress,
-         * advance past the field
-         */
-        fieldState.inFlight = false;
-
-        const sz = t.size(loc);
-        assert(sz != SIZE_INVALID && sz < uint.max);
-        uint memsize = cast(uint)sz;                // size of member
-        uint memalignsize = target.fieldalign(t);   // size of member for alignment purposes
-        offset = AggregateDeclaration.placeField(
-            &fieldState.offset,
-            memsize, memalignsize, alignment,
-            &ad.structsize, &ad.alignsize,
-            isunion);
-
-        //printf("\t%s: memalignsize = %d\n", toChars(), memalignsize);
-        //printf(" addField '%s' to '%s' at offset %d, size = %d\n", toChars(), ad.toChars(), offset, memsize);
-    }
-
     override const(char)* kind() const
     {
         return "variable";
@@ -1215,7 +1219,7 @@ extern (C++) class VarDeclaration : Declaration
 
     override final inout(AggregateDeclaration) isThis() inout
     {
-        if (!(storage_class & (STC.static_ | STC.extern_ | STC.manifest | STC.templateparameter | STC.tls | STC.gshared | STC.ctfe)))
+        if (!(storage_class & (STC.static_ | STC.extern_ | STC.manifest | STC.templateparameter | STC.gshared | STC.ctfe)))
         {
             /* The casting is necessary because `s = s.parent` is otherwise rejected
              */
@@ -1239,14 +1243,23 @@ extern (C++) class VarDeclaration : Declaration
 
     override final bool isExport() const
     {
-        return visibility.kind == Visibility.Kind.export_;
+        return visibility.kind == Visibility.Kind.export_ || dllExport;
     }
 
     override final bool isImportedSymbol() const
     {
-        if (visibility.kind == Visibility.Kind.export_ && !_init && (storage_class & STC.static_ || parent.isModule()))
-            return true;
-        return false;
+        /* If global variable has `export` and `extern` then it is imported
+         *   export int sym1;            // definition:  exported
+         *   export extern int sym2;     // declaration: imported
+         *   export extern int sym3 = 0; // error, extern cannot have initializer
+         */
+        bool result =
+            dllImport ||
+            visibility.kind == Visibility.Kind.export_ &&
+            storage_class & STC.extern_ &&
+            (storage_class & STC.static_ || parent.isModule());
+        //printf("isImportedSymbol() %s %d\n", toChars(), result);
+        return result;
     }
 
     final bool isCtorinit() const pure nothrow @nogc @safe
@@ -1280,10 +1293,10 @@ extern (C++) class VarDeclaration : Declaration
             Dsymbol parent = toParent();
             if (!parent && !(storage_class & STC.static_))
             {
-                error("forward referenced");
+                .error(loc, "%s `%s` forward referenced", kind, toPrettyChars);
                 type = Type.terror;
             }
-            else if (storage_class & (STC.static_ | STC.extern_ | STC.tls | STC.gshared) ||
+            else if (storage_class & (STC.static_ | STC.extern_ | STC.gshared) ||
                 parent.isModule() || parent.isTemplateInstance() || parent.isNspace())
             {
                 assert(!isParameter() && !isResult());
@@ -1367,7 +1380,7 @@ extern (C++) class VarDeclaration : Declaration
      */
     final bool needsScopeDtor()
     {
-        //printf("VarDeclaration::needsScopeDtor() %s\n", toChars());
+        //printf("VarDeclaration::needsScopeDtor() %s %d\n", toChars(), edtor && !(storage_class & STC.nodtor));
         return edtor && !(storage_class & STC.nodtor);
     }
 
@@ -1429,16 +1442,17 @@ extern (C++) class VarDeclaration : Declaration
                 const sdsz = sd.type.size();
                 assert(sdsz != SIZE_INVALID && sdsz != 0);
                 const n = sz / sdsz;
-                e = new SliceExp(loc, e, new IntegerExp(loc, 0, Type.tsize_t), new IntegerExp(loc, n, Type.tsize_t));
+                SliceExp se = new SliceExp(loc, e, new IntegerExp(loc, 0, Type.tsize_t),
+                    new IntegerExp(loc, n, Type.tsize_t));
 
                 // Prevent redundant bounds check
-                (cast(SliceExp)e).upperIsInBounds = true;
-                (cast(SliceExp)e).lowerIsLessThanUpper = true;
+                se.upperIsInBounds = true;
+                se.lowerIsLessThanUpper = true;
 
                 // This is a hack so we can call destructors on const/immutable objects.
-                e.type = sd.type.arrayOf();
+                se.type = sd.type.arrayOf();
 
-                e = new CallExp(loc, new IdentifierExp(loc, Id.__ArrayDtor), e);
+                e = new CallExp(loc, new IdentifierExp(loc, Id.__ArrayDtor), se);
             }
             return e;
         }
@@ -1454,7 +1468,7 @@ extern (C++) class VarDeclaration : Declaration
                 //if (cd.isInterfaceDeclaration())
                 //    error("interface `%s` cannot be scope", cd.toChars());
 
-                if (mynew || onstack) // if any destructors
+                if (onstack) // if any destructors
                 {
                     // delete'ing C++ classes crashes (and delete is deprecated anyway)
                     if (cd.classKind == ClassKind.cpp)
@@ -1494,7 +1508,7 @@ extern (C++) class VarDeclaration : Declaration
         uint oldgag = global.gag;
         if (global.gag)
         {
-            Dsymbol sym = toParent().isAggregateDeclaration();
+            Dsymbol sym = isMember();
             if (sym && !sym.isSpeculative())
                 global.gag = 0;
         }
@@ -1503,6 +1517,8 @@ extern (C++) class VarDeclaration : Declaration
         {
             inuse++;
             _init = _init.initializerSemantic(_scope, type, INITinterpret);
+            import dmd.semantic2 : lowerStaticAAs;
+            lowerStaticAAs(this, _scope);
             _scope = null;
             inuse--;
         }
@@ -1587,8 +1603,7 @@ extern (C++) class VarDeclaration : Declaration
         // Add this VarDeclaration to fdv.closureVars[] if not already there
         if (!sc.intypeof && !(sc.flags & SCOPE.compile) &&
             // https://issues.dlang.org/show_bug.cgi?id=17605
-            (fdv.flags & FUNCFLAG.compileTimeOnly || !(fdthis.flags & FUNCFLAG.compileTimeOnly))
-           )
+            (fdv.skipCodegen || !fdthis.skipCodegen))
         {
             if (!fdv.closureVars.contains(this))
                 fdv.closureVars.push(this);
@@ -1625,8 +1640,8 @@ extern (C++) class VarDeclaration : Declaration
         if ((!type || !type.deco) && _scope)
             dsymbolSemantic(this, _scope);
 
-        assert(this != aliassym);
-        Dsymbol s = aliassym ? aliassym.toAlias() : this;
+        assert(this != aliasTuple);
+        Dsymbol s = aliasTuple ? aliasTuple.toAlias() : this;
         return s;
     }
 
@@ -1639,66 +1654,6 @@ extern (C++) class VarDeclaration : Declaration
     override void accept(Visitor v)
     {
         v.visit(this);
-    }
-
-    /**********************************
-     * Determine if `this` has a lifetime that lasts past
-     * the destruction of `v`
-     * Params:
-     *  v = variable to test against
-     * Returns:
-     *  true if it does
-     */
-    final bool enclosesLifetimeOf(VarDeclaration v) const pure
-    {
-        // VarDeclaration's with these STC's need special treatment
-        enum special = STC.temp | STC.foreach_;
-
-        // Sequence numbers work when there are no special VarDeclaration's involved
-        if (!((this.storage_class | v.storage_class) & special))
-        {
-            // FIXME: VarDeclaration's for parameters are created in semantic3, so
-            //        they will have a greater sequence number than local variables.
-            //        Hence reverse the result for mixed comparisons.
-            const exp = this.isParameter() == v.isParameter();
-
-            return (this.sequenceNumber < v.sequenceNumber) == exp;
-        }
-
-        // Assume that semantic produces temporaries according to their lifetime
-        // (It won't create a temporary before the actual content)
-        if ((this.storage_class & special) && (v.storage_class & special))
-            return this.sequenceNumber < v.sequenceNumber;
-
-        // Fall back to lexical order
-        assert(this.loc != Loc.initial);
-        assert(v.loc != Loc.initial);
-
-        if (this.loc.linnum != v.loc.linnum)
-            return this.loc.linnum < v.loc.linnum;
-
-        if (this.loc.charnum != v.loc.charnum)
-            return this.loc.charnum < v.loc.charnum;
-
-        // Default fallback
-        return this.sequenceNumber < v.sequenceNumber;
-    }
-
-    /***************************************
-     * Add variable to maybes[].
-     * When a maybescope variable `v` is assigned to a maybescope variable `this`,
-     * we cannot determine if `this` is actually scope until the semantic
-     * analysis for the function is completed. Thus, we save the data
-     * until then.
-     * Params:
-     *  v = an STC.maybescope variable that was assigned to `this`
-     */
-    final void addMaybe(VarDeclaration v)
-    {
-        //printf("add %s to %s's list of dependencies\n", v.toChars(), toChars());
-        if (!maybes)
-            maybes = new VarDeclarations();
-        maybes.push(v);
     }
 }
 
@@ -1739,193 +1694,30 @@ extern (C++) class BitFieldDeclaration : VarDeclaration
         v.visit(this);
     }
 
-    override final void setFieldOffset(AggregateDeclaration ad, ref FieldState fieldState, bool isunion)
+    /***********************************
+     * Retrieve the .min or .max values.
+     * Only valid after semantic analysis.
+     * Params:
+     *  id = Id.min or Id.max
+     * Returns:
+     *  the min or max value
+     */
+    final ulong getMinMax(Identifier id)
     {
-        //printf("BitFieldDeclaration::setFieldOffset(ad: %s, field: %s)\n", ad.toChars(), toChars());
-        static void print(const ref FieldState fieldState)
-        {
-            printf("FieldState.offset      = %d bytes\n",   fieldState.offset);
-            printf("          .fieldOffset = %d bytes\n",   fieldState.fieldOffset);
-            printf("          .bitOffset   = %d bits\n",    fieldState.bitOffset);
-            printf("          .fieldSize   = %d bytes\n",   fieldState.fieldSize);
-            printf("          .inFlight    = %d\n\n", fieldState.inFlight);
-        }
-        //print(fieldState);
-
-        Type t = type.toBasetype();
-        const bool anon = isAnonymous();
-
-        // List in ad.fields. Even if the type is error, it's necessary to avoid
-        // pointless error diagnostic "more initializers than fields" on struct literal.
-        if (!anon)
-            ad.fields.push(this);
-
-        if (t.ty == Terror)
-            return;
-
-        const sz = t.size(loc);
-        assert(sz != SIZE_INVALID && sz < uint.max);
-        uint memsize = cast(uint)sz;                // size of member
-        uint memalignsize = target.fieldalign(t);   // size of member for alignment purposes
-
-        if (fieldWidth == 0 && !anon)
-            error(loc, "named bit fields cannot have 0 width");
-        if (fieldWidth > memsize * 8)
-            error(loc, "bit field width %d is larger than type", fieldWidth);
-
-        const style = target.c.bitFieldStyle;
-
-        void startNewField()
-        {
-            uint alignsize;
-            if (style == TargetC.BitFieldStyle.Gcc_Clang)
-            {
-                if (fieldWidth > 32)
-                    alignsize = memalignsize;
-                else if (fieldWidth > 16)
-                    alignsize = 4;
-                else if (fieldWidth > 8)
-                    alignsize = 2;
-                else
-                    alignsize = 1;
-            }
-            else
-                alignsize = memsize; // not memalignsize
-
-            uint dummy;
-            offset = AggregateDeclaration.placeField(
-                &fieldState.offset,
-                memsize, alignsize, alignment,
-                &ad.structsize,
-                (anon && style == TargetC.BitFieldStyle.Gcc_Clang) ? &dummy : &ad.alignsize,
-                isunion);
-
-            fieldState.inFlight = true;
-            fieldState.fieldOffset = offset;
-            fieldState.bitOffset = 0;
-            fieldState.fieldSize = memsize;
-        }
-
-        if (style == TargetC.BitFieldStyle.Gcc_Clang)
-        {
-            if (fieldWidth == 0)
-            {
-                if (!isunion)
-                {
-                    // Use type of zero width field to align to next field
-                    fieldState.offset = (fieldState.offset + memalignsize - 1) & ~(memalignsize - 1);
-                    ad.structsize = fieldState.offset;
-                }
-
-                fieldState.inFlight = false;
-                return;
-            }
-
-            if (ad.alignsize == 0)
-                ad.alignsize = 1;
-            if (!anon &&
-                  ad.alignsize < memalignsize)
-                ad.alignsize = memalignsize;
-        }
-        else if (style == TargetC.BitFieldStyle.MS)
-        {
-            if (ad.alignsize == 0)
-                ad.alignsize = 1;
-            if (fieldWidth == 0)
-            {
-                if (fieldState.inFlight && !isunion)
-                {
-                    // documentation says align to next int
-                    //const alsz = cast(uint)Type.tint32.size();
-                    const alsz = memsize; // but it really does this
-                    fieldState.offset = (fieldState.offset + alsz - 1) & ~(alsz - 1);
-                    ad.structsize = fieldState.offset;
-                }
-
-                fieldState.inFlight = false;
-                return;
-            }
-        }
-        else if (style == TargetC.BitFieldStyle.DM)
-        {
-            if (anon && fieldWidth && (!fieldState.inFlight || fieldState.bitOffset == 0))
-                return;  // this probably should be a bug in DMC
-            if (ad.alignsize == 0)
-                ad.alignsize = 1;
-            if (fieldWidth == 0)
-            {
-                if (fieldState.inFlight && !isunion)
-                {
-                    const alsz = memsize;
-                    fieldState.offset = (fieldState.offset + alsz - 1) & ~(alsz - 1);
-                    ad.structsize = fieldState.offset;
-                }
-
-                fieldState.inFlight = false;
-                return;
-            }
-        }
-
-        if (!fieldState.inFlight)
-        {
-            startNewField();
-        }
-        else if (style == TargetC.BitFieldStyle.Gcc_Clang)
-        {
-            if (fieldState.bitOffset + fieldWidth > memsize * 8)
-            {
-                //printf("start1 fieldState.bitOffset:%u fieldWidth:%u memsize:%u\n", fieldState.bitOffset, fieldWidth, memsize);
-                startNewField();
-            }
-            else
-            {
-                // if alignment boundary is crossed
-                uint start = fieldState.fieldOffset * 8 + fieldState.bitOffset;
-                uint end   = start + fieldWidth;
-                //printf("%s start: %d end: %d memalignsize: %d\n", ad.toChars(), start, end, memalignsize);
-                if (start / (memalignsize * 8) != (end - 1) / (memalignsize * 8))
-                {
-                    //printf("alignment is crossed\n");
-                    startNewField();
-                }
-            }
-        }
-        else if (style == TargetC.BitFieldStyle.DM ||
-                 style == TargetC.BitFieldStyle.MS)
-        {
-            if (memsize != fieldState.fieldSize ||
-                fieldState.bitOffset + fieldWidth > fieldState.fieldSize * 8)
-            {
-                startNewField();
-            }
-        }
+        const width = fieldWidth;
+        const uns = type.isunsigned();
+        const min = id == Id.min;
+        ulong v;
+        assert(width != 0);  // should have been rejected in semantic pass
+        if (width == ulong.sizeof * 8)
+            v = uns ? (min ? ulong.min : ulong.max)
+                    : (min ?  long.min :  long.max);
         else
-            assert(0);
-
-        offset = fieldState.fieldOffset;
-        bitOffset = fieldState.bitOffset;
-
-        const pastField = bitOffset + fieldWidth;
-        if (style == TargetC.BitFieldStyle.Gcc_Clang)
-        {
-            auto size = (pastField + 7) / 8;
-            fieldState.fieldSize = size;
-            //printf(" offset: %d, size: %d\n", offset, size);
-            ad.structsize = offset + size;
-        }
-        else
-            fieldState.fieldSize = memsize;
-        //printf("at end: ad.structsize = %d\n", cast(int)ad.structsize);
-        //print(fieldState);
-
-        if (!isunion)
-        {
-            fieldState.offset = offset + fieldState.fieldSize;
-            fieldState.bitOffset = pastField;
-        }
-
-        //printf("\t%s: memalignsize = %d\n", toChars(), memalignsize);
-        //printf(" addField '%s' to '%s' at offset %d, size = %d\n", toChars(), ad.toChars(), offset, memsize);
+            v = uns ? (min ? 0
+                           : (1L << width) - 1)
+                    : (min ? -(1L << (width - 1))
+                           :  (1L << (width - 1)) - 1);
+        return v;
     }
 }
 
@@ -1936,7 +1728,7 @@ extern (C++) final class SymbolDeclaration : Declaration
 {
     AggregateDeclaration dsym;
 
-    extern (D) this(const ref Loc loc, AggregateDeclaration dsym)
+    extern (D) this(const ref Loc loc, AggregateDeclaration dsym) @safe
     {
         super(loc, dsym.ident);
         this.dsym = dsym;
@@ -1957,6 +1749,35 @@ extern (C++) final class SymbolDeclaration : Declaration
 
 /***********************************************************
  */
+private Identifier getTypeInfoIdent(Type t)
+{
+    import dmd.dmangle;
+    import core.stdc.stdlib;
+    import dmd.root.rmem;
+    // _init_10TypeInfo_%s
+    OutBuffer buf;
+    buf.reserve(32);
+    mangleToBuffer(t, buf);
+
+    const slice = buf[];
+
+    // Allocate buffer on stack, fail over to using malloc()
+    char[128] namebuf;
+    const namelen = 19 + size_t.sizeof * 3 + slice.length + 1;
+    auto name = namelen <= namebuf.length ? namebuf.ptr : cast(char*)Mem.check(malloc(namelen));
+
+    const length = snprintf(name, namelen, "_D%lluTypeInfo_%.*s6__initZ",
+            cast(ulong)(9 + slice.length), cast(int)slice.length, slice.ptr);
+    //printf("%p %s, deco = %s, name = %s\n", this, toChars(), deco, name);
+    assert(0 < length && length < namelen); // don't overflow the buffer
+
+    auto id = Identifier.idPool(name[0 .. length]);
+
+    if (name != namebuf.ptr)
+        free(name);
+    return id;
+}
+
 extern (C++) class TypeInfoDeclaration : VarDeclaration
 {
     Type tinfo;
@@ -1967,7 +1788,7 @@ extern (C++) class TypeInfoDeclaration : VarDeclaration
         this.tinfo = tinfo;
         storage_class = STC.static_ | STC.gshared;
         visibility = Visibility(Visibility.Kind.public_);
-        linkage = LINK.c;
+        _linkage = LINK.c;
         alignment.set(target.ptrsize);
     }
 

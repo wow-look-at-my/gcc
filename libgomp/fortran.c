@@ -1,4 +1,4 @@
-/* Copyright (C) 2005-2022 Free Software Foundation, Inc.
+/* Copyright (C) 2005-2024 Free Software Foundation, Inc.
    Contributed by Jakub Jelinek <jakub@redhat.com>.
 
    This file is part of the GNU Offloading and Multi Processing Library
@@ -76,6 +76,7 @@ ialias_redirect (omp_get_ancestor_thread_num)
 ialias_redirect (omp_get_team_size)
 ialias_redirect (omp_get_active_level)
 ialias_redirect (omp_in_final)
+ialias_redirect (omp_in_explicit_task)
 ialias_redirect (omp_get_cancellation)
 ialias_redirect (omp_get_proc_bind)
 ialias_redirect (omp_get_num_places)
@@ -482,6 +483,12 @@ omp_in_final_ (void)
   return omp_in_final ();
 }
 
+int32_t
+omp_in_explicit_task_ (void)
+{
+  return omp_in_explicit_task ();
+}
+
 void
 omp_set_num_teams_ (const int32_t *num_teams)
 {
@@ -491,7 +498,7 @@ omp_set_num_teams_ (const int32_t *num_teams)
 void
 omp_set_num_teams_8_ (const int64_t *num_teams)
 {
-  omp_set_max_active_levels (TO_INT (*num_teams));
+  omp_set_num_teams (TO_INT (*num_teams));
 }
 
 int32_t

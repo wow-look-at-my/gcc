@@ -2,7 +2,6 @@
 
 /++
 
-$(SCRIPT inhibitQuickIndex = 1;)
 $(DIVC quickindex,
 $(BOOKTABLE,
 $(TR $(TH Category) $(TH Functions))
@@ -390,6 +389,33 @@ public:
                            hnsecsToUnixEpoch;
                 }
             }
+            else version (Hurd)
+            {
+                static if (clockType == ClockType.second)
+                    return unixTimeToStdTime(core.stdc.time.time(null));
+                else
+                {
+                    import core.sys.hurd.time : CLOCK_REALTIME_COARSE;
+                    import core.sys.posix.time : clock_gettime, CLOCK_REALTIME;
+                    static if (clockType == ClockType.coarse)       alias clockArg = CLOCK_REALTIME_COARSE;
+                    else static if (clockType == ClockType.normal)  alias clockArg = CLOCK_REALTIME;
+                    else static if (clockType == ClockType.precise) alias clockArg = CLOCK_REALTIME;
+                    else static assert(0, "Previous static if is wrong.");
+                    timespec ts = void;
+                    immutable error = clock_gettime(clockArg, &ts);
+                    // Posix clock_gettime called with a valid address and valid clock_id is only
+                    // permitted to fail if the number of seconds does not fit in time_t. If tv_sec
+                    // is long or larger overflow won't happen before 292 billion years A.D.
+                    static if (ts.tv_sec.max < long.max)
+                    {
+                        if (error)
+                            throw new TimeException("Call to clock_gettime() failed");
+                    }
+                    return convert!("seconds", "hnsecs")(ts.tv_sec) +
+                           ts.tv_nsec / 100 +
+                           hnsecsToUnixEpoch;
+                }
+            }
             else static assert(0, "Unsupported OS");
         }
         else static assert(0, "Unsupported OS");
@@ -441,30 +467,38 @@ private:
     `SysTime` (though for local time applications, time zones can be ignored
     and it will work, since it defaults to using the local time zone). It holds
     its internal time in std time (hnsecs since midnight, January 1st, 1 A.D.
-    UTC), so it interfaces well with the system time. However, that means that,
-    unlike $(REF DateTime,std,datetime,date), it is not optimized for
-    calendar-based operations, and getting individual units from it such as
-    years or days is going to involve conversions and be less efficient.
+    UTC), so it interfaces well with the system time.
 
     An $(I hnsec) (hecto-nanosecond) is 100 nanoseconds. There are 10,000,000 hnsecs in a second.
 
-    For calendar-based operations that don't
-    care about time zones, then $(REF DateTime,std,datetime,date) would be
-    the type to use. For system time, use `SysTime`.
+$(PANEL
+    Unlike $(REF_SHORT DateTime,std,datetime,date), `SysTime` is not optimized for
+    calendar-based operations, and getting individual units from it such as
+    years or days is going to involve conversions and be less efficient.
 
-    $(LREF Clock.currTime) will return the current time as a `SysTime`.
-    To convert a `SysTime` to a $(REF Date,std,datetime,date) or
-    $(REF DateTime,std,datetime,date), simply cast it. To convert a
-    $(REF Date,std,datetime,date) or $(REF DateTime,std,datetime,date) to a
+    For calendar-based operations that don't
+    care about time zones, then $(REF_SHORT DateTime,std,datetime,date) would be
+    the type to use. For system time, use `SysTime`.
+)
+$(P
+    Casting a `SysTime` to one of the following types will perform a conversion:
+)
+    * $(REF Date,std,datetime,date)
+    * $(REF_SHORT DateTime,std,datetime,date)
+    * $(REF_SHORT TimeOfDay,std,datetime,date)
+$(P
+    To convert a
+    $(REF_SHORT Date,std,datetime,date) or $(REF_SHORT DateTime,std,datetime,date) to a
     `SysTime`, use `SysTime`'s constructor, and pass in the intended time
     zone with it (or don't pass in a $(REF TimeZone,std,datetime,timezone), and
     the local time zone will be used). Be aware, however, that converting from a
-    $(REF DateTime,std,datetime,date) to a `SysTime` will not necessarily
+    $(REF_SHORT DateTime,std,datetime,date) to a `SysTime` will not necessarily
     be 100% accurate due to DST (one hour of the year doesn't exist and another
     occurs twice). To not risk any conversion errors, keep times as
     `SysTime`s. Aside from DST though, there shouldn't be any conversion
     problems.
-
+)
+$(PANEL
     For using time zones other than local time or UTC, use
     $(REF PosixTimeZone,std,datetime,timezone) on Posix systems (or on Windows,
     if providing the TZ Database files), and use
@@ -472,16 +506,20 @@ private:
     `SysTime` is kept internally in hnsecs from midnight, January 1st, 1 A.D.
     UTC. Conversion error cannot happen when changing the time zone of a
     `SysTime`. $(REF LocalTime,std,datetime,timezone) is the
-    $(REF TimeZone,std,datetime,timezone) class which represents the local time,
-    and `UTC` is the $(REF TimeZone,std,datetime,timezone) class which
-    represents UTC. `SysTime` uses $(REF LocalTime,std,datetime,timezone) if
-    no $(REF TimeZone,std,datetime,timezone) is provided. For more details on
-    time zones, see the documentation for $(REF TimeZone,std,datetime,timezone),
-    $(REF PosixTimeZone,std,datetime,timezone), and
-    $(REF WindowsTimeZone,std,datetime,timezone).
-
+    $(REF_SHORT TimeZone,std,datetime,timezone) class which represents the local time,
+    and `UTC` is the $(REF_SHORT TimeZone,std,datetime,timezone) class which
+    represents UTC. `SysTime` uses $(REF_SHORT LocalTime,std,datetime,timezone) if
+    no $(REF_SHORT TimeZone,std,datetime,timezone) is provided. For more details on
+    time zones, see the documentation for $(REF_SHORT TimeZone,std,datetime,timezone),
+    $(REF_SHORT PosixTimeZone,std,datetime,timezone), and
+    $(REF_SHORT WindowsTimeZone,std,datetime,timezone).
+)
+$(P
     `SysTime`'s range is from approximately 29,000 B.C. to approximately
     29,000 A.D.
+)
+See_Also:
+    $(RELATIVE_LINK2 .Clock.currTime, `Clock.currTime`) will return the current time as a `SysTime`.
   +/
 struct SysTime
 {
@@ -693,7 +731,7 @@ public:
 
         Returns: The `this` of this `SysTime`.
       +/
-    ref SysTime opAssign()(auto ref const(SysTime) rhs) return scope @safe pure nothrow
+    ref SysTime opAssign()(auto ref const(SysTime) rhs) scope return @safe pure nothrow
     {
         _stdTime = rhs._stdTime;
         _timezone = rhs._timezone;
@@ -6269,7 +6307,7 @@ public:
             duration = The $(REF Duration, core,time) to add to or subtract from
                        this $(LREF SysTime).
       +/
-    SysTime opBinary(string op)(Duration duration) @safe const pure nothrow scope
+    SysTime opBinary(string op)(Duration duration) @safe const pure nothrow return scope
         if (op == "+" || op == "-")
     {
         SysTime retval = SysTime(this._stdTime, this._timezone);
@@ -7668,7 +7706,7 @@ public:
         $(LREF SysTime) for the last day in the month that this Date is in.
         The time portion of endOfMonth is always 23:59:59.9999999.
       +/
-    @property SysTime endOfMonth() @safe const nothrow scope
+    @property SysTime endOfMonth() @safe const nothrow return scope
     {
         immutable hnsecs = adjTime;
         immutable days = getUnitsFromHNSecs!"days"(hnsecs);
@@ -8713,13 +8751,14 @@ public:
 
     /++
         Creates a $(LREF SysTime) from a string with the format
-        YYYYMMDDTHHMMSS.FFFFFFFTZ (where F is fractional seconds is the time
-        zone). Whitespace is stripped from the given string.
+        YYYYMMDDTHHMMSS.FFFFFFFTZ (where F is fractional seconds and TZ
+        is the time zone). Whitespace is stripped from the given string.
 
-        The exact format is exactly as described in `toISOString` except that
-        trailing zeroes are permitted - including having fractional seconds with
-        all zeroes. However, a decimal point with nothing following it is
-        invalid. Also, while $(LREF toISOString) will never generate a string
+        The exact format is exactly as described in $(LREF toISOString) except
+        that trailing zeroes are permitted - including having fractional seconds
+        with all zeroes. The time zone and fractional seconds are optional,
+        however, a decimal point with nothing following it is invalid.
+        Also, while $(LREF toISOString) will never generate a string
         with more than 7 digits in the fractional seconds (because that's the
         limit with hecto-nanosecond precision), it will allow more than 7 digits
         in order to read strings from other sources that have higher precision
@@ -9024,13 +9063,14 @@ public:
 
     /++
         Creates a $(LREF SysTime) from a string with the format
-        YYYY-MM-DDTHH:MM:SS.FFFFFFFTZ (where F is fractional seconds is the
-        time zone). Whitespace is stripped from the given string.
+        YYYY-MM-DDTHH:MM:SS.FFFFFFFTZ (where F is fractional seconds and TZ
+        is the time zone). Whitespace is stripped from the given string.
 
-        The exact format is exactly as described in `toISOExtString`
+        The exact format is exactly as described in $(LREF toISOExtString)
         except that trailing zeroes are permitted - including having fractional
-        seconds with all zeroes. However, a decimal point with nothing following
-        it is invalid. Also, while $(LREF toISOExtString) will never generate a
+        seconds with all zeroes. The time zone and fractional seconds are
+        optional, however, a decimal point with nothing following it is invalid.
+        Also, while $(LREF toISOExtString) will never generate a
         string with more than 7 digits in the fractional seconds (because that's
         the limit with hecto-nanosecond precision), it will allow more than 7
         digits in order to read strings from other sources that have higher
@@ -9273,13 +9313,14 @@ public:
 
     /++
         Creates a $(LREF SysTime) from a string with the format
-        YYYY-MM-DD HH:MM:SS.FFFFFFFTZ (where F is fractional seconds is the
-        time zone). Whitespace is stripped from the given string.
+        YYYY-Mon-DD HH:MM:SS.FFFFFFFTZ (where F is fractional seconds and TZ
+        is the time zone). Whitespace is stripped from the given string.
 
-        The exact format is exactly as described in `toSimpleString` except
+        The exact format is exactly as described in $(LREF toSimpleString) except
         that trailing zeroes are permitted - including having fractional seconds
-        with all zeroes. However, a decimal point with nothing following it is
-        invalid. Also, while $(LREF toSimpleString) will never generate a
+        with all zeroes. The time zone and fractional seconds are optional,
+        however, a decimal point with nothing following it is invalid.
+        Also, while $(LREF toSimpleString) will never generate a
         string with more than 7 digits in the fractional seconds (because that's
         the limit with hecto-nanosecond precision), it will allow more than 7
         digits in order to read strings from other sources that have higher
@@ -9644,16 +9685,25 @@ private:
 @safe unittest
 {
     import core.time : days, hours, seconds;
-    import std.datetime.date : DateTime;
+    import std.datetime.date : Date, DateTime;
     import std.datetime.timezone : SimpleTimeZone, UTC;
 
+    const dt = DateTime(2018, 1, 1, 10, 30, 0);
     // make a specific point in time in the UTC timezone
-    auto st = SysTime(DateTime(2018, 1, 1, 10, 30, 0), UTC());
+    auto st = SysTime(dt, UTC());
+    assert(st.year == 2018);
+    assert(st.hour == 10);
+
+    // cast to convert
+    assert(cast(DateTime) st == dt);
+    assert(cast(Date) st == Date(2018, 1, 1));
+
     // make a specific point in time in the New York timezone
-    auto ny = SysTime(
-        DateTime(2018, 1, 1, 10, 30, 0),
+    const ny = SysTime(dt,
         new immutable SimpleTimeZone(-5.hours, "America/New_York")
     );
+    assert(ny != st);
+    assert(ny.hour == 10);
 
     // ISO standard time strings
     assert(st.toISOString() == "20180101T103000Z");
@@ -9745,7 +9795,7 @@ long unixTimeToStdTime(long unixTime) @safe pure nothrow @nogc
 
     "std time"'s epoch is based on the Proleptic Gregorian Calendar per ISO
     8601 and is what $(LREF SysTime) uses internally. However, holding the time
-    as an integer in hnescs since that epoch technically isn't actually part of
+    as an integer in hnsecs since that epoch technically isn't actually part of
     the standard, much as it's based on it, so the name "std time" isn't
     particularly good, but there isn't an official name for it. C# uses "ticks"
     for the same thing, but they aren't actually clock ticks, and the term
@@ -10065,7 +10115,7 @@ else version (Windows)
 
         static void testScope(scope ref SysTime st) @safe
         {
-            auto result = SysTimeToSYSTEMTIME(st);
+            auto localResult = SysTimeToSYSTEMTIME(st);
         }
     }
 
@@ -10148,7 +10198,7 @@ else version (Windows)
 
         static void testScope(scope ref SysTime st) @safe
         {
-            auto result = SysTimeToFILETIME(st);
+            auto local_result = SysTimeToFILETIME(st);
         }
     }
 }

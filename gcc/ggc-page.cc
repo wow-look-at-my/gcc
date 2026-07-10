@@ -1,5 +1,5 @@
 /* "Bag-of-pages" garbage collector for the GNU compiler.
-   Copyright (C) 1999-2022 Free Software Foundation, Inc.
+   Copyright (C) 1999-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -722,6 +722,18 @@ alloc_anon (char *pref ATTRIBUTE_UNUSED, size_t size, bool check)
   /* Remember that we allocated this memory.  */
   G.bytes_mapped += size;
 
+  /* Back the GC heap with transparent huge pages where the kernel supports it.
+     The common small-object path allocates GGC_QUIRE_SIZE pages at once
+     (2 MB on a 4 KB-page host) and these maps are 2 MB-aligned, making them
+     ideal THP candidates; the GC heap is where every 'tree' node lives, so
+     promoting it to huge pages cuts first-touch minor page faults and relieves
+     dTLB pressure on allocation-heavy (e.g. heavily templated C++) compiles.
+     This is advisory: the kernel ignores it for sub-2 MB or misaligned maps,
+     and the whole thing is a no-op on platforms without MADV_HUGEPAGE.  */
+#ifdef MADV_HUGEPAGE
+  madvise (page, size, MADV_HUGEPAGE);
+#endif
+
   /* Pretend we don't have access to the allocated pages.  We'll enable
      access to smaller pieces of the area in ggc_internal_alloc.  Discard the
      handle to avoid handle leak.  */
@@ -940,8 +952,9 @@ alloc_page (unsigned order)
 
   if (GGC_DEBUG_LEVEL >= 2)
     fprintf (G.debug_file,
-	     "Allocating page at %p, object size=%lu, data %p-%p\n",
-	     (void *) entry, (unsigned long) OBJECT_SIZE (order),
+	     "Allocating page at %p, object size="
+	     HOST_SIZE_T_PRINT_UNSIGNED ", data %p-%p\n",
+	     (void *) entry, (fmt_size_t) OBJECT_SIZE (order),
 	     (void *) page, (void *) (page + entry_size - 1));
 
   return entry;
@@ -1448,8 +1461,10 @@ ggc_internal_alloc (size_t size, void (*f)(void *), size_t s, size_t n
 
   if (GGC_DEBUG_LEVEL >= 3)
     fprintf (G.debug_file,
-	     "Allocating object, requested size=%lu, actual=%lu at %p on %p\n",
-	     (unsigned long) size, (unsigned long) object_size, result,
+	     "Allocating object, requested size="
+	     HOST_SIZE_T_PRINT_UNSIGNED ", actual=" HOST_SIZE_T_PRINT_UNSIGNED
+	     " at %p on %p\n",
+	     (fmt_size_t) size, (fmt_size_t) object_size, result,
 	     (void *) entry);
 
   return result;
@@ -1538,7 +1553,7 @@ gt_ggc_mx (unsigned char& x ATTRIBUTE_UNUSED)
    P must have been allocated by the GC allocator; it mustn't point to
    static objects, stack variables, or memory allocated with malloc.  */
 
-int
+bool
 ggc_set_mark (const void *p)
 {
   page_entry *entry;
@@ -1558,7 +1573,7 @@ ggc_set_mark (const void *p)
 
   /* If the bit was previously set, skip it.  */
   if (entry->in_use_p[word] & mask)
-    return 1;
+    return true;
 
   /* Otherwise set it, and decrement the free object count.  */
   entry->in_use_p[word] |= mask;
@@ -1567,14 +1582,14 @@ ggc_set_mark (const void *p)
   if (GGC_DEBUG_LEVEL >= 4)
     fprintf (G.debug_file, "Marking %p\n", p);
 
-  return 0;
+  return false;
 }
 
-/* Return 1 if P has been marked, zero otherwise.
+/* Return true if P has been marked, zero otherwise.
    P must have been allocated by the GC allocator; it mustn't point to
    static objects, stack variables, or memory allocated with malloc.  */
 
-int
+bool
 ggc_marked_p (const void *p)
 {
   page_entry *entry;
@@ -1621,8 +1636,9 @@ ggc_free (void *p)
 
   if (GGC_DEBUG_LEVEL >= 3)
     fprintf (G.debug_file,
-	     "Freeing object, actual size=%lu, at %p on %p\n",
-	     (unsigned long) size, p, (void *) pe);
+	     "Freeing object, actual size="
+	     HOST_SIZE_T_PRINT_UNSIGNED ", at %p on %p\n",
+	     (fmt_size_t) size, p, (void *) pe);
 
 #ifdef ENABLE_GC_CHECKING
   /* Poison the data, to indicate the data is garbage.  */
@@ -2409,7 +2425,7 @@ init_ggc_pch (void)
 
 void
 ggc_pch_count_object (struct ggc_pch_data *d, void *x ATTRIBUTE_UNUSED,
-		      size_t size, bool is_string ATTRIBUTE_UNUSED)
+		      size_t size)
 {
   unsigned order;
 
@@ -2452,7 +2468,7 @@ ggc_pch_this_base (struct ggc_pch_data *d, void *base)
 
 char *
 ggc_pch_alloc_object (struct ggc_pch_data *d, void *x ATTRIBUTE_UNUSED,
-		      size_t size, bool is_string ATTRIBUTE_UNUSED)
+		      size_t size)
 {
   unsigned order;
   char *result;
@@ -2481,7 +2497,7 @@ ggc_pch_prepare_write (struct ggc_pch_data *d ATTRIBUTE_UNUSED,
 void
 ggc_pch_write_object (struct ggc_pch_data *d,
 		      FILE *f, void *x, void *newx ATTRIBUTE_UNUSED,
-		      size_t size, bool is_string ATTRIBUTE_UNUSED)
+		      size_t size)
 {
   unsigned order;
   static const char emptyBytes[256] = { 0 };

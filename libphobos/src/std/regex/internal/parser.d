@@ -841,7 +841,7 @@ if (isForwardRange!R && is(ElementType!R : dchar))
         switch (front)
         {
         case '*', '?', '+', '|', '{', '}':
-            error("'*', '+', '?', '{', '}' not allowed in atom");
+            return error("'*', '+', '?', '{', '}' not allowed in atom");
         case '.':
             if (re_flags & RegexOption.singleline)
                 g.put(Bytecode(IR.Any, 0));
@@ -1010,12 +1010,14 @@ if (isForwardRange!R && is(ElementType!R : dchar))
     //
     @trusted void error(string msg)
     {
-        import std.array : appender;
-        import std.format.write : formattedWrite;
-        auto app = appender!string();
-        formattedWrite(app, "%s\nPattern with error: `%s` <--HERE-- `%s`",
-                       msg, origin[0..$-pat.length], pat);
-        throw new RegexException(app.data);
+        import std.conv : text;
+        string app = msg;
+        app ~= "\nPattern with error: `";
+        app ~= origin[0..$-pat.length].text;
+        app ~= "` <--HERE-- `";
+        app ~= pat.text;
+        app ~= "`";
+        throw new RegexException(app);
     }
 
     alias Char = BasicElementOf!R;

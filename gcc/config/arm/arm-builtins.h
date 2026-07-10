@@ -1,5 +1,5 @@
 /* Declarations for determining resolver for a given builtin.
-   Copyright (C) 2020-2022 Free Software Foundation, Inc.
+   Copyright (C) 2020-2024 Free Software Foundation, Inc.
 
    This file is part of GCC.
 
@@ -27,6 +27,7 @@
 
 enum resolver_ident {
     arm_cde_resolver,
+    arm_mve_resolver,
     arm_no_resolver
 };
 enum resolver_ident arm_describe_resolver (tree);
@@ -84,7 +85,9 @@ enum arm_type_qualifiers
   qualifier_lane_pair_index = 0x1000,
   /* Lane indices selected in quadtuplets - must be within range of previous
      argument = a vector.  */
-  qualifier_lane_quadtup_index = 0x2000
+  qualifier_lane_quadtup_index = 0x2000,
+  /* MVE vector predicates.  */
+  qualifier_predicate = 0x4000
 };
 
 struct arm_simd_type_info

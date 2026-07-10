@@ -1,7 +1,7 @@
 /**
  * Perform constant folding.
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/optimize.d, _optimize.d)
@@ -16,6 +16,7 @@ import core.stdc.stdio;
 import dmd.astenums;
 import dmd.constfold;
 import dmd.ctfeexpr;
+import dmd.dcast;
 import dmd.dclass;
 import dmd.declaration;
 import dmd.dsymbol;
@@ -24,12 +25,15 @@ import dmd.errors;
 import dmd.expression;
 import dmd.expressionsem;
 import dmd.globals;
+import dmd.hdrgen;
 import dmd.init;
+import dmd.location;
 import dmd.mtype;
 import dmd.printast;
 import dmd.root.ctfloat;
 import dmd.sideeffect;
 import dmd.tokens;
+import dmd.typesem;
 import dmd.visitor;
 
 /*************************************
@@ -89,7 +93,7 @@ Expression expandVar(int result, VarDeclaration v)
                 {
                     if (v.storage_class & STC.manifest)
                     {
-                        v.error("recursive initialization of constant");
+                        .error(v.loc, "%s `%s` recursive initialization of constant", v.kind, v.toPrettyChars);
                         return errorReturn();
                     }
                     return nullReturn();
@@ -99,7 +103,7 @@ Expression expandVar(int result, VarDeclaration v)
                 {
                     if (v.storage_class & STC.manifest)
                     {
-                        v.error("enum cannot be initialized with `%s`", v._init.toChars());
+                        .error(v.loc, "%s `%s` enum cannot be initialized with `%s`", v.kind, v.toPrettyChars, dmd.hdrgen.toChars(v._init));
                         return errorReturn();
                     }
                     return nullReturn();
@@ -188,7 +192,7 @@ private Expression fromConstInitializer(int result, Expression e1)
         {
             // If it is a comma expression involving a declaration, we mustn't
             // perform a copy -- we'd get two declarations of the same variable.
-            // See bugzilla 4465.
+            // See https://issues.dlang.org/show_bug.cgi?id=4465.
             if (e.op == EXP.comma && e.isCommaExp().e1.isDeclarationExp())
                 e = e1;
             else if (e.type != e1.type && e1.type && e1.type.ty != Tident)
@@ -221,11 +225,11 @@ package void setLengthVarIfKnown(VarDeclaration lengthVar, Expression arr)
         return;
     if (lengthVar._init && !lengthVar._init.isVoidInitializer())
         return; // we have previously calculated the length
-    d_uns64 len;
+    dinteger_t len;
     if (auto se = arr.isStringExp())
         len = se.len;
     else if (auto ale = arr.isArrayLiteralExp())
-        len = ale.elements.dim;
+        len = ale.elements.length;
     else
     {
         auto tsa = arr.type.toBasetype().isTypeSArray();
@@ -253,7 +257,7 @@ package void setLengthVarIfKnown(VarDeclaration lengthVar, Type type)
     auto tsa = type.toBasetype().isTypeSArray();
     if (!tsa)
         return; // we don't know the length yet
-    d_uns64 len = tsa.dim.toInteger();
+    const len = tsa.dim.toInteger();
     Expression dollar = new IntegerExp(Loc.initial, len, Type.tsize_t);
     lengthVar._init = new ExpInitializer(Loc.initial, dollar);
     lengthVar.storage_class |= STC.static_ | STC.const_;
@@ -269,12 +273,12 @@ package void setLengthVarIfKnown(VarDeclaration lengthVar, Type type)
  * Returns:
  *      Constant folded version of `e`
  */
-Expression Expression_optimize(Expression e, int result, bool keepLvalue)
+Expression optimize(Expression e, int result, bool keepLvalue = false)
 {
-    //printf("Expression_optimize() %s\n", e.toChars());
+    //printf("optimize() e: %s result: %d keepLvalue %d\n", e.toChars(), result, keepLvalue);
     Expression ret = e;
 
-    void error()
+    void errorReturn()
     {
         ret = ErrorExp.get();
     }
@@ -285,7 +289,7 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
     {
         if (!e)
             return false;
-        Expression ex = Expression_optimize(e, flags, keepLvalue);
+        Expression ex = optimize(e, flags, keepLvalue);
         if (ex.op == EXP.error)
         {
             ret = ex; // store error result
@@ -338,9 +342,9 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
     void visitTuple(TupleExp e)
     {
         expOptimize(e.e0, WANTvalue);
-        for (size_t i = 0; i < e.exps.dim; i++)
+        foreach (ref ex; (*e.exps)[])
         {
-            expOptimize((*e.exps)[i], WANTvalue);
+            expOptimize(ex, WANTvalue);
         }
     }
 
@@ -349,19 +353,19 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
         if (e.elements)
         {
             expOptimize(e.basis, result & WANTexpand);
-            for (size_t i = 0; i < e.elements.dim; i++)
+            foreach (ref ex; (*e.elements)[])
             {
-                expOptimize((*e.elements)[i], result & WANTexpand);
+                expOptimize(ex, result & WANTexpand);
             }
         }
     }
 
     void visitAssocArrayLiteral(AssocArrayLiteralExp e)
     {
-        assert(e.keys.dim == e.values.dim);
-        for (size_t i = 0; i < e.keys.dim; i++)
+        assert(e.keys.length == e.values.length);
+        foreach (i, ref ekey; (*e.keys)[])
         {
-            expOptimize((*e.keys)[i], result & WANTexpand);
+            expOptimize(ekey, result & WANTexpand);
             expOptimize((*e.values)[i], result & WANTexpand);
         }
     }
@@ -370,13 +374,13 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
     {
         if (e.stageflags & stageOptimize)
             return;
-        int old = e.stageflags;
+        const old = e.stageflags;
         e.stageflags |= stageOptimize;
         if (e.elements)
         {
-            for (size_t i = 0; i < e.elements.dim; i++)
+            foreach (ref ex; (*e.elements)[])
             {
-                expOptimize((*e.elements)[i], result & WANTexpand);
+                expOptimize(ex, result & WANTexpand);
             }
         }
         e.stageflags = old;
@@ -426,7 +430,7 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
 
     void visitAddr(AddrExp e)
     {
-        //printf("AddrExp::optimize(result = %d) %s\n", result, e.toChars());
+        //printf("AddrExp::optimize(result = %d, keepLvalue = %d) %s\n", result, keepLvalue, e.toChars());
         /* Rewrite &(a,b) as (a,&b)
          */
         if (auto ce = e.e1.isCommaExp())
@@ -438,7 +442,8 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
         }
         // Keep lvalue-ness
         if (expOptimize(e.e1, result, true))
-            return;
+            return;                     // error return
+
         // Convert &*ex to ex
         if (auto pe = e.e1.isPtrExp())
         {
@@ -469,10 +474,11 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
              * Params:
              *      e = the DotVarExp or VarExp
              *      var = set to the VarExp at the end, or null if doesn't end in VarExp
+             *      eint = set to the IntegerExp at the end, or null if doesn't end in IntegerExp
              *      offset = accumulation of all the .var offsets encountered
              * Returns: true on error
              */
-            static bool getVarAndOffset(Expression e, ref VarDeclaration var, ref uint offset)
+            static bool getVarAndOffset(Expression e, out VarDeclaration var, out IntegerExp eint, ref uint offset)
             {
                 if (e.type.size() == SIZE_INVALID)  // trigger computation of v.offset
                     return true;
@@ -483,7 +489,7 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
                     if (!v || !v.isField() || v.isBitFieldDeclaration())
                         return false;
 
-                    if (getVarAndOffset(dve.e1, var, offset))
+                    if (getVarAndOffset(dve.e1, var, eint, offset))
                         return true;
                     offset += v.offset;
                 }
@@ -497,12 +503,47 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
                         var = ve.var.isVarDeclaration();
                     }
                 }
+                else if (auto ep = e.isPtrExp())
+                {
+                    if (auto ei = ep.e1.isIntegerExp())
+                    {
+                        eint = ei;
+                    }
+                    else if (auto se = ep.e1.isSymOffExp())
+                    {
+                        if (!se.var.isReference() &&
+                            !se.var.isImportedSymbol() &&
+                            se.var.isDataseg())
+                        {
+                            var = se.var.isVarDeclaration();
+                            offset += se.offset;
+                        }
+                    }
+                }
+                else if (auto ei = e.isIndexExp())
+                {
+                    if (auto ve = ei.e1.isVarExp())
+                    {
+                        if (!ve.var.isReference() &&
+                            !ve.var.isImportedSymbol() &&
+                            ve.var.isDataseg() &&
+                            ve.var.isCsymbol())
+                        {
+                            if (auto ie = ei.e2.isIntegerExp())
+                            {
+                                var = ve.var.isVarDeclaration();
+                                offset += ie.toInteger() * ve.type.toBasetype().nextOf().size();
+                            }
+                        }
+                    }
+                }
                 return false;
             }
 
             uint offset;
             VarDeclaration var;
-            if (getVarAndOffset(e.e1, var, offset))
+            IntegerExp eint;
+            if (getVarAndOffset(e.e1, var, eint, offset))
             {
                 ret = ErrorExp.get();
                 return;
@@ -513,11 +554,51 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
                 ret.type = e.type;
                 return;
             }
+            if (eint)
+            {
+                ret = new IntegerExp(e.loc, eint.toInteger() + offset, e.type);
+                return;
+            }
         }
-        if (auto ae = e.e1.isIndexExp())
+        else if (auto ae = e.e1.isIndexExp())
         {
+            if (ae.e2.isIntegerExp() && ae.e1.isIndexExp())
+            {
+                /* Rewrite `(a[i])[index]` to `(&a[i]) + index*size`
+                 */
+                sinteger_t index = ae.e2.toInteger();
+                auto ae1 = ae.e1.isIndexExp();          // ae1 is a[i]
+                if (auto ts = ae1.type.isTypeSArray())
+                {
+                    sinteger_t dim = ts.dim.toInteger();
+
+                    if (index < 0 || index > dim)
+                    {
+                        error(e.loc, "array index %lld is out of bounds `[0..%lld]`", index, dim);
+                        return errorReturn();
+                    }
+
+                    import core.checkedint : mulu;
+                    bool overflow;
+                    const offset = mulu(index, ts.nextOf().size(e.loc), overflow); // offset = index*size
+                    if (overflow)
+                    {
+                        error(e.loc, "array offset overflow");
+                        return errorReturn();
+                    }
+
+                    Expression ex = new AddrExp(ae1.loc, ae1);  // &a[i]
+                    ex.type = ae1.type.pointerTo();
+
+                    Expression add = new AddExp(ae.loc, ex, new IntegerExp(ae.e2.loc, offset, ae.e2.type));
+                    add.type = e.type;
+                    ret = optimize(add, result, keepLvalue);
+                    return;
+                }
+            }
+
             // Convert &array[n] to &array+n
-            if (ae.e2.op == EXP.int64 && ae.e1.isVarExp())
+            if (ae.e2.isIntegerExp() && ae.e1.isVarExp())
             {
                 sinteger_t index = ae.e2.toInteger();
                 VarExp ve = ae.e1.isVarExp();
@@ -527,8 +608,14 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
                     sinteger_t dim = ts.dim.toInteger();
                     if (index < 0 || index >= dim)
                     {
-                        e.error("array index %lld is out of bounds `[0..%lld]`", index, dim);
-                        return error();
+                        /* 0 for C static arrays means size is unknown, no need to check,
+                         * and address one past the end is OK, too
+                         */
+                        if (!((dim == 0 || dim == index) && ve.var.isCsymbol()))
+                        {
+                            error(e.loc, "array index %lld is out of bounds `[0..%lld]`", index, dim);
+                            return errorReturn();
+                        }
                     }
 
                     import core.checkedint : mulu;
@@ -536,11 +623,48 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
                     const offset = mulu(index, ts.nextOf().size(e.loc), overflow);
                     if (overflow)
                     {
-                        e.error("array offset overflow");
-                        return error();
+                        error(e.loc, "array offset overflow");
+                        return errorReturn();
                     }
 
                     ret = new SymOffExp(e.loc, ve.var, offset);
+                    ret.type = e.type;
+                    return;
+                }
+            }
+            // Convert &((a.b)[index]) to (&a.b)+index*elementsize
+            else if (ae.e2.isIntegerExp() && ae.e1.isDotVarExp())
+            {
+                sinteger_t index = ae.e2.toInteger();
+                DotVarExp ve = ae.e1.isDotVarExp();
+                if (ve.type.isTypeSArray() && ve.var.isField() && ve.e1.isPtrExp())
+                {
+                    TypeSArray ts = ve.type.isTypeSArray();
+                    sinteger_t dim = ts.dim.toInteger();
+                    if (index < 0 || index >= dim)
+                    {
+                        /* 0 for C static arrays means size is unknown, no need to check,
+                         * and address one past the end is OK, too
+                         */
+                        if (!((dim == 0 || dim == index) && ve.var.isCsymbol()))
+                        {
+                            error(e.loc, "array index %lld is out of bounds `[0..%lld]`", index, dim);
+                            return errorReturn();
+                        }
+                    }
+
+                    import core.checkedint : mulu;
+                    bool overflow;
+                    const offset = mulu(index, ts.nextOf().size(e.loc), overflow); // index*elementsize
+                    if (overflow)
+                    {
+                        error(e.loc, "array offset overflow");
+                        return errorReturn();
+                    }
+
+                    auto pe = new AddrExp(e.loc, ve);
+                    pe.type = e.type;
+                    ret = new AddExp(e.loc, pe, new IntegerExp(e.loc, offset, Type.tsize_t));
                     ret.type = e.type;
                     return;
                 }
@@ -631,18 +755,11 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
     {
         expOptimize(e.thisexp, WANTvalue);
         // Optimize parameters
-        if (e.newargs)
-        {
-            for (size_t i = 0; i < e.newargs.dim; i++)
-            {
-                expOptimize((*e.newargs)[i], WANTvalue);
-            }
-        }
         if (e.arguments)
         {
-            for (size_t i = 0; i < e.arguments.dim; i++)
+            foreach (ref arg; (*e.arguments)[])
             {
-                expOptimize((*e.arguments)[i], WANTvalue);
+                expOptimize(arg, WANTvalue);
             }
         }
     }
@@ -655,17 +772,14 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
             return;
         if (e.arguments)
         {
-            Type t1 = e.e1.type.toBasetype();
-            if (t1.ty == Tdelegate)
-                t1 = t1.nextOf();
             // t1 can apparently be void for __ArrayDtor(T) calls
-            if (auto tf = t1.isTypeFunction())
+            if (auto tf = e.calledFunctionType())
             {
-                for (size_t i = 0; i < e.arguments.dim; i++)
+                foreach (i, ref arg; (*e.arguments)[])
                 {
                     Parameter p = tf.parameterList[i];
                     bool keep = p && p.isReference();
-                    expOptimize((*e.arguments)[i], WANTvalue, keep);
+                    expOptimize(arg, WANTvalue, keep);
                 }
             }
         }
@@ -697,7 +811,7 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
             const esz  = e.type.nextOf().size(e.loc);
             const e1sz = e.e1.type.toBasetype().nextOf().size(e.e1.loc);
             if (esz == SIZE_INVALID || e1sz == SIZE_INVALID)
-                return error();
+                return errorReturn();
 
             if (e1sz == esz)
             {
@@ -712,14 +826,17 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
             }
         }
 
+        // Returning e.e1 with changing its type
+        void returnE_e1()
+        {
+            ret = (e1old == e.e1 ? e.e1.copy() : e.e1);
+            ret.type = e.type;
+        }
+
         if (e.e1.op == EXP.structLiteral && e.e1.type.implicitConvTo(e.type) >= MATCH.constant)
         {
             //printf(" returning2 %s\n", e.e1.toChars());
-        L1:
-            // Returning e1 with changing its type
-            ret = (e1old == e.e1 ? e.e1.copy() : e.e1);
-            ret.type = e.type;
-            return;
+            return returnE_e1();
         }
         /* The first test here is to prevent infinite loops
          */
@@ -731,7 +848,7 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
         if (e.e1.op == EXP.null_ && (e.type.ty == Tpointer || e.type.ty == Tclass || e.type.ty == Tarray))
         {
             //printf(" returning3 %s\n", e.e1.toChars());
-            goto L1;
+            return returnE_e1();
         }
         if (e.type.ty == Tclass && e.e1.type.ty == Tclass)
         {
@@ -741,25 +858,26 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
             ClassDeclaration cdfrom = e.e1.type.isClassHandle();
             ClassDeclaration cdto = e.type.isClassHandle();
             if (cdfrom.errors || cdto.errors)
-                return error();
+                return errorReturn();
             if (cdto == ClassDeclaration.object && !cdfrom.isInterfaceDeclaration())
-                goto L1;    // can always convert a class to Object
+                return returnE_e1();    // can always convert a class to Object
             // Need to determine correct offset before optimizing away the cast.
             // https://issues.dlang.org/show_bug.cgi?id=16980
-            cdfrom.size(e.loc);
+            if (cdfrom.size(e.loc) == SIZE_INVALID)
+                return errorReturn();
             assert(cdfrom.sizeok == Sizeok.done);
             assert(cdto.sizeok == Sizeok.done || !cdto.isBaseOf(cdfrom, null));
             int offset;
             if (cdto.isBaseOf(cdfrom, &offset) && offset == 0)
             {
                 //printf(" returning4 %s\n", e.e1.toChars());
-                goto L1;
+                return returnE_e1();
             }
         }
         if (e.e1.type.mutableOf().unSharedOf().equals(e.to.mutableOf().unSharedOf()))
         {
             //printf(" returning5 %s\n", e.e1.toChars());
-            goto L1;
+            return returnE_e1();
         }
         if (e.e1.isConst())
         {
@@ -771,10 +889,10 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
                     const e1sz = e.e1.type.size(e.e1.loc);
                     if (esz == SIZE_INVALID ||
                         e1sz == SIZE_INVALID)
-                        return error();
+                        return errorReturn();
 
                     if (esz == e1sz)
-                        goto L1;
+                        return returnE_e1();
                 }
                 return;
             }
@@ -799,16 +917,24 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
             if (e.e2.isConst() == 1)
             {
                 sinteger_t i2 = e.e2.toInteger();
-                d_uns64 sz = e.e1.type.size(e.e1.loc);
+                uinteger_t sz = e.e1.type.size(e.e1.loc);
                 assert(sz != SIZE_INVALID);
                 sz *= 8;
                 if (i2 < 0 || i2 >= sz)
                 {
-                    e.error("shift assign by %lld is outside the range `0..%llu`", i2, cast(ulong)sz - 1);
-                    return error();
+                    error(e.loc, "shift assign by %lld is outside the range `0..%llu`", i2, cast(ulong)sz - 1);
+                    return errorReturn();
                 }
             }
         }
+    }
+
+    void visitCatAssign(CatAssignExp e)
+    {
+        if (auto lowering = e.lowering)
+            optimize(lowering, result, keepLvalue);
+        else
+            visitBinAssign(e);
     }
 
     void visitBin(BinExp e)
@@ -835,6 +961,7 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
 
     void visitMin(MinExp e)
     {
+        //printf("MinExp::optimize(%s)\n", e.toChars());
         if (binOptimize(e, result))
             return;
         if (e.e1.isConst() && e.e2.isConst())
@@ -884,13 +1011,13 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
         if (e.e2.isConst() == 1)
         {
             sinteger_t i2 = e.e2.toInteger();
-            d_uns64 sz = e.e1.type.size(e.e1.loc);
+            uinteger_t sz = e.e1.type.size(e.e1.loc);
             assert(sz != SIZE_INVALID);
             sz *= 8;
             if (i2 < 0 || i2 >= sz)
             {
-                e.error("shift by %lld is outside the range `0..%llu`", i2, cast(ulong)sz - 1);
-                return error();
+                error(e.loc, "shift by %lld is outside the range `0..%llu`", i2, cast(ulong)sz - 1);
+                return errorReturn();
             }
             if (e.e1.isConst() == 1)
                 ret = (*shift)(e.loc, e.type, e.e1, e.e2).copy();
@@ -946,8 +1073,8 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
         // All negative integral powers are illegal.
         if (e.e1.type.isintegral() && (e.e2.op == EXP.int64) && cast(sinteger_t)e.e2.toInteger() < 0)
         {
-            e.error("cannot raise `%s` to a negative integer power. Did you mean `(cast(real)%s)^^%s` ?", e.e1.type.toBasetype().toChars(), e.e1.toChars(), e.e2.toChars());
-            return error();
+            error(e.loc, "cannot raise `%s` to a negative integer power. Did you mean `(cast(real)%s)^^%s` ?", e.e1.type.toBasetype().toChars(), e.e1.toChars(), e.e2.toChars());
+            return errorReturn();
         }
         // If e2 *could* have been an integer, make it one.
         if (e.e2.op == EXP.float64 && e.e2.toReal() == real_t(cast(sinteger_t)e.e2.toReal()))
@@ -1003,7 +1130,7 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
                     e.e1 = ci;
             }
         }
-        if (e.e1.op == EXP.string_ || e.e1.op == EXP.arrayLiteral || e.e1.op == EXP.assocArrayLiteral || e.e1.type.toBasetype().ty == Tsarray)
+        if (e.e1.op == EXP.string_ || e.e1.op == EXP.arrayLiteral || e.e1.op == EXP.assocArrayLiteral || e.e1.type.toBasetype().ty == Tsarray || e.e1.op == EXP.null_)
         {
             ret = ArrayLength(e.type, e.e1).copy();
         }
@@ -1057,7 +1184,7 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
         // Don't optimize to an array literal element directly in case an lvalue is requested
         if (keepLvalue && ex.op == EXP.arrayLiteral)
             return;
-        ret = Index(e.type, ex, e.e2).copy();
+        ret = Index(e.type, ex, e.e2, e.indexIsInBounds).copy();
         if (CTFEExp.isCantExp(ret) || (!ret.isErrorExp() && keepLvalue && !ret.isLvalue()))
             ret = e;
     }
@@ -1121,7 +1248,7 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
                 ret = new CastExp(e.loc, ret, Type.tvoid);
                 ret.type = e.type;
             }
-            ret = Expression_optimize(ret, result, false);
+            ret = optimize(ret, result, false);
             return;
         }
         expOptimize(e.e2, WANTvalue);
@@ -1130,8 +1257,8 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
             const e1Opt = e.e1.toBool();
             if (e.e2.isConst())
             {
-                bool n1 = e1Opt.hasValue(true);
-                bool n2 = e.e2.toBool().hasValue(true);
+                bool n1 = e1Opt.get();
+                bool n2 = e.e2.toBool().get();
                 ret = new IntegerExp(e.loc, oror ? (n1 || n2) : (n1 && n2), e.type);
             }
             else if (e1Opt.hasValue(!oror))
@@ -1164,19 +1291,25 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
         //printf("CatExp::optimize(%d) %s\n", result, e.toChars());
         if (binOptimize(e, result))
             return;
-        if (auto ce1 = e.e1.isCatExp())
-        {
-            // https://issues.dlang.org/show_bug.cgi?id=12798
-            // optimize ((expr ~ str1) ~ str2)
-            scope CatExp cex = new CatExp(e.loc, ce1.e2, e.e2);
-            cex.type = e.type;
-            Expression ex = Expression_optimize(cex, result, false);
-            if (ex != cex)
+
+        if (e.type == Type.tstring)
+            if (auto ce1 = e.e1.isCatExp())
             {
-                e.e1 = ce1.e1;
-                e.e2 = ex;
+                // https://issues.dlang.org/show_bug.cgi?id=12798
+                // optimize ((expr ~ str1) ~ str2)
+                // https://issues.dlang.org/show_bug.cgi?id=24078
+                // This optimization is only valid if `expr` is a string.
+                // Otherwise it leads to:
+                // `["c"] ~ "a" ~ "b"` becoming `["c"] ~ "ab"`
+                scope CatExp cex = new CatExp(e.loc, ce1.e2, e.e2);
+                cex.type = e.type;
+                Expression ex = optimize(cex, result, false);
+                if (ex != cex)
+                {
+                    e.e1 = ce1.e1;
+                    e.e2 = ex;
+                }
             }
-        }
         // optimize "str"[] -> "str"
         if (auto se1 = e.e1.isSliceExp())
         {
@@ -1199,9 +1332,9 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
             return;
         const opt = e.econd.toBool();
         if (opt.hasValue(true))
-            ret = Expression_optimize(e.e1, result, keepLvalue);
+            ret = optimize(e.e1, result, keepLvalue);
         else if (opt.hasValue(false))
-            ret = Expression_optimize(e.e2, result, keepLvalue);
+            ret = optimize(e.e2, result, keepLvalue);
         else
         {
             expOptimize(e.e1, result, keepLvalue);
@@ -1215,8 +1348,8 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
     {
         if (b++ == global.recursionLimit)
         {
-            e.error("infinite loop while optimizing expression");
-            fatal();
+            error(e.loc, "infinite loop while optimizing expression");
+            return ErrorExp.get();
         }
 
         auto ex = ret;
@@ -1268,9 +1401,9 @@ Expression Expression_optimize(Expression e, int result, bool keepLvalue)
             case EXP.leftShiftAssign:
             case EXP.rightShiftAssign:
             case EXP.unsignedRightShiftAssign:
+            case EXP.concatenateDcharAssign: visitBinAssign(ex.isBinAssignExp()); break;
             case EXP.concatenateElemAssign:
-            case EXP.concatenateDcharAssign:
-            case EXP.concatenateAssign: visitBinAssign(ex.isBinAssignExp()); break;
+            case EXP.concatenateAssign:      visitCatAssign(cast(CatAssignExp) ex); break;
 
             case EXP.minusMinus:
             case EXP.plusPlus:

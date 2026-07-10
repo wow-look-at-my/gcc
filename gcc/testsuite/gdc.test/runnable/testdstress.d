@@ -1,10 +1,4 @@
 // PERMUTE_ARGS:
-/*
-TEST_OUTPUT:
----
-runnable/testdstress.d(666): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
----
-*/
 
 module run.module_01;
 
@@ -500,7 +494,7 @@ void test23()
 int status24;
 
 class C24{
-        this(){
+        this() scope {
                 assert(status24==0);
                 status24+=2;
         }
@@ -663,7 +657,7 @@ void test30()
 
         assert(status30 == 1);
 
-        delete m;   // _d_callfinalizer
+        destroy(m);   // _d_callfinalizer
     }
     catch (Error e) // FinalizeError
     {

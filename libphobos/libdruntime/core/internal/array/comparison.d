@@ -60,24 +60,21 @@ int __cmp(T)(scope const T[] lhs, scope const T[] rhs) @trusted
         immutable len = lhs.length <= rhs.length ? lhs.length : rhs.length;
         foreach (const u; 0 .. len)
         {
-            static if (__traits(isFloating, T))
+            auto a = lhs.ptr[u], b = rhs.ptr[u];
+            static if (is(T : creal))
             {
-                immutable a = lhs.ptr[u], b = rhs.ptr[u];
-                static if (is(T == cfloat) || is(T == cdouble)
-                    || is(T == creal))
-                {
-                    // Use rt.cmath2._Ccmp instead ?
-                    auto r = (a.re > b.re) - (a.re < b.re);
-                    if (!r) r = (a.im > b.im) - (a.im < b.im);
-                }
-                else
-                {
-                    const r = (a > b) - (a < b);
-                }
-                if (r) return r;
+                // Use rt.cmath2._Ccmp instead ?
+                // Also: if NaN is present, numbers will appear equal.
+                auto r = (a.re > b.re) - (a.re < b.re);
+                if (!r) r = (a.im > b.im) - (a.im < b.im);
             }
-            else if (lhs.ptr[u] != rhs.ptr[u])
-                return lhs.ptr[u] < rhs.ptr[u] ? -1 : 1;
+            else
+            {
+                // This pattern for three-way comparison is better than conditional operators
+                // See e.g. https://godbolt.org/z/3j4vh1
+                const r = (a > b) - (a < b);
+            }
+            if (r) return r;
         }
         return (lhs.length > rhs.length) - (lhs.length < rhs.length);
     }
@@ -86,7 +83,7 @@ int __cmp(T)(scope const T[] lhs, scope const T[] rhs) @trusted
 // This function is called by the compiler when dealing with array
 // comparisons in the semantic analysis phase of CmpExp. The ordering
 // comparison is lowered to a call to this template.
-int __cmp(T1, T2)(T1[] s1, T2[] s2)
+auto __cmp(T1, T2)(T1[] s1, T2[] s2)
 if (!__traits(isScalar, T1) && !__traits(isScalar, T2))
 {
     import core.internal.traits : Unqual;
@@ -117,8 +114,8 @@ if (!__traits(isScalar, T1) && !__traits(isScalar, T2))
         }
         else static if (__traits(compiles, at(s1, u) < at(s2, u)))
         {
-            if (at(s1, u) != at(s2, u))
-                return at(s1, u) < at(s2, u) ? -1 : 1;
+            if (int result = (at(s1, u) > at(s2, u)) - (at(s1, u) < at(s2, u)))
+                return result;
         }
         else
         {
@@ -239,4 +236,27 @@ if (!__traits(isScalar, T1) && !__traits(isScalar, T2))
     auto va = [cast(immutable void[])a[0], a[1]];
     auto vb = [cast(void[])b[0], b[1]];
     assert(less2(va, vb));
+}
+
+// custom aggregate types
+@safe unittest
+{
+    // https://issues.dlang.org/show_bug.cgi?id=24044
+    // Support float opCmp(...) with array
+    static struct F
+    {
+        float f;
+        float opCmp(F other) const { return this.f - other.f; }
+    }
+
+    F[2] a = [F(1.0f), F(float.nan)];
+    F[2] b = [F(1.0f), F(1.0f)];
+    F[1] c = [F(1.0f)];
+
+    bool isNan(float f) { return f != f; }
+
+    assert(isNan(__cmp(a, b)));
+    assert(isNan(__cmp(a, a)));
+    assert(__cmp(b, b) == 0);
+    assert(__cmp(a, c) > 0);
 }

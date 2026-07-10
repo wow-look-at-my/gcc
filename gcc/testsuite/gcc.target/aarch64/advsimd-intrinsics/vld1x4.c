@@ -1,8 +1,9 @@
 /* We haven't implemented these intrinsics for arm yet.  */
-/* { dg-xfail-if "" { arm*-*-* } } */
 /* { dg-do run } */
+/* { dg-skip-if "unimplemented" { arm*-*-* } } */
 /* { dg-options "-O3" } */
 
+#include <stdbool.h>
 #include <arm_neon.h>
 #include "arm-neon-ref.h"
 
@@ -71,13 +72,16 @@ VARIANT (float64, 2, q_f64)
 VARIANTS (TESTMETH)
 
 #define CHECKS(BASE, ELTS, SUFFIX)	\
-  if (test_vld1##SUFFIX##_x4 () != 0)	\
-    fprintf (stderr, "test_vld1##SUFFIX##_x4");
+  if (test_vld1##SUFFIX##_x4 () != 0) {	\
+    fprintf (stderr, "test_vld1" #SUFFIX "_x4 failed\n"); \
+    failed = true; \
+  }
 
 int
 main (int argc, char **argv)
 {
+  bool failed = false;
   VARIANTS (CHECKS)
 
-  return 0;
+  return (failed) ? 1 : 0;
 }

@@ -1,7 +1,7 @@
 /* Pass to free or clear language-specific data structures from
    the IL before they reach the middle end.
 
-   Copyright (C) 1987-2022 Free Software Foundation, Inc.
+   Copyright (C) 1987-2024 Free Software Foundation, Inc.
 
    This file is part of GCC.
 
@@ -234,7 +234,7 @@ fld_decl_context (tree ctx)
   return ctx;
 }
 
-/* For T being aggregate type try to turn it into a incomplete variant.
+/* For T being aggregate type try to turn it into an incomplete variant.
    Return T if no simplification is possible.  */
 
 static tree
@@ -436,9 +436,7 @@ free_lang_data_in_type (tree type, class free_lang_data_d *fld)
 	 different front ends.  */
       for (tree p = TYPE_ARG_TYPES (type); p; p = TREE_CHAIN (p))
 	{
-	  TREE_VALUE (p) = fld_simplified_type (TREE_VALUE (p), fld);
 	  tree arg_type = TREE_VALUE (p);
-
 	  if (TYPE_READONLY (arg_type) || TYPE_VOLATILE (arg_type))
 	    {
 	      int quals = TYPE_QUALS (arg_type)
@@ -448,6 +446,7 @@ free_lang_data_in_type (tree type, class free_lang_data_d *fld)
 	      if (!fld->pset.add (TREE_VALUE (p)))
 		free_lang_data_in_type (TREE_VALUE (p), fld);
 	    }
+	  TREE_VALUE (p) = fld_simplified_type (TREE_VALUE (p), fld);
 	  /* C++ FE uses TREE_PURPOSE to store initial values.  */
 	  TREE_PURPOSE (p) = NULL;
 	}
@@ -672,7 +671,7 @@ free_lang_data_in_decl (tree decl, class free_lang_data_d *fld)
         }
     }
   /* We need to keep field decls associated with their trees. Otherwise tree
-     merging may merge some fileds and keep others disjoint wich in turn will
+     merging may merge some fields and keep others disjoint which in turn will
      not do well with TREE_CHAIN pointers linking them.
 
      Also do not drop containing types for virtual methods and tables because
@@ -841,6 +840,20 @@ find_decls_types_r (tree *tp, int *ws, void *data)
       for (tree tem = BLOCK_SUBBLOCKS (t); tem; tem = BLOCK_CHAIN (tem))
 	fld_worklist_push (tem, fld);
       fld_worklist_push (BLOCK_ABSTRACT_ORIGIN (t), fld);
+    }
+  /* walk_tree does not visit ce->index which can be a FIELD_DECL, pulling
+     in otherwise unused structure fields so handle CTORs explicitly.  */
+  else if (TREE_CODE (t) == CONSTRUCTOR)
+    {
+      unsigned HOST_WIDE_INT idx;
+      constructor_elt *ce;
+      for (idx = 0; vec_safe_iterate (CONSTRUCTOR_ELTS (t), idx, &ce); idx++)
+	{
+	  if (ce->index)
+	    fld_worklist_push (ce->index, fld);
+	  fld_worklist_push (ce->value, fld);
+	}
+      *ws = 0;
     }
 
   if (TREE_CODE (t) != IDENTIFIER_NODE
@@ -1109,9 +1122,7 @@ free_lang_data (void)
   free_lang_data_in_cgraph (&fld);
 
   /* Create gimple variants for common types.  */
-  for (unsigned i = 0;
-       i < sizeof (builtin_structptr_types) / sizeof (builtin_structptr_type);
-       ++i)
+  for (unsigned i = 0; i < ARRAY_SIZE (builtin_structptr_types); ++i)
     builtin_structptr_types[i].node = builtin_structptr_types[i].base;
 
   /* Reset some langhooks.  Do not reset types_compatible_p, it may
@@ -1175,7 +1186,7 @@ public:
   {}
 
   /* opt_pass methods: */
-  virtual unsigned int execute (function *) { return free_lang_data (); }
+  unsigned int execute (function *) final override { return free_lang_data (); }
 
 }; // class pass_ipa_free_lang_data
 

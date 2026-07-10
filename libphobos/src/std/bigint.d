@@ -254,11 +254,11 @@ public:
 
         static if (op=="+")
         {
-            data = BigUint.addOrSubInt(data, u, sign != (y<0), sign);
+            data = BigUint.addOrSubInt!ulong(data, u, wantSub: sign != (y<0), sign);
         }
         else static if (op=="-")
         {
-            data = BigUint.addOrSubInt(data, u, sign == (y<0), sign);
+            data = BigUint.addOrSubInt!ulong(data, u, wantSub: sign == (y<0), sign);
         }
         else static if (op=="*")
         {
@@ -323,7 +323,15 @@ public:
         else static if (op=="^^")
         {
             sign = (y & 1) ? sign : false;
-            data = BigUint.pow(data, u);
+            if (y < 0)
+            {
+                checkDivByZero();
+                data = cast(ulong) (data == 1);
+            }
+            else
+            {
+                data = BigUint.pow(data, u);
+            }
         }
         else static if (op=="&")
         {
@@ -411,20 +419,33 @@ public:
         ));
     }
 
+    // https://issues.dlang.org/show_bug.cgi?id=24028
+    @system unittest
+    {
+        import std.exception : assertThrown;
+        import core.exception : AssertError;
+
+        assert(BigInt(100) ^^ -1 == BigInt(0));
+        assert(BigInt(1) ^^ -1 == BigInt(1));
+        assert(BigInt(-1) ^^ -1 == BigInt(-1));
+        assert(BigInt(-1) ^^ -2 == BigInt(1));
+        assertThrown!AssertError(BigInt(0) ^^ -1);
+    }
+
     /**
      * Implements assignment operators of the form `BigInt op= BigInt`.
      */
-    BigInt opOpAssign(string op, T)(T y) pure nothrow @safe scope return
+    BigInt opOpAssign(string op, T)(T y) pure nothrow @safe return scope
         if ((op=="+" || op== "-" || op=="*" || op=="|" || op=="&" || op=="^" || op=="/" || op=="%")
             && is (T: BigInt))
     {
         static if (op == "+")
         {
-            data = BigUint.addOrSub(data, y.data, sign != y.sign, &sign);
+            data = BigUint.addOrSub(data, y.data, sign != y.sign, sign);
         }
         else static if (op == "-")
         {
-            data = BigUint.addOrSub(data, y.data, sign == y.sign, &sign);
+            data = BigUint.addOrSub(data, y.data, sign == y.sign, sign);
         }
         else static if (op == "*")
         {
@@ -613,7 +634,7 @@ public:
         static if (op == "-")
         {
             r.sign = sign;
-            r.data = BigUint.addOrSubInt(data, u, sign == (y<0), r.sign);
+            r.data = BigUint.addOrSubInt!ulong(data, u, wantSub: sign == (y<0), r.sign);
             r.negate();
         }
         return r;
@@ -670,12 +691,12 @@ public:
     {
         static if (op=="++")
         {
-            data = BigUint.addOrSubInt(data, 1UL, sign, sign);
+            data = BigUint.addOrSubInt!ulong(data, 1UL, wantSub: sign, sign);
             return this;
         }
         else static if (op=="--")
         {
-            data = BigUint.addOrSubInt(data, 1UL, !sign, sign);
+            data = BigUint.addOrSubInt!ulong(data, 1UL, wantSub: !sign, sign);
             return this;
         }
     }
@@ -1541,7 +1562,7 @@ Returns:
     number in upper case.
 
 */
-string toHex(const(BigInt) x) @safe
+string toHex(const(BigInt) x) pure @safe
 {
     import std.array : appender;
     auto outbuff = appender!string();
@@ -2244,7 +2265,7 @@ void divMod(const BigInt dividend, const BigInt divisor, out BigInt quotient, ou
     BigUint.divMod(dividend.data, divisor.data, q, r);
     quotient.sign = dividend.sign != divisor.sign;
     quotient.data = q;
-    remainder.sign = dividend.sign;
+    remainder.sign = r.isZero() ? false : dividend.sign;
     remainder.data = r;
 }
 
@@ -2289,6 +2310,14 @@ void divMod(const BigInt dividend, const BigInt divisor, out BigInt quotient, ou
     assert(q == -10);
     assert(r == -24);
     assert(q * d + r == -c);
+}
+
+// https://issues.dlang.org/show_bug.cgi?id=22771
+@safe pure nothrow unittest
+{
+    BigInt quotient, remainder;
+    divMod(BigInt(-50), BigInt(1), quotient, remainder);
+    assert(remainder == 0);
 }
 
 // https://issues.dlang.org/show_bug.cgi?id=19740

@@ -1,5 +1,5 @@
 /* main.c: defines main() for cc1, cc1plus, etc.
-   Copyright (C) 2007-2022 Free Software Foundation, Inc.
+   Copyright (C) 2007-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -37,9 +37,9 @@ main (int argc, char **argv)
 		 true /* init_signals */);
 
   int r = toplev.main (argc, argv);
-#if CHECKING_P
-  toplev.finalize ();
-#endif
+
+  if (flag_checking && !seen_error ())
+    toplev.finalize ();
 
   return r;
 }

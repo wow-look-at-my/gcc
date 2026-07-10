@@ -2326,7 +2326,7 @@ struct Bug10840
     Data10840* _data;
 }
 
-bool bug10840(int n)
+enum bug10840 = (int n)
 {
     Bug10840 stack;
     if (n == 1)
@@ -2336,7 +2336,7 @@ bool bug10840(int n)
     }
     // Wrong-code for ?:
     return stack._data ? false : true;
-}
+};
 
 static assert(bug10840(0));
 static assert(!is(typeof(Compileable!(bug10840(1)))));
@@ -2473,12 +2473,12 @@ static assert(checkPass("foobar") == 1);
 
 struct Toq
 {
-    const(char)* m;
+    char* m;
 }
 
 Toq ptrRet(bool b)
 {
-    string x = "abc";
+    char[] x = "abc".dup;
     return Toq(b ? x[0 .. 1].ptr : null);
 }
 
@@ -5910,13 +5910,13 @@ struct Bug7527
     char[] data;
 }
 
-int bug7527()
+enum bug7527 = ()
 {
     auto app = Bug7527();
 
     app.data.ptr[0 .. 1] = "x";
     return 1;
-}
+};
 
 static assert(!is(typeof(compiles!(bug7527()))));
 
@@ -7208,7 +7208,7 @@ struct S13630(T)
 {
     T[3] arr;
 
-    this(A...)(auto ref in A args)
+    this(A...)(const auto ref A args)
     {
         auto p = arr.ptr;
 
@@ -7238,7 +7238,7 @@ struct Matrix13827(T, uint N)
         T[N] flat;
     }
 
-    this(A...)(auto ref in A args)
+    this(A...)(const auto ref A args)
     {
         uint k;
 
@@ -7808,3 +7808,101 @@ int test9937()
 }
 
 static assert(test9937());
+
+/************************************************/
+// static array .tupleof
+
+struct SArrayTupleEquiv(T)
+{
+    T f1;
+    T f2;
+}
+
+// basic .tupleof invariants
+bool testSArrayTupleA()
+{
+    int[2] xs;
+    assert(xs.tupleof == TypeTuple!(0, 0));
+    assert(xs.tupleof == (cast(int[2])[0, 0]).tupleof);
+
+    xs.tupleof = TypeTuple!(1, 2);
+    assert(xs.tupleof == TypeTuple!(1, 2));
+
+    auto ys = SArrayTupleEquiv!int(1, 2);
+    assert(xs.tupleof == ys.tupleof);
+
+    return true;
+}
+static assert(testSArrayTupleA());
+
+// tuples with side effects
+bool testSArrayTupleB()
+{
+    // Counter records lifetime events in copies/dtors, as a cheap way to check that .tupleof for
+    // static arrays exhibit all the same side effects as an equivalent struct's .tupleof
+    int[int] copies;
+    int[int] dtors;
+    struct Counter
+    {
+        int id = -1;
+
+        this(this)
+        {
+            copies[id] = copies.get(id, 0) + 1;
+        }
+
+        ~this()
+        {
+            dtors[id] = dtors.get(id, 0) + 1;
+        }
+    }
+
+    void consume(Counter, Counter) {}
+    Counter[2] produce(int id1, int id2)
+    {
+        return [Counter(id1), Counter(id2)];
+    }
+
+    // first sample expected behavior from struct .tupleof
+    // braces create a subscope, shortening lifetimes
+    {
+        auto a = SArrayTupleEquiv!Counter(Counter(0), Counter(1));
+
+        typeof(a) b;
+        b.tupleof = a.tupleof;
+
+        Counter x, y;
+        TypeTuple!(x, y) = a.tupleof;
+
+        a.tupleof[0] = Counter(2);
+        a.tupleof[1] = Counter(3);
+        consume(a.tupleof);
+
+        a.tupleof = produce(4, 5).tupleof;
+    }
+    int[int][2] expected = [copies.dup, dtors.dup];
+    copies = null; // .clear is not CTFE friendly
+    dtors = null;
+
+    // the real test -- sample behavior of array .tupleof
+    {
+        Counter[2] a = [Counter(0), Counter(1)];
+
+        typeof(a) b;
+        b.tupleof = a.tupleof;
+
+        Counter x, y;
+        TypeTuple!(x, y) = a.tupleof;
+
+        a.tupleof[0] = Counter(2);
+        a.tupleof[1] = Counter(3);
+        consume(a.tupleof);
+
+        a.tupleof = produce(4, 5).tupleof;
+    }
+    assert(expected[0] == copies);
+    assert(expected[1] == dtors);
+
+    return true;
+}
+static assert(testSArrayTupleB());

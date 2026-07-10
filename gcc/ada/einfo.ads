@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 S p e c                                  --
 --                                                                          --
---          Copyright (C) 1992-2022, Free Software Foundation, Inc.         --
+--          Copyright (C) 1992-2024, Free Software Foundation, Inc.         --
 --                                                                          --
 -- GNAT is free software;  you can  redistribute it  and/or modify it under --
 -- terms of the  GNU General Public License as published  by the Free Soft- --
@@ -222,10 +222,9 @@ package Einfo is
 --  on the actions triggered by a freeze node, which include the construction
 --  of initialization procedures and dispatch tables.
 
---  b) The presence of a freeze node on an entity is used by the back end to
---  defer elaboration of the entity until its freeze node is seen. In the
---  absence of an explicit freeze node, an entity is frozen (and elaborated)
---  at the point of declaration.
+--  b) The flag is used by the back end to defer elaboration of the entity
+--  until its freeze node is seen. In the absence of an explicit freeze node,
+--  an entity is frozen (and elaborated) at the point of declaration.
 
 --  For object declarations, the flag is set when an address clause for the
 --  object is encountered. Legality checks on the address expression only take
@@ -359,9 +358,11 @@ package Einfo is
 --
 --       For objects, the Actual_Subtype is set only if this is a discriminated
 --       type. For arrays, the bounds of the expression are obtained and the
---       Etype of the object is directly the constrained subtype. This is
---       rather irregular, and the semantic checks that depend on the nominal
---       subtype being unconstrained use flag Is_Constr_Subt_For_U_Nominal(qv).
+--       Etype of the object is directly the constrained subtype, except in the
+--       case of a return object that lives on the secondary stack where Etype
+--       is the nominal unconstrained subtype. This is rather irregular and the
+--       semantic checks that depend on the nominal subtype being unconstrained
+--       use flag Is_Constr_Subt_For_U_Nominal(qv).
 
 --    Address_Clause (synthesized)
 --       Applies to entries, objects and subprograms. Set if an address clause
@@ -605,10 +606,10 @@ package Einfo is
 
 --    Checks_May_Be_Suppressed
 --       Defined in all entities. Set if a pragma Suppress or Unsuppress
---       mentions the entity specifically in the second argument. If this
---       flag is set the Global_Entity_Suppress and Local_Entity_Suppress
---       tables must be consulted to determine if there actually is an active
---       Suppress or Unsuppress pragma that applies to the entity.
+--       mentions the entity specifically in the second argument. If this flag
+--       is set the global and local suppress stacks must be consulted to
+--       determine if there actually is an active Suppress or Unsuppress pragma
+--       that applies to the entity.
 
 --    Class_Postconditions
 --       Defined on subprogram entities. Set if the subprogram has class-wide
@@ -863,29 +864,12 @@ package Einfo is
 --       and IN OUT parameters in the absence of errors).
 
 --    Delay_Cleanups
---       Defined in entities that have finalization lists (subprograms
---       blocks, and tasks). Set if there are pending generic body
---       instantiations for the corresponding entity. If this flag is
---       set, then generation of cleanup actions for the corresponding
---       entity must be delayed, since the insertion of the generic body
---       may affect cleanup generation (see Inline for further details).
-
---    Delay_Subprogram_Descriptors
---       Defined in entities for which exception subprogram descriptors
---       are generated (subprograms, package declarations and package
---       bodies). Defined if there are pending generic body instantiations
---       for the corresponding entity. If this flag is set, then generation
---       of the subprogram descriptor for the corresponding enities must
---       be delayed, since the insertion of the generic body may add entries
---       to the list of handlers.
---
---       Note: for subprograms, Delay_Subprogram_Descriptors is set if and
---       only if Delay_Cleanups is set. But Delay_Cleanups can be set for a
---       a block (in which case Delay_Subprogram_Descriptors is set for the
---       containing subprogram). In addition Delay_Subprogram_Descriptors is
---       set for a library level package declaration or body which contains
---       delayed instantiations (in this case the descriptor refers to the
---       enclosing elaboration procedure).
+--       Defined in entities that have finalization lists (subprograms, blocks
+--       and tasks) or finalizers (package specs and bodies). Set if there are
+--       pending package body instantiations for the corresponding entity. If
+--       it is set, then generation of cleanup actions for the corresponding
+--       entity must be delayed, since the insertion of the package bodies may
+--       affect cleanup generation (see Inline for further details).
 
 --    Delta_Value
 --       Defined in fixed and decimal types. Points to a universal real
@@ -1147,6 +1131,8 @@ package Einfo is
 --       object for task entry calls and a Communications_Block object
 --       in the case of protected entry calls. In both cases the objects
 --       are declared in outer scopes to this block.
+--       This is also defined in labels, because we temporarily set the
+--       Ekind of an E_Block to E_Label in Analyze_Implicit_Label_Declaration.
 
 --    Entry_Component
 --       Defined in formal parameters (in, in out and out parameters). Used
@@ -1345,12 +1331,14 @@ package Einfo is
 --       find the first discriminant if discriminants are present.
 
 --    First_Entity
---       Defined in all entities which act as scopes to which a list of
---       associated entities is attached (blocks, class subtypes and types,
---       entries, functions, loops, packages, procedures, protected objects,
---       record types and subtypes, private types, task types and subtypes).
---       Points to a list of associated entities using the Next_Entity field
---       as a chain pointer with Empty marking the end of the list.
+--       Defined in all entities that act as scopes to which a list of
+--       associated entities is attached, and also in all [sub]types. Some
+--       entities are both; for example E_Record_Type acts as a scope and
+--       is a type. [Sub]types that do not act as scopes (e.g. scalars) are
+--       included to make it more convenient to Mutate_Entity between type
+--       kinds. Points to a list of associated entities linked through the
+--       Next_Entity field with Empty marking end-of-list.
+--       See also Last_Entity.
 
 --    First_Exit_Statement
 --       Defined in E_Loop entity. The exit statements for a loop are chained
@@ -1576,7 +1564,8 @@ package Einfo is
 
 --    Has_Controlling_Result
 --       Defined in E_Function entities. Set if the function is a primitive
---       function of a tagged type which can dispatch on result.
+--       function of a tagged type which can dispatch on result. Also set on
+--       secondary stack thunks built for such a primitive function.
 
 --    Has_Convention_Pragma
 --       Defined in all entities. Set for an entity for which a valid pragma
@@ -1687,6 +1676,10 @@ package Einfo is
 --       replaced by the fully qualified name, as used for debug output. See
 --       Exp_Dbug for a full description of the use of this flag and also the
 --       related flag Has_Qualified_Name.
+
+--    Has_Ghost_Predicate_Aspect
+--       Defined in all types and subtypes. Set if a Ghost_Predicate aspect
+--       was explicitly applied to the type.
 
 --    Has_Gigi_Rep_Item
 --       Defined in all entities. Set if the rep item chain (referenced by
@@ -1863,7 +1856,7 @@ package Einfo is
 --    Has_Per_Object_Constraint
 --       Defined in E_Component entities. Set if the subtype of the component
 --       has a per object constraint. Per object constraints result from the
---       following situations :
+--       following situations:
 --
 --       1. N_Attribute_Reference - when the prefix is the enclosing type and
 --          the attribute is Access.
@@ -1976,7 +1969,7 @@ package Einfo is
 --       is defined for the type.
 
 --    Has_Private_Ancestor
---       Applies to type extensions. True if some ancestor is derived from a
+--       Applies to derived record types. True if an ancestor is derived from a
 --       private type, making some components invisible and aggregates illegal.
 --       This flag is set at the point of derivation. The legality of the
 --       aggregate must be rechecked because it also depends on the visibility
@@ -2308,6 +2301,10 @@ package Einfo is
 --       the corresponding entity. Reset at end of corresponding declarative
 --       part. The flag on a type is also used to determine the visibility of
 --       the primitive operators of the type.
+--
+--       Note that manipulation of scopes on the scope stack will also cause
+--       the flag to be set/unset since the setting of scopes affects
+--       visibility.
 
 --    Is_Abstract_Subprogram
 --       Defined in all subprograms and entries. Set for abstract subprograms.
@@ -2477,16 +2474,16 @@ package Einfo is
 --       and subtypes, string types and subtypes, and all numeric types).
 --       Set if the type or subtype is constrained.
 
+--    Is_Constr_Array_Subt_With_Bounds
+--       Defined in all types and subtypes. Set only for an array subtype
+--       which is constrained but nevertheless requires objects of this
+--       subtype to be allocated with their bounds. This flag is used by
+--       the back end to determine whether the bounds must be constructed.
+
 --    Is_Constr_Subt_For_U_Nominal
 --       Defined in all types and subtypes. Set only for the constructed
 --       subtype of an object whose nominal subtype is unconstrained. Note
 --       that the constructed subtype itself will be constrained.
-
---    Is_Constr_Subt_For_UN_Aliased
---       Defined in all types and subtypes. This flag can be set only if
---       Is_Constr_Subt_For_U_Nominal is also set. It indicates that in
---       addition the object concerned is aliased. This flag is used by
---       the backend to determine whether a template must be constructed.
 
 --    Is_Constructor
 --       Defined in function and procedure entities. Set if a pragma
@@ -2566,7 +2563,7 @@ package Einfo is
 
 --    Is_Elaboration_Checks_OK_Id
 --       Defined in elaboration targets (see terminology in Sem_Elab). Set when
---       the target appears in a region which is subject to elabled elaboration
+--       the target appears in a region which is subject to enabled elaboration
 --       checks. Such targets are allowed to generate run-time conditional ABE
 --       checks or guaranteed ABE failures.
 
@@ -2599,7 +2596,8 @@ package Einfo is
 --       test for the need to replace references in Exp_Ch2.
 
 --    Is_Entry_Wrapper
---       Defined on wrappers created for entries that have precondition aspects
+--       Defined on wrappers created for entries that have precondition or
+--       postcondition aspects.
 
 --    Is_Enumeration_Type (synthesized)
 --       Defined in all entities, true for enumeration types and subtypes
@@ -2729,19 +2727,17 @@ package Einfo is
 --       instantiation of a child unit, and whose entities are not visible
 --       during analysis of the instance.
 
+--    Is_Ignored_For_Finalization
+--       Defined in constants and variables. Set when an object must be ignored
+--       by the general finalization mechanism because its cleanup actions are
+--       already accounted for.
+
 --    Is_Ignored_Ghost_Entity
 --       Applies to all entities. Set for abstract states, [generic] packages,
 --       [generic] subprograms, components, discriminants, formal parameters,
 --       objects, package bodies, subprogram bodies, and [sub]types subject to
 --       pragma Ghost or inherit "ghostness" from an enclosing construct, and
 --       subject to Assertion_Policy Ghost => Ignore.
-
---    Is_Ignored_Transient
---       Defined in constants, loop parameters of generalized iterators, and
---       variables. Set when a transient object must be processed by one of
---       the transient finalization mechanisms. Once marked, a transient is
---       intentionally ignored by the general finalization mechanism because
---       its clean up actions are context specific.
 
 --    Is_Immediately_Visible
 --       Defined in all entities. Set if entity is immediately visible, i.e.
@@ -3095,6 +3091,18 @@ package Einfo is
 --       procedure which verifies the invariants of the partial view of a
 --       private type or private extension.
 
+--    Is_Not_Self_Hidden
+--       Defined in all entities. Roughly speaking, this is False if the
+--       declaration of the entity is hidden from all visibility because
+--       we are within its declaration, as defined by 8.3(16-18). When
+--       we reach the end of the declaration or other place defined by
+--       8.3(16-18), this is set to True. However, this flag is not used
+--       for most overloaded declarations (but is used for enumeration
+--       literals), and is also used for other cases of premature usage
+--       such as defined in 3.8(10) for record components and the like.
+--       In addition, there are cases involving discriminants where we
+--       set this True, then temporarily False again.
+
 --    Is_Potentially_Use_Visible
 --       Defined in all entities. Set if entity is potentially use visible,
 --       i.e. it is defined in a package that appears in a currently active
@@ -3105,16 +3113,11 @@ package Einfo is
 --       Present in functions and procedures. Set for generated predicate
 --       functions.
 
---    Is_Predicate_Function_M
---       Present in functions and procedures. Set for special version of
---       predicate function generated for use in membership tests, where
---       raise expressions are transformed to return False.
-
 --    Is_Preelaborated
 --       Defined in all entities, set in E_Package and E_Generic_Package
 --       entities to which a pragma Preelaborate is applied, and also in
 --       all entities within such packages. Note that the fact that this
---       flag is set does not necesarily mean that no elaboration code is
+--       flag is set does not necessarily mean that no elaboration code is
 --       generated for the package.
 
 --    Is_Primitive
@@ -3228,7 +3231,7 @@ package Einfo is
 --       Defined in all entities, set only for a variable or constant for
 --       which the Renamed_Object field is non-empty and for which the
 --       renaming is handled by the front end, by macro substitution of
---       a copy of the (evaluated) name tree whereever the variable is used.
+--       a copy of the (evaluated) name tree wherever the variable is used.
 
 --    Is_Return_Object
 --       Defined in all object entities. True if the object is the return
@@ -3326,17 +3329,29 @@ package Einfo is
 --       Applies to all entities. True for task types and subtypes
 
 --    Is_Thunk
---       Defined in all entities. True for subprograms that are thunks: that is
---       small subprograms built by the expander for tagged types that cover
---       interface types. As part of the runtime call to an interface, thunks
+--       Defined in all entities. True for subprograms that are thunks, that is
+--       small subprograms built by the expander for particular tagged types.
+--       There are two different kinds of thunk: interface thunk and secondary
+--       stack thunk. Interface thunks are built for tagged types that cover
+--       interface types. As part of the runtime call to an interface, they
 --       displace the pointer to the object (pointer named "this" in the C++
 --       terminology) from a secondary dispatch table to the primary dispatch
 --       table associated with a given tagged type; if the thunk is a function
 --       that returns an object which covers an interface type then the thunk
 --       displaces the pointer to the object from the primary dispatch table to
---       the secondary dispatch table associated with the interface type. Set
---       by Expand_Interface_Thunk and used by Expand_Call to handle extra
---       actuals associated with accessibility level.
+--       the secondary dispatch table associated with the interface type.
+
+--       Secondary stack thunks are built for tagged types that do not need to
+--       be returned on the secondary stack but have primitive functions which
+--       can dispatch on result. In this case, dispatching calls made to these
+--       primitive functions nevertheless need to return on the secondary stack
+--       and a thunk is built to move the result from the primary stack onto
+--       the secondary stack on return from the primitive function. The flag
+--       Has_Controlling_Result is set on secondary stack thunks but not on
+--       interface thunks.
+
+--       Thunks may be chained in a single way: an interface thunk may point to
+--       a secondary stack thunk, which points to the final thunk target.
 
 --    Is_Trivial_Subprogram
 --       Defined in all entities. Set in subprograms where either the body
@@ -3496,12 +3511,8 @@ package Einfo is
 --       statements whose value is not used.
 
 --    Last_Entity
---       Defined in all entities which act as scopes to which a list of
---       associated entities is attached (blocks, class subtypes and types,
---       entries, functions, loops, packages, procedures, protected objects,
---       record types and subtypes, private types, task types and subtypes).
---       Points to the last entry in the list of associated entities chained
---       through the Next_Entity field. Empty if no entities are chained.
+--       Defined for the same entity kinds as First_Entity. Last_Entity
+--       is the last entry in the list. Empty if no entities are chained.
 
 --    Last_Formal (synthesized)
 --       Applies to subprograms and subprogram types, and also in entries
@@ -3524,7 +3535,7 @@ package Einfo is
 --       field may be set as a result of a linker section pragma applied to the
 --       type of the object.
 
---    Lit_Hash
+--    Lit_Hash [root type only]
 --       Defined in enumeration types and subtypes. Non-empty only for the
 --       case of an enumeration root type, where it contains the entity for
 --       the generated hash function. See unit Exp_Imgv for full details of
@@ -3819,7 +3830,7 @@ package Einfo is
 
 --    Number_Formals (synthesized)
 --       Applies to subprograms and subprogram types. Yields the number of
---       formals as a value of type Pos.
+--       formals as a value of type Nat.
 
 --    Object_Size_Clause (synthesized)
 --       Applies to entities for types and subtypes. If an object size clause
@@ -3952,7 +3963,8 @@ package Einfo is
 --       Present in variable entities. Contains all references to the variable
 --       when it is subject to pragma Part_Of. If the variable is a constituent
 --       of a single protected/task type, the references are examined as they
---       must appear only within the type defintion and the corresponding body.
+--       must appear only within the type definition and the corresponding
+--       body.
 
 --    Partial_DIC_Procedure (synthesized)
 --       Defined in type entities. Set for a private type and its full view
@@ -4001,16 +4013,15 @@ package Einfo is
 --       fully initialized when the full view is frozen.
 
 --    Postconditions_Proc
---       Defined in functions, procedures, entries, and entry families. Refers
---       to the entity of the _Postconditions procedure used to check contract
---       assertions on exit from a subprogram.
+--       Obsolete field which can be removed once CodePeer is fixed ???
 
 --    Predicate_Function (synthesized)
 --       Defined in all types. Set for types for which (Has_Predicates is True)
 --       and for which a predicate procedure has been built that tests that the
 --       specified predicates are True. Contains the entity for the function
---       which takes a single argument of the given type, and returns True if
---       the predicate holds and False if it does not.
+--       which takes a single argument of the given type (and sometimes an
+--       additional Boolean parameter), and returns True if the predicate
+--       holds and False if it does not.
 --
 --       Note: flag Has_Predicate does not imply that Predicate_Function is set
 --       to a non-empty entity; this happens, for example, for itypes created
@@ -4023,11 +4034,14 @@ package Einfo is
 --       Note: the reason this is marked as a synthesized attribute is that the
 --       way this is stored is as an element of the Subprograms_For_Type field.
 
---    Predicate_Function_M (synthesized)
---       Defined in all types. Present only if Predicate_Function is present,
---       and only if the predicate function has Raise_Expression nodes. It
---       is the special version created for membership tests, where if one of
---       these raise expressions is executed, the result is to return False.
+--    Predicate_Expression
+--      Defined on functions. For the defining identifier of the subprogram
+--      declaration (not of the subprogram body) of a predicate function,
+--      yields the expression for the noninherited portion of the given
+--      predicate (except in the case where the inherited portion is
+--      non-empty and the non-inherited portion is empty, in which case the
+--      expression for the inherited portion is returned). Otherwise yields
+--      empty.
 
 --    Predicated_Parent
 --       Defined on itypes created by subtype indications, when the parent
@@ -4044,7 +4058,7 @@ package Einfo is
 
 --    Prev_Entity
 --       Defined in all entities. The entities of a scope are chained, and this
---       field is used as a backward pointer for this entity list - effectivly
+--       field is used as a backward pointer for this entity list - effectively
 --       making the entity chain doubly-linked.
 
 --    Primitive_Operations (synthesized)
@@ -4096,7 +4110,7 @@ package Einfo is
 --    Protected_Subprogram
 --       Defined in functions and procedures. Set for the pair of subprograms
 --       which emulate the runtime semantics of a protected subprogram. Denotes
---       the entity of the origial protected subprogram.
+--       the entity of the original protected subprogram.
 
 --    Protection_Object
 --       Applies to protected entries, entry families and subprograms. Denotes
@@ -4119,14 +4133,14 @@ package Einfo is
 --       set instead, or a similar appearance as an out parameter actual, in
 --       which case Referenced_As_Out_Parameter is set.
 
---    Referenced_As_LHS :
+--    Referenced_As_LHS
 --       Defined in all entities. This flag is set instead of Referenced if a
 --       simple variable that is not a renaming appears as the left side of an
 --       assignment. The reason we distinguish this kind of reference is that
 --       we have a separate warning for variables that are only assigned and
 --       never read.
 
---    Referenced_As_Out_Parameter :
+--    Referenced_As_Out_Parameter
 --       Defined in all entities. This flag is set instead of Referenced if a
 --       simple variable that is not a renaming appears as an actual for an out
 --       formal. The reason we distinguish this kind of reference is that
@@ -4241,8 +4255,7 @@ package Einfo is
 --    Returns_By_Ref
 --       Defined in subprogram type entities and functions. Set if a function
 --       (or an access-to-function type) returns a result by reference, either
---       because its return type is a by-reference-type or because the function
---       explicitly uses the secondary stack.
+--       because the result is built in place, or its type is by-reference.
 
 --    Reverse_Bit_Order [base type only]
 --       Defined in all record type entities. Set if entity has a Bit_Order
@@ -4315,14 +4328,14 @@ package Einfo is
 --       concurrent types, private types and entries, and also to record types,
 --       i.e. to any entity that can appear on the scope stack. Yields the
 --       scope depth value, which for those entities other than records is
---       simply the scope depth value, for record entities, it is the
---       Scope_Depth of the record scope.
+--       simply the Scope_Depth_Value, and for record entities, is the
+--       Scope_Depth of the record's scope.
 
 --    Scope_Depth_Value
 --       Defined in program units, blocks, loops, return statements,
 --       concurrent types, private types and entries.
 --       Indicates the number of scopes that statically enclose the declaration
---       of the unit or type. Library units have a depth of zero. Note that
+--       of the unit or type. Library units have a depth of one. Note that
 --       record types can act as scopes but do NOT have this field set (see
 --       Scope_Depth above). Queries should normally be via Scope_Depth,
 --       and not call Scope_Depth_Value directly.
@@ -4503,11 +4516,11 @@ package Einfo is
 --    Status_Flag_Or_Transient_Decl
 --       Defined in constant, loop, and variable entities. Applies to objects
 --       that require special treatment by the finalization machinery, such as
---       extended return results, IF and CASE expression results, and objects
+--       extended return objects, conditional expression results, and objects
 --       inside N_Expression_With_Actions nodes. The attribute contains the
---       entity of a flag which specifies particular behavior over a region of
---       code or the declaration of a "hook" object.
---       In which case is it a flag, or a hook object???
+--       entity of a flag which specifies a particular behavior over a region
+--       of the extended return for the return objects, or the declaration of a
+--       hook object for conditional expressions and N_Expression_With_Actions.
 
 --    Storage_Size_Variable [implementation base type only]
 --       Defined in access types and task type entities. This flag is set
@@ -4519,11 +4532,9 @@ package Einfo is
 --       share the same storage pool).
 
 --    Stored_Constraint
---       Defined in entities that can have discriminants (concurrent types
---       subtypes, record types and subtypes, private types and subtypes,
---       limited private types and subtypes and incomplete types). Points
---       to an element list containing the expressions for each of the
---       stored discriminants for the record (sub)type.
+--       Defined in type entities. Points to an element list containing the
+--       expressions for each of the stored discriminants, if any, for the
+--       (sub)type.
 
 --    Stores_Attribute_Old_Prefix
 --       Defined in constants, variables, and types which are created during
@@ -4751,11 +4762,19 @@ package Einfo is
 --       Defined in functions and procedures which have been classified as
 --       Is_Primitive_Wrapper. Set to the entity being wrapper.
 
+--    Wrapped_Statements
+--       Defined in functions, procedures, entries, and entry families. Refers
+--       to the entity of the _Wrapped_Statements procedure, which gets
+--       generated as part of the expansion of contracts and postconditions
+--       and contains its enclosing subprogram's original source declarations
+--       and statements.
+
 --    LSP_Subprogram
 --       Defined in subprogram entities. Set on wrappers created to handle
 --       inherited class-wide pre/post conditions that call overridden
 --       primitives. It references the parent primitive that has the
---       class-wide pre/post conditions.
+--       class-wide pre/post conditions. LSP stands for Liskov Substitution
+--       Principle.
 
 ---------------------------
 -- Renaming and Aliasing --
@@ -4804,39 +4823,6 @@ package Einfo is
 
 --  The front-end does not store explicitly the fact that Z renames X.
 
---------------------------------------
--- Delayed Freezing and Elaboration --
---------------------------------------
-
---  The flag Has_Delayed_Freeze indicates that an entity carries an explicit
---  freeze node, which appears later in the expanded tree.
-
---  a) The flag is used by the front-end to trigger expansion actions
---  which include the generation of that freeze node. Typically this happens at
---  the end of the current compilation unit, or before the first subprogram
---  body is encountered in the current unit. See files freeze and exp_ch13 for
---  details on the actions triggered by a freeze node, which include the
---  construction of initialization procedures and dispatch tables.
-
---  b) The flag is used by the backend to defer elaboration of the entity until
---  its freeze node is seen. In the absence of an explicit freeze node, an
---  entity is frozen (and elaborated) at the point of declaration.
-
---  For object declarations, the flag is set when an address clause for the
---  object is encountered. Legality checks on the address expression only
---  take place at the freeze point of the object.
-
---  Most types have an explicit freeze node, because they cannot be elaborated
---  until all representation and operational items that apply to them have been
---  analyzed. Private types and incomplete types have the flag set as well, as
---  do task and protected types.
-
---  Implicit base types created for type derivations, as well as classwide
---  types created for all tagged types, have the flag set.
-
---  If a subprogram has an access parameter whose designated type is incomplete
---  the subprogram has the flag set.
-
 ------------------
 -- Access Kinds --
 ------------------
@@ -4846,23 +4832,29 @@ package Einfo is
 
 --    E_Access_Type,
 --    E_General_Access_Type,
+--    E_Anonymous_Access_Type
+
 --    E_Access_Subprogram_Type,
 --    E_Anonymous_Access_Subprogram_Type,
+
 --    E_Access_Protected_Subprogram_Type,
 --    E_Anonymous_Access_Protected_Subprogram_Type
---    E_Anonymous_Access_Type.
 
---  E_Access_Subtype is for an access subtype created by a subtype
---  declaration.
+--  E_Access_Subtype is for an access subtype created by a subtype declaration
 
 --  In addition, we define the kind E_Allocator_Type to label allocators.
 --  This is because special resolution rules apply to this construct.
 --  Eventually the constructs are labeled with the access type imposed by
 --  the context. The backend should never see types with this Ekind.
 
---  Similarly, the type E_Access_Attribute_Type is used as the initial kind
---  associated with an access attribute. After resolution a specific access
---  type will be established as determined by the context.
+--  Similarly, we define the kind E_Access_Attribute_Type as the initial
+--  kind associated with an access attribute whose prefix is an object.
+--  After resolution, a specific access type will be established instead
+--  as determined by the context. Note that, for the case of an access
+--  attribute whose prefix is a subprogram, we build a corresponding type
+--  with E_Access_Subprogram_Type or E_Access_Protected_Subprogram_Type kind
+--  but whose designated type is the subprogram itself, instead of a regular
+--  E_Subprogram_Type entity.
 
    --------------------------------------------------------
    -- Description of Defined Attributes for Entity_Kinds --
@@ -4953,6 +4945,7 @@ package Einfo is
    --    Is_Obsolescent
    --    Is_Package_Body_Entity
    --    Is_Packed_Array_Impl_Type
+   --    Is_Not_Self_Hidden
    --    Is_Potentially_Use_Visible
    --    Is_Preelaborated
    --    Is_Primitive_Wrapper
@@ -5035,6 +5028,7 @@ package Einfo is
    --    Has_Delayed_Rep_Aspects
    --    Has_Discriminants
    --    Has_Dynamic_Predicate_Aspect
+   --    Has_Ghost_Predicate_Aspect
    --    Has_Independent_Components           (base type only)
    --    Has_Inheritable_Invariants           (base type only)
    --    Has_Inherited_DIC                    (base type only)
@@ -5064,8 +5058,8 @@ package Einfo is
    --    Is_Abstract_Type
    --    Is_Asynchronous
    --    Is_Atomic
+   --    Is_Constr_Array_Subt_With_Bounds
    --    Is_Constr_Subt_For_U_Nominal
-   --    Is_Constr_Subt_For_UN_Aliased
    --    Is_Controlled_Active                 (base type only)
    --    Is_Eliminated
    --    Is_Frozen
@@ -5108,7 +5102,6 @@ package Einfo is
    --    Partial_DIC_Procedure               (synth)
    --    Partial_Invariant_Procedure         (synth)
    --    Predicate_Function                  (synth)
-   --    Predicate_Function_M                (synth)
    --    Root_Type                           (synth)
    --    Size_Clause                         (synth)
 
@@ -5330,7 +5323,7 @@ package Einfo is
    --    Is_Elaboration_Warnings_OK_Id         (constants only)
    --    Is_Eliminated
    --    Is_Finalized_Transient
-   --    Is_Ignored_Transient
+   --    Is_Ignored_For_Finalization
    --    Is_Independent
    --    Is_Return_Object
    --    Is_True_Constant
@@ -5391,7 +5384,6 @@ package Einfo is
    --    Protected_Body_Subprogram
    --    Barrier_Function
    --    Elaboration_Entity
-   --    Postconditions_Proc
    --    Entry_Parameters_Type
    --    First_Entity
    --    Alias                                (for entry only. Empty)
@@ -5506,7 +5498,6 @@ package Einfo is
    --    Protected_Body_Subprogram
    --    Next_Inlined_Subprogram
    --    Elaboration_Entity                   (not implicit /=)
-   --    Postconditions_Proc                  (non-generic case only)
    --    DT_Position
    --    DTC_Entity
    --    First_Entity
@@ -5549,7 +5540,6 @@ package Einfo is
    --    Contains_Ignored_Ghost_Code
    --    Default_Expressions_Processed
    --    Delay_Cleanups
-   --    Delay_Subprogram_Descriptors
    --    Discard_Names
    --    Elaboration_Entity_Required
    --    Has_Completion
@@ -5584,7 +5574,6 @@ package Einfo is
    --    Is_Machine_Code_Subprogram           (non-generic case only)
    --    Is_Partial_Invariant_Procedure       (non-generic case only)
    --    Is_Predicate_Function                (non-generic case only)
-   --    Is_Predicate_Function_M              (non-generic case only)
    --    Is_Primitive
    --    Is_Primitive_Wrapper                 (non-generic case only)
    --    Is_Private_Descendant
@@ -5676,6 +5665,7 @@ package Einfo is
    --  E_Label
    --    Renamed_Object $$$
    --    Renamed_Entity $$$
+   --    Entry_Cancel_Parameter
    --    Enclosing_Scope
    --    Reachable
 
@@ -5799,7 +5789,6 @@ package Einfo is
    --    Body_Needed_For_Inlining
    --    Body_Needed_For_SAL
    --    Contains_Ignored_Ghost_Code
-   --    Delay_Subprogram_Descriptors
    --    Discard_Names
    --    Elaborate_Body_Desirable             (non-generic case only)
    --    Elaboration_Entity_Required
@@ -5842,7 +5831,6 @@ package Einfo is
    --    SPARK_Pragma
    --    SPARK_Aux_Pragma
    --    Contains_Ignored_Ghost_Code
-   --    Delay_Subprogram_Descriptors
    --    Ignore_SPARK_Mode_Pragmas
    --    SPARK_Aux_Pragma_Inherited
    --    SPARK_Pragma_Inherited
@@ -5871,7 +5859,6 @@ package Einfo is
    --    Protected_Body_Subprogram
    --    Next_Inlined_Subprogram
    --    Elaboration_Entity
-   --    Postconditions_Proc                  (non-generic case only)
    --    DT_Position
    --    DTC_Entity
    --    First_Entity
@@ -5917,7 +5904,6 @@ package Einfo is
    --    Elaboration_Entity_Required
    --    Default_Expressions_Processed
    --    Delay_Cleanups
-   --    Delay_Subprogram_Descriptors
    --    Discard_Names
    --    Has_Completion
    --    Has_Expanded_Contract                (non-generic case only)
@@ -5949,7 +5935,6 @@ package Einfo is
    --    Is_Partial_DIC_Procedure             (synth) (non-generic case only)
    --    Is_Partial_Invariant_Procedure       (non-generic case only)
    --    Is_Predicate_Function                (non-generic case only)
-   --    Is_Predicate_Function_M              (non-generic case only)
    --    Is_Primitive
    --    Is_Primitive_Wrapper                 (non-generic case only)
    --    Is_Private_Descendant
@@ -6226,7 +6211,7 @@ package Einfo is
    --    Is_Elaboration_Warnings_OK_Id
    --    Is_Eliminated
    --    Is_Finalized_Transient
-   --    Is_Ignored_Transient
+   --    Is_Ignored_For_Finalization
    --    Is_Independent
    --    Is_Return_Object
    --    Is_Safe_To_Reevaluate

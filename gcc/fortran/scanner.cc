@@ -1,5 +1,5 @@
 /* Character scanner.
-   Copyright (C) 2000-2022 Free Software Foundation, Inc.
+   Copyright (C) 2000-2024 Free Software Foundation, Inc.
    Contributed by Andy Vaught
 
 This file is part of GCC.
@@ -56,7 +56,7 @@ gfc_directorylist *include_dirs, *intrinsic_modules_dirs;
 
 static gfc_file *file_head, *current_file;
 
-static int continue_flag, end_flag, gcc_attribute_flag;
+static bool continue_flag, end_flag, gcc_attribute_flag;
 /* If !$omp/!$acc occurred in current comment line.  */
 static int openmp_flag, openacc_flag;
 static int continue_count, continue_line;
@@ -86,7 +86,7 @@ static gfc_char_t *last_error_char;
 /* Functions dealing with our wide characters (gfc_char_t) and
    sequences of such characters.  */
 
-int
+bool
 gfc_wide_fits_in_byte (gfc_char_t c)
 {
   return (c <= UCHAR_MAX);
@@ -98,7 +98,7 @@ wide_is_ascii (gfc_char_t c)
   return (gfc_wide_fits_in_byte (c) && ((unsigned char) c & ~0x7f) == 0);
 }
 
-int
+bool
 gfc_wide_is_printable (gfc_char_t c)
 {
   return (gfc_wide_fits_in_byte (c) && ISPRINT ((unsigned char) c));
@@ -116,7 +116,7 @@ gfc_wide_toupper (gfc_char_t c)
   return (wide_is_ascii (c) ? (gfc_char_t) TOUPPER((unsigned char) c) : c);
 }
 
-int
+bool
 gfc_wide_is_digit (gfc_char_t c)
 {
   return (c >= '0' && c <= '9');
@@ -409,9 +409,7 @@ add_path_to_list (gfc_directorylist **list, const char *path,
     *list = dir;
   dir->use_for_modules = use_for_modules;
   dir->warn = warn;
-  dir->path = XCNEWVEC (char, strlen (p) + 2);
-  strcpy (dir->path, p);
-  strcat (dir->path, "/");	/* make '/' last character */
+  dir->path = xstrdup (p);
 }
 
 /* defer_warn is set to true while parsing the commandline.  */
@@ -476,8 +474,9 @@ open_included_file (const char *name, gfc_directorylist *list,
       if (module && !p->use_for_modules)
 	continue;
 
-      fullname = (char *) alloca(strlen (p->path) + strlen (name) + 1);
+      fullname = (char *) alloca(strlen (p->path) + strlen (name) + 2);
       strcpy (fullname, p->path);
+      strcat (fullname, "/");
       strcat (fullname, name);
 
       f = gfc_open_file (fullname);
@@ -519,7 +518,7 @@ gfc_open_included_file (const char *name, bool include_cwd, bool module)
 
 /* Test to see if we're at the end of the main source file.  */
 
-int
+bool
 gfc_at_end (void)
 {
   return end_flag;
@@ -528,7 +527,7 @@ gfc_at_end (void)
 
 /* Test to see if we're at the end of the current file.  */
 
-int
+bool
 gfc_at_eof (void)
 {
   if (gfc_at_end ())
@@ -546,7 +545,7 @@ gfc_at_eof (void)
 
 /* Test to see if we're at the beginning of a new line.  */
 
-int
+bool
 gfc_at_bol (void)
 {
   if (gfc_at_eof ())
@@ -558,7 +557,7 @@ gfc_at_bol (void)
 
 /* Test to see if we're at the end of a line.  */
 
-int
+bool
 gfc_at_eol (void)
 {
   if (gfc_at_eof ())
@@ -703,7 +702,7 @@ skip_comment_line (void)
 }
 
 
-int
+bool
 gfc_define_undef_line (void)
 {
   char *tmp;
@@ -777,6 +776,8 @@ skip_free_oacc_sentinel (locus start, locus old_loc)
       if ((c = next_char ()) == ' ' || c == '\t'
 	  || continue_flag)
 	{
+	  if (!continue_flag && (c == ' ' || c == '\t'))
+	    openmp_flag = 0;
 	  while (gfc_is_whitespace (c))
 	    c = next_char ();
 	  if (c != '\n' && c != '!')
@@ -817,6 +818,8 @@ skip_free_omp_sentinel (locus start, locus old_loc)
       if ((c = next_char ()) == ' ' || c == '\t'
 	  || continue_flag)
 	{
+	  if (!continue_flag && (c == ' ' || c == '\t'))
+	    openacc_flag = 0;
 	  while (gfc_is_whitespace (c))
 	    c = next_char ();
 	  if (c != '\n' && c != '!')
@@ -878,7 +881,7 @@ skip_free_comments (void)
 
 	  /* If -fopenmp/-fopenacc, we need to handle here 2 things:
 	     1) don't treat !$omp/!$acc as comments, but directives
-	     2) handle OpenMP/OpenACC conditional compilation, where
+	     2) handle OpenMP conditional compilation, where
 		!$ should be treated as 2 spaces (for initial lines
 		only if followed by space).  */
 	  if (at_bol)
@@ -983,8 +986,9 @@ static bool
 skip_fixed_omp_sentinel (locus *start)
 {
   gfc_char_t c;
-  if (((c = next_char ()) == 'm' || c == 'M')
-      && ((c = next_char ()) == 'p' || c == 'P'))
+  if ((c = next_char ()) != 'm' && c != 'M')
+    return false;
+  if ((c = next_char ()) == 'p' || c == 'P')
     {
       c = next_char ();
       if (c != '\n'
@@ -1006,6 +1010,9 @@ skip_fixed_omp_sentinel (locus *start)
 	    }
 	}
     }
+  else if (UNLIKELY (c == 'x' || c == 'X'))
+    gfc_warning_now (OPT_Wsurprising,
+		     "Ignoring '!$omx' vendor-extension sentinel at %C");
   return false;
 }
 
@@ -1103,7 +1110,7 @@ skip_fixed_comments (void)
 	  /* If -fopenmp/-fopenacc, we need to handle here 2 things:
 	     1) don't treat !$omp/!$acc|c$omp/c$acc|*$omp / *$acc as comments, 
 		but directives
-	     2) handle OpenMP/OpenACC conditional compilation, where
+	     2) handle OpenMP conditional compilation, where
 		!$|c$|*$ should be treated as 2 spaces if the characters
 		in columns 3 to 6 are valid fixed form label columns
 		characters.  */
@@ -1800,7 +1807,7 @@ gfc_gobble_whitespace (void)
 	 easily report line and column numbers consistent with other 
 	 parts of gfortran.  */
 
-static int
+static bool
 load_line (FILE *input, gfc_char_t **pbuf, int *pbuflen, const int *first_char)
 {
   int c, maxlen, i, preprocessor_flag, buflen = *pbuflen;
@@ -1915,7 +1922,7 @@ load_line (FILE *input, gfc_char_t **pbuf, int *pbuflen, const int *first_char)
 
       /* For truncation and tab warnings, set seen_comment to false if one has
 	 either an OpenMP or OpenACC directive - or a !GCC$ attribute.  If
-	 OpenMP is enabled, use '!$' as as conditional compilation sentinel
+	 OpenMP is enabled, use '!$' as conditional compilation sentinel
 	 and OpenMP directive ('!$omp').  */
       if (seen_comment && first_comment && flag_openmp && comment_ix + 1 == i
 	  && c == '$')

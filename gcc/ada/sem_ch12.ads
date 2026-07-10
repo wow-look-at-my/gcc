@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 S p e c                                  --
 --                                                                          --
---          Copyright (C) 1992-2022, Free Software Foundation, Inc.         --
+--          Copyright (C) 1992-2024, Free Software Foundation, Inc.         --
 --                                                                          --
 -- GNAT is free software;  you can  redistribute it  and/or modify it under --
 -- terms of the  GNU General Public License as published  by the Free Soft- --
@@ -27,15 +27,15 @@ with Inline; use Inline;
 with Types;  use Types;
 
 package Sem_Ch12 is
-   procedure Analyze_Generic_Package_Declaration        (N : Node_Id);
-   procedure Analyze_Generic_Subprogram_Declaration     (N : Node_Id);
-   procedure Analyze_Package_Instantiation              (N : Node_Id);
-   procedure Analyze_Procedure_Instantiation            (N : Node_Id);
-   procedure Analyze_Function_Instantiation             (N : Node_Id);
-   procedure Analyze_Formal_Object_Declaration          (N : Node_Id);
-   procedure Analyze_Formal_Type_Declaration            (N : Node_Id);
-   procedure Analyze_Formal_Subprogram_Declaration      (N : Node_Id);
-   procedure Analyze_Formal_Package_Declaration         (N : Node_Id);
+   procedure Analyze_Generic_Package_Declaration    (N : Node_Id);
+   procedure Analyze_Generic_Subprogram_Declaration (N : Node_Id);
+   procedure Analyze_Package_Instantiation          (N : Node_Id);
+   procedure Analyze_Procedure_Instantiation        (N : Node_Id);
+   procedure Analyze_Function_Instantiation         (N : Node_Id);
+   procedure Analyze_Formal_Object_Declaration      (N : Node_Id);
+   procedure Analyze_Formal_Type_Declaration        (N : Node_Id);
+   procedure Analyze_Formal_Subprogram_Declaration  (N : Node_Id);
+   procedure Analyze_Formal_Package_Declaration     (N : Node_Id);
 
    procedure Start_Generic;
    --  Must be invoked before starting to process a generic spec or body
@@ -109,6 +109,10 @@ package Sem_Ch12 is
    --  Called after semantic analysis, to complete the instantiation of
    --  function and procedure instances. The flag Body_Optional has the
    --  same purpose as described for Instantiate_Package_Body.
+
+   function Is_Abbreviated_Instance (E : Entity_Id) return Boolean;
+   --  Return true if E is a package created for an abbreviated instantiation
+   --  to check conformance between formal package and corresponding actual.
 
    function Need_Subprogram_Instance_Body
      (N    : Node_Id;
@@ -200,7 +204,9 @@ package Sem_Ch12 is
    --  the current view after instantiation. The processing is driven by the
    --  current private status of the type of the node, and Has_Private_View,
    --  a flag that is set at the point of generic compilation. If view and
-   --  flag are inconsistent then the type is updated appropriately.
+   --  flag are inconsistent then the type is updated appropriately. A second
+   --  flag Has_Secondary_Private_View is used to update a second type related
+   --  to this type if need be.
    --
    --  This subprogram is used in Check_Generic_Actuals and Copy_Generic_Node,
    --  and is exported here for the purpose of front-end inlining (see Exp_Ch6.

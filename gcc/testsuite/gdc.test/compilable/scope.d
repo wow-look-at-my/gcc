@@ -142,7 +142,7 @@ int f1_20682(return scope ref D d) @safe
     return d.pos;
 }
 
-ref int f2_20682(return scope ref D d) @safe
+ref int f2_20682(return ref scope D d) @safe
 {
     return d.pos;
 }
@@ -252,4 +252,13 @@ void main21209()
     float[10] fs;
     testForeach(cs);
     testForeach(fs);
+}
+
+struct S23669
+{
+    string[] a;
+    @safe void reserve() scope
+    {
+        a.length += 1;
+    }
 }

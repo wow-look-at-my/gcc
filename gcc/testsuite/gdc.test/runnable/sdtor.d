@@ -3,19 +3,13 @@
 /*
 TEST_OUTPUT:
 ---
-runnable/sdtor.d(36): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/sdtor.d(59): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/sdtor.d(93): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/sdtor.d(117): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/sdtor.d(143): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/sdtor.d(177): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/sdtor.d(203): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/sdtor.d(276): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
 S7353
 ---
 */
 
 import core.vararg;
+// FIXME: Shouldn't tests that use this go in core.memory now that `delete` has been removed?
+import core.memory : __delete;
 
 extern (C) int printf(const(char*) fmt, ...) nothrow;
 
@@ -33,7 +27,7 @@ struct S1
 void test1()
 {
     S1* s = new S1();
-    delete s;
+    __delete(s);
     assert(sdtor == 1);
 }
 
@@ -56,7 +50,7 @@ void test3()
 {
     T3* s = new T3();
     s.s.a = 3;
-    delete s;
+    __delete(s);
     assert(sdtor3 == 1);
 }
 
@@ -90,7 +84,7 @@ void test4()
 {
     T4* s = new T4();
     s.s.a = 4;
-    delete s;
+    __delete(s);
     assert(sdtor4 == 3);
 }
 
@@ -114,7 +108,7 @@ struct T5
 void test5()
 {
     T5* s = new T5();
-    delete s;
+    __delete(s);
     assert(sdtor5 == 2);
 }
 
@@ -140,7 +134,7 @@ class T6
 void test6()
 {
     T6 s = new T6();
-    delete s;
+    __delete(s);
     assert(sdtor6 == 2);
 }
 
@@ -174,7 +168,7 @@ struct T7
 void test7()
 {
     T7* s = new T7();
-    delete s;
+    __delete(s);
     assert(sdtor7 == 4);
 }
 
@@ -200,7 +194,7 @@ void test8()
     s[0].c = 2;
     s[1].c = 1;
     s[2].c = 0;
-    delete s;
+    __delete(s);
     assert(sdtor8 == 3);
 }
 
@@ -273,7 +267,7 @@ class T11
 void test11()
 {
     T11 s = new T11();
-    delete s;
+    __delete(s);
     assert(sdtor11 == 2);
 }
 
@@ -4820,6 +4814,41 @@ void testPR12012()
 }
 
 /**********************************/
+// https://issues.dlang.org/show_bug.cgi?id=24010
+
+alias AliasSeq(TList...) = TList;
+
+__gshared int x24010 = 7;
+
+struct A24010 {
+    int x;
+    ~this() {
+        printf("A.~this\n");
+        x24010 += 1;
+    }
+}
+
+struct B24010 {
+    ~this() {
+        printf("B.~this\n");
+        x24010 *= 10;
+    }
+}
+
+void test24010()
+{
+    {
+        AliasSeq!(A24010, B24010) params;
+        printf("statement\n");
+        params[0].x = 3;
+        printf(".x = %d\n", params[0].x);
+        assert(params[0].x == 3);
+        assert(x24010 == 7);
+    }
+    assert(x24010 == 71);
+}
+
+/**********************************/
 
 int main()
 {
@@ -4960,6 +4989,7 @@ int main()
     test67();
     test68();
     testPR12012();
+    test24010();
 
     printf("Success\n");
     return 0;

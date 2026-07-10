@@ -4,14 +4,6 @@ TEST_OUTPUT:
 true
 g
 &Test109S(&Test109S(<recursion>))
-runnable/interpret.d(3197): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/interpret.d(3199): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/interpret.d(3202): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/interpret.d(3205): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/interpret.d(3206): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/interpret.d(3212): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/interpret.d(3213): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
-runnable/interpret.d(3216): Deprecation: The `delete` keyword has been deprecated.  Use `object.destroy()` (and `core.memory.GC.free()` if applicable) instead.
 tfoo
 tfoo
 Crash!
@@ -2204,7 +2196,7 @@ struct Q
     Q opOpAssign(string op)(int w) if (op == "-")
     {
         x -= w;
-        version(D_Version2) { mixin("return this;"); } else { mixin("return *this;"); }
+        return this;
     }
     int boo()  { return 4; }
     int coo()  { return x; }
@@ -2434,7 +2426,7 @@ static assert(bug1605() == 27);
 
 int bug2564()
 {
-    version(D_Version2) { mixin("enum int Q = 0;"); }else {mixin("int Q = 0;"); }
+    enum int Q = 0;
     string [2] s = ["a", "b"];
     assert(s[Q].dup == "a");
     return 0;
@@ -2653,8 +2645,6 @@ static assert(lazyTest2(17) == 18);
 
 /************************************************/
 
-version(D_Version2)
-{
 // https://issues.dlang.org/show_bug.cgi?id=4020
 // https://issues.dlang.org/show_bug.cgi?id=4027
 // D2 only
@@ -2683,7 +2673,6 @@ string delegate() bug4027(string s)
 static if (is(typeof((){ static const s = bug4027("aaa")(); }()))) {
     static assert(bug4027("aaa")() == "aaa");
     static assert(bug4027("bbb")() == "bbb");
-}
 }
 
 // ---
@@ -3187,33 +3176,96 @@ auto test110 = [Test110f(1, Test110s(1, 2, 3))];
 
 /************************************************/
 // https://issues.dlang.org/show_bug.cgi?id=6907
+// FIXME: Shouldn't this go in core.memory now that `delete` has been removed?
 
 int test6907()
 {
+    import core.memory : __delete;
+
     int dtor1;
     class C { ~this() { ++dtor1; } }
 
     // delete on Object
-    { Object o; delete o; }
+    { Object o; if (!__ctfe) __delete(o); }
     { scope o = new Object(); }
-    { Object o = new Object(); delete o; }
+    { Object o = new Object(); if (!__ctfe) __delete(o); }
 
     // delete on C
-    { C c; delete c; }
-    { { scope c = new C(); } assert(dtor1 == 1); }
-    { { scope Object o = new C(); } assert(dtor1 == 2); }
-    { C c = new C(); delete c; assert(dtor1 == 3); }
-    { Object o = new C(); delete o; assert(dtor1 == 4); }
+    {
+        C c;
+        if (!__ctfe)
+            __delete(c);
+    }
+    {
+        { scope c = new C(); }
+        assert(dtor1 == 1);
+    }
+    {
+        { scope Object o = new C(); }
+        assert(dtor1 == 2);
+    }
+    {
+        C c = new C();
+        if (__ctfe)
+        {
+            c.__dtor();
+            c = null;
+        }
+        else
+            __delete(c);
+        assert(dtor1 == 3);
+    }
+    {
+        Object o = new C();
+        if (__ctfe)
+        {
+            (cast(C)o).__dtor();
+            o = null;
+        }
+        else
+            __delete(o);
+        assert(dtor1 == 4);
+    }
 
     int dtor2;
     struct S1 { ~this() { ++dtor2; } }
 
     // delete on S1
-    { S1* p; delete p; }
-    { S1* p = new S1(); delete p; assert(dtor2 == 1); }
+    {
+        S1* p;
+        // https://issues.dlang.org/show_bug.cgi?id=22779
+        // Uncomment after druntime fix
+        version (none)
+        {
+            if (!__ctfe)
+                __delete(p);
+        }
+    }
+    {
+        S1* p = new S1();
+        if (__ctfe)
+        {
+            (*p).__dtor();
+            destroy(p);
+        }
+        else
+            __delete(p);
+        assert(dtor2 == 1);
+    }
 
     // delete on S1[]
-    { S1[] a = [S1(), S1()]; delete a; assert(dtor2 == 3); }
+    {
+        S1[] a = [S1(), S1()];
+        if (__ctfe)
+        {
+            a[1].__dtor();
+            a[0].__dtor();
+            destroy(a);
+        }
+        else
+            __delete(a);
+        assert(dtor2 == 3);
+    }
 
     return 1;
 }
@@ -3397,6 +3449,21 @@ void test113()
         compare(ctval6, rtval6);
     }
 }
+
+/************************************************/
+
+bool test114()
+{
+    string fizzBuzz()
+    {
+        string result = "fizz ";
+        return result ~= "buzz";
+    }
+
+    assert(fizzBuzz() == "fizz buzz");
+    return true;
+}
+static assert(test114());
 
 /************************************************/
 // https://issues.dlang.org/show_bug.cgi?id=14140
@@ -3797,6 +3864,7 @@ int main()
     test109();
     test112();
     test113();
+    test114();
     test6439();
     test6504();
     test8818();

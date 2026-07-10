@@ -1,5 +1,5 @@
 /* Internals of libgccjit: classes for recording calls made to the JIT API.
-   Copyright (C) 2013-2022 Free Software Foundation, Inc.
+   Copyright (C) 2013-2024 Free Software Foundation, Inc.
    Contributed by David Malcolm <dmalcolm@redhat.com>.
 
 This file is part of GCC.
@@ -19,13 +19,13 @@ along with GCC; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
 #include "config.h"
+#define INCLUDE_SSTREAM
 #include "system.h"
 #include "coretypes.h"
 #include "tm.h"
 #include "pretty-print.h"
 #include "toplev.h"
 
-#include <pthread.h>
 
 #include "jit-builtins.h"
 #include "jit-recording.h"
@@ -568,9 +568,7 @@ recording::context::context (context *parent_ctxt)
   if (parent_ctxt)
     {
       /* Inherit options from parent.  */
-      for (unsigned i = 0;
-	   i < sizeof (m_str_options) / sizeof (m_str_options[0]);
-	   i++)
+      for (unsigned i = 0; i < ARRAY_SIZE (m_str_options); i++)
 	{
 	  const char *parent_opt = parent_ctxt->m_str_options[i];
 	  m_str_options[i] = parent_opt ? xstrdup (parent_opt) : NULL;
@@ -592,6 +590,7 @@ recording::context::context (context *parent_ctxt)
       memset (m_int_options, 0, sizeof (m_int_options));
       memset (m_bool_options, 0, sizeof (m_bool_options));
       memset (m_inner_bool_options, 0, sizeof (m_inner_bool_options));
+      m_inner_bool_options[INNER_BOOL_OPTION_PRINT_ERRORS_TO_STDERR] = true;
     }
 
   memset (m_basic_types, 0, sizeof (m_basic_types));
@@ -822,6 +821,10 @@ recording::context::get_int_type (int num_bytes, int is_signed)
     return get_type (is_signed
 		     ? GCC_JIT_TYPE_LONG_LONG
 		     : GCC_JIT_TYPE_UNSIGNED_LONG_LONG);
+  if (num_bits == 128)
+    return get_type (is_signed
+		     ? GCC_JIT_TYPE_INT128_T
+		     : GCC_JIT_TYPE_UINT128_T);
 
   /* Some other size, not corresponding to the C int types.  */
   /* To be written: support arbitrary other sizes, sharing by
@@ -1074,6 +1077,21 @@ recording::context::new_global_init_rvalue (lvalue *variable,
   gbl->set_rvalue_init (init); /* Needed by the global for write dump.  */
 }
 
+/* Create a recording::memento_of_sizeof instance and add it
+   to this context's list of mementos.
+
+   Implements the post-error-checking part of
+   gcc_jit_context_new_sizeof.  */
+
+recording::rvalue *
+recording::context::new_sizeof (recording::type *type)
+{
+  recording::rvalue *result =
+    new memento_of_sizeof (this, NULL, type);
+  record (result);
+  return result;
+}
+
 /* Create a recording::memento_of_new_string_literal instance and add it
    to this context's list of mementos.
 
@@ -1238,6 +1256,22 @@ recording::context::new_cast (recording::location *loc,
 			      recording::type *type_)
 {
   recording::rvalue *result = new cast (this, loc, expr, type_);
+  record (result);
+  return result;
+}
+
+/* Create a recording::bitcast instance and add it to this context's list
+   of mementos.
+
+   Implements the post-error-checking part of
+   gcc_jit_context_new_bitcast.  */
+
+recording::rvalue *
+recording::context::new_bitcast (location *loc,
+				 rvalue *expr,
+				 type *type_)
+{
+  recording::rvalue *result = new bitcast (this, loc, expr, type_);
   record (result);
   return result;
 }
@@ -1551,15 +1585,20 @@ recording::context::add_error_va (location *loc, const char *fmt, va_list ap)
   if (!ctxt_progname)
     ctxt_progname = "libgccjit.so";
 
-  if (loc)
-    fprintf (stderr, "%s: %s: error: %s\n",
-	     ctxt_progname,
-	     loc->get_debug_string (),
-	     errmsg);
-  else
-    fprintf (stderr, "%s: error: %s\n",
-	     ctxt_progname,
-	     errmsg);
+  bool print_errors_to_stderr =
+      get_inner_bool_option (INNER_BOOL_OPTION_PRINT_ERRORS_TO_STDERR);
+  if (print_errors_to_stderr)
+  {
+    if (loc)
+      fprintf (stderr, "%s: %s: error: %s\n",
+	       ctxt_progname,
+	       loc->get_debug_string (),
+	       errmsg);
+    else
+      fprintf (stderr, "%s: error: %s\n",
+	       ctxt_progname,
+	       errmsg);
+  }
 
   if (!m_error_count)
     {
@@ -1687,7 +1726,8 @@ static const char * const
 static const char * const
  inner_bool_option_reproducer_strings[NUM_INNER_BOOL_OPTIONS] = {
   "gcc_jit_context_set_bool_allow_unreachable_blocks",
-  "gcc_jit_context_set_bool_use_external_driver"
+  "gcc_jit_context_set_bool_use_external_driver",
+  "gcc_jit_context_set_bool_print_errors_to_stderr",
 };
 
 /* Write the current value of all options to the log file (if any).  */
@@ -2044,7 +2084,7 @@ recording::memento::get_debug_string ()
 void
 recording::memento::write_to_dump (dump &d)
 {
-  d.write("  %s\n", get_debug_string ());
+  d.write ("  %s\n", get_debug_string ());
 }
 
 /* The implementation of class gcc::jit::recording::string.  */
@@ -2243,6 +2283,19 @@ recording::type::get_const ()
   return result;
 }
 
+/* Given a type T, get the type restrict T.
+
+   Implements the post-error-checking part of
+   gcc_jit_type_get_restrict.  */
+
+recording::type *
+recording::type::get_restrict ()
+{
+  recording::type *result = new memento_of_get_restrict (this);
+  m_ctxt->record (result);
+  return result;
+}
+
 /* Given a type T, get the type volatile T.
 
    Implements the post-error-checking part of
@@ -2325,6 +2378,26 @@ recording::memento_of_get_type::get_size ()
     case GCC_JIT_TYPE_UNSIGNED_LONG_LONG:
       size = LONG_LONG_TYPE_SIZE;
       break;
+    case GCC_JIT_TYPE_UINT8_T:
+    case GCC_JIT_TYPE_INT8_T:
+      size = 8;
+      break;
+    case GCC_JIT_TYPE_UINT16_T:
+    case GCC_JIT_TYPE_INT16_T:
+      size = 16;
+      break;
+    case GCC_JIT_TYPE_UINT32_T:
+    case GCC_JIT_TYPE_INT32_T:
+      size = 32;
+      break;
+    case GCC_JIT_TYPE_UINT64_T:
+    case GCC_JIT_TYPE_INT64_T:
+      size = 64;
+      break;
+    case GCC_JIT_TYPE_UINT128_T:
+    case GCC_JIT_TYPE_INT128_T:
+      size = 128;
+      break;
     case GCC_JIT_TYPE_FLOAT:
       size = FLOAT_TYPE_SIZE;
       break;
@@ -2333,6 +2406,9 @@ recording::memento_of_get_type::get_size ()
       break;
     case GCC_JIT_TYPE_LONG_DOUBLE:
       size = LONG_DOUBLE_TYPE_SIZE;
+      break;
+    case GCC_JIT_TYPE_SIZE_T:
+      size = MAX_BITS_PER_WORD;
       break;
     default:
       /* As this function is called by
@@ -2373,6 +2449,16 @@ recording::memento_of_get_type::dereference ()
     case GCC_JIT_TYPE_UNSIGNED_LONG:
     case GCC_JIT_TYPE_LONG_LONG:
     case GCC_JIT_TYPE_UNSIGNED_LONG_LONG:
+    case GCC_JIT_TYPE_UINT8_T:
+    case GCC_JIT_TYPE_UINT16_T:
+    case GCC_JIT_TYPE_UINT32_T:
+    case GCC_JIT_TYPE_UINT64_T:
+    case GCC_JIT_TYPE_UINT128_T:
+    case GCC_JIT_TYPE_INT8_T:
+    case GCC_JIT_TYPE_INT16_T:
+    case GCC_JIT_TYPE_INT32_T:
+    case GCC_JIT_TYPE_INT64_T:
+    case GCC_JIT_TYPE_INT128_T:
     case GCC_JIT_TYPE_FLOAT:
     case GCC_JIT_TYPE_DOUBLE:
     case GCC_JIT_TYPE_LONG_DOUBLE:
@@ -2425,6 +2511,16 @@ recording::memento_of_get_type::is_int () const
     case GCC_JIT_TYPE_UNSIGNED_LONG:
     case GCC_JIT_TYPE_LONG_LONG:
     case GCC_JIT_TYPE_UNSIGNED_LONG_LONG:
+    case GCC_JIT_TYPE_UINT8_T:
+    case GCC_JIT_TYPE_UINT16_T:
+    case GCC_JIT_TYPE_UINT32_T:
+    case GCC_JIT_TYPE_UINT64_T:
+    case GCC_JIT_TYPE_UINT128_T:
+    case GCC_JIT_TYPE_INT8_T:
+    case GCC_JIT_TYPE_INT16_T:
+    case GCC_JIT_TYPE_INT32_T:
+    case GCC_JIT_TYPE_INT64_T:
+    case GCC_JIT_TYPE_INT128_T:
       return true;
 
     case GCC_JIT_TYPE_FLOAT:
@@ -2440,6 +2536,60 @@ recording::memento_of_get_type::is_int () const
 
     case GCC_JIT_TYPE_FILE_PTR:
       return false;
+
+    case GCC_JIT_TYPE_COMPLEX_FLOAT:
+    case GCC_JIT_TYPE_COMPLEX_DOUBLE:
+    case GCC_JIT_TYPE_COMPLEX_LONG_DOUBLE:
+      return false;
+    }
+}
+
+/* Implementation of pure virtual hook recording::type::is_signed for
+   recording::memento_of_get_type.  */
+
+bool
+recording::memento_of_get_type::is_signed () const
+{
+  switch (m_kind)
+    {
+    default: gcc_unreachable ();
+
+    case GCC_JIT_TYPE_SIGNED_CHAR:
+    case GCC_JIT_TYPE_CHAR:
+    case GCC_JIT_TYPE_SHORT:
+    case GCC_JIT_TYPE_INT:
+    case GCC_JIT_TYPE_LONG:
+    case GCC_JIT_TYPE_LONG_LONG:
+    case GCC_JIT_TYPE_INT8_T:
+    case GCC_JIT_TYPE_INT16_T:
+    case GCC_JIT_TYPE_INT32_T:
+    case GCC_JIT_TYPE_INT64_T:
+    case GCC_JIT_TYPE_INT128_T:
+      return true;
+
+    case GCC_JIT_TYPE_VOID:
+    case GCC_JIT_TYPE_VOID_PTR:
+    case GCC_JIT_TYPE_BOOL:
+    case GCC_JIT_TYPE_UNSIGNED_CHAR:
+    case GCC_JIT_TYPE_UNSIGNED_SHORT:
+    case GCC_JIT_TYPE_UNSIGNED_INT:
+    case GCC_JIT_TYPE_UNSIGNED_LONG:
+    case GCC_JIT_TYPE_UNSIGNED_LONG_LONG:
+    case GCC_JIT_TYPE_UINT8_T:
+    case GCC_JIT_TYPE_UINT16_T:
+    case GCC_JIT_TYPE_UINT32_T:
+    case GCC_JIT_TYPE_UINT64_T:
+    case GCC_JIT_TYPE_UINT128_T:
+
+    case GCC_JIT_TYPE_FLOAT:
+    case GCC_JIT_TYPE_DOUBLE:
+    case GCC_JIT_TYPE_LONG_DOUBLE:
+
+    case GCC_JIT_TYPE_CONST_CHAR_PTR:
+
+    case GCC_JIT_TYPE_SIZE_T:
+
+    case GCC_JIT_TYPE_FILE_PTR:
 
     case GCC_JIT_TYPE_COMPLEX_FLOAT:
     case GCC_JIT_TYPE_COMPLEX_DOUBLE:
@@ -2478,6 +2628,16 @@ recording::memento_of_get_type::is_float () const
     case GCC_JIT_TYPE_UNSIGNED_LONG:
     case GCC_JIT_TYPE_LONG_LONG:
     case GCC_JIT_TYPE_UNSIGNED_LONG_LONG:
+    case GCC_JIT_TYPE_UINT8_T:
+    case GCC_JIT_TYPE_UINT16_T:
+    case GCC_JIT_TYPE_UINT32_T:
+    case GCC_JIT_TYPE_UINT64_T:
+    case GCC_JIT_TYPE_UINT128_T:
+    case GCC_JIT_TYPE_INT8_T:
+    case GCC_JIT_TYPE_INT16_T:
+    case GCC_JIT_TYPE_INT32_T:
+    case GCC_JIT_TYPE_INT64_T:
+    case GCC_JIT_TYPE_INT128_T:
       return false;
 
     case GCC_JIT_TYPE_FLOAT:
@@ -2531,6 +2691,16 @@ recording::memento_of_get_type::is_bool () const
     case GCC_JIT_TYPE_UNSIGNED_LONG:
     case GCC_JIT_TYPE_LONG_LONG:
     case GCC_JIT_TYPE_UNSIGNED_LONG_LONG:
+    case GCC_JIT_TYPE_UINT8_T:
+    case GCC_JIT_TYPE_UINT16_T:
+    case GCC_JIT_TYPE_UINT32_T:
+    case GCC_JIT_TYPE_UINT64_T:
+    case GCC_JIT_TYPE_UINT128_T:
+    case GCC_JIT_TYPE_INT8_T:
+    case GCC_JIT_TYPE_INT16_T:
+    case GCC_JIT_TYPE_INT32_T:
+    case GCC_JIT_TYPE_INT64_T:
+    case GCC_JIT_TYPE_INT128_T:
       return false;
 
     case GCC_JIT_TYPE_FLOAT:
@@ -2601,7 +2771,18 @@ static const char * const get_type_strings[] = {
 
   "complex float", /* GCC_JIT_TYPE_COMPLEX_FLOAT */
   "complex double", /* GCC_JIT_TYPE_COMPLEX_DOUBLE */
-  "complex long double"  /* GCC_JIT_TYPE_COMPLEX_LONG_DOUBLE */
+  "complex long double",  /* GCC_JIT_TYPE_COMPLEX_LONG_DOUBLE */
+
+  "__uint8_t",    /* GCC_JIT_TYPE_UINT8_T */
+  "__uint16_t",   /* GCC_JIT_TYPE_UINT16_T */
+  "__uint32_t",   /* GCC_JIT_TYPE_UINT32_T */
+  "__uint64_t",   /* GCC_JIT_TYPE_UINT64_T */
+  "__uint128_t",  /* GCC_JIT_TYPE_UINT128_T */
+  "__int8_t",     /* GCC_JIT_TYPE_INT8_T */
+  "__int16_t",    /* GCC_JIT_TYPE_INT16_T */
+  "__int32_t",    /* GCC_JIT_TYPE_INT32_T */
+  "__int64_t",    /* GCC_JIT_TYPE_INT64_T */
+  "__int128_t",   /* GCC_JIT_TYPE_INT128_T */
 
 };
 
@@ -2637,7 +2818,17 @@ static const char * const get_type_enum_strings[] = {
   "GCC_JIT_TYPE_FILE_PTR",
   "GCC_JIT_TYPE_COMPLEX_FLOAT",
   "GCC_JIT_TYPE_COMPLEX_DOUBLE",
-  "GCC_JIT_TYPE_COMPLEX_LONG_DOUBLE"
+  "GCC_JIT_TYPE_COMPLEX_LONG_DOUBLE",
+  "GCC_JIT_TYPE_UINT8_T",
+  "GCC_JIT_TYPE_UINT16_T",
+  "GCC_JIT_TYPE_UINT32_T",
+  "GCC_JIT_TYPE_UINT64_T",
+  "GCC_JIT_TYPE_UINT128_T",
+  "GCC_JIT_TYPE_INT8_T",
+  "GCC_JIT_TYPE_INT16_T",
+  "GCC_JIT_TYPE_INT32_T",
+  "GCC_JIT_TYPE_INT64_T",
+  "GCC_JIT_TYPE_INT128_T",
 };
 
 void
@@ -2794,6 +2985,40 @@ recording::memento_of_get_volatile::write_reproducer (reproducer &r)
   const char *id = r.make_identifier (this, "type");
   r.write ("  gcc_jit_type *%s =\n"
 	   "    gcc_jit_type_get_volatile (%s);\n",
+	   id,
+	   r.get_identifier_as_type (m_other_type));
+}
+
+/* The implementation of class gcc::jit::recording::memento_of_get_restrict.  */
+
+/* Implementation of pure virtual hook recording::memento::replay_into
+   for recording::memento_of_get_restrict.  */
+
+void
+recording::memento_of_get_restrict::replay_into (replayer *)
+{
+  set_playback_obj (m_other_type->playback_type ()->get_restrict ());
+}
+
+/* Implementation of recording::memento::make_debug_string for
+   results of get_restrict, prepending "restrict ".  */
+
+recording::string *
+recording::memento_of_get_restrict::make_debug_string ()
+{
+  return string::from_printf (m_ctxt,
+			      "restrict %s", m_other_type->get_debug_string ());
+}
+
+/* Implementation of recording::memento::write_reproducer for restrict
+   types.  */
+
+void
+recording::memento_of_get_restrict::write_reproducer (reproducer &r)
+{
+  const char *id = r.make_identifier (this, "type");
+  r.write ("  gcc_jit_type *%s =\n"
+	   "    gcc_jit_type_get_restrict (%s);\n",
 	   id,
 	   r.get_identifier_as_type (m_other_type));
 }
@@ -3578,7 +3803,7 @@ class rvalue_usage_validator : public recording::rvalue_visitor
 			  recording::statement *stmt);
 
   void
-  visit (recording::rvalue *rvalue) FINAL OVERRIDE;
+  visit (recording::rvalue *rvalue) final override;
 
  private:
   const char *m_api_funcname;
@@ -3807,6 +4032,23 @@ void recording::lvalue::set_link_section (const char *name)
   m_link_section = new_string (name);
 }
 
+void recording::lvalue::set_register_name (const char *reg_name)
+{
+  m_reg_name = new_string (reg_name);
+}
+
+void recording::lvalue::set_alignment (unsigned bytes)
+{
+  m_alignment = bytes;
+}
+
+void recording::lvalue::add_string_attribute (
+	gcc_jit_variable_attribute attribute,
+	const char* value)
+{
+  m_string_attributes.push_back (std::make_pair (attribute, std::string (value)));
+}
+
 /* The implementation of class gcc::jit::recording::param.  */
 
 /* Implementation of pure virtual hook recording::memento::replay_into
@@ -3883,7 +4125,10 @@ recording::function::function (context *ctxt,
   m_builtin_id (builtin_id),
   m_locals (),
   m_blocks (),
-  m_fn_ptr_type (NULL)
+  m_fn_ptr_type (NULL),
+  m_attributes (),
+  m_string_attributes (),
+  m_int_array_attributes ()
 {
   for (int i = 0; i< num_params; i++)
     {
@@ -3942,7 +4187,10 @@ recording::function::replay_into (replayer *r)
 				     m_name->c_str (),
 				     &params,
 				     m_is_variadic,
-				     m_builtin_id));
+				     m_builtin_id,
+				     m_attributes,
+				     m_string_attributes,
+				     m_int_array_attributes));
 }
 
 /* Create a recording::local instance and add it to
@@ -3991,6 +4239,40 @@ recording::function::new_block (const char *name)
 void
 recording::function::write_to_dump (dump &d)
 {
+  for (auto attr: m_attributes)
+  {
+    const char* attribute = fn_attribute_to_string (attr);
+    if (attribute)
+      d.write ("__attribute(%s)__\n", attribute);
+  }
+  for (auto attr: m_string_attributes)
+  {
+    gcc_jit_fn_attribute& name = std::get<0>(attr);
+    std::string& value = std::get<1>(attr);
+    const char* attribute = fn_attribute_to_string (name);
+
+    if (attribute)
+      d.write ("__attribute(%s(\"%s\"))__\n", attribute, value.c_str());
+  }
+  for (auto attr: m_int_array_attributes)
+  {
+    gcc_jit_fn_attribute& name = std::get<0>(attr);
+    std::vector<int>& values = std::get<1>(attr);
+    const char* attribute = fn_attribute_to_string (name);
+    if (attribute)
+    {
+      d.write ("__attribute(%s(", attribute);
+      for (size_t i = 0; i < values.size(); ++i)
+      {
+	if (i > 0)
+	  d.write (", %d", values[i]);
+	else
+	  d.write ("%d", values[i]);
+      }
+      d.write ("))__\n");
+    }
+  }
+
   switch (m_kind)
     {
     default: gcc_unreachable ();
@@ -4185,6 +4467,31 @@ recording::function::get_address (recording::location *loc)
   return result;
 }
 
+void
+recording::function::add_attribute (gcc_jit_fn_attribute attribute)
+{
+  m_attributes.push_back (attribute);
+}
+
+void
+recording::function::add_string_attribute (gcc_jit_fn_attribute attribute,
+					   const char* value)
+{
+  m_string_attributes.push_back (
+	std::make_pair (attribute, std::string (value)));
+}
+
+void
+recording::function::add_integer_array_attribute (
+	gcc_jit_fn_attribute attribute,
+	const int* value,
+	size_t length)
+{
+  m_int_array_attributes.push_back (std::make_pair (
+    attribute,
+    std::vector<int> (value, value + length)));
+}
+
 /* Implementation of recording::memento::make_debug_string for
    functions.  */
 
@@ -4205,6 +4512,39 @@ static const char * const names_of_function_kinds[] = {
 };
 
 /* Implementation of recording::memento::write_reproducer for functions. */
+
+static const char * const fn_attribute_reproducer_strings[] =
+{
+  "GCC_JIT_FN_ATTRIBUTE_ALIAS",
+  "GCC_JIT_FN_ATTRIBUTE_ALWAYS_INLINE",
+  "GCC_JIT_FN_ATTRIBUTE_INLINE",
+  "GCC_JIT_FN_ATTRIBUTE_NOINLINE",
+  "GCC_JIT_FN_ATTRIBUTE_TARGET",
+  "GCC_JIT_FN_ATTRIBUTE_USED",
+  "GCC_JIT_FN_ATTRIBUTE_VISIBILITY",
+  "GCC_JIT_FN_ATTRIBUTE_COLD",
+  "GCC_JIT_FN_ATTRIBUTE_RETURNS_TWICE",
+  "GCC_JIT_FN_ATTRIBUTE_PURE",
+  "GCC_JIT_FN_ATTRIBUTE_CONST",
+  "GCC_JIT_FN_ATTRIBUTE_WEAK",
+  "GCC_JIT_FN_ATTRIBUTE_NONNULL",
+};
+
+std::string
+get_vector_int_debug (std::vector<int> &values)
+{
+  std::stringstream s;
+
+  s << "{";
+  for(auto it = values.begin(); it != values.end(); ++it)
+    {
+      if (it != values.begin() )
+	 s << ", ";
+      s << *it;
+    }
+  s << "}";
+  return s.str();
+}
 
 void
 recording::function::write_reproducer (reproducer &r)
@@ -4248,6 +4588,25 @@ recording::function::write_reproducer (reproducer &r)
 	   m_params.length (),
 	   params_id,
 	   m_is_variadic);
+  for (auto attribute : m_attributes)
+    r.write("  gcc_jit_function_add_attribute (%s, %s);\n",
+	    id,
+	    fn_attribute_reproducer_strings[attribute]);
+  for (auto attribute : m_string_attributes)
+    r.write("  gcc_jit_function_add_string_attribute (%s, %s, \"%s\");\n",
+	    id,
+	    fn_attribute_reproducer_strings[std::get<0>(attribute)],
+	    std::get<1>(attribute).c_str());
+  for (auto attribute : m_int_array_attributes) {
+    r.write("  gcc_jit_function_add_integer_array_attribute (%s,\n"
+	    "                                                %s,\n"
+	    "                                                (int[])%s,\n"
+	    "                                                %lu);\n",
+	    id,
+	    fn_attribute_reproducer_strings[std::get<0>(attribute)],
+	    get_vector_int_debug (std::get<1>(attribute)).c_str(),
+	    std::get<1>(attribute).size ());
+  }
 }
 
 
@@ -4660,18 +5019,26 @@ recording::global::replay_into (replayer *r)
 				 / m_type->dereference ()->get_size (),
 				 m_initializer,
 				 playback_string (m_name),
-				 m_flags)
+				 m_flags,
+				 m_string_attributes)
     : r->new_global (playback_location (r, m_loc),
 		     m_kind,
 		     m_type->playback_type (),
 		     playback_string (m_name),
-		     m_flags);
+		     m_flags,
+		     m_string_attributes);
 
   if (m_tls_model != GCC_JIT_TLS_MODEL_NONE)
     global->set_tls_model (recording::tls_models[m_tls_model]);
 
   if (m_link_section != NULL)
     global->set_link_section (m_link_section->c_str ());
+
+  if (m_reg_name != NULL)
+    global->set_register_name (m_reg_name->c_str ());
+
+  if (m_alignment != 0)
+    global->set_alignment (m_alignment);
 
   set_playback_obj (global);
 }
@@ -4718,6 +5085,15 @@ recording::global::write_to_dump (dump &d)
       break;
     }
 
+  for (auto attr: m_string_attributes)
+  {
+    gcc_jit_variable_attribute& name = std::get<0>(attr);
+    std::string& value = std::get<1>(attr);
+    const char* attribute = variable_attribute_to_string (name);
+
+    if (attribute)
+      d.write ("__attribute(%s(\"%s\"))__\n", attribute, value.c_str());
+  }
   d.write ("%s %s",
 	   m_type->get_debug_string (),
 	   get_debug_string ());
@@ -4741,7 +5117,7 @@ recording::global::write_to_dump (dump &d)
   else if (m_rvalue_init)
     {
       d.write (" = ");
-      d.write (m_rvalue_init->get_debug_string ());
+      d.write ("%s", m_rvalue_init->get_debug_string ());
       d.write (";\n");
     }
 
@@ -4788,6 +5164,10 @@ static const char * const tls_model_enum_strings[] = {
   "GCC_JIT_TLS_MODEL_LOCAL_EXEC",
 };
 
+static const char * const gcc_jit_variable_attribute_enum_strings[] = {
+  "GCC_JIT_VARIABLE_ATTRIBUTE_VISIBILITY",
+};
+
 void
 recording::global::write_reproducer (reproducer &r)
 {
@@ -4816,6 +5196,13 @@ recording::global::write_reproducer (reproducer &r)
 	"                                  \"%s\"); /* */\n",
      id,
      m_link_section->c_str ());
+
+  for (auto attribute : m_string_attributes)
+    r.write("  gcc_jit_lvalue_add_string_attribute (%s, %s, \"%s\");\n",
+	    id,
+	    gcc_jit_variable_attribute_enum_strings[std::get<0>(attribute)],
+	    std::get<1>(attribute).c_str());
+
 
   if (m_initializer)
     switch (m_type->dereference ()->get_size ())
@@ -5084,6 +5471,43 @@ memento_of_new_rvalue_from_const <void *>::write_reproducer (reproducer &r)
    can exit the gcc::jit::recording namespace.  */
 
 } // namespace recording
+
+/* The implementation of class gcc::jit::recording::memento_of_sizeof.  */
+
+/* Implementation of pure virtual hook recording::memento::replay_into
+   for recording::memento_of_sizeof.  */
+
+void
+recording::memento_of_sizeof::replay_into (replayer *r)
+{
+  set_playback_obj (r->new_sizeof (m_type->playback_type ()));
+}
+
+/* Implementation of recording::memento::make_debug_string for
+   sizeof expressions.  */
+
+recording::string *
+recording::memento_of_sizeof::make_debug_string ()
+{
+  return string::from_printf (m_ctxt,
+			      "sizeof (%s)",
+			      m_type->get_debug_string ());
+}
+
+/* Implementation of recording::memento::write_reproducer for sizeof
+   expressions.  */
+
+void
+recording::memento_of_sizeof::write_reproducer (reproducer &r)
+{
+  const char *id = r.make_identifier (this, "rvalue");
+  r.write ("  gcc_jit_rvalue *%s =\n"
+    "    gcc_jit_context_new_sizeof (%s, /* gcc_jit_context *ctxt */\n"
+    "                                %s); /* gcc_jit_type *type */\n",
+    id,
+    r.get_identifier (get_context ()),
+    r.get_identifier (m_type));
+}
 
 /* The implementation of class gcc::jit::recording::memento_of_new_string_literal.  */
 
@@ -5658,7 +6082,8 @@ recording::comparison::replay_into (replayer *r)
   set_playback_obj (r->new_comparison (playback_location (r, m_loc),
 				       m_op,
 				       m_a->playback_rvalue (),
-				       m_b->playback_rvalue ()));
+				       m_b->playback_rvalue (),
+				       m_type->playback_type ()));
 }
 
 /* Implementation of pure virtual hook recording::rvalue::visit_children
@@ -5733,6 +6158,56 @@ recording::cast::write_reproducer (reproducer &r)
 	   "                              %s, /* gcc_jit_location *loc */\n"
 	   "                              %s, /* gcc_jit_rvalue *rvalue */\n"
 	   "                              %s); /* gcc_jit_type *type */\n",
+	   id,
+	   r.get_identifier (get_context ()),
+	   r.get_identifier (m_loc),
+	   r.get_identifier_as_rvalue (m_rvalue),
+	   r.get_identifier_as_type (get_type ()));
+}
+
+/* Implementation of pure virtual hook recording::memento::replay_into
+   for recording::bitcast.  */
+
+void
+recording::bitcast::replay_into (replayer *r)
+{
+  set_playback_obj (r->new_bitcast (playback_location (r, m_loc),
+				    m_rvalue->playback_rvalue (),
+				    get_type ()->playback_type ()));
+}
+
+/* Implementation of pure virtual hook recording::rvalue::visit_children
+   for recording::bitcast.  */
+void
+recording::bitcast::visit_children (rvalue_visitor *v)
+{
+  v->visit (m_rvalue);
+}
+
+/* Implementation of recording::memento::make_debug_string for
+   casts.  */
+
+recording::string *
+recording::bitcast::make_debug_string ()
+{
+  enum precedence prec = get_precedence ();
+  return string::from_printf (m_ctxt,
+			      "bitcast(%s, %s)",
+			      m_rvalue->get_debug_string_parens (prec),
+			      get_type ()->get_debug_string ());
+}
+
+/* Implementation of recording::memento::write_reproducer for casts.  */
+
+void
+recording::bitcast::write_reproducer (reproducer &r)
+{
+  const char *id = r.make_identifier (this, "rvalue");
+  r.write ("  gcc_jit_rvalue *%s =\n"
+	   "    gcc_jit_context_new_bitcast (%s,\n"
+	   "                                 %s, /* gcc_jit_location *loc */\n"
+	   "                                 %s, /* gcc_jit_rvalue *rvalue */\n"
+	   "                                 %s); /* gcc_jit_type *type */\n",
 	   id,
 	   r.get_identifier (get_context ()),
 	   r.get_identifier (m_loc),
@@ -6343,11 +6818,19 @@ recording::function_pointer::write_reproducer (reproducer &r)
 void
 recording::local::replay_into (replayer *r)
 {
-  set_playback_obj (
-    m_func->playback_function ()
+  playback::lvalue *obj = m_func->playback_function ()
       ->new_local (playback_location (r, m_loc),
 		   m_type->playback_type (),
-		   playback_string (m_name)));
+		   playback_string (m_name),
+		   m_string_attributes);
+
+  if (m_reg_name != NULL)
+    obj->set_register_name (m_reg_name->c_str ());
+
+  if (m_alignment != 0)
+    obj->set_alignment (m_alignment);
+
+  set_playback_obj (obj);
 }
 
 /* Override the default implementation of
@@ -6361,9 +6844,9 @@ recording::local::write_to_dump (dump &d)
 {
   if (d.update_locations ())
     m_loc = d.make_location ();
-  d.write("  %s %s;\n",
-	  m_type->get_debug_string (),
-	  get_debug_string ());
+  d.write ("  %s %s;\n",
+	   m_type->get_debug_string (),
+	   get_debug_string ());
 }
 
 void

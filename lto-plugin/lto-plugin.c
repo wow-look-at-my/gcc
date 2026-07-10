@@ -1,5 +1,5 @@
-/* LTO plugin for gold and/or GNU ld.
-   Copyright (C) 2009-2022 Free Software Foundation, Inc.
+/* LTO plugin for linkers like gold, GNU ld or mold.
+   Copyright (C) 2009-2024 Free Software Foundation, Inc.
    Contributed by Rafael Avila de Espindola (espindola@google.com).
 
 This program is free software; you can redistribute it and/or modify
@@ -16,11 +16,11 @@ You should have received a copy of the GNU General Public License
 along with this program; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
-/* The plugin has only one external function: onload. Gold passes it an array of
-   function that the plugin uses to communicate back to gold.
+/* The plugin has only one external function: onload. A linker passes it an array of
+   function that the plugin uses to communicate back to the linker.
 
-   With the functions provided by gold, the plugin can be notified when
-   gold first analyzes a file and pass a symbol table back to gold. The plugin
+   With the functions provided by the linker, the plugin can be notified when
+   the linker first analyzes a file and pass a symbol table back to the linker. The plugin
    is also notified when all symbols have been read and it is time to generate
    machine code for the necessary symbols.
 
@@ -55,6 +55,9 @@ along with this program; see the file COPYING3.  If not see
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#if HAVE_PTHREAD_LOCKING
+#include <pthread.h>
+#endif
 #ifdef HAVE_SYS_WAIT_H
 #include <sys/wait.h>
 #endif
@@ -122,7 +125,7 @@ struct plugin_symtab
 struct plugin_objfile
 {
   int found;
-  int offload;
+  bool offload;
   simple_object_read *objfile;
   struct plugin_symtab *out;
   const struct ld_plugin_input_file *file;
@@ -157,8 +160,20 @@ enum symbol_style
   ss_uscore,	/* Underscore prefix all symbols.  */
 };
 
+#if HAVE_PTHREAD_LOCKING
+/* Plug-in mutex.  */
+static pthread_mutex_t plugin_lock;
+
+#define LOCK_SECTION pthread_mutex_lock (&plugin_lock)
+#define UNLOCK_SECTION pthread_mutex_unlock (&plugin_lock)
+#else
+#define LOCK_SECTION
+#define UNLOCK_SECTION
+#endif
+
 static char *arguments_file_name;
 static ld_plugin_register_claim_file register_claim_file;
+static ld_plugin_register_claim_file_v2 register_claim_file_v2;
 static ld_plugin_register_all_symbols_read register_all_symbols_read;
 static ld_plugin_get_symbols get_symbols, get_symbols_v2, get_symbols_v3;
 static ld_plugin_register_cleanup register_cleanup;
@@ -166,6 +181,10 @@ static ld_plugin_add_input_file add_input_file;
 static ld_plugin_add_input_library add_input_library;
 static ld_plugin_message message;
 static ld_plugin_add_symbols add_symbols, add_symbols_v2;
+static ld_plugin_get_api_version get_api_version;
+
+/* By default, use version LAPI_V0 if there is not negotiation.  */
+static enum linker_api_version api_version = LAPI_V0;
 
 static struct plugin_file_info *claimed_files = NULL;
 static unsigned int num_claimed_files = 0;
@@ -206,7 +225,7 @@ static const char *link_output_name = NULL;
 
 /* This indicates link_output_name already contains the dot of the
    suffix, so we can skip it in extensions.  */
-static int skip_in_suffix = 0;
+static bool skip_in_suffix = false;
 
 /* The version of gold being used, or -1 if not gold.  The number is
    MAJOR * 100 + MINOR.  */
@@ -661,7 +680,8 @@ exec_lto_wrapper (char *argv[])
   /* Write argv to a file to avoid a command line that is too long
      Save the file locally on save-temps.  */
   const char *suffix = ".lto_wrapper_args";
-  suffix += skip_in_suffix;
+  if (skip_in_suffix)
+    suffix++;
   if (save_temps && link_output_name)
     arguments_file_name = concat (link_output_name, suffix, NULL);
   else
@@ -824,8 +844,15 @@ all_symbols_read_handler (void)
       char *arg;
       char *offload_objects_file_name;
       struct plugin_offload_file *ofld;
+      const char *suffix = ".ofldlist";
 
-      offload_objects_file_name = make_temp_file (".ofldlist");
+      if (save_temps && link_output_name)
+	{
+	  suffix += skip_in_suffix;
+	  offload_objects_file_name = concat (link_output_name, suffix, NULL);
+	}
+      else
+	offload_objects_file_name = make_temp_file (suffix);
       check (offload_objects_file_name, LDPL_FATAL,
 	     "Failed to generate a temporary file name");
       f = fopen (offload_objects_file_name, "w");
@@ -1158,18 +1185,26 @@ process_offload_section (void *data, const char *name, off_t offset, off_t len)
   if (startswith (name, ".gnu.offload_lto_.opts"))
     {
       struct plugin_objfile *obj = (struct plugin_objfile *) data;
-      obj->offload = 1;
+      obj->offload = true;
       return 0;
     }
 
   return 1;
 }
 
-/* Callback used by gold to check if the plugin will claim FILE. Writes
-   the result in CLAIMED. */
+/* Callback used by a linker to check if the plugin can claim FILE.
+   Writes the result in CAN_BE_CLAIMED.  If KNOWN_USED != 0, the object
+   is known by the linker to be included in link output, or an older API
+   version is in use that does not provide that information.  Otherwise,
+   the linker is only determining whether this is a plugin object and
+   only the symbol table is needed by the linker.  In this case, the
+   object should not be included in link output and this function will
+   be called by the linker again with KNOWN_USED != 0 after the linker
+   decides the object should be included in link output. */
 
 static enum ld_plugin_status
-claim_file_handler (const struct ld_plugin_input_file *file, int *claimed)
+claim_file_handler_v2 (const struct ld_plugin_input_file *file,
+		       int *can_be_claimed, int known_used)
 {
   enum ld_plugin_status status;
   struct plugin_objfile obj;
@@ -1198,10 +1233,10 @@ claim_file_handler (const struct ld_plugin_input_file *file, int *claimed)
     }
   lto_file.handle = file->handle;
 
-  *claimed = 0;
+  *can_be_claimed = 0;
   obj.file = file;
   obj.found = 0;
-  obj.offload = 0;
+  obj.offload = false;
   obj.out = &lto_file.symtab;
   errmsg = NULL;
   obj.objfile = simple_object_start_read (file->fd, file->offset, LTO_SEGMENT_NAME,
@@ -1239,7 +1274,7 @@ claim_file_handler (const struct ld_plugin_input_file *file, int *claimed)
     simple_object_find_sections (obj.objfile, process_offload_section,
 				 &obj, &err);
 
-  if (obj.found == 0 && obj.offload == 0)
+  if (obj.found == 0 && !obj.offload)
     goto err;
 
   if (obj.found > 1)
@@ -1255,15 +1290,22 @@ claim_file_handler (const struct ld_plugin_input_file *file, int *claimed)
 			      lto_file.symtab.syms);
       check (status == LDPS_OK, LDPL_FATAL, "could not add symbols");
 
-      num_claimed_files++;
-      claimed_files =
-	xrealloc (claimed_files,
-		  num_claimed_files * sizeof (struct plugin_file_info));
-      claimed_files[num_claimed_files - 1] = lto_file;
+      /* Include it only if it is known to be used for link output.  */
+      if (known_used)
+	{
+	  LOCK_SECTION;
+	  num_claimed_files++;
+	  claimed_files =
+	    xrealloc (claimed_files,
+		      num_claimed_files * sizeof (struct plugin_file_info));
+	  claimed_files[num_claimed_files - 1] = lto_file;
+	  UNLOCK_SECTION;
+	}
 
-      *claimed = 1;
+      *can_be_claimed = 1;
     }
 
+  LOCK_SECTION;
   if (offload_files == NULL)
     {
       /* Add dummy item to the start of the list.  */
@@ -1276,10 +1318,10 @@ claim_file_handler (const struct ld_plugin_input_file *file, int *claimed)
   /* If this is an LTO file without offload, and it is the first LTO file, save
      the pointer to the last offload file in the list.  Further offload LTO
      files will be inserted after it, if any.  */
-  if (*claimed && obj.offload == 0 && offload_files_last_lto == NULL)
+  if (*can_be_claimed && !obj.offload && offload_files_last_lto == NULL)
     offload_files_last_lto = offload_files_last;
 
-  if (obj.offload == 1)
+  if (obj.offload && known_used)
     {
       /* Add file to the list.  The order must be exactly the same as the final
 	 order after recompilation and linking, otherwise host and target tables
@@ -1290,7 +1332,9 @@ claim_file_handler (const struct ld_plugin_input_file *file, int *claimed)
       ofld->name = lto_file.name;
       ofld->next = NULL;
 
-      if (*claimed && offload_files_last_lto == NULL && file->offset != 0
+      if (*can_be_claimed
+	  && offload_files_last_lto == NULL
+	  && file->offset != 0
 	  && gold_version == -1)
 	{
 	  /* ld only: insert first LTO file from the archive after the last real
@@ -1307,7 +1351,7 @@ claim_file_handler (const struct ld_plugin_input_file *file, int *claimed)
 	      offload_files->next = ofld;
 	    }
 	}
-      else if (*claimed && offload_files_last_lto != NULL)
+      else if (*can_be_claimed && offload_files_last_lto != NULL)
 	{
 	  /* Insert LTO file after the last LTO file in the list.  */
 	  ofld->next = offload_files_last_lto->next;
@@ -1322,15 +1366,19 @@ claim_file_handler (const struct ld_plugin_input_file *file, int *claimed)
 	offload_files_last = ofld;
       if (file->offset == 0)
 	offload_files_last_obj = ofld;
-      if (*claimed)
+      if (*can_be_claimed)
 	offload_files_last_lto = ofld;
       num_offload_files++;
     }
 
+  UNLOCK_SECTION;
+
   goto cleanup;
 
  err:
+  LOCK_SECTION;
   non_claimed_files++;
+  UNLOCK_SECTION;
   free (lto_file.name);
 
  cleanup:
@@ -1338,6 +1386,15 @@ claim_file_handler (const struct ld_plugin_input_file *file, int *claimed)
     simple_object_release_read (obj.objfile);
 
   return LDPS_OK;
+}
+
+/* Callback used by a linker to check if the plugin will claim FILE. Writes
+   the result in CLAIMED. */
+
+static enum ld_plugin_status
+claim_file_handler (const struct ld_plugin_input_file *file, int *claimed)
+{
+  return claim_file_handler_v2 (file, claimed, true);
 }
 
 /* Parse the plugin options. */
@@ -1400,13 +1457,58 @@ process_option (const char *option)
   verbose = verbose || debug;
 }
 
-/* Called by gold after loading the plugin. TV is the transfer vector. */
+/* Negotiate linker API version.  */
+
+static void
+negotiate_api_version (void)
+{
+  const char *linker_identifier;
+  const char *linker_version;
+
+  enum linker_api_version supported_api = LAPI_V0;
+#if HAVE_PTHREAD_LOCKING
+  supported_api = LAPI_V1;
+#endif
+
+  api_version = get_api_version ("GCC", BASE_VERSION, LAPI_V0,
+				 supported_api, &linker_identifier, &linker_version);
+  if (api_version > supported_api)
+    {
+      fprintf (stderr, "requested an unsupported API version (%d)\n", api_version);
+      abort ();
+    }
+
+  switch (api_version)
+    {
+    case LAPI_V0:
+      break;
+    case LAPI_V1:
+      check (get_symbols_v3, LDPL_FATAL,
+	     "get_symbols_v3 required for API version 1");
+      check (add_symbols_v2, LDPL_FATAL,
+	     "add_symbols_v2 required for API version 1");
+      break;
+    default:
+      fprintf (stderr, "unsupported API version (%d)\n", api_version);
+      abort ();
+    }
+}
+
+/* Called by a linker after loading the plugin. TV is the transfer vector. */
 
 enum ld_plugin_status
 onload (struct ld_plugin_tv *tv)
 {
   struct ld_plugin_tv *p;
   enum ld_plugin_status status;
+
+#if HAVE_PTHREAD_LOCKING
+  if (pthread_mutex_init (&plugin_lock, NULL) != 0)
+    {
+      fprintf (stderr, "mutex init failed\n");
+      abort ();
+    }
+#endif
 
   p = tv;
   while (p->tv_tag)
@@ -1418,6 +1520,9 @@ onload (struct ld_plugin_tv *tv)
           break;
 	case LDPT_REGISTER_CLAIM_FILE_HOOK:
 	  register_claim_file = p->tv_u.tv_register_claim_file;
+	  break;
+	case LDPT_REGISTER_CLAIM_FILE_HOOK_V2:
+	  register_claim_file_v2 = p->tv_u.tv_register_claim_file_v2;
 	  break;
 	case LDPT_ADD_SYMBOLS_V2:
 	  add_symbols_v2 = p->tv_u.tv_add_symbols;
@@ -1460,17 +1565,30 @@ onload (struct ld_plugin_tv *tv)
 	  /* We only use this to make user-friendly temp file names.  */
 	  link_output_name = p->tv_u.tv_string;
 	  break;
+	case LDPT_GET_API_VERSION:
+	  get_api_version = p->tv_u.tv_get_api_version;
+	  break;
 	default:
 	  break;
 	}
       p++;
     }
 
+  if (get_api_version)
+    negotiate_api_version ();
+
   check (register_claim_file, LDPL_FATAL, "register_claim_file not found");
   check (add_symbols, LDPL_FATAL, "add_symbols not found");
   status = register_claim_file (claim_file_handler);
   check (status == LDPS_OK, LDPL_FATAL,
 	 "could not register the claim_file callback");
+
+  if (register_claim_file_v2)
+    {
+      status = register_claim_file_v2 (claim_file_handler_v2);
+      check (status == LDPS_OK, LDPL_FATAL,
+	     "could not register the claim_file_v2 callback");
+    }
 
   if (register_cleanup)
     {
@@ -1569,7 +1687,7 @@ onload (struct ld_plugin_tv *tv)
 	  assert (escapes == 0);
 	  assert (ticks == oddticks);
 	  assert (q - link_output_name == len - 1);
-	  skip_in_suffix = 1;
+	  skip_in_suffix = true;
 	}
     }
 

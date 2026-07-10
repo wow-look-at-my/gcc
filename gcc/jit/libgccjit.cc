@@ -1,5 +1,5 @@
 /* Implementation of the C API; all wrappers into the internal C++ API
-   Copyright (C) 2013-2022 Free Software Foundation, Inc.
+   Copyright (C) 2013-2024 Free Software Foundation, Inc.
    Contributed by David Malcolm <dmalcolm@redhat.com>.
 
 This file is part of GCC.
@@ -19,12 +19,12 @@ along with GCC; see the file COPYING3.  If not see
 <http://www.gnu.org/licenses/>.  */
 
 #include "config.h"
+#define INCLUDE_MUTEX
 #include "system.h"
 #include "coretypes.h"
 #include "timevar.h"
 #include "typed-splay-tree.h"
 #include "cppbuiltin.h"
-#include <pthread.h>
 
 #include "libgccjit.h"
 #include "jit-recording.h"
@@ -352,6 +352,17 @@ compatible_types (gcc::jit::recording::type *ltype,
   return ltype->accepts_writes_from (rtype);
 }
 
+/* Public entrypoint wrapping compatible_types.  */
+
+int
+gcc_jit_compatible_types (gcc_jit_type *ltype,
+			  gcc_jit_type *rtype)
+{
+  RETURN_VAL_IF_FAIL (ltype, 0, NULL, NULL, "NULL ltype");
+  RETURN_VAL_IF_FAIL (rtype, 0, NULL, NULL, "NULL rtype");
+  return compatible_types (ltype, rtype);
+}
+
 /* Public entrypoint for acquiring a gcc_jit_context.
    Note that this creates a new top-level context; contrast with
    gcc_jit_context_new_child_context below.
@@ -456,7 +467,7 @@ gcc_jit_context_get_type (gcc_jit_context *ctxt,
   JIT_LOG_FUNC (ctxt->get_logger ());
   RETURN_NULL_IF_FAIL_PRINTF1 (
     (type >= GCC_JIT_TYPE_VOID
-     && type <= GCC_JIT_TYPE_FILE_PTR),
+     && type < NUM_GCC_JIT_TYPES),
     ctxt, NULL,
     "unrecognized value for enum gcc_jit_types: %i", type);
 
@@ -521,6 +532,37 @@ gcc_jit_type_get_volatile (gcc_jit_type *type)
   RETURN_NULL_IF_FAIL (type, NULL, NULL, "NULL type");
 
   return (gcc_jit_type *)type->get_volatile ();
+}
+
+/* Public entrypoint.  See description in libgccjit.h.
+
+   After error-checking, the real work is done by the
+   gcc::jit::recording::type::get_restrict method, in
+   jit-recording.cc.  */
+
+gcc_jit_type *
+gcc_jit_type_get_restrict (gcc_jit_type *type)
+{
+  RETURN_NULL_IF_FAIL (type, NULL, NULL, "NULL type");
+  RETURN_NULL_IF_FAIL (type->is_pointer (), NULL, NULL, "not a pointer type");
+
+  return (gcc_jit_type *)type->get_restrict ();
+}
+
+/* Public entrypoint.  See description in libgccjit.h.
+
+   After error-checking, the real work is done by the
+   gcc::jit::recording::type::get_size method, in
+   jit-recording.cc.  */
+
+ssize_t
+gcc_jit_type_get_size (gcc_jit_type *type)
+{
+  RETURN_VAL_IF_FAIL (type, -1, NULL, NULL, "NULL type");
+  RETURN_VAL_IF_FAIL
+    (type->is_int () || type->is_float () || type->is_pointer (), -1, NULL, NULL,
+     "only getting the size of integer or floating-point or pointer types is supported for now");
+  return type->get_size ();
 }
 
 /* Public entrypoint.  See description in libgccjit.h.
@@ -2034,6 +2076,24 @@ gcc_jit_context_null (gcc_jit_context *ctxt,
 /* Public entrypoint.  See description in libgccjit.h.
 
    After error-checking, the real work is done by the
+   gcc::jit::recording::context::new_sizeof method in
+   jit-recording.cc.  */
+
+gcc_jit_rvalue *
+gcc_jit_context_new_sizeof (gcc_jit_context *ctxt,
+			    gcc_jit_type *type)
+{
+  RETURN_NULL_IF_FAIL (ctxt, NULL, NULL, "NULL context");
+  RETURN_NULL_IF_FAIL (type, ctxt, NULL, "NULL type");
+  JIT_LOG_FUNC (ctxt->get_logger ());
+
+  return ((gcc_jit_rvalue *)ctxt
+	  ->new_sizeof (type));
+}
+
+/* Public entrypoint.  See description in libgccjit.h.
+
+   After error-checking, the real work is done by the
    gcc::jit::recording::context::new_string_literal method in
    jit-recording.cc.  */
 
@@ -2072,7 +2132,7 @@ gcc_jit_context_new_unary_op (gcc_jit_context *ctxt,
     op);
   RETURN_NULL_IF_FAIL (result_type, ctxt, loc, "NULL result_type");
   RETURN_NULL_IF_FAIL_PRINTF3 (
-    result_type->is_numeric (), ctxt, loc,
+    result_type->is_numeric () || result_type->is_numeric_vector (), ctxt, loc,
     "gcc_jit_unary_op %s with operand %s "
     "has non-numeric result_type: %s",
     gcc::jit::unary_op_reproducer_strings[op],
@@ -2119,7 +2179,8 @@ gcc_jit_context_new_binary_op (gcc_jit_context *ctxt,
   RETURN_NULL_IF_FAIL (a, ctxt, loc, "NULL a");
   RETURN_NULL_IF_FAIL (b, ctxt, loc, "NULL b");
   RETURN_NULL_IF_FAIL_PRINTF4 (
-    a->get_type ()->unqualified () == b->get_type ()->unqualified (),
+    compatible_types (a->get_type ()->unqualified (),
+		      b->get_type ()->unqualified ()),
     ctxt, loc,
     "mismatching types for binary op:"
     " a: %s (type: %s) b: %s (type: %s)",
@@ -2128,7 +2189,7 @@ gcc_jit_context_new_binary_op (gcc_jit_context *ctxt,
     b->get_debug_string (),
     b->get_type ()->get_debug_string ());
   RETURN_NULL_IF_FAIL_PRINTF4 (
-    result_type->is_numeric (), ctxt, loc,
+    result_type->is_numeric () || result_type->is_numeric_vector (), ctxt, loc,
     "gcc_jit_binary_op %s with operands a: %s b: %s "
     "has non-numeric result_type: %s",
     gcc::jit::binary_op_reproducer_strings[op],
@@ -2408,6 +2469,28 @@ gcc_jit_context_new_cast (gcc_jit_context *ctxt,
 /* Public entrypoint.  See description in libgccjit.h.
 
    After error-checking, the real work is done by the
+   gcc::jit::recording::context::new_bitcast method in jit-recording.c.  */
+
+gcc_jit_rvalue *
+gcc_jit_context_new_bitcast (gcc_jit_context *ctxt,
+			     gcc_jit_location *loc,
+			     gcc_jit_rvalue *rvalue,
+			     gcc_jit_type *type)
+{
+  RETURN_NULL_IF_FAIL (ctxt, NULL, loc, "NULL context");
+  JIT_LOG_FUNC (ctxt->get_logger ());
+  /* LOC can be NULL.  */
+  RETURN_NULL_IF_FAIL (rvalue, ctxt, loc, "NULL rvalue");
+  RETURN_NULL_IF_FAIL (type, ctxt, loc, "NULL type");
+  /* We cannot check if the size of rvalue matches the size of type here, so
+   we'll do it at playback. */
+
+  return static_cast <gcc_jit_rvalue *> (ctxt->new_bitcast (loc, rvalue, type));
+}
+
+/* Public entrypoint.  See description in libgccjit.h.
+
+   After error-checking, the real work is done by the
    gcc::jit::recording::context::new_array_access method in
    jit-recording.cc.  */
 
@@ -2647,6 +2730,47 @@ gcc_jit_lvalue_set_link_section (gcc_jit_lvalue *lvalue,
 {
   RETURN_IF_FAIL (section_name, NULL, NULL, "NULL section_name");
   lvalue->set_link_section (section_name);
+}
+
+/* Public entrypoint.  See description in libgccjit.h.
+
+   After error-checking, the real work is done by the
+   gcc::jit::recording::lvalue::get_alignment method in jit-recording.cc.  */
+
+unsigned
+gcc_jit_lvalue_get_alignment (gcc_jit_lvalue *lvalue)
+{
+  RETURN_VAL_IF_FAIL (lvalue, 0, NULL, NULL, "NULL lvalue");
+  return lvalue->get_alignment ();
+}
+
+/* Public entrypoint.  See description in libgccjit.h.
+
+   After error-checking, the real work is done by the
+   gcc::jit::recording::lvalue::set_alignment method in jit-recording.cc.  */
+
+void
+gcc_jit_lvalue_set_alignment (gcc_jit_lvalue *lvalue,
+			      unsigned bytes)
+{
+  RETURN_IF_FAIL (lvalue, NULL, NULL, "NULL lvalue");
+  RETURN_IF_FAIL ((bytes & (bytes - 1)) == 0, NULL, NULL,
+		  "alignment is not a power of 2");
+  lvalue->set_alignment (bytes);
+}
+
+/* Public entrypoint.  See description in libgccjit.h.
+
+   After error-checking, the real work is done by the
+   gcc::jit::recording::lvalue::set_register_name method in jit-recording.cc.  */
+
+void
+gcc_jit_lvalue_set_register_name (gcc_jit_lvalue *lvalue,
+				  const char *reg_name)
+{
+  RETURN_IF_FAIL (lvalue, NULL, NULL, "NULL lvalue");
+  RETURN_IF_FAIL (reg_name, NULL, NULL, "NULL reg_name");
+  lvalue->set_register_name (reg_name);
 }
 
 /* Public entrypoint.  See description in libgccjit.h.
@@ -3437,6 +3561,23 @@ gcc_jit_context_set_bool_allow_unreachable_blocks (gcc_jit_context *ctxt,
    gcc::jit::recording::context::set_inner_bool_option method in
    jit-recording.cc.  */
 
+void
+gcc_jit_context_set_bool_print_errors_to_stderr (gcc_jit_context *ctxt,
+						 int enabled)
+{
+  RETURN_IF_FAIL (ctxt, NULL, NULL, "NULL context");
+  JIT_LOG_FUNC (ctxt->get_logger ());
+  ctxt->set_inner_bool_option (
+    gcc::jit::INNER_BOOL_OPTION_PRINT_ERRORS_TO_STDERR,
+    enabled);
+}
+
+/* Public entrypoint.  See description in libgccjit.h.
+
+   After error-checking, the real work is done by the
+   gcc::jit::recording::context::set_inner_bool_option method in
+   jit-recording.cc.  */
+
 extern void
 gcc_jit_context_set_bool_use_external_driver (gcc_jit_context *ctxt,
 					      int bool_value)
@@ -3842,6 +3983,73 @@ gcc_jit_type_get_aligned (gcc_jit_type *type,
   return (gcc_jit_type *)type->get_aligned (alignment_in_bytes);
 }
 
+void
+gcc_jit_function_add_attribute (gcc_jit_function *func,
+				gcc_jit_fn_attribute attribute)
+{
+  RETURN_IF_FAIL (func, NULL, NULL, "NULL func");
+  RETURN_IF_FAIL ((attribute >= 0 && attribute < GCC_JIT_FN_ATTRIBUTE_MAX),
+		  NULL,
+		  NULL,
+		  "attribute should be a `gcc_jit_fn_attribute` enum value");
+
+  func->add_attribute (attribute);
+}
+
+void
+gcc_jit_function_add_string_attribute (gcc_jit_function *func,
+				       gcc_jit_fn_attribute attribute,
+				       const char* value)
+{
+  RETURN_IF_FAIL (func, NULL, NULL, "NULL func");
+  RETURN_IF_FAIL (value, NULL, NULL, "NULL value");
+  RETURN_IF_FAIL ((attribute >= 0 && attribute < GCC_JIT_FN_ATTRIBUTE_MAX),
+		  NULL,
+		  NULL,
+		  "attribute should be a `gcc_jit_fn_attribute` enum value");
+
+  func->add_string_attribute (attribute, value);
+}
+
+/* This function adds an attribute with multiple integer values.  For example
+   `nonnull(1, 2)`.  The numbers in `values` are supposed to map how they
+   should be written in C code.  So for `nonnull(1, 2)`, you should pass `1`
+   and `2` in `values` (and set `length` to `2`). */
+void
+gcc_jit_function_add_integer_array_attribute (gcc_jit_function *func,
+					      gcc_jit_fn_attribute attribute,
+					      const int* values,
+					      size_t length)
+{
+  RETURN_IF_FAIL (func, NULL, NULL, "NULL func");
+  RETURN_IF_FAIL (values, NULL, NULL, "NULL values");
+  RETURN_IF_FAIL ((attribute >= 0 && attribute < GCC_JIT_FN_ATTRIBUTE_MAX),
+		  NULL,
+		  NULL,
+		  "attribute should be a `gcc_jit_fn_attribute` enum value");
+
+  func->add_integer_array_attribute (attribute, values, length);
+}
+
+void
+gcc_jit_lvalue_add_string_attribute (gcc_jit_lvalue *variable,
+				     gcc_jit_variable_attribute attribute,
+				     const char* value)
+{
+  RETURN_IF_FAIL (variable, NULL, NULL, "NULL variable");
+  RETURN_IF_FAIL (value, NULL, NULL, "NULL value");
+  RETURN_IF_FAIL (variable->is_global () || variable->is_local (),
+		  NULL,
+		  NULL,
+		  "variable should be a variable");
+  RETURN_IF_FAIL ((attribute >= 0 && attribute < GCC_JIT_VARIABLE_ATTRIBUTE_MAX),
+		  NULL,
+		  NULL,
+		  "attribute should be a `gcc_jit_variable_attribute` enum value");
+
+  variable->add_string_attribute (attribute, value);
+}
+
 /* Public entrypoint.  See description in libgccjit.h.
 
    After error-checking, the real work is done by the
@@ -3952,7 +4160,7 @@ gcc_jit_context_new_rvalue_from_vector (gcc_jit_context *ctxt,
    Ideally this would be within parse_basever, but the mutex is only needed
    by libgccjit.  */
 
-static pthread_mutex_t version_mutex = PTHREAD_MUTEX_INITIALIZER;
+static std::mutex version_mutex;
 
 struct jit_version_info
 {
@@ -3960,9 +4168,8 @@ struct jit_version_info
      guarded by version_mutex.  */
   jit_version_info ()
   {
-    pthread_mutex_lock (&version_mutex);
+    std::lock_guard<std::mutex> g (version_mutex);
     parse_basever (&major, &minor, &patchlevel);
-    pthread_mutex_unlock (&version_mutex);
   }
 
   int major;

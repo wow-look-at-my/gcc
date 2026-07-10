@@ -1,5 +1,5 @@
 /* Routines for manipulation of expression nodes.
-   Copyright (C) 2000-2022 Free Software Foundation, Inc.
+   Copyright (C) 2000-2024 Free Software Foundation, Inc.
    Contributed by Andy Vaught
 
 This file is part of GCC.
@@ -466,6 +466,10 @@ free_expr0 (gfc_expr *e)
 	  mpc_clear (e->value.complex);
 	  break;
 
+	case BT_BOZ:
+	  free (e->boz.str);
+	  break;
+
 	default:
 	  break;
 	}
@@ -545,6 +549,7 @@ gfc_free_actual_arglist (gfc_actual_arglist *a1)
       a2 = a1->next;
       if (a1->expr)
 	gfc_free_expr (a1->expr);
+      free (a1->associated_dummy);
       free (a1);
       a1 = a2;
     }
@@ -564,6 +569,12 @@ gfc_copy_actual_arglist (gfc_actual_arglist *p)
     {
       new_arg = gfc_get_actual_arglist ();
       *new_arg = *p;
+
+      if (p->associated_dummy != NULL)
+	{
+	  new_arg->associated_dummy = gfc_get_dummy_arg ();
+	  *new_arg->associated_dummy = *p->associated_dummy;
+	}
 
       new_arg->expr = gfc_copy_expr (p->expr);
       new_arg->next = NULL;
@@ -787,7 +798,7 @@ gfc_copy_ref (gfc_ref *src)
 
 /* Detect whether an expression has any vector index array references.  */
 
-int
+bool
 gfc_has_vector_index (gfc_expr *e)
 {
   gfc_ref *ref;
@@ -798,6 +809,14 @@ gfc_has_vector_index (gfc_expr *e)
 	if (ref->u.ar.dimen_type[i] == DIMEN_VECTOR)
 	  return 1;
   return 0;
+}
+
+
+bool
+gfc_is_ptr_fcn (gfc_expr *e)
+{
+  return e != NULL && e->expr_type == EXPR_FUNCTION
+	      && gfc_expr_attr (e).pointer;
 }
 
 
@@ -877,7 +896,7 @@ gfc_kind_max (gfc_expr *e1, gfc_expr *e2)
 
 /* Returns nonzero if the type is numeric, zero otherwise.  */
 
-static int
+static bool
 numeric_type (bt type)
 {
   return type == BT_COMPLEX || type == BT_REAL || type == BT_INTEGER;
@@ -886,7 +905,7 @@ numeric_type (bt type)
 
 /* Returns nonzero if the typespec is a numeric type, zero otherwise.  */
 
-int
+bool
 gfc_numeric_ts (gfc_typespec *ts)
 {
   return numeric_type (ts->type);
@@ -1149,6 +1168,7 @@ is_subref_array (gfc_expr * e)
 	 what follows cannot be a subreference array, unless there is a
 	 substring reference.  */
       if (!seen_array && ref->type == REF_COMPONENT
+	  && ref->next == NULL
 	  && ref->u.c.component->ts.type != BT_CHARACTER
 	  && ref->u.c.component->ts.type != BT_CLASS
 	  && !gfc_bt_struct (ref->u.c.component->ts.type))
@@ -1528,6 +1548,7 @@ find_array_section (gfc_expr *expr, gfc_ref *ref)
   mpz_init_set_ui (delta_mpz, one);
   mpz_init_set_ui (nelts, one);
   mpz_init (tmp_mpz);
+  mpz_init (ptr);
 
   /* Do the initialization now, so that we can cleanup without
      keeping track of where we were.  */
@@ -1551,6 +1572,16 @@ find_array_section (gfc_expr *expr, gfc_ref *ref)
       step = ref->u.ar.stride[d];
       lower = ref->u.ar.as->lower[d];
       upper = ref->u.ar.as->upper[d];
+
+      if (!lower || !upper
+	  || lower->expr_type != EXPR_CONSTANT
+	  || upper->expr_type != EXPR_CONSTANT
+	  || lower->ts.type != BT_INTEGER
+	  || upper->ts.type != BT_INTEGER)
+	{
+	  t = false;
+	  goto cleanup;
+	}
 
       if (ref->u.ar.dimen_type[d] == DIMEN_VECTOR)  /* Vector subscript.  */
 	{
@@ -1661,7 +1692,6 @@ find_array_section (gfc_expr *expr, gfc_ref *ref)
       mpz_mul (delta_mpz, delta_mpz, tmp_mpz);
     }
 
-  mpz_init (ptr);
   cons = gfc_constructor_first (base);
 
   /* Now clock through the array reference, calculating the index in
@@ -1714,16 +1744,21 @@ find_array_section (gfc_expr *expr, gfc_ref *ref)
 		     "at %L requires an increase of the allowed %d "
 		     "upper limit.  See %<-fmax-array-constructor%> "
 		     "option", &expr->where, flag_max_array_constructor);
-	  return false;
+	  t = false;
+	  goto cleanup;
 	}
 
       cons = gfc_constructor_lookup (base, limit);
-      gcc_assert (cons);
+      if (cons == NULL)
+	{
+	  gfc_error ("Error in array constructor referenced at %L",
+		     &ref->u.ar.where);
+	  t = false;
+	  goto cleanup;
+	}
       gfc_constructor_append_expr (&expr->value.constructor,
 				   gfc_copy_expr (cons->expr), NULL);
     }
-
-  mpz_clear (ptr);
 
 cleanup:
 
@@ -1738,6 +1773,7 @@ cleanup:
       mpz_clear (ctr[d]);
       mpz_clear (stride[d]);
     }
+  mpz_clear (ptr);
   gfc_constructor_free (base);
   return t;
 }
@@ -1809,6 +1845,11 @@ find_inquiry_ref (gfc_expr *p, gfc_expr **newp)
 
   gfc_resolve_expr (tmp);
 
+  /* Leave these to the backend since the type and kind is not confirmed until
+     resolution.  */
+  if (IS_INFERRED_TYPE (tmp))
+    goto cleanup;
+
   /* In principle there can be more than one inquiry reference.  */
   for (; inquiry; inquiry = inquiry->next)
     {
@@ -1827,6 +1868,13 @@ find_inquiry_ref (gfc_expr *p, gfc_expr **newp)
 	  else if (tmp->expr_type == EXPR_CONSTANT)
 	    *newp = gfc_get_int_expr (gfc_default_integer_kind,
 				      NULL, tmp->value.character.length);
+	  else if (gfc_init_expr_flag
+		   && tmp->ts.u.cl->length->symtree->n.sym->attr.pdt_len)
+	    *newp = gfc_pdt_find_component_copy_initializer (tmp->symtree->n
+							     .sym,
+							     tmp->ts.u.cl
+							     ->length->symtree
+							     ->n.sym->name);
 	  else
 	    goto cleanup;
 
@@ -1867,7 +1915,9 @@ find_inquiry_ref (gfc_expr *p, gfc_expr **newp)
 		    mpc_imagref (tmp->value.complex), GFC_RND_MODE);
 	  break;
 	}
-      tmp = gfc_copy_expr (*newp);
+      // TODO: Fix leaking expr tmp, when simplify is done twice.
+      if (inquiry->next)
+	gfc_replace_expr (tmp, *newp);
     }
 
   if (!(*newp))
@@ -2032,7 +2082,7 @@ static bool
 simplify_ref_chain (gfc_ref *ref, int type, gfc_expr **p)
 {
   int n;
-  gfc_expr *newp;
+  gfc_expr *newp = NULL;
 
   for (; ref; ref = ref->next)
     {
@@ -2279,7 +2329,8 @@ gfc_simplify_expr (gfc_expr *p, int type)
 	 initialization expression, or we want a subsection.  */
       if (p->symtree->n.sym->attr.flavor == FL_PARAMETER
 	  && (gfc_init_expr_flag || p->ref
-	      || p->symtree->n.sym->value->expr_type != EXPR_ARRAY))
+	      || (p->symtree->n.sym->value
+		  && p->symtree->n.sym->value->expr_type != EXPR_ARRAY)))
 	{
 	  if (!simplify_parameter_variable (p, type))
 	    return false;
@@ -3151,6 +3202,11 @@ gfc_reduce_init_expr (gfc_expr *expr)
 {
   bool t;
 
+  /* It is far too early to resolve a class compcall. Punt to resolution.  */
+  if (expr && expr->expr_type == EXPR_COMPCALL
+      && expr->symtree->n.sym->ts.type == BT_CLASS)
+    return false;
+
   gfc_init_expr_flag = true;
   t = gfc_resolve_expr (expr);
   if (t)
@@ -3193,7 +3249,7 @@ gfc_match_init_expr (gfc_expr **result)
       return m;
     }
 
-  if (gfc_derived_parameter_expr (expr))
+  if (expr->expr_type != EXPR_FUNCTION && gfc_derived_parameter_expr (expr))
     {
       *result = expr;
       gfc_init_expr_flag = false;
@@ -3464,21 +3520,14 @@ check_restricted (gfc_expr *e)
       if (!check_references (e->ref, &check_restricted))
 	break;
 
-      /* gfc_is_formal_arg broadcasts that a formal argument list is being
-	 processed in resolve.cc(resolve_formal_arglist).  This is done so
-	 that host associated dummy array indices are accepted (PR23446).
-	 This mechanism also does the same for the specification expressions
-	 of array-valued functions.  */
       if (e->error
 	    || sym->attr.in_common
 	    || sym->attr.use_assoc
+	    || sym->attr.used_in_submodule
 	    || sym->attr.dummy
 	    || sym->attr.implied_index
 	    || sym->attr.flavor == FL_PARAMETER
-	    || is_parent_of_current_ns (sym->ns)
-	    || (sym->ns->proc_name != NULL
-		  && sym->ns->proc_name->attr.flavor == FL_MODULE)
-	    || (gfc_is_formal_arg () && (sym->ns == gfc_current_ns)))
+	    || is_parent_of_current_ns (gfc_get_spec_ns (sym)))
 	{
 	  t = true;
 	  break;
@@ -3630,7 +3679,7 @@ gfc_check_conformance (gfc_expr *op1, gfc_expr *op2, const char *optype_msgid, .
 /* Given an assignable expression and an arbitrary expression, make
    sure that the assignment can take place.  Only add a call to the intrinsic
    conversion routines, when allow_convert is set.  When this assign is a
-   coarray call, then the convert is done by the coarray routine implictly and
+   coarray call, then the convert is done by the coarray routine implicitly and
    adding the intrinsic conversion would do harm in most cases.  */
 
 bool
@@ -4983,14 +5032,14 @@ get_union_initializer (gfc_symbol *union_type, gfc_component **map_p)
 static bool
 class_allocatable (gfc_component *comp)
 {
-  return comp->ts.type == BT_CLASS && CLASS_DATA (comp)
+  return comp->ts.type == BT_CLASS && comp->attr.class_ok && CLASS_DATA (comp)
     && CLASS_DATA (comp)->attr.allocatable;
 }
 
 static bool
 class_pointer (gfc_component *comp)
 {
-  return comp->ts.type == BT_CLASS && CLASS_DATA (comp)
+  return comp->ts.type == BT_CLASS && comp->attr.class_ok && CLASS_DATA (comp)
     && CLASS_DATA (comp)->attr.pointer;
 }
 
@@ -5448,7 +5497,7 @@ gfc_traverse_expr (gfc_expr *expr, gfc_symbol *sym,
 	  break;
 
 	case REF_INQUIRY:
-	  return true;
+	  return false;
 
 	default:
 	  gcc_unreachable ();
@@ -5821,9 +5870,9 @@ gfc_get_corank (gfc_expr *e)
   if (!gfc_is_coarray (e))
     return 0;
 
-  if (e->ts.type == BT_CLASS && e->ts.u.derived->components)
-    corank = e->ts.u.derived->components->as
-	     ? e->ts.u.derived->components->as->corank : 0;
+  if (e->ts.type == BT_CLASS && CLASS_DATA (e))
+    corank = CLASS_DATA (e)->as
+	     ? CLASS_DATA (e)->as->corank : 0;
   else
     corank = e->symtree->n.sym->as ? e->symtree->n.sym->as->corank : 0;
 
@@ -5915,6 +5964,20 @@ gfc_is_simply_contiguous (gfc_expr *expr, bool strict, bool permit_element)
   if (expr->expr_type == EXPR_ARRAY)
     return true;
 
+  if (expr->expr_type == EXPR_NULL)
+    {
+      /* F2018:16.9.144  NULL ([MOLD]):
+	 "If MOLD is present, the characteristics are the same as MOLD."
+	 "If MOLD is absent, the characteristics of the result are
+	 determined by the entity with which the reference is associated."
+	 F2018:15.3.2.2 characteristics attributes include CONTIGUOUS.  */
+      if (expr->ts.type == BT_UNKNOWN)
+	return true;
+      else
+	return (gfc_variable_attr (expr, NULL).contiguous
+		|| gfc_variable_attr (expr, NULL).allocatable);
+    }
+
   if (expr->expr_type == EXPR_FUNCTION)
     {
       if (expr->value.function.isym)
@@ -5968,15 +6031,16 @@ gfc_is_simply_contiguous (gfc_expr *expr, bool strict, bool permit_element)
     }
 
   sym = expr->symtree->n.sym;
-  if (expr->ts.type != BT_CLASS
-      && ((part_ref
-	   && !part_ref->u.c.component->attr.contiguous
-	   && part_ref->u.c.component->attr.pointer)
-	  || (!part_ref
-	      && !sym->attr.contiguous
-	      && (sym->attr.pointer
-		  || (sym->as && sym->as->type == AS_ASSUMED_RANK)
-		  || (sym->as && sym->as->type == AS_ASSUMED_SHAPE)))))
+  if ((part_ref
+       && part_ref->u.c.component
+       && !part_ref->u.c.component->attr.contiguous
+       && IS_POINTER (part_ref->u.c.component))
+      || (!part_ref
+	  && expr->ts.type != BT_CLASS
+	  && !sym->attr.contiguous
+	  && (sym->attr.pointer
+	      || (sym->as && sym->as->type == AS_ASSUMED_RANK)
+	      || (sym->as && sym->as->type == AS_ASSUMED_SHAPE))))
     return false;
 
   if (!ar || ar->type == AR_FULL)
@@ -6230,7 +6294,7 @@ gfc_check_vardef_context (gfc_expr* e, bool pointer, bool alloc_obj,
       && !(sym->attr.flavor == FL_PROCEDURE && sym == sym->result)
       && !(sym->attr.flavor == FL_PROCEDURE && sym->attr.proc_pointer)
       && !(sym->attr.flavor == FL_PROCEDURE
-	   && sym->attr.function && sym->attr.pointer))
+	   && sym->attr.function && attr.pointer))
     {
       if (context)
 	gfc_error ("%qs in variable definition context (%s) at %L is not"
@@ -6431,7 +6495,8 @@ gfc_check_vardef_context (gfc_expr* e, bool pointer, bool alloc_obj,
 	{
 	  if (context)
 	    {
-	      if (assoc->target->expr_type == EXPR_VARIABLE)
+	      if (assoc->target->expr_type == EXPR_VARIABLE
+		  && gfc_has_vector_index (assoc->target))
 		gfc_error ("%qs at %L associated to vector-indexed target"
 			   " cannot be used in a variable definition"
 			   " context (%s)",
@@ -6443,6 +6508,22 @@ gfc_check_vardef_context (gfc_expr* e, bool pointer, bool alloc_obj,
 			   name, &e->where, context);
 	    }
 	  return false;
+	}
+      else if (context && gfc_is_ptr_fcn (assoc->target))
+	{
+	  if (!gfc_notify_std (GFC_STD_F2018, "%qs at %L associated to "
+			       "pointer function target being used in a "
+			       "variable definition context (%s)", name,
+			       &e->where, context))
+	    return false;
+	  else if (gfc_has_vector_index (e))
+	    {
+	      gfc_error ("%qs at %L associated to vector-indexed target"
+			 " cannot be used in a variable definition"
+			 " context (%s)",
+			 name, &e->where, context);
+	      return false;
+	    }
 	}
 
       /* Target must be allowed to appear in a variable definition context.  */
@@ -6505,4 +6586,20 @@ gfc_check_vardef_context (gfc_expr* e, bool pointer, bool alloc_obj,
 	    }
 
   return true;
+}
+
+gfc_expr*
+gfc_pdt_find_component_copy_initializer (gfc_symbol *sym, const char *name)
+{
+  /* The actual length of a pdt is in its components.  In the
+     initializer of the current ref is only the default value.
+     Therefore traverse the chain of components and pick the correct
+     one's initializer expressions.  */
+  for (gfc_component *comp = sym->ts.u.derived->components; comp != NULL;
+       comp = comp->next)
+    {
+      if (!strcmp (comp->name, name))
+	return gfc_copy_expr (comp->initializer);
+    }
+  return NULL;
 }

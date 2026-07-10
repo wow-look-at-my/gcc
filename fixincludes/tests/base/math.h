@@ -32,6 +32,7 @@
 
 #if defined( DARWIN_FLT_EVAL_METHOD_CHECK )
 #if __FLT_EVAL_METHOD__ == 0 || __FLT_EVAL_METHOD__ == 16
+#if __FLT_EVAL_METHOD__ == 0 || __FLT_EVAL_METHOD__ == -1 || __FLT_EVAL_METHOD__ == 16
 #endif  /* DARWIN_FLT_EVAL_METHOD_CHECK */
 
 
@@ -55,6 +56,13 @@
 #if defined( HPUX11_CPP_POW_INLINE_CHECK )
 
 #endif  /* HPUX11_CPP_POW_INLINE_CHECK */
+
+
+#if defined( HPUX_MATH_CONSTEXPR_CHECK )
+#  define _DINFINITY (__builtin_inf ())
+#    define _SINFINITY (__builtin_inff ())
+#    define _SQNAN (__builtin_nanf (""))
+#endif  /* HPUX_MATH_CONSTEXPR_CHECK */
 
 
 #if defined( HPUX11_FABSF_CHECK )

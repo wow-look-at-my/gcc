@@ -528,7 +528,6 @@ version (CppMangle_Itanium)
     static assert(basic_ostream!(char, char_traits!char).food.mangleof == "_ZNSo4foodEv");
     static assert(basic_iostream!(char, char_traits!char).fooe.mangleof == "_ZNSd4fooeEv");
 
-    static assert(func_18957_2.mangleof == `_Z12func_18957_2PSaIiE`);
     static assert(func_18957_2!(allocator!int).mangleof == `_Z12func_18957_2ISaIiEET_PS1_`);
 
     static assert(func_20413.mangleof == `_Z10func_20413St4pairIifES_IfiE`);
@@ -1327,3 +1326,8 @@ extern (C++)
             static assert(funccpp.mangleof == "?funccpp@@YAHP6AXXZ@Z");
     }
 }
+
+/*****************************************/
+
+extern(C++) enum _LIBNAME = "library";
+extern(C++) enum _DEBUG = _LIBNAME.length && 'd' == _LIBNAME[$-1];

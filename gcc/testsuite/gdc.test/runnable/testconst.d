@@ -551,7 +551,7 @@ void test38()
 static const int x39;
 const int y39;
 
-static this()
+shared static this()
 {
     x39 = 3;
     y39 = 4;
@@ -613,7 +613,7 @@ class C42
     static const int d;
     static const int e = ctfe() + 2;
 
-    static this()
+    shared static this()
     {
         d = 4;
     }
@@ -1302,7 +1302,7 @@ void test78()
 
 const bool[string] stopWords79;
 
-static this()
+shared static this()
 {
     stopWords79 = [ "a"[]:1 ];
 }
@@ -1623,7 +1623,7 @@ struct S3748
     const int z = 6;
     C3748 c;
 
-    inout(int)* getX() inout
+    inout(int)* getX() inout return
     {
         static assert(!__traits(compiles, {
             x = 4;
@@ -3348,9 +3348,9 @@ struct S10758
 {
     int x;
         inout(int)   screwUpVal(ref inout(int) _) inout { return x; }
-    ref inout(int)   screwUpRef(ref inout(int) _) inout { return x; }
-        inout(int)*  screwUpPtr(ref inout(int) _) inout { return &x; }
-        inout(int)[] screwUpArr(ref inout(int) _) inout { return (&x)[0 .. 1]; }
+    ref inout(int)   screwUpRef(ref inout(int) _) inout return { return x; }
+        inout(int)*  screwUpPtr(ref inout(int) _) inout return { return &x; }
+        inout(int)[] screwUpArr(ref inout(int) _) inout return { return (&x)[0 .. 1]; }
 }
 
 void test10758(ref inout(int) wx, inout(int)* wp, inout(int)[] wa, inout(S10758) ws)
@@ -3497,14 +3497,14 @@ inout(int)* delegate(inout(int)*) nest10761(inout(int)* x)
 struct S10761
 {
     int x;
-    inout(int)* screwUp() inout { return &x; }
+    inout(int)* screwUp() inout return { return &x; }
 }
 
-inout(int)* delegate() inout memfn10761(inout(int)* x)
+inout(int)* delegate() inout return memfn10761(inout(int)* x)
 {
     auto s = new inout S10761(1);
     auto dg = &s.screwUp;
-    static assert(is(typeof(dg) == inout(int)* delegate() inout));
+    static assert(is(typeof(dg) == inout(int)* delegate() inout return));
     return dg;
 }
 
@@ -3542,7 +3542,7 @@ void test10761()
         auto dg_m = memfn10761(&mx);
         auto dg_c = memfn10761(&cx);
         auto dg_i = memfn10761(&ix);
-        alias DG = const(int)* delegate() const;
+        alias DG = const(int)* delegate() return const;
         static assert(is(typeof(dg_m) == DG));
         static assert(is(typeof(dg_c) == DG));
         static assert(is(typeof(dg_i) == DG));

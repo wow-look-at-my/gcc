@@ -1,4 +1,4 @@
-// REQUIRED_ARGS: -w -de
+// REQUIRED_ARGS: -w -dw
 // PERMUTE_ARGS:
 
 /***************************************************/

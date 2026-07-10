@@ -1,7 +1,7 @@
 /**
  * Code for generating .json descriptions of the module when passing the `-X` flag to dmd.
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/json.d, _json.d)
@@ -32,9 +32,10 @@ import dmd.globals;
 import dmd.hdrgen;
 import dmd.id;
 import dmd.identifier;
+import dmd.location;
 import dmd.mtype;
 import dmd.common.outbuffer;
-import dmd.root.rootobject;
+import dmd.rootobject;
 import dmd.root.string;
 import dmd.target;
 import dmd.visitor;
@@ -53,7 +54,7 @@ public:
     int indentLevel;
     const(char)[] filename;
 
-    extern (D) this(OutBuffer* buf)
+    extern (D) this(OutBuffer* buf) scope @safe
     {
         this.buf = buf;
     }
@@ -302,8 +303,7 @@ public:
             //property(name, "impure");
             break;
         case PURE.weak:     return property(name, "weak");
-        case PURE.const_:   return property(name, "const");
-        case PURE.strong:   return property(name, "strong");
+        case PURE.const_:   return property(name, "strong");
         case PURE.fwdref:   return property(name, "fwdref");
         }
     }
@@ -320,10 +320,7 @@ public:
             // Should not be printed
             //property(name, "d");
             break;
-        case LINK.system:
-            // Should not be printed
-            //property(name, "system");
-            break;
+        case LINK.system:   return property(name, "system");
         case LINK.c:        return property(name, "c");
         case LINK.cpp:      return property(name, "cpp");
         case LINK.windows:  return property(name, "windows");
@@ -390,13 +387,13 @@ public:
 
     extern(D) void property(const char[] name, Parameters* parameters)
     {
-        if (parameters is null || parameters.dim == 0)
+        if (parameters is null || parameters.length == 0)
             return;
         propertyStart(name);
         arrayStart();
         if (parameters)
         {
-            for (size_t i = 0; i < parameters.dim; i++)
+            for (size_t i = 0; i < parameters.length; i++)
             {
                 Parameter p = (*parameters)[i];
                 objectStart();
@@ -450,7 +447,7 @@ public:
             return;
         jsonProperties(cast(Dsymbol)d);
         propertyStorageClass("storageClass", d.storage_class);
-        property("linkage", d.linkage);
+        property("linkage", d._linkage);
         property("type", "deco", d.type);
         // Emit originalType if it differs from type
         if (d.type != d.originalType && d.originalType)
@@ -495,7 +492,7 @@ public:
         property("comment", s.comment.toDString);
         propertyStart("members");
         arrayStart();
-        for (size_t i = 0; i < s.members.dim; i++)
+        for (size_t i = 0; i < s.members.length; i++)
         {
             (*s.members)[i].accept(this);
         }
@@ -526,7 +523,7 @@ public:
             property("alias", s.aliasId.toString());
         bool hasRenamed = false;
         bool hasSelective = false;
-        for (size_t i = 0; i < s.aliases.dim; i++)
+        for (size_t i = 0; i < s.aliases.length; i++)
         {
             // avoid empty "renamed" and "selective" sections
             if (hasRenamed && hasSelective)
@@ -541,7 +538,7 @@ public:
             // import foo : alias1 = target1;
             propertyStart("renamed");
             objectStart();
-            for (size_t i = 0; i < s.aliases.dim; i++)
+            for (size_t i = 0; i < s.aliases.length; i++)
             {
                 const name = s.names[i];
                 const _alias = s.aliases[i];
@@ -570,7 +567,7 @@ public:
         Dsymbols* ds = d.include(null);
         if (ds)
         {
-            for (size_t i = 0; i < ds.dim; i++)
+            for (size_t i = 0; i < ds.length; i++)
             {
                 Dsymbol s = (*ds)[i];
                 s.accept(this);
@@ -586,7 +583,7 @@ public:
             return; // Don't visit the if/else bodies again below
         }
         Dsymbols* ds = d.decl ? d.decl : d.elsedecl;
-        for (size_t i = 0; i < ds.dim; i++)
+        for (size_t i = 0; i < ds.length; i++)
         {
             Dsymbol s = (*ds)[i];
             s.accept(this);
@@ -635,7 +632,7 @@ public:
         {
             propertyStart("members");
             arrayStart();
-            for (size_t i = 0; i < d.members.dim; i++)
+            for (size_t i = 0; i < d.members.length; i++)
             {
                 Dsymbol s = (*d.members)[i];
                 s.accept(this);
@@ -653,11 +650,11 @@ public:
         if (tf && tf.ty == Tfunction)
             property("parameters", tf.parameterList.parameters);
         property("endline", "endchar", d.endloc);
-        if (d.foverrides.dim)
+        if (d.foverrides.length)
         {
             propertyStart("overrides");
             arrayStart();
-            for (size_t i = 0; i < d.foverrides.dim; i++)
+            for (size_t i = 0; i < d.foverrides.length; i++)
             {
                 FuncDeclaration fd = d.foverrides[i];
                 item(fd.toPrettyChars().toDString);
@@ -685,7 +682,7 @@ public:
         jsonProperties(d);
         propertyStart("parameters");
         arrayStart();
-        for (size_t i = 0; i < d.parameters.dim; i++)
+        for (size_t i = 0; i < d.parameters.length; i++)
         {
             TemplateParameter s = (*d.parameters)[i];
             objectStart();
@@ -736,7 +733,7 @@ public:
         }
         propertyStart("members");
         arrayStart();
-        for (size_t i = 0; i < d.members.dim; i++)
+        for (size_t i = 0; i < d.members.length; i++)
         {
             Dsymbol s = (*d.members)[i];
             s.accept(this);
@@ -751,7 +748,7 @@ public:
         {
             if (d.members)
             {
-                for (size_t i = 0; i < d.members.dim; i++)
+                for (size_t i = 0; i < d.members.length; i++)
                 {
                     Dsymbol s = (*d.members)[i];
                     s.accept(this);
@@ -766,7 +763,7 @@ public:
         {
             propertyStart("members");
             arrayStart();
-            for (size_t i = 0; i < d.members.dim; i++)
+            for (size_t i = 0; i < d.members.length; i++)
             {
                 Dsymbol s = (*d.members)[i];
                 s.accept(this);
@@ -791,7 +788,7 @@ public:
         objectStart();
         jsonProperties(d);
         if (d._init)
-            property("init", d._init.toString());
+            property("init", toString(d._init));
         if (d.isField())
             property("offset", d.offset);
         if (!d.alignment.isUnknown() && !d.alignment.isDefault())
@@ -813,17 +810,14 @@ public:
     Params:
      modules = array of the "root modules"
     */
-    private void generateModules(Modules* modules)
+    private void generateModules(ref Modules modules)
     {
         arrayStart();
-        if (modules)
+        foreach (m; modules)
         {
-            foreach (m; *modules)
-            {
-                if (global.params.verbose)
-                    message("json gen %s", m.toChars());
-                m.accept(this);
-            }
+            if (global.params.v.verbose)
+                message("json gen %s", m.toChars());
+            m.accept(this);
         }
         arrayEnd();
     }
@@ -836,7 +830,7 @@ public:
     {
         import dmd.target : target;
         objectStart();
-        requiredProperty("vendor", global.vendor);
+        requiredProperty("vendor", global.compileEnv.vendor);
         requiredProperty("version", global.versionString());
         property("__VERSION__", global.versionNumber());
         requiredProperty("interface", determineCompilerInterface());
@@ -879,12 +873,9 @@ public:
 
         propertyStart("predefinedVersions");
         arrayStart();
-        if (global.versionids)
+        foreach (const versionid; global.versionids)
         {
-            foreach (const versionid; *global.versionids)
-            {
-                item(versionid.toString());
-            }
+            item(versionid.toString());
         }
         arrayEnd();
 
@@ -911,12 +902,9 @@ public:
 
         propertyStart("importPaths");
         arrayStart();
-        if (global.params.imppath)
+        foreach (importPath; global.params.imppath[])
         {
-            foreach (importPath; *global.params.imppath)
-            {
-                item(importPath.toDString);
-            }
+            item(importPath.toDString);
         }
         arrayEnd();
 
@@ -938,7 +926,7 @@ public:
 
         propertyStart("ddocFiles");
         arrayStart();
-        foreach (ddocFile; global.params.ddocfiles)
+        foreach (ddocFile; global.params.ddoc.files)
         {
             item(ddocFile.toDString);
         }
@@ -967,7 +955,7 @@ public:
             requiredProperty("name", m.md ? m.md.toString() : null);
             requiredProperty("file", m.srcfile.toString());
             propertyBool("isRoot", m.isRoot());
-            if(m.contentImportedFiles.dim > 0)
+            if(m.contentImportedFiles.length > 0)
             {
                 propertyStart("contentImports");
                 arrayStart();
@@ -984,9 +972,15 @@ public:
     }
 }
 
-extern (C++) void json_generate(OutBuffer* buf, Modules* modules)
+/***********************************
+ * Generate json for the modules.
+ * Params:
+ *      modules = array of Modules
+ *      buf = write json output to buf
+ */
+void json_generate(ref Modules modules, ref OutBuffer buf)
 {
-    scope ToJsonVisitor json = new ToJsonVisitor(buf);
+    scope ToJsonVisitor json = new ToJsonVisitor(&buf);
     // write trailing newline
     scope(exit) buf.writeByte('\n');
 
@@ -1053,7 +1047,7 @@ Params:
 Returns: JsonFieldFlags.none on error, otherwise the JsonFieldFlags value
          corresponding to the given fieldName.
 */
-extern (C++) JsonFieldFlags tryParseJsonField(const(char)* fieldName)
+JsonFieldFlags tryParseJsonField(const(char)* fieldName)
 {
     auto fieldNameString = fieldName.toDString();
     foreach (idx, enumName; __traits(allMembers, JsonFieldFlags))
@@ -1073,13 +1067,13 @@ Determines and returns the compiler interface which is one of `dmd`, `ldc`,
 */
 private extern(D) string determineCompilerInterface()
 {
-    if (global.vendor == "Digital Mars D")
+    if (global.compileEnv.vendor == "Digital Mars D")
         return "dmd";
-    if (global.vendor == "LDC")
+    if (global.compileEnv.vendor == "LDC")
         return "ldc";
-    if (global.vendor == "GNU D")
+    if (global.compileEnv.vendor == "GNU D")
         return "gdc";
-    if (global.vendor == "SDC")
+    if (global.compileEnv.vendor == "SDC")
         return "sdc";
     return null;
 }

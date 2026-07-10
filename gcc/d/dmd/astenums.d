@@ -1,7 +1,7 @@
 /**
  * Defines enums common to dmd and dmd as parse library.
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/astenums.d, _astenums.d)
  * Documentation:  https://dlang.org/phobos/dmd_astenums.html
@@ -28,6 +28,7 @@ enum Baseok : ubyte
 
 enum MODFlags : int
 {
+    none         = 0,    // default (mutable)
     const_       = 1,    // type is const
     immutable_   = 4,    // type is immutable
     shared_      = 2,    // type is shared
@@ -62,12 +63,11 @@ enum STC : ulong  // transfer changes to declaration.h
     foreach_            = 0x4000,   /// variable for foreach loop
     variadic            = 0x8000,   /// the `variadic` parameter in: T foo(T a, U b, V variadic...)
 
-    //                  = 0x1_0000,
+    constscoperef       = 0x1_0000,   /// when `in` means const|scope|ref
     templateparameter   = 0x2_0000,   /// template parameter
     ref_                = 0x4_0000,   /// `ref`
     scope_              = 0x8_0000,   /// `scope`
 
-    maybescope          = 0x10_0000,   /// parameter might be `scope`
     scopeinferred       = 0x20_0000,   /// `scope` has been inferred and should not be part of mangling, `scope_` must also be set
     return_             = 0x40_0000,   /// 'return ref' or 'return scope' for function parameters
     returnScope         = 0x80_0000,   /// if `ref return scope` then resolve to `ref` and `return scope`
@@ -112,7 +112,7 @@ enum STC : ulong  // transfer changes to declaration.h
     volatile_           = 0x40_0000_0000_0000,   /// destined for volatile in the back end
 
     safeGroup = STC.safe | STC.trusted | STC.system,
-    IOR  = STC.in_ | STC.ref_ | STC.out_,
+    IOR  = STC.constscoperef | STC.in_ | STC.ref_ | STC.out_,
     TYPECTOR = (STC.const_ | STC.immutable_ | STC.shared_ | STC.wild),
     FUNCATTR = (STC.ref_ | STC.nothrow_ | STC.nogc | STC.pure_ | STC.property | STC.live |
                 safeGroup),
@@ -134,6 +134,8 @@ enum STC : ulong  // transfer changes to declaration.h
 
 }
 
+alias StorageClass = ulong;
+
 /********
  * Determine if it's the ambigous case of where `return` attaches to.
  * Params:
@@ -150,7 +152,7 @@ bool isRefReturnScope(const ulong stc)
 
 /* This is different from the one in declaration.d, make that fix a separate PR */
 static if (0)
-extern (C++) __gshared const(StorageClass) STCStorageClass =
+__gshared const(StorageClass) STCStorageClass =
     (STC.auto_ | STC.scope_ | STC.static_ | STC.extern_ | STC.const_ | STC.final_ |
      STC.abstract_ | STC.synchronized_ | STC.deprecated_ | STC.override_ | STC.lazy_ |
      STC.alias_ | STC.out_ | STC.in_ | STC.manifest | STC.immutable_ | STC.shared_ |
@@ -212,8 +214,8 @@ enum TY : ubyte
     Tmixin,
     Tnoreturn,
     Ttag,
-    TMAX
 }
+enum TMAX = TY.max + 1;
 
 alias Tarray = TY.Tarray;
 alias Tsarray = TY.Tsarray;
@@ -263,7 +265,6 @@ alias Ttraits = TY.Ttraits;
 alias Tmixin = TY.Tmixin;
 alias Tnoreturn = TY.Tnoreturn;
 alias Ttag = TY.Ttag;
-alias TMAX = TY.TMAX;
 
 enum TFlags
 {
@@ -302,8 +303,7 @@ enum PURE : ubyte
     impure      = 0,    // not pure at all
     fwdref      = 1,    // it's pure, but not known which level yet
     weak        = 2,    // no mutable globals are read or written
-    const_      = 3,    // parameters are values or const
-    strong      = 4,    // parameters are values or immutable
+    const_      = 3,    // parameters are values or const = strongly pure
 }
 
 // Whether alias this dependency is recursive or not
@@ -327,6 +327,7 @@ enum VarArg : ubyte
     variadic = 1,  /// (T t, ...)  can be C-style (core.stdc.stdarg) or D-style (core.vararg)
     typesafe = 2,  /// (T t ...) typesafe https://dlang.org/spec/function.html#typesafe_variadic_functions
                    ///   or https://dlang.org/spec/function.html#typesafe_variadic_functions
+    KRvariadic = 3, /// K+R C style variadics (no function prototype)
 }
 
 /*************************
@@ -338,7 +339,7 @@ enum STMT : ubyte
     Error,
     Peel,
     Exp, DtorExp,
-    Compile,
+    Mixin,
     Compound, CompoundDeclaration, CompoundAsm,
     UnrolledLoop,
     Scope,
@@ -382,6 +383,7 @@ enum STMT : ubyte
 enum InitKind : ubyte
 {
     void_,
+    default_,
     error,
     struct_,
     array,
@@ -389,3 +391,77 @@ enum InitKind : ubyte
     C_,
 }
 
+/// A linkage attribute as defined by `extern(XXX)`
+///
+/// https://dlang.org/spec/attribute.html#linkage
+enum LINK : ubyte
+{
+    default_,
+    d,
+    c,
+    cpp,
+    windows,
+    objc,
+    system,
+}
+
+/// Whether to mangle an external aggregate as a struct or class, as set by `extern(C++, struct)`
+enum CPPMANGLE : ubyte
+{
+    def,      /// default
+    asStruct, /// `extern(C++, struct)`
+    asClass,  /// `extern(C++, class)`
+}
+
+/// Function match levels
+///
+/// https://dlang.org/spec/function.html#function-overloading
+enum MATCH : int
+{
+    nomatch,   /// no match
+    convert,   /// match with conversions
+    constant,  /// match with conversion to const
+    exact,     /// exact match
+}
+
+/// Inline setting as defined by `pragma(inline, XXX)`
+enum PINLINE : ubyte
+{
+    default_, /// as specified on the command line
+    never,    /// never inline
+    always,   /// always inline
+}
+
+/// Source file type
+enum FileType : ubyte
+{
+    d,    /// normal D source file
+    dhdr, /// D header file (.di)
+    ddoc, /// Ddoc documentation file (.dd)
+    c,    /// C source file
+}
+
+extern (C++) struct structalign_t
+{
+  private:
+    ushort value = 0;  // unknown
+    enum STRUCTALIGN_DEFAULT = 1234;   // default = match whatever the corresponding C compiler does
+    bool pack;         // use #pragma pack semantics
+
+  public:
+  pure @safe @nogc nothrow:
+    bool isDefault() const { return value == STRUCTALIGN_DEFAULT; }
+    void setDefault()      { value = STRUCTALIGN_DEFAULT; }
+    bool isUnknown() const { return value == 0; }  // value is not set
+    void setUnknown()      { value = 0; }
+    void set(uint value)   { this.value = cast(ushort)value; }
+    uint get() const       { return value; }
+    bool isPack() const    { return pack; }
+    void setPack(bool pack) { this.pack = pack; }
+}
+
+/// Use to return D arrays from C++ functions
+extern (C++) struct DArray(T)
+{
+    T[] data;
+}

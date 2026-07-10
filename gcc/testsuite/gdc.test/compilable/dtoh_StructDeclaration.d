@@ -8,9 +8,9 @@ TEST_OUTPUT:
 #pragma once
 
 #include <assert.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <math.h>
 
 #ifdef CUSTOM_D_ARRAY_TYPE
 #define _d_dynamicArray CUSTOM_D_ARRAY_TYPE
@@ -45,6 +45,9 @@ struct S final
     int32_t b;
     int64_t c;
     _d_dynamicArray< int32_t > arr;
+private:
+    ~S();
+public:
     S() :
         a(),
         b(),
@@ -81,7 +84,6 @@ struct S3 final
     int32_t a;
     int32_t b;
     int64_t c;
-    extern "C" S3(int32_t a);
     S3() :
         a(42),
         b(),
@@ -143,7 +145,6 @@ struct A final
 {
     int32_t a;
     S s;
-    extern "C" void bar();
     void baz(int32_t x = 42);
     struct
     {
@@ -172,12 +173,16 @@ struct A final
 
     A() :
         a(),
-        s()
+        s(),
+        x(),
+        y()
     {
     }
-    A(int32_t a, S s = S(0, 0, 0LL, {})) :
+    A(int32_t a, S s = S(), int32_t x = 0, int32_t y = 0) :
         a(a),
-        s(s)
+        s(s),
+        x(x),
+        y(y)
         {}
 };
 
@@ -185,6 +190,48 @@ union U
 {
     int32_t i;
     char c;
+};
+
+struct Array final
+{
+    uint32_t length;
+private:
+    _d_dynamicArray< char > data;
+    char smallarray[1$?:32=u|64=LLU$];
+public:
+    Array() :
+        length(),
+        data()
+    {
+    }
+    Array(uint32_t length, _d_dynamicArray< char > data = {}) :
+        length(length),
+        data(data)
+        {}
+};
+
+struct Params final
+{
+    bool obj;
+    Array ddocfiles;
+    Params() :
+        obj(true),
+        ddocfiles()
+    {
+    }
+    Params(bool obj, Array ddocfiles = Array()) :
+        obj(obj),
+        ddocfiles(ddocfiles)
+        {}
+};
+
+struct Loc final
+{
+    static int32_t showColumns;
+    void toChars(int32_t showColumns = Loc::showColumns);
+    Loc()
+    {
+    }
 };
 ---
 */
@@ -201,6 +248,7 @@ extern (C++) struct S
     int b;
     long c;
     int[] arr;
+    extern(D) ~this() {}
 }
 
 extern (C++) struct S2
@@ -283,4 +331,24 @@ extern(C++) union U
 {
     int i;
     char c;
+}
+
+extern (C++) struct Array
+{
+    uint length;
+private:
+    char[] data;
+    char[1] smallarray;
+}
+
+extern (C++) struct Params
+{
+    bool obj = true;
+    Array ddocfiles;
+}
+
+extern (C++) struct Loc
+{
+    __gshared int showColumns;
+    void toChars(int showColumns = Loc.showColumns) {}
 }

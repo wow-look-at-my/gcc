@@ -1,5 +1,5 @@
 /* A pure C API to enable client code to embed GCC as a JIT-compiler.
-   Copyright (C) 2013-2022 Free Software Foundation, Inc.
+   Copyright (C) 2013-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -293,6 +293,24 @@ gcc_jit_context_set_bool_allow_unreachable_blocks (gcc_jit_context *ctxt,
    tested for with #ifdef.  */
 #define LIBGCCJIT_HAVE_gcc_jit_context_set_bool_allow_unreachable_blocks
 
+/* By default, libgccjit will print errors to stderr.
+
+   This option can be used to disable the printing.
+
+   This entrypoint was added in LIBGCCJIT_ABI_23; you can test for
+   its presence using
+     #ifdef LIBGCCJIT_HAVE_gcc_jit_context_set_bool_print_errors_to_stderr
+*/
+
+extern void
+gcc_jit_context_set_bool_print_errors_to_stderr (gcc_jit_context *ctxt,
+						 int enabled);
+
+/* Pre-canned feature macro to indicate the presence of
+   gcc_jit_context_set_bool_print_errors_to_stderr.  This can be
+   tested for with #ifdef.  */
+#define LIBGCCJIT_HAVE_gcc_jit_context_set_bool_print_errors_to_stderr
+
 /* Implementation detail:
    libgccjit internally generates assembler, and uses "driver" code
    for converting it to other formats (e.g. shared libraries).
@@ -574,8 +592,19 @@ enum gcc_jit_types
   /* Complex numbers.  */
   GCC_JIT_TYPE_COMPLEX_FLOAT,
   GCC_JIT_TYPE_COMPLEX_DOUBLE,
-  GCC_JIT_TYPE_COMPLEX_LONG_DOUBLE
+  GCC_JIT_TYPE_COMPLEX_LONG_DOUBLE,
 
+  /* Sized integer types.  */
+  GCC_JIT_TYPE_UINT8_T,
+  GCC_JIT_TYPE_UINT16_T,
+  GCC_JIT_TYPE_UINT32_T,
+  GCC_JIT_TYPE_UINT64_T,
+  GCC_JIT_TYPE_UINT128_T,
+  GCC_JIT_TYPE_INT8_T,
+  GCC_JIT_TYPE_INT16_T,
+  GCC_JIT_TYPE_INT32_T,
+  GCC_JIT_TYPE_INT64_T,
+  GCC_JIT_TYPE_INT128_T
 };
 
 extern gcc_jit_type *
@@ -600,6 +629,32 @@ gcc_jit_type_get_const (gcc_jit_type *type);
 /* Given type "T", get type "volatile T".  */
 extern gcc_jit_type *
 gcc_jit_type_get_volatile (gcc_jit_type *type);
+
+#define LIBGCCJIT_HAVE_gcc_jit_type_get_restrict
+
+/* Given type "T", get type "restrict T".
+   This API entrypoint was added in LIBGCCJIT_ABI_25; you can test for its
+   presence using
+     #ifdef LIBGCCJIT_HAVE_gcc_jit_type_get_restrict  */
+extern gcc_jit_type *
+gcc_jit_type_get_restrict (gcc_jit_type *type);
+
+#define LIBGCCJIT_HAVE_SIZED_INTEGERS
+
+/* Given types LTYPE and RTYPE, return non-zero if they are compatible.
+   This API entrypoint was added in LIBGCCJIT_ABI_20; you can test for its
+   presence using
+     #ifdef LIBGCCJIT_HAVE_SIZED_INTEGERS  */
+extern int
+gcc_jit_compatible_types (gcc_jit_type *ltype,
+			  gcc_jit_type *rtype);
+
+/* Given type "T", get its size.
+   This API entrypoint was added in LIBGCCJIT_ABI_20; you can test for its
+   presence using
+     #ifdef LIBGCCJIT_HAVE_SIZED_INTEGERS  */
+extern ssize_t
+gcc_jit_type_get_size (gcc_jit_type *type);
 
 /* Given type "T", get type "T[N]" (for a constant N).  */
 extern gcc_jit_type *
@@ -842,7 +897,7 @@ gcc_jit_context_new_global (gcc_jit_context *ctxt,
    set to the corresponding value in `values`.  `fields` and `values`
    are paired by index.
 
-   Each value has to have have the same unqualified type as the field
+   Each value has to have the same unqualified type as the field
    it is applied to.
 
    A NULL value element  in `values` is a shorthand for zero initialization
@@ -892,7 +947,7 @@ gcc_jit_context_new_struct_constructor (gcc_jit_context *ctxt,
    `value` specifies what value to set the corresponding field to.
    If `value` is NULL, zero initialization will be used.
 
-   Each value has to have have the same unqualified type as the field
+   Each value has to have the same unqualified type as the field
    it is applied to.
 
    `field` need to be the same objects that were used
@@ -1037,6 +1092,18 @@ gcc_jit_context_new_rvalue_from_ptr (gcc_jit_context *ctxt,
 extern gcc_jit_rvalue *
 gcc_jit_context_null (gcc_jit_context *ctxt,
 		      gcc_jit_type *pointer_type);
+
+#define LIBGCCJIT_HAVE_gcc_jit_context_new_sizeof
+
+/* Generates an rvalue that is equal to the size of type.
+
+   This API entrypoint was added in LIBGCCJIT_ABI_27; you can test for its
+   presence using
+     #ifdef LIBGCCJIT_HAVE_gcc_jit_context_new_sizeof  */
+
+extern gcc_jit_rvalue *
+gcc_jit_context_new_sizeof (gcc_jit_context *ctxt,
+			    gcc_jit_type *type);
 
 /* String literals. */
 extern gcc_jit_rvalue *
@@ -1206,6 +1273,40 @@ gcc_jit_context_new_cast (gcc_jit_context *ctxt,
 			  gcc_jit_rvalue *rvalue,
 			  gcc_jit_type *type);
 
+#define LIBGCCJIT_HAVE_gcc_jit_context_new_bitcast
+
+/* Reinterpret a value as another type.
+
+   The types must be of the same size.
+
+   This API entrypoint was added in LIBGCCJIT_ABI_21; you can test for its
+   presence using
+     #ifdef LIBGCCJIT_HAVE_gcc_jit_context_new_bitcast  */
+extern gcc_jit_rvalue *
+gcc_jit_context_new_bitcast (gcc_jit_context *ctxt,
+			     gcc_jit_location *loc,
+			     gcc_jit_rvalue *rvalue,
+			     gcc_jit_type *type);
+
+#define LIBGCCJIT_HAVE_ALIGNMENT
+
+/* Set the alignment of a variable.
+
+   This API entrypoint was added in LIBGCCJIT_ABI_24; you can test for its
+   presence using
+     #ifdef LIBGCCJIT_HAVE_ALIGNMENT  */
+extern void
+gcc_jit_lvalue_set_alignment (gcc_jit_lvalue *lvalue,
+			      unsigned bytes);
+
+/* Get the alignment of a variable.
+
+   This API entrypoint was added in LIBGCCJIT_ABI_24; you can test for its
+   presence using
+     #ifdef LIBGCCJIT_HAVE_ALIGNMENT  */
+extern unsigned
+gcc_jit_lvalue_get_alignment (gcc_jit_lvalue *lvalue);
+
 extern gcc_jit_lvalue *
 gcc_jit_context_new_array_access (gcc_jit_context *ctxt,
 				  gcc_jit_location *loc,
@@ -1276,6 +1377,18 @@ gcc_jit_lvalue_set_tls_model (gcc_jit_lvalue *lvalue,
 extern void
 gcc_jit_lvalue_set_link_section (gcc_jit_lvalue *lvalue,
 			    const char *section_name);
+
+#define LIBGCCJIT_HAVE_gcc_jit_lvalue_set_register_name
+
+/* Make this variable a register variable and set its register name.
+
+   This API entrypoint was added in LIBGCCJIT_ABI_22; you can test for its
+   presence using
+     #ifdef LIBGCCJIT_HAVE_gcc_jit_lvalue_set_register_name
+*/
+void
+gcc_jit_lvalue_set_register_name (gcc_jit_lvalue *lvalue,
+				  const char *reg_name);
 
 extern gcc_jit_lvalue *
 gcc_jit_function_new_local (gcc_jit_function *func,
@@ -1897,6 +2010,61 @@ gcc_jit_vector_type_get_element_type (gcc_jit_vector_type *vector_type);
  * and alignment qualifiers.  */
 extern gcc_jit_type *
 gcc_jit_type_unqualified (gcc_jit_type *type);
+
+#define LIBGCCJIT_HAVE_ATTRIBUTES
+
+/* Function attributes.  */
+enum gcc_jit_fn_attribute
+{
+  GCC_JIT_FN_ATTRIBUTE_ALIAS,
+  GCC_JIT_FN_ATTRIBUTE_ALWAYS_INLINE,
+  GCC_JIT_FN_ATTRIBUTE_INLINE,
+  GCC_JIT_FN_ATTRIBUTE_NOINLINE,
+  GCC_JIT_FN_ATTRIBUTE_TARGET,
+  GCC_JIT_FN_ATTRIBUTE_USED,
+  GCC_JIT_FN_ATTRIBUTE_VISIBILITY,
+  GCC_JIT_FN_ATTRIBUTE_COLD,
+  GCC_JIT_FN_ATTRIBUTE_RETURNS_TWICE,
+  GCC_JIT_FN_ATTRIBUTE_PURE,
+  GCC_JIT_FN_ATTRIBUTE_CONST,
+  GCC_JIT_FN_ATTRIBUTE_WEAK,
+  GCC_JIT_FN_ATTRIBUTE_NONNULL,
+
+  /* Maximum value of this enum, should always be last. */
+  GCC_JIT_FN_ATTRIBUTE_MAX,
+};
+
+/* Add an attribute to a function.  */
+extern void
+gcc_jit_function_add_attribute (gcc_jit_function *func,
+				enum gcc_jit_fn_attribute attribute);
+
+extern void
+gcc_jit_function_add_string_attribute (gcc_jit_function *func,
+				       enum gcc_jit_fn_attribute attribute,
+				       const char* value);
+
+extern void
+gcc_jit_function_add_integer_array_attribute (
+  gcc_jit_function *func,
+  enum gcc_jit_fn_attribute attribute,
+  const int* value,
+  size_t length);
+
+/* Variable attributes.  */
+enum gcc_jit_variable_attribute
+{
+  GCC_JIT_VARIABLE_ATTRIBUTE_VISIBILITY,
+
+  /* Maximum value of this enum, should always be last. */
+  GCC_JIT_VARIABLE_ATTRIBUTE_MAX,
+};
+
+/* Add a string attribute to a variable.  */
+extern void
+gcc_jit_lvalue_add_string_attribute (gcc_jit_lvalue *variable,
+				     enum gcc_jit_variable_attribute attribute,
+				     const char* value);
 
 #ifdef __cplusplus
 }

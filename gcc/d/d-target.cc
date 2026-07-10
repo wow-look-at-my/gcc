@@ -1,5 +1,5 @@
 /* d-target.cc -- Target interface for the D front end.
-   Copyright (C) 2013-2022 Free Software Foundation, Inc.
+   Copyright (C) 2013-2024 Free Software Foundation, Inc.
 
 GCC is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -158,9 +158,16 @@ Target::_init (const Param &)
   Type::thash_t = Type::tsize_t;
 
   /* Set-up target C ABI.  */
-  this->c.longsize = int_size_in_bytes (long_integer_type_node);
-  this->c.long_doublesize = int_size_in_bytes (long_double_type_node);
+  this->c.boolsize = (BOOL_TYPE_SIZE / BITS_PER_UNIT);
+  this->c.shortsize = (SHORT_TYPE_SIZE / BITS_PER_UNIT);
+  this->c.intsize = (INT_TYPE_SIZE / BITS_PER_UNIT);
+  this->c.longsize = (LONG_TYPE_SIZE / BITS_PER_UNIT);
+  this->c.long_longsize = (LONG_LONG_TYPE_SIZE / BITS_PER_UNIT);
+  this->c.long_doublesize = (LONG_DOUBLE_TYPE_SIZE / BITS_PER_UNIT);
   this->c.wchar_tsize = (WCHAR_TYPE_SIZE / BITS_PER_UNIT);
+
+  this->c.bitFieldStyle = targetm.ms_bitfield_layout_p (unknown_type_node)
+    ? TargetC::BitFieldStyle::MS : TargetC::BitFieldStyle::Gcc_Clang;
 
   /* Set-up target C++ ABI.  */
   this->cpp.reverseOverloads = false;
@@ -316,17 +323,6 @@ Target::isVectorOpSupported (Type *type, EXP op, Type *)
       /* Logical operators must have a result type of bool.  */
       return false;
 
-    case EXP::lessOrEqual:
-    case EXP::lessThan:
-    case EXP::greaterOrEqual:
-    case EXP::greaterThan:
-    case EXP::equal:
-    case EXP::notEqual:
-    case EXP::identity:
-    case EXP::notIdentity:
-      /* Comparison operators must have a result type of bool.  */
-      return false;
-
     default:
       break;
     }
@@ -339,7 +335,7 @@ Target::isVectorOpSupported (Type *type, EXP op, Type *)
 const char *
 TargetCPP::toMangle (Dsymbol *s)
 {
-  return toCppMangleItanium (s);
+  return dmd::toCppMangleItanium (s);
 }
 
 /* Return the symbol mangling of CD for C++ linkage.  */
@@ -347,7 +343,7 @@ TargetCPP::toMangle (Dsymbol *s)
 const char *
 TargetCPP::typeInfoMangle (ClassDeclaration *cd)
 {
-  return cppTypeInfoMangleItanium (cd);
+  return dmd::cppTypeInfoMangleItanium (cd);
 }
 
 /* Get mangle name of a this-adjusting thunk to the function declaration FD
@@ -356,7 +352,7 @@ TargetCPP::typeInfoMangle (ClassDeclaration *cd)
 const char *
 TargetCPP::thunkMangle (FuncDeclaration *fd, int offset)
 {
-  return cppThunkMangleItanium (fd, offset);
+  return dmd::cppThunkMangleItanium (fd, offset);
 }
 
 /* For a vendor-specific type, return a string containing the C++ mangling.
@@ -379,32 +375,21 @@ TargetCPP::typeMangle (Type *type)
    ARG to an extern(C++) function.  */
 
 Type *
-TargetCPP::parameterType (Parameter *arg)
+TargetCPP::parameterType (Type *type)
 {
-  Type *t = arg->type->merge2 ();
-  if (arg->storageClass & (STCout | STCref))
-    t = t->referenceTo ();
-  else if (arg->storageClass & STClazy)
-    {
-      /* Mangle as delegate.  */
-      TypeFunction *tf = TypeFunction::create (NULL, t, VARARGnone, LINK::d);
-      TypeDelegate *td = TypeDelegate::create (tf);
-      t = td->merge2 ();
-    }
-
   /* Could be a va_list, which we mangle as a pointer.  */
   Type *tvalist = target.va_listType (Loc (), NULL);
-  if (t->ty == TY::Tsarray && tvalist->ty == TY::Tsarray)
+  if (type->ty == TY::Tsarray && tvalist->ty == TY::Tsarray)
     {
-      Type *tb = t->toBasetype ()->mutableOf ();
+      Type *tb = dmd::mutableOf (type->toBasetype ());
       if (tb == tvalist)
 	{
-	  tb = t->nextOf ()->pointerTo ();
-	  t = tb->castMod (t->mod);
+	  tb = dmd::pointerTo (type->nextOf ());
+	  type = dmd::castMod (tb, type->mod);
 	}
     }
 
-  return t;
+  return type;
 }
 
 /* Checks whether TYPE is a vendor-specific fundamental type.  Stores the result
@@ -468,6 +453,8 @@ Target::isReturnOnStack (TypeFunction *tf, bool)
     return false;
 
   Type *tn = tf->next->toBasetype ();
+  if (tn->size () == SIZE_INVALID)
+    return false;
 
   return (tn->ty == TY::Tstruct || tn->ty == TY::Tsarray);
 }
@@ -579,32 +566,25 @@ Target::libraryObjectMonitors (FuncDeclaration *, Statement *)
   return true;
 }
 
+/* Returns true if the target supports `pragma(linkerDirective)'.  */
+
+bool
+Target::supportsLinkerDirective (void) const
+{
+  return false;
+}
+
 /* Decides whether an `in' parameter of the specified POD type PARAM_TYPE is to
-   be passed by reference or by valie.  This is used only when compiling with
+   be passed by reference or by value.  This is used only when compiling with
    `-fpreview=in' enabled.  */
 
 bool
 Target::preferPassByRef (Type *param_type)
 {
-  if (param_type->size () == SIZE_INVALID)
+  /* See note in Target::isReturnOnStack.  */
+  Type *tb = param_type->toBasetype ();
+  if (tb->size () == SIZE_INVALID)
     return false;
 
-  tree type = build_ctype (param_type);
-
-  /* Prefer a `ref' if the type is an aggregate, and its size is greater than
-     its alignment.  */
-  if (AGGREGATE_TYPE_P (type)
-      && (!valid_constant_size_p (TYPE_SIZE_UNIT (type))
-	  || compare_tree_int (TYPE_SIZE_UNIT (type), TYPE_ALIGN (type)) > 0))
-    return true;
-
-  /* If the back-end is always going to pass this by invisible reference.  */
-  if (pass_by_reference (NULL, function_arg_info (type, true)))
-    return true;
-
-  /* If returning the parameter means the caller will do RVO.  */
-  if (targetm.calls.return_in_memory (type, NULL_TREE))
-    return true;
-
-  return false;
+  return (tb->ty == TY::Tstruct || tb->ty == TY::Tsarray);
 }

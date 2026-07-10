@@ -1,6 +1,6 @@
 
 /* Compiler implementation of the D programming language
- * Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * written by Walter Bright
  * https://www.digitalmars.com
  * Distributed under the Boost Software License, Version 1.0.
@@ -28,6 +28,13 @@ struct Ensure
 class FuncDeclaration;
 class StructDeclaration;
 struct IntRange;
+struct AttributeViolation;
+
+namespace dmd
+{
+    bool functionSemantic(FuncDeclaration* fd);
+    bool functionSemantic3(FuncDeclaration* fd);
+}
 
 //enum STC : ulong from astenums.d:
 
@@ -53,12 +60,11 @@ struct IntRange;
     #define STCforeach            0x4000ULL    /// variable for foreach loop
     #define STCvariadic           0x8000ULL    /// the `variadic` parameter in: T foo(T a, U b, V variadic...)
 
-    //                            0x10000ULL
+    #define STCconstscoperef      0x10000ULL    /// when `in` means const|scope|ref
     #define STCtemplateparameter  0x20000ULL    /// template parameter
     #define STCref                0x40000ULL    /// `ref`
     #define STCscope              0x80000ULL    /// `scope`
 
-    #define STCmaybescope         0x100000ULL    /// parameter might be `scope`
     #define STCscopeinferred      0x200000ULL    /// `scope` has been inferred and should not be part of mangling, `scope` must also be set
     #define STCreturn             0x400000ULL    /// 'return ref' or 'return scope' for function parameters
     #define STCreturnScope        0x800000ULL    /// if `ref return scope` then resolve to `ref` and `return scope`
@@ -71,7 +77,6 @@ struct IntRange;
     #define STCnodtor             0x10000000ULL    /// do not run destructor
     #define STCnothrow            0x20000000ULL    /// `nothrow` meaning never throws exceptions
     #define STCpure               0x40000000ULL    /// `pure` function
-    #define STCtls                0x80000000ULL    /// thread local
 
     #define STCalias              0x100000000ULL    /// `alias` parameter
     #define STCshared             0x200000000ULL    /// accessible from multiple threads
@@ -105,8 +110,6 @@ struct IntRange;
 #define STC_TYPECTOR    (STCconst | STCimmutable | STCshared | STCwild)
 #define STC_FUNCATTR    (STCref | STCnothrow | STCnogc | STCpure | STCproperty | STCsafe | STCtrusted | STCsystem)
 
-void ObjectNotFound(Identifier *id);
-
 /**************************************************************/
 
 class Declaration : public Dsymbol
@@ -116,17 +119,17 @@ public:
     Type *originalType;         // before semantic analysis
     StorageClass storage_class;
     Visibility visibility;
-    LINK linkage;
+    LINK _linkage;              // may be `LINK::system`; use `resolvedLinkage()` to resolve it
     short inuse;                // used to detect cycles
     uint8_t adFlags;
     DString mangleOverride;     // overridden symbol with pragma(mangle, "...")
 
-    const char *kind() const;
-    d_uns64 size(const Loc &loc);
+    const char *kind() const override;
+    uinteger_t size(const Loc &loc) override final;
 
-    Dsymbol *search(const Loc &loc, Identifier *ident, int flags = SearchLocalsOnly);
 
     bool isStatic() const { return (storage_class & STCstatic) != 0; }
+    LINK resolvedLinkage() const; // returns the linkage, resolving the target-specific `System` one
     virtual bool isDelete();
     virtual bool isDataseg();
     virtual bool isThreadlocal();
@@ -138,9 +141,10 @@ public:
     bool isWild() const         { return (storage_class & STCwild) != 0; }
     bool isAuto() const         { return (storage_class & STCauto) != 0; }
     bool isScope() const        { return (storage_class & STCscope) != 0; }
+    bool isReturn() const       { return (storage_class & STCreturn) != 0; }
     bool isSynchronized() const { return (storage_class & STCsynchronized) != 0; }
     bool isParameter() const    { return (storage_class & STCparameter) != 0; }
-    bool isDeprecated() const   { return (storage_class & STCdeprecated) != 0; }
+    bool isDeprecated() const override final { return (storage_class & STCdeprecated) != 0; }
     bool isOverride() const     { return (storage_class & STCoverride) != 0; }
     bool isResult() const       { return (storage_class & STCresult) != 0; }
     bool isField() const        { return (storage_class & STCfield) != 0; }
@@ -152,35 +156,35 @@ public:
 
     bool isFuture() const { return (storage_class & STCfuture) != 0; }
 
-    Visibility visible();
+    Visibility visible() override final;
 
-    Declaration *isDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    Declaration *isDeclaration() override final { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 /**************************************************************/
 
-class TupleDeclaration : public Declaration
+class TupleDeclaration final : public Declaration
 {
 public:
     Objects *objects;
-    bool isexp;                 // true: expression tuple
-
     TypeTuple *tupletype;       // !=NULL if this is a type tuple
+    d_bool isexp;                 // true: expression tuple
+    d_bool building;              // it's growing in AliasAssign semantic
 
-    TupleDeclaration *syntaxCopy(Dsymbol *);
-    const char *kind() const;
-    Type *getType();
-    Dsymbol *toAlias2();
-    bool needThis();
+    TupleDeclaration *syntaxCopy(Dsymbol *) override;
+    const char *kind() const override;
+    Type *getType() override;
+    Dsymbol *toAlias2() override;
+    bool needThis() override;
 
-    TupleDeclaration *isTupleDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    TupleDeclaration *isTupleDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 /**************************************************************/
 
-class AliasDeclaration : public Declaration
+class AliasDeclaration final : public Declaration
 {
 public:
     Dsymbol *aliassym;
@@ -188,36 +192,36 @@ public:
     Dsymbol *_import;           // !=NULL if unresolved internal alias for selective import
 
     static AliasDeclaration *create(const Loc &loc, Identifier *id, Type *type);
-    AliasDeclaration *syntaxCopy(Dsymbol *);
-    bool overloadInsert(Dsymbol *s);
-    const char *kind() const;
-    Type *getType();
-    Dsymbol *toAlias();
-    Dsymbol *toAlias2();
-    bool isOverloadable() const;
+    AliasDeclaration *syntaxCopy(Dsymbol *) override;
+    bool overloadInsert(Dsymbol *s) override;
+    const char *kind() const override;
+    Type *getType() override;
+    Dsymbol *toAlias() override;
+    Dsymbol *toAlias2() override;
+    bool isOverloadable() const override;
 
-    AliasDeclaration *isAliasDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    AliasDeclaration *isAliasDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 /**************************************************************/
 
-class OverDeclaration : public Declaration
+class OverDeclaration final : public Declaration
 {
 public:
     Dsymbol *overnext;          // next in overload list
     Dsymbol *aliassym;
 
-    const char *kind() const;
-    bool equals(const RootObject *o) const;
-    bool overloadInsert(Dsymbol *s);
+    const char *kind() const override;
+    bool equals(const RootObject * const o) const override;
+    bool overloadInsert(Dsymbol *s) override;
 
-    Dsymbol *toAlias();
+    Dsymbol *toAlias() override;
     Dsymbol *isUnique();
-    bool isOverloadable() const;
+    bool isOverloadable() const override;
 
-    OverDeclaration *isOverDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    OverDeclaration *isOverDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 /**************************************************************/
@@ -227,7 +231,7 @@ class VarDeclaration : public Declaration
 public:
     Initializer *_init;
     FuncDeclarations nestedrefs; // referenced by these lexically nested functions
-    Dsymbol *aliassym;          // if redone as alias to another symbol
+    TupleDeclaration *aliasTuple;  // if `this` is really a tuple of declarations
     VarDeclaration *lastVar;    // Linked list of variables for goto-skips-init detection
     Expression *edtor;          // if !=NULL, does the destruction of the variable
     IntRange *range;            // if !NULL, the variable is known to be within the range
@@ -241,45 +245,63 @@ public:
     // When interpreting, these point to the value (NULL if value not determinable)
     // The index of this variable on the CTFE stack, ~0u if not allocated
     unsigned ctfeAdrOnStack;
-
-    bool isargptr;              // if parameter that _argptr points to
-    bool ctorinit;              // it has been initialized in a ctor
-    bool iscatchvar;            // this is the exception object variable in catch() clause
-    bool isowner;               // this is an Owner, despite it being `scope`
-    bool setInCtorOnly;         // field can only be set in a constructor, as it is const or immutable
-    bool onstack;               // it is a class that was allocated on the stack
-    bool mynew;                 // it is a class new'd with custom operator new
-    char canassign;             // it can be assigned to
-    bool overlapped;            // if it is a field and has overlapping
-    bool overlapUnsafe;         // if it is an overlapping field and the overlaps are unsafe
-    bool doNotInferScope;       // do not infer 'scope' for this variable
-    bool doNotInferReturn;      // do not infer 'return' for this variable
-    unsigned char isdataseg;    // private data for isDataseg
-    bool isArgDtorVar;          // temporary created to handle scope destruction of a function argument
-
+private:
+    uint32_t bitFields;
 public:
+    int8_t canassign; // // it can be assigned to
+    uint8_t isdataseg; // private data for isDataseg
+    bool isargptr() const; // if parameter that _argptr points to
+    bool isargptr(bool v);
+    bool ctorinit() const; // it has been initialized in a ctor
+    bool ctorinit(bool v);
+    bool iscatchvar() const; // this is the exception object variable in catch() clause
+    bool iscatchvar(bool v);
+    bool isowner() const; // this is an Owner, despite it being `scope`
+    bool isowner(bool v);
+    bool setInCtorOnly() const; // field can only be set in a constructor, as it is const or immutable
+    bool setInCtorOnly(bool v);
+    bool onstack() const; // it is a class that was allocated on the stack
+    bool onstack(bool v);
+    bool overlapped() const; // if it is a field and has overlapping
+    bool overlapped(bool v);
+    bool overlapUnsafe() const; // if it is an overlapping field and the overlaps are unsafe
+    bool overlapUnsafe(bool v);
+    bool maybeScope() const; // allow inferring 'scope' for this variable
+    bool maybeScope(bool v);
+    bool doNotInferReturn() const; // do not infer 'return' for this variable
+    bool doNotInferReturn(bool v);
+    bool isArgDtorVar() const; // temporary created to handle scope destruction of a function argument
+    bool isArgDtorVar(bool v);
+    bool isCmacro() const; // if a C macro turned into a C variable
+    bool isCmacro(bool v);
+#if MARS
+    bool inClosure() const; // is inserted into a GC allocated closure
+    bool inClosure(bool v);
+    bool inAlignSection() const; // is inserted into aligned section on stack
+    bool inAlignSection(bool v);
+#endif
+    bool systemInferred() const;
+    bool systemInferred(bool v);
     static VarDeclaration *create(const Loc &loc, Type *t, Identifier *id, Initializer *init, StorageClass storage_class = STCundefined);
-    VarDeclaration *syntaxCopy(Dsymbol *);
-    void setFieldOffset(AggregateDeclaration *ad, FieldState& fieldState, bool isunion);
-    const char *kind() const;
-    AggregateDeclaration *isThis();
-    bool needThis();
-    bool isExport() const;
-    bool isImportedSymbol() const;
+    VarDeclaration *syntaxCopy(Dsymbol *) override;
+    const char *kind() const override;
+    AggregateDeclaration *isThis() override final;
+    bool needThis() override final;
+    bool isExport() const override final;
+    bool isImportedSymbol() const override final;
     bool isCtorinit() const;
-    bool isDataseg();
-    bool isThreadlocal();
+    bool isDataseg() override final;
+    bool isThreadlocal() override final;
     bool isCTFE();
     bool isOverlappedWith(VarDeclaration *v);
-    bool hasPointers();
+    bool hasPointers() override final;
     bool canTakeAddressOf();
     bool needsScopeDtor();
-    bool enclosesLifetimeOf(VarDeclaration *v) const;
-    void checkCtorConstInit();
-    Dsymbol *toAlias();
+    void checkCtorConstInit() override final;
+    Dsymbol *toAlias() override final;
     // Eliminate need for dynamic_cast
-    VarDeclaration *isVarDeclaration() { return (VarDeclaration *)this; }
-    void accept(Visitor *v) { v->visit(this); }
+    VarDeclaration *isVarDeclaration() override final { return (VarDeclaration *)this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 /**************************************************************/
@@ -292,23 +314,23 @@ public:
     unsigned fieldWidth;
     unsigned bitOffset;
 
-    BitFieldDeclaration *syntaxCopy(Dsymbol*);
-    BitFieldDeclaration *isBitFieldDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    BitFieldDeclaration *syntaxCopy(Dsymbol *) override;
+    BitFieldDeclaration *isBitFieldDeclaration() override final { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 /**************************************************************/
 
 // This is a shell around a back end symbol
 
-class SymbolDeclaration : public Declaration
+class SymbolDeclaration final : public Declaration
 {
 public:
     AggregateDeclaration *dsym;
 
     // Eliminate need for dynamic_cast
-    SymbolDeclaration *isSymbolDeclaration() { return (SymbolDeclaration *)this; }
-    void accept(Visitor *v) { v->visit(this); }
+    SymbolDeclaration *isSymbolDeclaration() override { return (SymbolDeclaration *)this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 class TypeInfoDeclaration : public VarDeclaration
@@ -317,149 +339,149 @@ public:
     Type *tinfo;
 
     static TypeInfoDeclaration *create(Type *tinfo);
-    TypeInfoDeclaration *syntaxCopy(Dsymbol *);
-    const char *toChars() const;
+    TypeInfoDeclaration *syntaxCopy(Dsymbol *) override final;
+    const char *toChars() const override final;
 
-    TypeInfoDeclaration *isTypeInfoDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    TypeInfoDeclaration *isTypeInfoDeclaration() override final { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoStructDeclaration : public TypeInfoDeclaration
+class TypeInfoStructDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoStructDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoClassDeclaration : public TypeInfoDeclaration
+class TypeInfoClassDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoClassDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoInterfaceDeclaration : public TypeInfoDeclaration
+class TypeInfoInterfaceDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoInterfaceDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoPointerDeclaration : public TypeInfoDeclaration
+class TypeInfoPointerDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoPointerDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoArrayDeclaration : public TypeInfoDeclaration
+class TypeInfoArrayDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoArrayDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoStaticArrayDeclaration : public TypeInfoDeclaration
+class TypeInfoStaticArrayDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoStaticArrayDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoAssociativeArrayDeclaration : public TypeInfoDeclaration
+class TypeInfoAssociativeArrayDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoAssociativeArrayDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoEnumDeclaration : public TypeInfoDeclaration
+class TypeInfoEnumDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoEnumDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoFunctionDeclaration : public TypeInfoDeclaration
+class TypeInfoFunctionDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoFunctionDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoDelegateDeclaration : public TypeInfoDeclaration
+class TypeInfoDelegateDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoDelegateDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoTupleDeclaration : public TypeInfoDeclaration
+class TypeInfoTupleDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoTupleDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoConstDeclaration : public TypeInfoDeclaration
+class TypeInfoConstDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoConstDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoInvariantDeclaration : public TypeInfoDeclaration
+class TypeInfoInvariantDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoInvariantDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoSharedDeclaration : public TypeInfoDeclaration
+class TypeInfoSharedDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoSharedDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoWildDeclaration : public TypeInfoDeclaration
+class TypeInfoWildDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoWildDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class TypeInfoVectorDeclaration : public TypeInfoDeclaration
+class TypeInfoVectorDeclaration final : public TypeInfoDeclaration
 {
 public:
     static TypeInfoVectorDeclaration *create(Type *tinfo);
 
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 /**************************************************************/
 
-class ThisDeclaration : public VarDeclaration
+class ThisDeclaration final : public VarDeclaration
 {
 public:
-    ThisDeclaration *syntaxCopy(Dsymbol *);
-    ThisDeclaration *isThisDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    ThisDeclaration *syntaxCopy(Dsymbol *) override;
+    ThisDeclaration *isThisDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 enum class ILS : unsigned char
@@ -515,22 +537,19 @@ enum class BUILTIN : unsigned char
 Expression *eval_builtin(const Loc &loc, FuncDeclaration *fd, Expressions *arguments);
 BUILTIN isBuiltin(FuncDeclaration *fd);
 
+struct ContractInfo;
+
 class FuncDeclaration : public Declaration
 {
 public:
-    Statements *frequires;              // in contracts
-    Ensures *fensures;                  // out contracts
-    Statement *frequire;                // lowered in contract
-    Statement *fensure;                 // lowered out contract
     Statement *fbody;
 
     FuncDeclarations foverrides;        // functions this function overrides
-    FuncDeclaration *fdrequire;         // function that does the in contract
-    FuncDeclaration *fdensure;          // function that does the out contract
 
-    Expressions *fdrequireParams;       // argument list for __require
-    Expressions *fdensureParams;        // argument list for __ensure
+private:
+    ContractInfo *contracts;            // contract information
 
+public:
     const char *mangleString;           // mangled symbol created from mangleExact()
 
     VarDeclaration *vresult;            // result variable for out contracts
@@ -542,7 +561,6 @@ public:
     // scopes from having the same name
     DsymbolTable *localsymtab;
     VarDeclaration *vthis;              // 'this' parameter (member and nested)
-    bool isThis2;                       // has a dual-context 'this' parameter
     VarDeclaration *v_arguments;        // '_arguments' parameter
 
     VarDeclaration *v_argptr;           // '_argptr' variable
@@ -552,29 +570,20 @@ public:
     FuncDeclaration *overnext0;         // next in overload list (only used during IFTI)
     Loc endloc;                         // location of closing curly bracket
     int vtblIndex;                      // for member functions, index into vtbl[]
-    bool naked;                         // true if naked
-    bool generated;                     // true if function was generated by the compiler rather than
-                                        // supplied by the user
-    bool hasAlwaysInlines;              // contains references to functions that must be inlined
-    unsigned char isCrtCtorDtor;        // has attribute pragma(crt_constructor(1)/crt_destructor(2))
-                                        // not set before the glue layer
+
     ILS inlineStatusStmt;
     ILS inlineStatusExp;
     PINLINE inlining;
 
     int inlineNest;                     // !=0 if nested inline
-    bool eh_none;                       /// true if no exception unwinding is needed
 
     // true if errors in semantic3 this function's frame ptr
-    bool semantic3Errors;
     ForeachStatement *fes;              // if foreach body, this is the foreach
     BaseClass* interfaceVirtual;        // if virtual, but only appears in interface vtbl[]
-    bool introducing;                   // true if 'introducing' function
     // if !=NULL, then this is the type
     // of the 'introducing' function
     // this one is overriding
     Type *tintro;
-    bool inferRetType;                  // true if return type is to be inferred
     StorageClass storage_class2;        // storage class for template onemember's
 
     // Things that should really go into Scope
@@ -586,8 +595,6 @@ public:
     // 16 if there are multiple return statements
     int hasReturnExp;
 
-    // Support for NRVO (named return value optimization)
-    bool nrvo_can;                      // true means we can do it
     VarDeclaration *nrvo_var;           // variable to replace with shidden
     Symbol *shidden;                    // hidden pointer passed to function
 
@@ -600,7 +607,7 @@ public:
 
     // set if someone took the address of this function
     int tookAddressOf;
-    bool requiresClosure;               // this function needs a closure
+    d_bool requiresClosure;               // this function needs a closure
 
     // local variables in this function which are referenced by nested functions
     VarDeclarations closureVars;
@@ -615,173 +622,232 @@ public:
 
     FuncDeclarations *inlinedNestedCallees;
 
-    unsigned flags;                     // FUNCFLAGxxxxx
+    AttributeViolation* safetyViolation;
+    AttributeViolation* nogcViolation;
+    AttributeViolation* pureViolation;
+    AttributeViolation* nothrowViolation;
+
+    // Formerly FUNCFLAGS
+    uint32_t flags;
+    bool purityInprocess() const;
+    bool purityInprocess(bool v);
+    bool safetyInprocess() const;
+    bool safetyInprocess(bool v);
+    bool nothrowInprocess() const;
+    bool nothrowInprocess(bool v);
+    bool nogcInprocess() const;
+    bool nogcInprocess(bool v);
+    bool returnInprocess() const;
+    bool returnInprocess(bool v);
+    bool inlineScanned() const;
+    bool inlineScanned(bool v);
+    bool inferScope() const;
+    bool inferScope(bool v);
+    bool hasCatches() const;
+    bool hasCatches(bool v);
+    bool skipCodegen() const;
+    bool skipCodegen(bool v);
+    bool printf() const;
+    bool printf(bool v);
+    bool scanf() const;
+    bool scanf(bool v);
+    bool noreturn() const;
+    bool noreturn(bool v);
+    bool isNRVO() const;
+    bool isNRVO(bool v);
+    bool isNaked() const;
+    bool isNaked(bool v);
+    bool isGenerated() const;
+    bool isGenerated(bool v);
+    bool isIntroducing() const;
+    bool isIntroducing(bool v);
+    bool hasSemantic3Errors() const;
+    bool hasSemantic3Errors(bool v);
+    bool hasNoEH() const;
+    bool hasNoEH(bool v);
+    bool inferRetType() const;
+    bool inferRetType(bool v);
+    bool hasDualContext() const;
+    bool hasDualContext(bool v);
+    bool hasAlwaysInlines() const;
+    bool hasAlwaysInlines(bool v);
+    bool isCrtCtor() const;
+    bool isCrtCtor(bool v);
+    bool isCrtDtor() const;
+    bool isCrtDtor(bool v);
+    bool dllImport() const;
+    bool dllImport(bool v);
+    bool dllExport() const;
+    bool dllExport(bool v);
 
     // Data for a function declaration that is needed for the Objective-C
     // integration.
     ObjcFuncDeclaration objc;
 
     static FuncDeclaration *create(const Loc &loc, const Loc &endloc, Identifier *id, StorageClass storage_class, Type *type, bool noreturn = false);
-    FuncDeclaration *syntaxCopy(Dsymbol *);
-    bool functionSemantic();
-    bool functionSemantic3();
-    bool equals(const RootObject *o) const;
+    FuncDeclaration *syntaxCopy(Dsymbol *) override;
+    Statements *frequires();
+    Ensures *fensures();
+    Statement *frequire();
+    Statement *fensure();
+    FuncDeclaration *fdrequire();
+    FuncDeclaration *fdensure();
+    Expressions *fdrequireParams();
+    Expressions *fdensureParams();
+    Statements *frequires(Statements *frs);
+    Ensures *fensures(Statements *fes);
+    Statement *frequire(Statement *fr);
+    Statement *fensure(Statement *fe);
+    FuncDeclaration *fdrequire(FuncDeclaration *fdr);
+    FuncDeclaration *fdensure(FuncDeclaration *fde);
+    Expressions *fdrequireParams(Expressions *fdrp);
+    Expressions *fdensureParams(Expressions *fdep);
+    bool equals(const RootObject * const o) const override final;
 
-    int overrides(FuncDeclaration *fd);
-    int findVtblIndex(Dsymbols *vtbl, int dim);
-    BaseClass *overrideInterface();
-    bool overloadInsert(Dsymbol *s);
+    bool overloadInsert(Dsymbol *s) override;
     bool inUnittest();
-    MATCH leastAsSpecialized(FuncDeclaration *g);
+    static MATCH leastAsSpecialized(FuncDeclaration *f, FuncDeclaration *g, Identifiers *names);
     LabelDsymbol *searchLabel(Identifier *ident, const Loc &loc);
-    int getLevel(FuncDeclaration *fd, int intypeof); // lexical nesting level difference
-    int getLevelAndCheck(const Loc &loc, Scope *sc, FuncDeclaration *fd);
-    const char *toPrettyChars(bool QualifyTypes = false);
+    const char *toPrettyChars(bool QualifyTypes = false) override;
     const char *toFullSignature();  // for diagnostics, e.g. 'int foo(int x, int y) pure'
     bool isMain() const;
     bool isCMain() const;
     bool isWinMain() const;
     bool isDllMain() const;
-    bool isExport() const;
-    bool isImportedSymbol() const;
-    bool isCodeseg() const;
-    bool isOverloadable() const;
-    bool isAbstract();
+    bool isExport() const override final;
+    bool isImportedSymbol() const override final;
+    bool isCodeseg() const override final;
+    bool isOverloadable() const override final;
+    bool isAbstract() override final;
     PURE isPure();
-    PURE isPureBypassingInference();
     bool isSafe();
-    bool isSafeBypassingInference();
     bool isTrusted();
-
     bool isNogc();
-    bool isNogcBypassingInference();
 
     virtual bool isNested() const;
-    AggregateDeclaration *isThis();
-    bool needThis();
+    AggregateDeclaration *isThis() override;
+    bool needThis() override final;
     bool isVirtualMethod();
     virtual bool isVirtual() const;
     bool isFinalFunc() const;
     virtual bool addPreInvariant();
     virtual bool addPostInvariant();
-    const char *kind() const;
+    const char *kind() const override;
     bool isUnique();
     bool needsClosure();
+    bool checkClosure();
     bool hasNestedFrameRefs();
     ParameterList getParameterList();
 
     static FuncDeclaration *genCfunc(Parameters *args, Type *treturn, const char *name, StorageClass stc=0);
     static FuncDeclaration *genCfunc(Parameters *args, Type *treturn, Identifier *id, StorageClass stc=0);
 
-    bool checkNRVO();
-
-    FuncDeclaration *isFuncDeclaration() { return this; }
+    FuncDeclaration *isFuncDeclaration() override final { return this; }
 
     virtual FuncDeclaration *toAliasFunc() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class FuncAliasDeclaration : public FuncDeclaration
+class FuncAliasDeclaration final : public FuncDeclaration
 {
 public:
     FuncDeclaration *funcalias;
-    bool hasOverloads;
+    d_bool hasOverloads;
 
-    FuncAliasDeclaration *isFuncAliasDeclaration() { return this; }
-    const char *kind() const;
+    FuncAliasDeclaration *isFuncAliasDeclaration() override { return this; }
+    const char *kind() const override;
 
-    FuncDeclaration *toAliasFunc();
-    void accept(Visitor *v) { v->visit(this); }
+    FuncDeclaration *toAliasFunc() override;
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class FuncLiteralDeclaration : public FuncDeclaration
+class FuncLiteralDeclaration final : public FuncDeclaration
 {
 public:
     TOK tok;                       // TOKfunction or TOKdelegate
     Type *treq;                         // target of return type inference
 
     // backend
-    bool deferToObj;
+    d_bool deferToObj;
 
-    FuncLiteralDeclaration *syntaxCopy(Dsymbol *);
-    bool isNested() const;
-    AggregateDeclaration *isThis();
-    bool isVirtual() const;
-    bool addPreInvariant();
-    bool addPostInvariant();
+    FuncLiteralDeclaration *syntaxCopy(Dsymbol *) override;
+    bool isNested() const override;
+    AggregateDeclaration *isThis() override;
+    bool isVirtual() const override;
+    bool addPreInvariant() override;
+    bool addPostInvariant() override;
 
-    void modifyReturns(Scope *sc, Type *tret);
-
-    FuncLiteralDeclaration *isFuncLiteralDeclaration() { return this; }
-    const char *kind() const;
-    const char *toPrettyChars(bool QualifyTypes = false);
-    void accept(Visitor *v) { v->visit(this); }
+    FuncLiteralDeclaration *isFuncLiteralDeclaration() override { return this; }
+    const char *kind() const override;
+    const char *toPrettyChars(bool QualifyTypes = false) override;
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class CtorDeclaration : public FuncDeclaration
+class CtorDeclaration final : public FuncDeclaration
 {
 public:
-    bool isCpCtor;
-    CtorDeclaration *syntaxCopy(Dsymbol *);
-    const char *kind() const;
-    const char *toChars() const;
-    bool isVirtual() const;
-    bool addPreInvariant();
-    bool addPostInvariant();
+    d_bool isCpCtor;
+    CtorDeclaration *syntaxCopy(Dsymbol *) override;
+    const char *kind() const override;
+    const char *toChars() const override;
+    bool isVirtual() const override;
+    bool addPreInvariant() override;
+    bool addPostInvariant() override;
 
-    CtorDeclaration *isCtorDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    CtorDeclaration *isCtorDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class PostBlitDeclaration : public FuncDeclaration
+class PostBlitDeclaration final : public FuncDeclaration
 {
 public:
-    PostBlitDeclaration *syntaxCopy(Dsymbol *);
-    bool isVirtual() const;
-    bool addPreInvariant();
-    bool addPostInvariant();
-    bool overloadInsert(Dsymbol *s);
+    PostBlitDeclaration *syntaxCopy(Dsymbol *) override;
+    bool isVirtual() const override;
+    bool addPreInvariant() override;
+    bool addPostInvariant() override;
+    bool overloadInsert(Dsymbol *s) override;
 
-    PostBlitDeclaration *isPostBlitDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    PostBlitDeclaration *isPostBlitDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class DtorDeclaration : public FuncDeclaration
+class DtorDeclaration final : public FuncDeclaration
 {
 public:
-    DtorDeclaration *syntaxCopy(Dsymbol *);
-    const char *kind() const;
-    const char *toChars() const;
-    bool isVirtual() const;
-    bool addPreInvariant();
-    bool addPostInvariant();
-    bool overloadInsert(Dsymbol *s);
+    DtorDeclaration *syntaxCopy(Dsymbol *) override;
+    const char *kind() const override;
+    const char *toChars() const override;
+    bool isVirtual() const override;
+    bool addPreInvariant() override;
+    bool addPostInvariant() override;
+    bool overloadInsert(Dsymbol *s) override;
 
-    DtorDeclaration *isDtorDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    DtorDeclaration *isDtorDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 class StaticCtorDeclaration : public FuncDeclaration
 {
 public:
-    StaticCtorDeclaration *syntaxCopy(Dsymbol *);
-    AggregateDeclaration *isThis();
-    bool isVirtual() const;
-    bool addPreInvariant();
-    bool addPostInvariant();
-    bool hasStaticCtorOrDtor();
+    StaticCtorDeclaration *syntaxCopy(Dsymbol *) override;
+    AggregateDeclaration *isThis() override final;
+    bool isVirtual() const override final;
+    bool addPreInvariant() override final;
+    bool addPostInvariant() override final;
+    bool hasStaticCtorOrDtor() override final;
 
-    StaticCtorDeclaration *isStaticCtorDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    StaticCtorDeclaration *isStaticCtorDeclaration() override final { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class SharedStaticCtorDeclaration : public StaticCtorDeclaration
+class SharedStaticCtorDeclaration final : public StaticCtorDeclaration
 {
 public:
-    SharedStaticCtorDeclaration *syntaxCopy(Dsymbol *);
+    bool standalone;
+    SharedStaticCtorDeclaration *syntaxCopy(Dsymbol *) override;
 
-    SharedStaticCtorDeclaration *isSharedStaticCtorDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    SharedStaticCtorDeclaration *isSharedStaticCtorDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
 class StaticDtorDeclaration : public FuncDeclaration
@@ -789,39 +855,39 @@ class StaticDtorDeclaration : public FuncDeclaration
 public:
     VarDeclaration *vgate;      // 'gate' variable
 
-    StaticDtorDeclaration *syntaxCopy(Dsymbol *);
-    AggregateDeclaration *isThis();
-    bool isVirtual() const;
-    bool hasStaticCtorOrDtor();
-    bool addPreInvariant();
-    bool addPostInvariant();
+    StaticDtorDeclaration *syntaxCopy(Dsymbol *) override;
+    AggregateDeclaration *isThis() override final;
+    bool isVirtual() const override final;
+    bool hasStaticCtorOrDtor() override final;
+    bool addPreInvariant() override final;
+    bool addPostInvariant() override final;
 
-    StaticDtorDeclaration *isStaticDtorDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    StaticDtorDeclaration *isStaticDtorDeclaration() override final { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class SharedStaticDtorDeclaration : public StaticDtorDeclaration
+class SharedStaticDtorDeclaration final : public StaticDtorDeclaration
 {
 public:
-    SharedStaticDtorDeclaration *syntaxCopy(Dsymbol *);
+    SharedStaticDtorDeclaration *syntaxCopy(Dsymbol *) override;
 
-    SharedStaticDtorDeclaration *isSharedStaticDtorDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    SharedStaticDtorDeclaration *isSharedStaticDtorDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class InvariantDeclaration : public FuncDeclaration
+class InvariantDeclaration final : public FuncDeclaration
 {
 public:
-    InvariantDeclaration *syntaxCopy(Dsymbol *);
-    bool isVirtual() const;
-    bool addPreInvariant();
-    bool addPostInvariant();
+    InvariantDeclaration *syntaxCopy(Dsymbol *) override;
+    bool isVirtual() const override;
+    bool addPreInvariant() override;
+    bool addPostInvariant() override;
 
-    InvariantDeclaration *isInvariantDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    InvariantDeclaration *isInvariantDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class UnitTestDeclaration : public FuncDeclaration
+class UnitTestDeclaration final : public FuncDeclaration
 {
 public:
     char *codedoc; /** For documented unittest. */
@@ -829,25 +895,25 @@ public:
     // toObjFile() these nested functions after this one
     FuncDeclarations deferredNested;
 
-    UnitTestDeclaration *syntaxCopy(Dsymbol *);
-    AggregateDeclaration *isThis();
-    bool isVirtual() const;
-    bool addPreInvariant();
-    bool addPostInvariant();
+    UnitTestDeclaration *syntaxCopy(Dsymbol *) override;
+    AggregateDeclaration *isThis() override;
+    bool isVirtual() const override;
+    bool addPreInvariant() override;
+    bool addPostInvariant() override;
 
-    UnitTestDeclaration *isUnitTestDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    UnitTestDeclaration *isUnitTestDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };
 
-class NewDeclaration : public FuncDeclaration
+class NewDeclaration final : public FuncDeclaration
 {
 public:
-    NewDeclaration *syntaxCopy(Dsymbol *);
-    const char *kind() const;
-    bool isVirtual() const;
-    bool addPreInvariant();
-    bool addPostInvariant();
+    NewDeclaration *syntaxCopy(Dsymbol *) override;
+    const char *kind() const override;
+    bool isVirtual() const override;
+    bool addPreInvariant() override;
+    bool addPostInvariant() override;
 
-    NewDeclaration *isNewDeclaration() { return this; }
-    void accept(Visitor *v) { v->visit(this); }
+    NewDeclaration *isNewDeclaration() override { return this; }
+    void accept(Visitor *v) override { v->visit(this); }
 };

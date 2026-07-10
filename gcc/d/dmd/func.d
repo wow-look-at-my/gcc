@@ -8,7 +8,7 @@
  * - `invariant`
  * - `unittest`
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/func.d, _func.d)
@@ -25,6 +25,7 @@ import dmd.arraytypes;
 import dmd.astenums;
 import dmd.blockexit;
 import dmd.gluelayer;
+import dmd.dcast;
 import dmd.dclass;
 import dmd.declaration;
 import dmd.delegatize;
@@ -33,7 +34,6 @@ import dmd.dmodule;
 import dmd.dscope;
 import dmd.dstruct;
 import dmd.dsymbol;
-import dmd.dsymbolsem;
 import dmd.dtemplate;
 import dmd.errors;
 import dmd.escape;
@@ -43,20 +43,25 @@ import dmd.hdrgen;
 import dmd.id;
 import dmd.identifier;
 import dmd.init;
+import dmd.location;
 import dmd.mtype;
 import dmd.objc;
 import dmd.root.aav;
 import dmd.common.outbuffer;
-import dmd.root.rootobject;
+import dmd.rootobject;
 import dmd.root.string;
 import dmd.root.stringtable;
 import dmd.semantic2;
 import dmd.semantic3;
 import dmd.statement_rewrite_walker;
 import dmd.statement;
-import dmd.statementsem;
 import dmd.tokens;
+import dmd.typesem;
 import dmd.visitor;
+
+version (IN_GCC) {}
+else version (IN_LLVM) {}
+else version = MARS;
 
 /// Inline Status
 enum ILS : ubyte
@@ -107,104 +112,37 @@ enum BUILTIN : ubyte
     toPrecReal
 }
 
-/* Tweak all return statements and dtor call for nrvo_var, for correct NRVO.
- */
-extern (C++) final class NrvoWalker : StatementRewriteWalker
+private struct FUNCFLAG
 {
-    alias visit = typeof(super).visit;
-public:
-    FuncDeclaration fd;
-    Scope* sc;
+    bool purityInprocess;    /// working on determining purity
+    bool safetyInprocess;    /// working on determining safety
+    bool nothrowInprocess;   /// working on determining nothrow
+    bool nogcInprocess;      /// working on determining @nogc
+    bool returnInprocess;    /// working on inferring 'return' for parameters
+    bool inlineScanned;      /// function has been scanned for inline possibilities
+    bool inferScope;         /// infer 'scope' for parameters
+    bool hasCatches;         /// function has try-catch statements
+    bool skipCodegen;        /// do not generate code for this function.
+    bool printf;             /// is a printf-like function
 
-    override void visit(ReturnStatement s)
-    {
-        // See if all returns are instead to be replaced with a goto returnLabel;
-        if (fd.returnLabel)
-        {
-            /* Rewrite:
-             *  return exp;
-             * as:
-             *  vresult = exp; goto Lresult;
-             */
-            auto gs = new GotoStatement(s.loc, Id.returnLabel);
-            gs.label = fd.returnLabel;
+    bool scanf;              /// is a scanf-like function
+    bool noreturn;           /// the function does not return
+    bool isNRVO = true;      /// Support for named return value optimization
+    bool isNaked;            /// The function is 'naked' (see inline ASM)
+    bool isGenerated;        /// The function is compiler generated (e.g. `opCmp`)
+    bool isIntroducing;      /// If this function introduces the overload set
+    bool hasSemantic3Errors; /// If errors in semantic3 this function's frame ptr
+    bool hasNoEH;            /// No exception unwinding is needed
+    bool inferRetType;       /// Return type is to be inferred
+    bool hasDualContext;     /// has a dual-context 'this' parameter
 
-            Statement s1 = gs;
-            if (s.exp)
-                s1 = new CompoundStatement(s.loc, new ExpStatement(s.loc, s.exp), gs);
-
-            replaceCurrent(s1);
-        }
-    }
-
-    override void visit(TryFinallyStatement s)
-    {
-        DtorExpStatement des;
-        if (fd.nrvo_can && s.finalbody && (des = s.finalbody.isDtorExpStatement()) !is null &&
-            fd.nrvo_var == des.var)
-        {
-            if (!(global.params.useExceptions && ClassDeclaration.throwable))
-            {
-                /* Don't need to call destructor at all, since it is nrvo
-                 */
-                replaceCurrent(s._body);
-                s._body.accept(this);
-                return;
-            }
-
-            /* Normally local variable dtors are called regardless exceptions.
-             * But for nrvo_var, its dtor should be called only when exception is thrown.
-             *
-             * Rewrite:
-             *      try { s.body; } finally { nrvo_var.edtor; }
-             *      // equivalent with:
-             *      //    s.body; scope(exit) nrvo_var.edtor;
-             * as:
-             *      try { s.body; } catch(Throwable __o) { nrvo_var.edtor; throw __o; }
-             *      // equivalent with:
-             *      //    s.body; scope(failure) nrvo_var.edtor;
-             */
-            Statement sexception = new DtorExpStatement(Loc.initial, fd.nrvo_var.edtor, fd.nrvo_var);
-            Identifier id = Identifier.generateId("__o");
-
-            Statement handler = new PeelStatement(sexception);
-            if (sexception.blockExit(fd, false) & BE.fallthru)
-            {
-                auto ts = new ThrowStatement(Loc.initial, new IdentifierExp(Loc.initial, id));
-                ts.internalThrow = true;
-                handler = new CompoundStatement(Loc.initial, handler, ts);
-            }
-
-            auto catches = new Catches();
-            auto ctch = new Catch(Loc.initial, getThrowable(), id, handler);
-            ctch.internalCatch = true;
-            ctch.catchSemantic(sc); // Run semantic to resolve identifier '__o'
-            catches.push(ctch);
-
-            Statement s2 = new TryCatchStatement(Loc.initial, s._body, catches);
-            fd.eh_none = false;
-            replaceCurrent(s2);
-            s2.accept(this);
-        }
-        else
-            StatementRewriteWalker.visit(s);
-    }
-}
-
-enum FUNCFLAG : uint
-{
-    purityInprocess  = 1,      /// working on determining purity
-    safetyInprocess  = 2,      /// working on determining safety
-    nothrowInprocess = 4,      /// working on determining nothrow
-    nogcInprocess    = 8,      /// working on determining @nogc
-    returnInprocess  = 0x10,   /// working on inferring 'return' for parameters
-    inlineScanned    = 0x20,   /// function has been scanned for inline possibilities
-    inferScope       = 0x40,   /// infer 'scope' for parameters
-    hasCatches       = 0x80,   /// function has try-catch statements
-    compileTimeOnly  = 0x100,  /// is a compile time only function; no code will be generated for it
-    printf           = 0x200,  /// is a printf-like function
-    scanf            = 0x400,  /// is a scanf-like function
-    noreturn         = 0x800,  /// the function does not return
+    bool hasAlwaysInlines;   /// Contains references to functions that must be inlined
+    bool isCrtCtor;          /// Has attribute pragma(crt_constructor)
+    bool isCrtDtor;          /// Has attribute pragma(crt_destructor)
+    bool hasEscapingSiblings;/// Has sibling functions that escape
+    bool computedEscapingSiblings; /// `hasEscapingSiblings` has been computed
+    bool dllImport;          /// __declspec(dllimport)
+    bool dllExport;          /// __declspec(dllexport)
 }
 
 /***********************************************************
@@ -241,21 +179,30 @@ extern (C++) struct Ensure
 }
 
 /***********************************************************
+ * Most functions don't have contracts, so save memory by grouping
+ * this information into a separate struct
  */
-extern (C++) class FuncDeclaration : Declaration
+private struct ContractInfo
 {
     Statements* frequires;              /// in contracts
     Ensures* fensures;                  /// out contracts
     Statement frequire;                 /// lowered in contract
     Statement fensure;                  /// lowered out contract
+    FuncDeclaration fdrequire;          /// function that does the in contract
+    FuncDeclaration fdensure;           /// function that does the out contract
+    Expressions* fdrequireParams;       /// argument list for __require
+    Expressions* fdensureParams;        /// argument list for __ensure
+}
+
+/***********************************************************
+ */
+extern (C++) class FuncDeclaration : Declaration
+{
     Statement fbody;                    /// function body
 
     FuncDeclarations foverrides;        /// functions this function overrides
-    FuncDeclaration fdrequire;          /// function that does the in contract
-    FuncDeclaration fdensure;           /// function that does the out contract
 
-    Expressions* fdrequireParams;       /// argument list for __require
-    Expressions* fdensureParams;        /// argument list for __ensure
+    private ContractInfo* contracts;    /// contract information
 
     const(char)* mangleString;          /// mangled symbol created from mangleExact()
 
@@ -268,7 +215,6 @@ extern (C++) class FuncDeclaration : Declaration
     // scopes from having the same name
     DsymbolTable localsymtab;
     VarDeclaration vthis;               /// 'this' parameter (member and nested)
-    bool isThis2;                       /// has a dual-context 'this' parameter
     VarDeclaration v_arguments;         /// '_arguments' parameter
 
     VarDeclaration v_argptr;            /// '_argptr' variable
@@ -278,31 +224,21 @@ extern (C++) class FuncDeclaration : Declaration
     FuncDeclaration overnext0;          /// next in overload list (only used during IFTI)
     Loc endloc;                         /// location of closing curly bracket
     int vtblIndex = -1;                 /// for member functions, index into vtbl[]
-    bool naked;                         /// true if naked
-    bool generated;                     /// true if function was generated by the compiler rather than
-                                        /// supplied by the user
-    bool hasAlwaysInlines;              /// contains references to functions that must be inlined
-    ubyte isCrtCtorDtor;                /// has attribute pragma(crt_constructor(1)/crt_destructor(2))
-                                        /// not set before the glue layer
 
     ILS inlineStatusStmt = ILS.uninitialized;
     ILS inlineStatusExp = ILS.uninitialized;
     PINLINE inlining = PINLINE.default_;
 
     int inlineNest;                     /// !=0 if nested inline
-    bool eh_none;                       /// true if no exception unwinding is needed
 
-    bool semantic3Errors;               /// true if errors in semantic3 this function's frame ptr
     ForeachStatement fes;               /// if foreach body, this is the foreach
     BaseClass* interfaceVirtual;        /// if virtual, but only appears in base interface vtbl[]
-    bool introducing;                   /// true if 'introducing' function
     /** if !=NULL, then this is the type
     of the 'introducing' function
     this one is overriding
     */
     Type tintro;
 
-    bool inferRetType;                  /// true if return type is to be inferred
     StorageClass storage_class2;        /// storage class for template onemember's
 
     // Things that should really go into Scope
@@ -314,14 +250,18 @@ extern (C++) class FuncDeclaration : Declaration
     /// 16 if there are multiple return statements
     int hasReturnExp;
 
-    // Support for NRVO (named return value optimization)
-    bool nrvo_can = true;               /// true means we can do NRVO
     VarDeclaration nrvo_var;            /// variable to replace with shidden
     Symbol* shidden;                    /// hidden pointer passed to function
 
     ReturnStatements* returns;
 
     GotoStatements* gotos;              /// Gotos with forward references
+
+    version (MARS)
+    {
+        VarDeclarations* alignSectionVars;  /// local variables with alignment needs larger than stackAlign
+        Symbol* salignSection;              /// pointer to aligned section, if any
+    }
 
     /// set if this is a known, builtin function we can evaluate at compile time
     BUILTIN builtin = BUILTIN.unknown;
@@ -346,7 +286,16 @@ extern (C++) class FuncDeclaration : Declaration
 
     FuncDeclarations *inlinedNestedCallees;
 
-    uint flags;                        /// FUNCFLAG.xxxxx
+    /// In case of failed `@safe` inference, store the error that made the function `@system` for
+    /// better diagnostics
+    AttributeViolation* safetyViolation;
+    AttributeViolation* nogcViolation;
+    AttributeViolation* pureViolation;
+    AttributeViolation* nothrowViolation;
+
+    /// See the `FUNCFLAG` struct
+    import dmd.common.bitfields;
+    mixin(generateBitFields!(FUNCFLAG, uint));
 
     /**
      * Data for a function declaration that is needed for the Objective-C
@@ -357,8 +306,8 @@ extern (C++) class FuncDeclaration : Declaration
     extern (D) this(const ref Loc loc, const ref Loc endloc, Identifier ident, StorageClass storage_class, Type type, bool noreturn = false)
     {
         super(loc, ident);
-        //printf("FuncDeclaration(id = '%s', type = %p)\n", id.toChars(), type);
-        //printf("storage_class = x%x\n", storage_class);
+        //.printf("FuncDeclaration(id = '%s', type = %s)\n", ident.toChars(), type.toChars());
+        //.printf("storage_class = x%llx\n", storage_class);
         this.storage_class = storage_class;
         this.type = type;
         if (type)
@@ -369,12 +318,13 @@ extern (C++) class FuncDeclaration : Declaration
         }
         this.endloc = endloc;
         if (noreturn)
-            this.flags |= FUNCFLAG.noreturn;
+            this.noreturn = true;
 
         /* The type given for "infer the return type" is a TypeFunction with
          * NULL for the return type.
          */
-        inferRetType = (type && type.nextOf() is null);
+        if (type && type.nextOf() is null)
+            this.inferRetType = true;
     }
 
     static FuncDeclaration create(const ref Loc loc, const ref Loc endloc, Identifier id, StorageClass storage_class, Type type, bool noreturn = false)
@@ -382,207 +332,53 @@ extern (C++) class FuncDeclaration : Declaration
         return new FuncDeclaration(loc, endloc, id, storage_class, type, noreturn);
     }
 
+    final nothrow pure @safe
+    {
+        private ref ContractInfo getContracts()
+        {
+            if (!contracts)
+                contracts = new ContractInfo();
+            return *contracts;
+        }
+
+        // getters
+        inout(Statements*) frequires() inout { return contracts ? contracts.frequires : null; }
+        inout(Ensures*) fensures() inout { return contracts ? contracts.fensures : null; }
+        inout(Statement) frequire() inout { return contracts ? contracts.frequire: null; }
+        inout(Statement) fensure() inout { return contracts ? contracts.fensure : null; }
+        inout(FuncDeclaration) fdrequire() inout { return contracts ? contracts.fdrequire : null; }
+        inout(FuncDeclaration) fdensure() inout { return contracts ? contracts.fdensure: null; }
+        inout(Expressions*) fdrequireParams() inout { return contracts ? contracts.fdrequireParams: null; }
+        inout(Expressions*) fdensureParams() inout { return contracts ? contracts.fdensureParams: null; }
+
+        extern (D) private static string generateContractSetter(string field, string type)
+        {
+            return type ~ " " ~ field ~ "(" ~ type ~ " param)" ~
+                    "{
+                        if (!param && !contracts) return null;
+                        return getContracts()." ~ field ~ " = param;
+                     }";
+        }
+
+        mixin(generateContractSetter("frequires", "Statements*"));
+        mixin(generateContractSetter("fensures", "Ensures*"));
+        mixin(generateContractSetter("frequire", "Statement"));
+        mixin(generateContractSetter("fensure", "Statement"));
+        mixin(generateContractSetter("fdrequire", "FuncDeclaration"));
+        mixin(generateContractSetter("fdensure", "FuncDeclaration"));
+        mixin(generateContractSetter("fdrequireParams", "Expressions*"));
+        mixin(generateContractSetter("fdensureParams", "Expressions*"));
+    }
+
     override FuncDeclaration syntaxCopy(Dsymbol s)
     {
         //printf("FuncDeclaration::syntaxCopy('%s')\n", toChars());
         FuncDeclaration f = s ? cast(FuncDeclaration)s
-                              : new FuncDeclaration(loc, endloc, ident, storage_class, type.syntaxCopy(), (flags & FUNCFLAG.noreturn) != 0);
+                              : new FuncDeclaration(loc, endloc, ident, storage_class, type.syntaxCopy(), this.noreturn != 0);
         f.frequires = frequires ? Statement.arraySyntaxCopy(frequires) : null;
         f.fensures = fensures ? Ensure.arraySyntaxCopy(fensures) : null;
         f.fbody = fbody ? fbody.syntaxCopy() : null;
         return f;
-    }
-
-    /****************************************************
-     * Resolve forward reference of function signature -
-     * parameter types, return type, and attributes.
-     * Returns:
-     *  false if any errors exist in the signature.
-     */
-    final bool functionSemantic()
-    {
-        //printf("functionSemantic() %p %s\n", this, toChars());
-        if (!_scope)
-            return !errors;
-
-        this.cppnamespace = _scope.namespace;
-
-        if (!originalType) // semantic not yet run
-        {
-            TemplateInstance spec = isSpeculative();
-            uint olderrs = global.errors;
-            uint oldgag = global.gag;
-            if (global.gag && !spec)
-                global.gag = 0;
-            dsymbolSemantic(this, _scope);
-            global.gag = oldgag;
-            if (spec && global.errors != olderrs)
-                spec.errors = (global.errors - olderrs != 0);
-            if (olderrs != global.errors) // if errors compiling this function
-                return false;
-        }
-
-        // if inferring return type, sematic3 needs to be run
-        // - When the function body contains any errors, we cannot assume
-        //   the inferred return type is valid.
-        //   So, the body errors should become the function signature error.
-        if (inferRetType && type && !type.nextOf())
-            return functionSemantic3();
-
-        TemplateInstance ti;
-        if (isInstantiated() && !isVirtualMethod() &&
-            ((ti = parent.isTemplateInstance()) is null || ti.isTemplateMixin() || ti.tempdecl.ident == ident))
-        {
-            AggregateDeclaration ad = isMemberLocal();
-            if (ad && ad.sizeok != Sizeok.done)
-            {
-                /* Currently dmd cannot resolve forward references per methods,
-                 * then setting SIZOKfwd is too conservative and would break existing code.
-                 * So, just stop method attributes inference until ad.dsymbolSemantic() done.
-                 */
-                //ad.sizeok = Sizeok.fwd;
-            }
-            else
-                return functionSemantic3() || !errors;
-        }
-
-        if (storage_class & STC.inference)
-            return functionSemantic3() || !errors;
-
-        return !errors;
-    }
-
-    /****************************************************
-     * Resolve forward reference of function body.
-     * Returns false if any errors exist in the body.
-     */
-    final bool functionSemantic3()
-    {
-        if (semanticRun < PASS.semantic3 && _scope)
-        {
-            /* Forward reference - we need to run semantic3 on this function.
-             * If errors are gagged, and it's not part of a template instance,
-             * we need to temporarily ungag errors.
-             */
-            TemplateInstance spec = isSpeculative();
-            uint olderrs = global.errors;
-            uint oldgag = global.gag;
-            if (global.gag && !spec)
-                global.gag = 0;
-            semantic3(this, _scope);
-            global.gag = oldgag;
-
-            // If it is a speculatively-instantiated template, and errors occur,
-            // we need to mark the template as having errors.
-            if (spec && global.errors != olderrs)
-                spec.errors = (global.errors - olderrs != 0);
-            if (olderrs != global.errors) // if errors compiling this function
-                return false;
-        }
-
-        return !errors && !semantic3Errors;
-    }
-
-    /****************************************************
-     * Check that this function type is properly resolved.
-     * If not, report "forward reference error" and return true.
-     */
-    extern (D) final bool checkForwardRef(const ref Loc loc)
-    {
-        if (!functionSemantic())
-            return true;
-
-        /* No deco means the functionSemantic() call could not resolve
-         * forward referenes in the type of this function.
-         */
-        if (!type.deco)
-        {
-            bool inSemantic3 = (inferRetType && semanticRun >= PASS.semantic3);
-            .error(loc, "forward reference to %s`%s`",
-                (inSemantic3 ? "inferred return type of function " : "").ptr,
-                toChars());
-            return true;
-        }
-        return false;
-    }
-
-    // called from semantic3
-    /**
-     * Creates and returns the hidden parameters for this function declaration.
-     *
-     * Hidden parameters include the `this` parameter of a class, struct or
-     * nested function and the selector parameter for Objective-C methods.
-     */
-    extern (D) final void declareThis(Scope* sc)
-    {
-        isThis2 = toParent2() != toParentLocal();
-        auto ad = isThis();
-        if (!isThis2 && !ad && !isNested())
-        {
-            vthis = null;
-            objc.selectorParameter = null;
-            return;
-        }
-
-        Type addModStc(Type t)
-        {
-            return t.addMod(type.mod).addStorageClass(storage_class);
-        }
-
-        if (isThis2 || isNested())
-        {
-            /* The 'this' for a nested function is the link to the
-             * enclosing function's stack frame.
-             * Note that nested functions and member functions are disjoint.
-             */
-            Type tthis = addModStc(isThis2 ?
-                                   Type.tvoidptr.sarrayOf(2).pointerTo() :
-                                   Type.tvoid.pointerTo());
-            vthis = new VarDeclaration(loc, tthis, isThis2 ? Id.this2 : Id.capture, null);
-            vthis.storage_class |= STC.parameter | STC.nodtor;
-        }
-        else if (ad)
-        {
-            Type thandle = addModStc(ad.handleType());
-            vthis = new ThisDeclaration(loc, thandle);
-            vthis.storage_class |= STC.parameter;
-            if (thandle.ty == Tstruct)
-            {
-                vthis.storage_class |= STC.ref_;
-                // if member function is marked 'inout', then 'this' is 'return ref'
-                if (type.ty == Tfunction && (cast(TypeFunction)type).isInOutQual())
-                    vthis.storage_class |= STC.return_;
-            }
-        }
-
-        if (auto tf = type.isTypeFunction())
-        {
-            if (tf.isreturn)
-                vthis.storage_class |= STC.return_;
-            if (tf.isScopeQual)
-                vthis.storage_class |= STC.scope_;
-
-            /* Add STC.returnScope like typesem.d does for TypeFunction parameters,
-             * at least it should be the same. At the moment, we'll just
-             * do existing practice. But we should examine how TypeFunction does
-             * it, for consistency.
-             */
-            if (!tf.isref && isRefReturnScope(vthis.storage_class))
-            {
-                /* if `ref return scope`, evaluate to `ref` `return scope`
-                 */
-                vthis.storage_class |= STC.returnScope;
-            }
-        }
-        if (flags & FUNCFLAG.inferScope && !(vthis.storage_class & STC.scope_))
-            vthis.storage_class |= STC.maybescope;
-
-        vthis.dsymbolSemantic(sc);
-        if (!sc.insert(vthis))
-            assert(0);
-        vthis.parent = this;
-        if (ad)
-            objc.selectorParameter = .objc.createSelectorParameter(this, sc);
     }
 
     override final bool equals(const RootObject o) const
@@ -630,7 +426,7 @@ extern (C++) class FuncDeclaration : Declaration
      * Determine if 'this' overrides fd.
      * Return !=0 if it does.
      */
-    final int overrides(FuncDeclaration fd)
+    extern (D) final int overrides(FuncDeclaration fd)
     {
         int result = 0;
         if (fd.ident == ident)
@@ -645,114 +441,6 @@ extern (C++) class FuncDeclaration : Declaration
             }
         }
         return result;
-    }
-
-    /*************************************************
-     * Find index of function in vtbl[0..dim] that
-     * this function overrides.
-     * Prefer an exact match to a covariant one.
-     * Params:
-     *      vtbl     = vtable to use
-     *      dim      = maximal vtable dimension
-     * Returns:
-     *      -1      didn't find one
-     *      -2      can't determine because of forward references
-     */
-    final int findVtblIndex(Dsymbols* vtbl, int dim)
-    {
-        //printf("findVtblIndex() %s\n", toChars());
-        FuncDeclaration mismatch = null;
-        StorageClass mismatchstc = 0;
-        int mismatchvi = -1;
-        int exactvi = -1;
-        int bestvi = -1;
-        for (int vi = 0; vi < dim; vi++)
-        {
-            FuncDeclaration fdv = (*vtbl)[vi].isFuncDeclaration();
-            if (fdv && fdv.ident == ident)
-            {
-                if (type.equals(fdv.type)) // if exact match
-                {
-                    if (fdv.parent.isClassDeclaration())
-                    {
-                        if (fdv.isFuture())
-                        {
-                            bestvi = vi;
-                            continue;           // keep looking
-                        }
-                        return vi; // no need to look further
-                    }
-
-                    if (exactvi >= 0)
-                    {
-                        error("cannot determine overridden function");
-                        return exactvi;
-                    }
-                    exactvi = vi;
-                    bestvi = vi;
-                    continue;
-                }
-
-                StorageClass stc = 0;
-                const cov = type.covariant(fdv.type, &stc);
-                //printf("\tbaseclass cov = %d\n", cov);
-                final switch (cov)
-                {
-                case Covariant.distinct:
-                    // types are distinct
-                    break;
-
-                case Covariant.yes:
-                    bestvi = vi; // covariant, but not identical
-                    break;
-                    // keep looking for an exact match
-
-                case Covariant.no:
-                    mismatchvi = vi;
-                    mismatchstc = stc;
-                    mismatch = fdv; // overrides, but is not covariant
-                    break;
-                    // keep looking for an exact match
-
-                case Covariant.fwdref:
-                    return -2; // forward references
-                }
-            }
-        }
-        if (bestvi == -1 && mismatch)
-        {
-            //type.print();
-            //mismatch.type.print();
-            //printf("%s %s\n", type.deco, mismatch.type.deco);
-            //printf("stc = %llx\n", mismatchstc);
-            if (mismatchstc)
-            {
-                // Fix it by modifying the type to add the storage classes
-                type = type.addStorageClass(mismatchstc);
-                bestvi = mismatchvi;
-            }
-        }
-        return bestvi;
-    }
-
-    /*********************************
-     * If function a function in a base class,
-     * return that base class.
-     * Returns:
-     *  base class if overriding, null if not
-     */
-    final BaseClass* overrideInterface()
-    {
-        for (ClassDeclaration cd = toParent2().isClassDeclaration(); cd; cd = cd.baseClass)
-        {
-            foreach (b; cd.interfaces)
-            {
-                auto v = findVtblIndex(&b.sym.vtbl, cast(int)b.sym.vtbl.dim);
-                if (v >= 0)
-                    return b;
-            }
-        }
-        return null;
     }
 
     /****************************************************
@@ -834,6 +522,8 @@ extern (C++) class FuncDeclaration : Declaration
         {
             auto f = s.isFuncDeclaration();
             if (!f)
+                return 0;
+            if (f.storage_class & STC.disable)
                 return 0;
             if (t.equals(f.type))
             {
@@ -958,7 +648,7 @@ extern (C++) class FuncDeclaration : Declaration
                 OutBuffer thisBuf, funcBuf;
                 MODMatchToBuffer(&thisBuf, tthis.mod, tf.mod);
                 MODMatchToBuffer(&funcBuf, tf.mod, tthis.mod);
-                .error(loc, "%smethod %s is not callable using a %sobject",
+                .error(loc, "%smethod %s is not callable using a %sobject", kind, toPrettyChars,
                     funcBuf.peekChars(), this.toPrettyChars(), thisBuf.peekChars());
             }
         }
@@ -1000,19 +690,24 @@ extern (C++) class FuncDeclaration : Declaration
     }
 
     /*************************************
-     * Determine partial specialization order of 'this' vs g.
+     * Determine partial specialization order of functions `f` vs `g`.
      * This is very similar to TemplateDeclaration::leastAsSpecialized().
+     * Params:
+     *  f = first function
+     *  g = second function
+     *  names = names of parameters
      * Returns:
      *      match   'this' is at least as specialized as g
      *      0       g is more specialized than 'this'
      */
-    final MATCH leastAsSpecialized(FuncDeclaration g)
+    static MATCH leastAsSpecialized(FuncDeclaration f, FuncDeclaration g, Identifiers* names)
     {
         enum LOG_LEASTAS = 0;
         static if (LOG_LEASTAS)
         {
-            printf("%s.leastAsSpecialized(%s)\n", toChars(), g.toChars());
-            printf("%s, %s\n", type.toChars(), g.type.toChars());
+            import core.stdc.stdio : printf;
+            printf("leastAsSpecialized(%s, %s, %s)\n", f.toChars(), g.toChars(), names ? names.toChars() : "null");
+            printf("%s, %s\n", f.type.toChars(), g.type.toChars());
         }
 
         /* This works by calling g() with f()'s parameters, and
@@ -1020,15 +715,15 @@ extern (C++) class FuncDeclaration : Declaration
          * as g() is.
          */
 
-        TypeFunction tf = type.toTypeFunction();
+        TypeFunction tf = f.type.toTypeFunction();
         TypeFunction tg = g.type.toTypeFunction();
 
         /* If both functions have a 'this' pointer, and the mods are not
          * the same and g's is not const, then this is less specialized.
          */
-        if (needThis() && g.needThis() && tf.mod != tg.mod)
+        if (f.needThis() && g.needThis() && tf.mod != tg.mod)
         {
-            if (isCtorDeclaration())
+            if (f.isCtorDeclaration())
             {
                 if (!MODimplicitConv(tg.mod, tf.mod))
                     return MATCH.nomatch;
@@ -1056,7 +751,7 @@ extern (C++) class FuncDeclaration : Declaration
             args.push(e);
         }
 
-        MATCH m = tg.callMatch(null, args[], 1);
+        MATCH m = tg.callMatch(null, ArgumentList(&args, names), 1);
         if (m > MATCH.nomatch)
         {
             /* A variadic parameter list is less specialized than a
@@ -1089,7 +784,7 @@ extern (C++) class FuncDeclaration : Declaration
      *
      * Returns: the `LabelDsymbol` for `ident`
      */
-    final LabelDsymbol searchLabel(Identifier ident, const ref Loc loc = Loc.initial)
+    final LabelDsymbol searchLabel(Identifier ident, const ref Loc loc)
     {
         Dsymbol s;
         if (!labtab)
@@ -1115,7 +810,7 @@ extern (C++) class FuncDeclaration : Declaration
      *      -1      increase nesting by 1 (`fd` is nested within `this`)
      *      LevelError  error, `this` cannot call `fd`
      */
-    final int getLevel(FuncDeclaration fd, int intypeof)
+    extern (D) final int getLevel(FuncDeclaration fd, int intypeof)
     {
         //printf("FuncDeclaration::getLevel(fd = '%s')\n", fd.toChars());
         Dsymbol fdparent = fd.toParent2();
@@ -1176,8 +871,8 @@ extern (C++) class FuncDeclaration : Declaration
      *      -1      increase nesting by 1 (`fd` is nested within 'this')
      *      LevelError  error
      */
-    final int getLevelAndCheck(const ref Loc loc, Scope* sc, FuncDeclaration fd,
-                               Declaration decl)
+    extern (D) final int getLevelAndCheck(const ref Loc loc, Scope* sc, FuncDeclaration fd,
+                                          Declaration decl)
     {
         int level = getLevel(fd, sc.intypeof);
         if (level != LevelError)
@@ -1211,18 +906,18 @@ extern (C++) class FuncDeclaration : Declaration
     final const(char)* toFullSignature()
     {
         OutBuffer buf;
-        functionToBufferWithIdent(type.toTypeFunction(), &buf, toChars(), isStatic);
+        functionToBufferWithIdent(type.toTypeFunction(), buf, toChars(), isStatic);
         return buf.extractChars();
     }
 
     final bool isMain() const
     {
-        return ident == Id.main && linkage != LINK.c && !isMember() && !isNested();
+        return ident == Id.main && resolvedLinkage() != LINK.c && !isMember() && !isNested();
     }
 
     final bool isCMain() const
     {
-        return ident == Id.main && linkage == LINK.c && !isMember() && !isNested();
+        return ident == Id.main && resolvedLinkage() == LINK.c && !isMember() && !isNested();
     }
 
     final bool isWinMain() const
@@ -1230,36 +925,36 @@ extern (C++) class FuncDeclaration : Declaration
         //printf("FuncDeclaration::isWinMain() %s\n", toChars());
         version (none)
         {
-            bool x = ident == Id.WinMain && linkage != LINK.c && !isMember();
+            bool x = ident == Id.WinMain && resolvedLinkage() != LINK.c && !isMember();
             printf("%s\n", x ? "yes" : "no");
             return x;
         }
         else
         {
-            return ident == Id.WinMain && linkage != LINK.c && !isMember();
+            return ident == Id.WinMain && resolvedLinkage() != LINK.c && !isMember();
         }
     }
 
     final bool isDllMain() const
     {
-        return ident == Id.DllMain && linkage != LINK.c && !isMember();
+        return ident == Id.DllMain && resolvedLinkage() != LINK.c && !isMember();
     }
 
     final bool isRtInit() const
     {
-        return ident == Id.rt_init && linkage == LINK.c && !isMember() && !isNested();
+        return ident == Id.rt_init && resolvedLinkage() == LINK.c && !isMember() && !isNested();
     }
 
     override final bool isExport() const
     {
-        return visibility.kind == Visibility.Kind.export_;
+        return visibility.kind == Visibility.Kind.export_ || dllExport;
     }
 
     override final bool isImportedSymbol() const
     {
         //printf("isImportedSymbol()\n");
         //printf("protection = %d\n", visibility);
-        return (visibility.kind == Visibility.Kind.export_) && !fbody;
+        return (visibility.kind == Visibility.Kind.export_ || dllImport) && !fbody;
     }
 
     override final bool isCodeseg() const pure nothrow @nogc @safe
@@ -1344,30 +1039,31 @@ extern (C++) class FuncDeclaration : Declaration
         //printf("initInferAttributes() for %s (%s)\n", toPrettyChars(), ident.toChars());
         TypeFunction tf = type.toTypeFunction();
         if (tf.purity == PURE.impure) // purity not specified
-            flags |= FUNCFLAG.purityInprocess;
+            purityInprocess = true;
 
         if (tf.trust == TRUST.default_)
-            flags |= FUNCFLAG.safetyInprocess;
+            safetyInprocess = true;
 
         if (!tf.isnothrow)
-            flags |= FUNCFLAG.nothrowInprocess;
+            nothrowInprocess = true;
 
         if (!tf.isnogc)
-            flags |= FUNCFLAG.nogcInprocess;
+            nogcInprocess = true;
 
-        if (!isVirtual() || introducing)
-            flags |= FUNCFLAG.returnInprocess;
+        if (!isVirtual() || this.isIntroducing())
+            returnInprocess = true;
 
         // Initialize for inferring STC.scope_
-        if (global.params.useDIP1000 == FeatureState.enabled)
-            flags |= FUNCFLAG.inferScope;
+        inferScope = true;
     }
 
     final PURE isPure()
     {
         //printf("FuncDeclaration::isPure() '%s'\n", toChars());
+
+
         TypeFunction tf = type.toTypeFunction();
-        if (flags & FUNCFLAG.purityInprocess)
+        if (purityInprocess)
             setImpure();
         if (tf.purity == PURE.fwdref)
             tf.purityLevel();
@@ -1391,113 +1087,213 @@ extern (C++) class FuncDeclaration : Declaration
         return purity;
     }
 
-    final PURE isPureBypassingInference()
+    extern (D) final PURE isPureBypassingInference()
     {
-        if (flags & FUNCFLAG.purityInprocess)
+        if (purityInprocess)
             return PURE.fwdref;
         else
             return isPure();
     }
 
     /**************************************
-     * The function is doing something impure,
-     * so mark it as impure.
-     * If there's a purity error, return true.
+     * The function is doing something impure, so mark it as impure.
+     *
+     * Params:
+     *     loc = location of impure action
+     *     fmt = format string for error message. Must include "%s `%s`" for the function kind and name.
+     *     arg0 = (optional) argument to format string
+     *
+     * Returns: `true` if there's a purity error
      */
-    extern (D) final bool setImpure()
+    extern (D) final bool setImpure(Loc loc = Loc.init, const(char)* fmt = null, RootObject arg0 = null)
     {
-        if (flags & FUNCFLAG.purityInprocess)
+        if (purityInprocess)
         {
-            flags &= ~FUNCFLAG.purityInprocess;
+            purityInprocess = false;
+            if (fmt)
+                pureViolation = new AttributeViolation(loc, fmt, this, arg0); // impure action
+            else if (arg0)
+                pureViolation = new AttributeViolation(loc, fmt, arg0); // call to impure function
+
             if (fes)
-                fes.func.setImpure();
+                fes.func.setImpure(loc, fmt, arg0);
         }
         else if (isPure())
             return true;
         return false;
     }
 
+    extern (D) final uint flags()
+    {
+        return bitFields;
+    }
+
+    extern (D) final uint flags(uint f)
+    {
+        bitFields = f;
+        return bitFields;
+    }
+
     final bool isSafe()
     {
-        if (flags & FUNCFLAG.safetyInprocess)
+        if (safetyInprocess)
             setUnsafe();
         return type.toTypeFunction().trust == TRUST.safe;
     }
 
-    final bool isSafeBypassingInference()
+    extern (D) final bool isSafeBypassingInference()
     {
-        return !(flags & FUNCFLAG.safetyInprocess) && isSafe();
+        return !(safetyInprocess) && isSafe();
     }
 
     final bool isTrusted()
     {
-        if (flags & FUNCFLAG.safetyInprocess)
+        if (safetyInprocess)
             setUnsafe();
         return type.toTypeFunction().trust == TRUST.trusted;
     }
 
     /**************************************
-     * The function is doing something unsafe,
-     * so mark it as unsafe.
-     * If there's a safe error, return true.
+     * The function is doing something unsafe, so mark it as unsafe.
+     *
+     * Params:
+     *   gag = surpress error message (used in escape.d)
+     *   loc = location of error
+     *   fmt = printf-style format string
+     *   arg0  = (optional) argument for first %s format specifier
+     *   arg1  = (optional) argument for second %s format specifier
+     *   arg2  = (optional) argument for third %s format specifier
+     * Returns: whether there's a safe error
      */
-    extern (D) final bool setUnsafe()
+    extern (D) final bool setUnsafe(
+        bool gag = false, Loc loc = Loc.init, const(char)* fmt = null,
+        RootObject arg0 = null, RootObject arg1 = null, RootObject arg2 = null)
     {
-        if (flags & FUNCFLAG.safetyInprocess)
+        if (safetyInprocess)
         {
-            flags &= ~FUNCFLAG.safetyInprocess;
+            safetyInprocess = false;
             type.toTypeFunction().trust = TRUST.system;
+            if (fmt || arg0)
+                safetyViolation = new AttributeViolation(loc, fmt, arg0, arg1, arg2);
+
             if (fes)
                 fes.func.setUnsafe();
         }
         else if (isSafe())
+        {
+            if (!gag && fmt)
+                .error(loc, fmt, arg0 ? arg0.toChars() : "", arg1 ? arg1.toChars() : "", arg2 ? arg2.toChars() : "");
+
             return true;
+        }
         return false;
+    }
+
+    /**************************************
+     * The function is calling `@system` function `f`, so mark it as unsafe.
+     *
+     * Params:
+     *   f = function being called (needed for diagnostic of inferred functions)
+     * Returns: whether there's a safe error
+     */
+    extern (D) final bool setUnsafeCall(FuncDeclaration f)
+    {
+        return setUnsafe(false, f.loc, null, f, null);
     }
 
     final bool isNogc()
     {
         //printf("isNogc() %s, inprocess: %d\n", toChars(), !!(flags & FUNCFLAG.nogcInprocess));
-        if (flags & FUNCFLAG.nogcInprocess)
-            setGC();
+        if (nogcInprocess)
+            setGC(loc, null);
         return type.toTypeFunction().isnogc;
     }
 
-    final bool isNogcBypassingInference()
+    extern (D) final bool isNogcBypassingInference()
     {
-        return !(flags & FUNCFLAG.nogcInprocess) && isNogc();
+        return !nogcInprocess && isNogc();
     }
 
     /**************************************
      * The function is doing something that may allocate with the GC,
      * so mark it as not nogc (not no-how).
+     *
+     * Params:
+     *     loc = location of impure action
+     *     fmt = format string for error message. Must include "%s `%s`" for the function kind and name.
+     *     arg0 = (optional) argument to format string
+     *
      * Returns:
      *      true if function is marked as @nogc, meaning a user error occurred
      */
-    extern (D) final bool setGC()
+    extern (D) final bool setGC(Loc loc, const(char)* fmt, RootObject arg0 = null)
     {
         //printf("setGC() %s\n", toChars());
-        if (flags & FUNCFLAG.nogcInprocess && semanticRun < PASS.semantic3 && _scope)
+        if (nogcInprocess && semanticRun < PASS.semantic3 && _scope)
         {
             this.semantic2(_scope);
             this.semantic3(_scope);
         }
 
-        if (flags & FUNCFLAG.nogcInprocess)
+        if (nogcInprocess)
         {
-            flags &= ~FUNCFLAG.nogcInprocess;
+            nogcInprocess = false;
+            if (fmt)
+                nogcViolation = new AttributeViolation(loc, fmt, this, arg0); // action that requires GC
+            else if (arg0)
+                nogcViolation = new AttributeViolation(loc, fmt, arg0); // call to non-@nogc function
+
             type.toTypeFunction().isnogc = false;
             if (fes)
-                fes.func.setGC();
+                fes.func.setGC(Loc.init, null, null);
         }
         else if (isNogc())
             return true;
         return false;
     }
 
+    /**************************************
+     * The function calls non-`@nogc` function f, mark it as not nogc.
+     * Params:
+     *     f = function being called
+     * Returns:
+     *      true if function is marked as @nogc, meaning a user error occurred
+     */
+    extern (D) final bool setGCCall(FuncDeclaration f)
+    {
+        return setGC(loc, null, f);
+    }
+
+    /**************************************
+     * The function is doing something that may throw an exception, register that in case nothrow is being inferred
+     *
+     * Params:
+     *     loc = location of action
+     *     fmt = format string for error message
+     *     arg0 = (optional) argument to format string
+     */
+    extern (D) final void setThrow(Loc loc, const(char)* fmt, RootObject arg0 = null)
+    {
+        if (nothrowInprocess && !nothrowViolation)
+        {
+            nothrowViolation = new AttributeViolation(loc, fmt, arg0); // action that requires GC
+        }
+    }
+
+    /**************************************
+     * The function calls non-`nothrow` function f, register that in case nothrow is being inferred
+     * Params:
+     *     loc = location of call
+     *     f = function being called
+     */
+    extern (D) final void setThrowCall(Loc loc, FuncDeclaration f)
+    {
+        return setThrow(loc, null, f);
+    }
+
     extern (D) final void printGCUsage(const ref Loc loc, const(char)* warn)
     {
-        if (!global.params.vgc)
+        if (!global.params.v.gc)
             return;
 
         Module m = getModule();
@@ -1630,7 +1426,7 @@ extern (C++) class FuncDeclaration : Declaration
             if (!tp)
                 continue;
 
-            if (fparam.storageClass & (STC.lazy_ | STC.out_ | STC.ref_))
+            if (fparam.isLazy() || fparam.isReference())
             {
                 if (!traverseIndirections(tp, t))
                     return false;
@@ -1701,7 +1497,7 @@ extern (C++) class FuncDeclaration : Declaration
         auto f = toAliasFunc();
         //printf("\ttoParent2() = '%s'\n", f.toParent2().toChars());
         return ((f.storage_class & STC.static_) == 0) &&
-                (f.linkage == LINK.d) &&
+                (f._linkage == LINK.d) &&
                 (f.toParent2().isFuncDeclaration() !is null ||
                  f.toParent2() !is f.toParentLocal());
     }
@@ -1739,7 +1535,7 @@ extern (C++) class FuncDeclaration : Declaration
         if (!isVirtual())
             return false;
         // If it's a final method, and does not override anything, then it is not virtual
-        if (isFinalFunc() && foverrides.dim == 0)
+        if (isFinalFunc() && foverrides.length == 0)
         {
             return false;
         }
@@ -1795,19 +1591,19 @@ extern (C++) class FuncDeclaration : Declaration
     {
         auto ad = isThis();
         ClassDeclaration cd = ad ? ad.isClassDeclaration() : null;
-        return (ad && !(cd && cd.isCPPclass()) && global.params.useInvariants == CHECKENABLE.on && (visibility.kind == Visibility.Kind.protected_ || visibility.kind == Visibility.Kind.public_ || visibility.kind == Visibility.Kind.export_) && !naked);
+        return (ad && !(cd && cd.isCPPclass()) && global.params.useInvariants == CHECKENABLE.on && (visibility.kind == Visibility.Kind.protected_ || visibility.kind == Visibility.Kind.public_ || visibility.kind == Visibility.Kind.export_) && !this.isNaked());
     }
 
     bool addPostInvariant()
     {
         auto ad = isThis();
         ClassDeclaration cd = ad ? ad.isClassDeclaration() : null;
-        return (ad && !(cd && cd.isCPPclass()) && ad.inv && global.params.useInvariants == CHECKENABLE.on && (visibility.kind == Visibility.Kind.protected_ || visibility.kind == Visibility.Kind.public_ || visibility.kind == Visibility.Kind.export_) && !naked);
+        return (ad && !(cd && cd.isCPPclass()) && ad.inv && global.params.useInvariants == CHECKENABLE.on && (visibility.kind == Visibility.Kind.protected_ || visibility.kind == Visibility.Kind.public_ || visibility.kind == Visibility.Kind.export_) && !this.isNaked());
     }
 
     override const(char)* kind() const
     {
-        return generated ? "generated function" : "function";
+        return this.isGenerated() ? "generated function" : "function";
     }
 
     /********************************************
@@ -1820,7 +1616,8 @@ extern (C++) class FuncDeclaration : Declaration
         overloadApply(cast() this, (Dsymbol s)
         {
             auto f = s.isFuncDeclaration();
-            if (!f)
+            auto td = s.isTemplateDeclaration();
+            if (!f && !td)
                 return 0;
             if (result)
             {
@@ -1896,16 +1693,19 @@ extern (C++) class FuncDeclaration : Declaration
                 if (fdthis != this)
                 {
                     bool found = false;
-                    for (size_t i = 0; i < siblingCallers.dim; ++i)
+                    for (size_t i = 0; i < siblingCallers.length; ++i)
                     {
                         if (siblingCallers[i] == fdthis)
                             found = true;
                     }
                     if (!found)
                     {
-                        //printf("\tadding sibling %s\n", fdthis.toPrettyChars());
+                        //printf("\tadding sibling %s to %s\n", fdthis.toPrettyChars(), toPrettyChars());
                         if (!sc.intypeof && !(sc.flags & SCOPE.compile))
+                        {
                             siblingCallers.push(fdthis);
+                            computedEscapingSiblings = false;
+                        }
                     }
                 }
 
@@ -1954,18 +1754,17 @@ extern (C++) class FuncDeclaration : Declaration
          * is already set to `true` upon entering this function when the
          * struct/class refers to a local variable and a closure is needed.
          */
-
-        //printf("FuncDeclaration::needsClosure() %s\n", toChars());
+        //printf("FuncDeclaration::needsClosure() %s\n", toPrettyChars());
 
         if (requiresClosure)
             goto Lyes;
 
-        for (size_t i = 0; i < closureVars.dim; i++)
+        for (size_t i = 0; i < closureVars.length; i++)
         {
             VarDeclaration v = closureVars[i];
             //printf("\tv = %s\n", v.toChars());
 
-            for (size_t j = 0; j < v.nestedrefs.dim; j++)
+            for (size_t j = 0; j < v.nestedrefs.length; j++)
             {
                 FuncDeclaration f = v.nestedrefs[j];
                 assert(f != this);
@@ -2019,7 +1818,6 @@ extern (C++) class FuncDeclaration : Declaration
         return false;
 
     Lyes:
-        //printf("\tneeds closure\n");
         return true;
     }
 
@@ -2031,14 +1829,21 @@ extern (C++) class FuncDeclaration : Declaration
      * Returns:
      *      true if any errors occur.
      */
-    extern (D) final bool checkClosure()
+    extern (C++) final bool checkClosure()
     {
+        //printf("checkClosure() %s\n", toPrettyChars());
         if (!needsClosure())
             return false;
 
-        if (setGC())
+        if (setGC(loc, "%s `%s` is `@nogc` yet allocates closure for `%s()` with the GC", this))
         {
-            error("is `@nogc` yet allocates closures with the GC");
+            .error(loc, "%s `%s` is `@nogc` yet allocates closure for `%s()` with the GC", kind, toPrettyChars, toChars());
+            if (global.gag)     // need not report supplemental errors
+                return true;
+        }
+        else if (!global.params.useGC)
+        {
+            .error(loc, "%s `%s` is `-betterC` yet allocates closure for `%s()` with the GC", kind, toPrettyChars, toChars());
             if (global.gag)     // need not report supplemental errors
                 return true;
         }
@@ -2071,8 +1876,11 @@ extern (C++) class FuncDeclaration : Declaration
                                 break LcheckAncestorsOfANestedRef;
                         }
                         a.push(f);
-                        .errorSupplemental(f.loc, "%s closes over variable %s at %s",
-                            f.toPrettyChars(), v.toChars(), v.loc.toChars());
+                        .errorSupplemental(f.loc, "%s `%s` closes over variable `%s`",
+                            f.kind, f.toPrettyChars(), v.toChars());
+                        if (v.ident != Id.This)
+                            .errorSupplemental(v.loc, "`%s` declared here", v.toChars());
+
                         break LcheckAncestorsOfANestedRef;
                     }
                 }
@@ -2088,7 +1896,7 @@ extern (C++) class FuncDeclaration : Declaration
      */
     final bool hasNestedFrameRefs()
     {
-        if (closureVars.dim)
+        if (closureVars.length)
             return true;
 
         /* If a virtual function has contracts, assume its variables are referenced
@@ -2102,9 +1910,9 @@ extern (C++) class FuncDeclaration : Declaration
         if (fdrequire || fdensure)
             return true;
 
-        if (foverrides.dim && isVirtualMethod())
+        if (foverrides.length && isVirtualMethod())
         {
-            for (size_t i = 0; i < foverrides.dim; i++)
+            for (size_t i = 0; i < foverrides.length; i++)
             {
                 FuncDeclaration fdv = foverrides[i];
                 if (fdv.hasNestedFrameRefs())
@@ -2124,44 +1932,6 @@ extern (C++) class FuncDeclaration : Declaration
     {
         auto f = cast(TypeFunction)type;
         return f && f.nextOf() && f.nextOf().toBasetype().ty != Tvoid;
-    }
-
-    /****************************************************
-     * Declare result variable lazily.
-     */
-    extern (D) final void buildResultVar(Scope* sc, Type tret)
-    {
-        if (!vresult)
-        {
-            Loc loc = fensure ? fensure.loc : this.loc;
-
-            /* If inferRetType is true, tret may not be a correct return type yet.
-             * So, in here it may be a temporary type for vresult, and after
-             * fbody.dsymbolSemantic() running, vresult.type might be modified.
-             */
-            vresult = new VarDeclaration(loc, tret, Id.result, null);
-            vresult.storage_class |= STC.nodtor | STC.temp;
-            if (!isVirtual())
-                vresult.storage_class |= STC.const_;
-            vresult.storage_class |= STC.result;
-
-            // set before the semantic() for checkNestedReference()
-            vresult.parent = this;
-        }
-
-        if (sc && vresult.semanticRun == PASS.init)
-        {
-            TypeFunction tf = type.toTypeFunction();
-            if (tf.isref)
-                vresult.storage_class |= STC.ref_;
-            vresult.type = tret;
-
-            vresult.dsymbolSemantic(sc);
-
-            if (!sc.insert(vresult))
-                error("out result %s is already defined", vresult.toChars());
-            assert(vresult.parent == this);
-        }
     }
 
     /****************************************************
@@ -2240,6 +2010,7 @@ extern (C++) class FuncDeclaration : Declaration
          *    base.in();
          *    assert(false, "Logic error: " ~ thr.msg);
          *  }
+         * }
          */
 
         foreach (fdv; foverrides)
@@ -2300,7 +2071,7 @@ extern (C++) class FuncDeclaration : Declaration
      * Returns:
      *      true    found an 'out' contract
      */
-    static bool needsFensure(FuncDeclaration fd)
+    static bool needsFensure(FuncDeclaration fd) @safe
     {
         if (fd.fensures)
             return true;
@@ -2327,7 +2098,7 @@ extern (C++) class FuncDeclaration : Declaration
              * becomes:
              *   in { { statements1... } { statements2... } ... }
              */
-            assert(frequires.dim);
+            assert(frequires.length);
             auto loc = (*frequires)[0].loc;
             auto s = new Statements;
             foreach (r; *frequires)
@@ -2346,7 +2117,7 @@ extern (C++) class FuncDeclaration : Declaration
              *   out(__result) { { ref id1 = __result; { statements1... } }
              *                   { ref id2 = __result; { statements2... } } ... }
              */
-            assert(fensures.dim);
+            assert(fensures.length);
             auto loc = (*fensures)[0].ensure.loc;
             auto s = new Statements;
             foreach (r; *fensures)
@@ -2385,7 +2156,7 @@ extern (C++) class FuncDeclaration : Declaration
             foreach (n, p; parameterList)
             {
                 p = p.syntaxCopy();
-                if (!(p.storageClass & STC.lazy_))
+                if (!p.isLazy())
                     p.storageClass = (p.storageClass | STC.ref_) & ~STC.out_;
                 p.defaultArg = null; // won't be the same with ref
                 result.push(p);
@@ -2448,7 +2219,7 @@ extern (C++) class FuncDeclaration : Declaration
             auto fparams = new Parameters();
             if (canBuildResultVar())
             {
-                Parameter p = new Parameter(STC.ref_ | STC.const_, f.nextOf(), Id.result, null, null);
+                Parameter p = new Parameter(loc, STC.ref_ | STC.const_, f.nextOf(), Id.result, null, null);
                 fparams.push(p);
             }
             auto fo = cast(TypeFunction)(originalType ? originalType : f);
@@ -2560,7 +2331,7 @@ extern (C++) class FuncDeclaration : Declaration
      */
     static FuncDeclaration genCfunc(Parameters* fparams, Type treturn, const(char)* name, StorageClass stc = 0)
     {
-        return genCfunc(fparams, treturn, Identifier.idPool(name, cast(uint)strlen(name)), stc);
+        return genCfunc(fparams, treturn, Identifier.idPool(name[0 .. strlen(name)]), stc);
     }
 
     static FuncDeclaration genCfunc(Parameters* fparams, Type treturn, Identifier id, StorageClass stc = 0)
@@ -2588,42 +2359,132 @@ extern (C++) class FuncDeclaration : Declaration
             tf = new TypeFunction(ParameterList(fparams), treturn, LINK.c, stc);
             fd = new FuncDeclaration(Loc.initial, Loc.initial, id, STC.static_, tf);
             fd.visibility = Visibility(Visibility.Kind.public_);
-            fd.linkage = LINK.c;
+            fd._linkage = LINK.c;
 
             st.insert(fd);
         }
         return fd;
     }
 
-    /******************
-     * Check parameters and return type of D main() function.
-     * Issue error messages.
-     */
-    extern (D) final void checkDmain()
+    /+
+     + Checks the parameter and return types iff this is a `main` function.
+     +
+     + The following signatures are allowed for a `D main`:
+     + - Either no or a single parameter of type `string[]`
+     + - Return type is either `void`, `int` or `noreturn`
+     +
+     + The following signatures are standard C:
+     + - `int main()`
+     + - `int main(int, char**)`
+     +
+     + This function accepts the following non-standard extensions:
+     + - `char** envp` as a third parameter
+     + - `void` / `noreturn` as return type
+     +
+     + This function will issue errors for unexpected arguments / return types.
+     +/
+    extern (D) final void checkMain()
     {
-        TypeFunction tf = type.toTypeFunction();
-        const nparams = tf.parameterList.length;
-        bool argerr;
-        if (nparams == 1)
-        {
-            auto fparam0 = tf.parameterList[0];
-            auto t = fparam0.type.toBasetype();
-            if (t.ty != Tarray ||
-                t.nextOf().ty != Tarray ||
-                t.nextOf().nextOf().ty != Tchar ||
-                fparam0.storageClass & (STC.out_ | STC.ref_ | STC.lazy_))
-            {
-                argerr = true;
-            }
-        }
+        if (ident != Id.main || isMember() || isNested())
+            return; // Not a main function
 
-        if (!tf.nextOf())
+        TypeFunction tf = type.toTypeFunction();
+
+        Type retType = tf.nextOf();
+        if (!retType)
+        {
             // auto main(), check after semantic
             assert(this.inferRetType);
-        else if (tf.nextOf().ty != Tint32 && tf.nextOf().ty != Tvoid && tf.nextOf().ty != Tnoreturn)
-            error("must return `int`, `void` or `noreturn`, not `%s`", tf.nextOf().toChars());
-        else if (tf.parameterList.varargs || nparams >= 2 || argerr)
-            error("parameters must be `main()` or `main(string[] args)`");
+            return;
+        }
+
+        /// Checks whether `t` is equivalent to `char**`
+        /// Ignores qualifiers and treats enums according to their base type
+        static bool isCharPtrPtr(Type t)
+        {
+            auto tp = t.toBasetype().isTypePointer();
+            if (!tp)
+                return false;
+
+            tp = tp.next.toBasetype().isTypePointer();
+            if (!tp)
+                return false;
+
+            return tp.next.toBasetype().ty == Tchar;
+        }
+
+        // Neither of these qualifiers is allowed because they affect the ABI
+        enum invalidSTC = STC.out_ | STC.ref_ | STC.lazy_;
+
+        const nparams = tf.parameterList.length;
+        bool argerr;
+
+        const linkage = resolvedLinkage();
+        if (linkage == LINK.d)
+        {
+            if (nparams == 1)
+            {
+                auto fparam0 = tf.parameterList[0];
+                auto t = fparam0.type.toBasetype();
+                if (t.ty != Tarray ||
+                    t.nextOf().ty != Tarray ||
+                    t.nextOf().nextOf().ty != Tchar ||
+                    fparam0.storageClass & invalidSTC)
+                {
+                    argerr = true;
+                }
+            }
+
+            if (tf.parameterList.varargs || nparams >= 2 || argerr)
+                .error(loc, "%s `%s` parameter list must be empty or accept one parameter of type `string[]`", kind, toPrettyChars);
+        }
+
+        else if (linkage == LINK.c)
+        {
+            if (nparams == 2 || nparams == 3)
+            {
+                // Argument count must be int
+                auto argCount = tf.parameterList[0];
+                argerr |= !!(argCount.storageClass & invalidSTC);
+                argerr |= argCount.type.toBasetype().ty != Tint32;
+
+                // Argument pointer must be char**
+                auto argPtr = tf.parameterList[1];
+                argerr |= !!(argPtr.storageClass & invalidSTC);
+                argerr |= !isCharPtrPtr(argPtr.type);
+
+                // `char** environ` is a common extension, see J.5.1 of the C standard
+                if (nparams == 3)
+                {
+                    auto envPtr = tf.parameterList[2];
+                    argerr |= !!(envPtr.storageClass & invalidSTC);
+                    argerr |= !isCharPtrPtr(envPtr.type);
+                }
+            }
+            else
+                argerr = nparams != 0;
+
+            // Disallow variadic main() - except for K&R declarations in C files.
+            // E.g. int main(), int main(argc, argv) int argc, char** argc { ... }
+            if (tf.parameterList.varargs && (!this.isCsymbol() || (!tf.parameterList.hasIdentifierList && nparams)))
+                argerr |= true;
+
+            if (argerr)
+            {
+                .error(loc, "%s `%s` parameters must match one of the following signatures", kind, toPrettyChars);
+                loc.errorSupplemental("`main()`");
+                loc.errorSupplemental("`main(int argc, char** argv)`");
+                loc.errorSupplemental("`main(int argc, char** argv, char** environ)` [POSIX extension]");
+            }
+        }
+        else
+            return; // Neither C nor D main, ignore (should probably be an error)
+
+        // Allow enums with appropriate base types (same ABI)
+        retType = retType.toBasetype();
+
+        if (retType.ty != Tint32 && retType.ty != Tvoid && retType.ty != Tnoreturn)
+            .error(loc, "%s `%s` must return `int`, `void` or `noreturn`, not `%s`", kind, toPrettyChars, tf.nextOf().toChars());
     }
 
     /***********************************************
@@ -2633,9 +2494,9 @@ extern (C++) class FuncDeclaration : Declaration
      * Returns:
      *      `false` if the result cannot be returned by hidden reference.
      */
-    final bool checkNRVO()
+    extern (D) final bool checkNRVO()
     {
-        if (!nrvo_can || returns is null)
+        if (!isNRVO() || returns is null)
             return false;
 
         auto tf = type.toTypeFunction();
@@ -2647,7 +2508,7 @@ extern (C++) class FuncDeclaration : Declaration
             if (auto ve = rs.exp.isVarExp())
             {
                 auto v = ve.var.isVarDeclaration();
-                if (!v || v.isOut() || v.isRef())
+                if (!v || v.isReference())
                     return false;
                 else if (nrvo_var is null)
                 {
@@ -2655,6 +2516,14 @@ extern (C++) class FuncDeclaration : Declaration
                     // parameters and closure variables cannot be NRVOed.
                     if (v.isDataseg() || v.isParameter() || v.toParent2() != this)
                         return false;
+                    if (v.nestedrefs.length && needsClosure())
+                        return false;
+                    // don't know if the return storage is aligned
+                    version (MARS)
+                    {
+                        if (alignSectionVars && (*alignSectionVars).contains(v))
+                            return false;
+                    }
                     // The variable type needs to be equivalent to the return type.
                     if (!v.type.equivalent(tf.next))
                         return false;
@@ -2686,57 +2555,6 @@ extern (C++) class FuncDeclaration : Declaration
     }
 }
 
-/********************************************************
- * Generate Expression to call the invariant.
- * Input:
- *      ad      aggregate with the invariant
- *      vthis   variable with 'this'
- * Returns:
- *      void expression that calls the invariant
- */
-Expression addInvariant(AggregateDeclaration ad, VarDeclaration vthis)
-{
-    Expression e = null;
-    // Call invariant directly only if it exists
-    FuncDeclaration inv = ad.inv;
-    ClassDeclaration cd = ad.isClassDeclaration();
-
-    while (!inv && cd)
-    {
-        cd = cd.baseClass;
-        if (!cd)
-            break;
-        inv = cd.inv;
-    }
-    if (inv)
-    {
-        version (all)
-        {
-            // Workaround for https://issues.dlang.org/show_bug.cgi?id=13394
-            // For the correct mangling,
-            // run attribute inference on inv if needed.
-            inv.functionSemantic();
-        }
-
-        //e = new DsymbolExp(Loc.initial, inv);
-        //e = new CallExp(Loc.initial, e);
-        //e = e.semantic(sc2);
-
-        /* https://issues.dlang.org/show_bug.cgi?id=13113
-         * Currently virtual invariant calls completely
-         * bypass attribute enforcement.
-         * Change the behavior of pre-invariant call by following it.
-         */
-        e = new ThisExp(Loc.initial);
-        e.type = ad.type.addMod(vthis.type.mod);
-        e = new DotVarExp(Loc.initial, e, inv, false);
-        e.type = inv.type;
-        e = new CallExp(Loc.initial, e);
-        e.type = Type.tvoid;
-    }
-    return e;
-}
-
 /***************************************************
  * Visit each overloaded function/template in turn, and call dg(s) on it.
  * Exit when no more, or dg(s) returns nonzero.
@@ -2753,89 +2571,100 @@ Expression addInvariant(AggregateDeclaration ad, VarDeclaration vthis)
  */
 extern (D) int overloadApply(Dsymbol fstart, scope int delegate(Dsymbol) dg, Scope* sc = null)
 {
-    Dsymbol next;
-    for (auto d = fstart; d; d = next)
+    Dsymbols visited;
+
+    int overloadApplyRecurse(Dsymbol fstart, scope int delegate(Dsymbol) dg, Scope* sc)
     {
-        import dmd.access : checkSymbolAccess;
-        if (auto od = d.isOverDeclaration())
+        // Detect cyclic calls.
+        if (visited.contains(fstart))
+            return 0;
+        visited.push(fstart);
+
+        Dsymbol next;
+        for (auto d = fstart; d; d = next)
         {
-            /* The scope is needed here to check whether a function in
-               an overload set was added by means of a private alias (or a
-               selective import). If the scope where the alias is created
-               is imported somewhere, the overload set is visible, but the private
-               alias is not.
-            */
-            if (sc)
+            import dmd.access : checkSymbolAccess;
+            if (auto od = d.isOverDeclaration())
             {
-                if (checkSymbolAccess(sc, od))
+                /* The scope is needed here to check whether a function in
+                   an overload set was added by means of a private alias (or a
+                   selective import). If the scope where the alias is created
+                   is imported somewhere, the overload set is visible, but the private
+                   alias is not.
+                */
+                if (sc)
                 {
-                    if (int r = overloadApply(od.aliassym, dg, sc))
+                    if (checkSymbolAccess(sc, od))
+                    {
+                        if (int r = overloadApplyRecurse(od.aliassym, dg, sc))
+                            return r;
+                    }
+                }
+                else if (int r = overloadApplyRecurse(od.aliassym, dg, sc))
+                    return r;
+                next = od.overnext;
+            }
+            else if (auto fa = d.isFuncAliasDeclaration())
+            {
+                if (fa.hasOverloads)
+                {
+                    if (int r = overloadApplyRecurse(fa.funcalias, dg, sc))
                         return r;
                 }
+                else if (auto fd = fa.toAliasFunc())
+                {
+                    if (int r = dg(fd))
+                        return r;
+                }
+                else
+                {
+                    .error(d.loc, "%s `%s` is aliased to a function", d.kind, d.toPrettyChars);
+                    break;
+                }
+                next = fa.overnext;
             }
-            else if (int r = overloadApply(od.aliassym, dg, sc))
-                return r;
-            next = od.overnext;
-        }
-        else if (auto fa = d.isFuncAliasDeclaration())
-        {
-            if (fa.hasOverloads)
+            else if (auto ad = d.isAliasDeclaration())
             {
-                if (int r = overloadApply(fa.funcalias, dg, sc))
-                    return r;
+                if (sc)
+                {
+                    if (checkSymbolAccess(sc, ad))
+                        next = ad.toAlias();
+                }
+                else
+                   next = ad.toAlias();
+                if (next == ad)
+                    break;
+                if (next == fstart)
+                    break;
             }
-            else if (auto fd = fa.toAliasFunc())
+            else if (auto td = d.isTemplateDeclaration())
+            {
+                if (int r = dg(td))
+                    return r;
+                next = td.overnext;
+            }
+            else if (auto fd = d.isFuncDeclaration())
             {
                 if (int r = dg(fd))
                     return r;
+                next = fd.overnext;
+            }
+            else if (auto os = d.isOverloadSet())
+            {
+                foreach (ds; os.a)
+                    if (int r = dg(ds))
+                        return r;
             }
             else
             {
-                d.error("is aliased to a function");
+                .error(d.loc, "%s `%s` is aliased to a function", d.kind, d.toPrettyChars);
                 break;
+                // BUG: should print error message?
             }
-            next = fa.overnext;
         }
-        else if (auto ad = d.isAliasDeclaration())
-        {
-            if (sc)
-            {
-                if (checkSymbolAccess(sc, ad))
-                    next = ad.toAlias();
-            }
-            else
-               next = ad.toAlias();
-            if (next == ad)
-                break;
-            if (next == fstart)
-                break;
-        }
-        else if (auto td = d.isTemplateDeclaration())
-        {
-            if (int r = dg(td))
-                return r;
-            next = td.overnext;
-        }
-        else if (auto fd = d.isFuncDeclaration())
-        {
-            if (int r = dg(fd))
-                return r;
-            next = fd.overnext;
-        }
-        else if (auto os = d.isOverloadSet())
-        {
-            foreach (ds; os.a)
-                if (int r = dg(ds))
-                    return r;
-        }
-        else
-        {
-            d.error("is aliased to a function");
-            break;
-            // BUG: should print error message?
-        }
+        return 0;
     }
-    return 0;
+    return overloadApplyRecurse(fstart, dg, sc);
 }
 
 /**
@@ -2917,321 +2746,6 @@ unittest
     mismatches = MODMatchToBuffer(&buf, 0, MODFlags.const_);
     assert(buf[] == "mutable ");
     assert(mismatches.isMutable);
-}
-
-private const(char)* prependSpace(const(char)* str)
-{
-    if (!str || !*str) return "";
-
-    return (" " ~ str.toDString() ~ "\0").ptr;
-}
-
-/// Flag used by $(LREF resolveFuncCall).
-enum FuncResolveFlag : ubyte
-{
-    standard = 0,       /// issue error messages, solve the call.
-    quiet = 1,          /// do not issue error message on no match, just return `null`.
-    overloadOnly = 2,   /// only resolve overloads, i.e. do not issue error on ambiguous
-                        /// matches and need explicit this.
-}
-
-/*******************************************
- * Given a symbol that could be either a FuncDeclaration or
- * a function template, resolve it to a function symbol.
- * Params:
- *      loc =           instantiation location
- *      sc =            instantiation scope
- *      s =             instantiation symbol
- *      tiargs =        initial list of template arguments
- *      tthis =         if !NULL, the `this` argument type
- *      fargs =         arguments to function
- *      flags =         see $(LREF FuncResolveFlag).
- * Returns:
- *      if match is found, then function symbol, else null
- */
-FuncDeclaration resolveFuncCall(const ref Loc loc, Scope* sc, Dsymbol s,
-    Objects* tiargs, Type tthis, Expressions* fargs, FuncResolveFlag flags)
-{
-    if (!s)
-        return null; // no match
-
-    version (none)
-    {
-        printf("resolveFuncCall('%s')\n", s.toChars());
-        if (tthis)
-            printf("\tthis: %s\n", tthis.toChars());
-        if (fargs)
-        {
-            for (size_t i = 0; i < fargs.dim; i++)
-            {
-                Expression arg = (*fargs)[i];
-                assert(arg.type);
-                printf("\t%s: %s\n", arg.toChars(), arg.type.toChars());
-            }
-        }
-    }
-
-    if (tiargs && arrayObjectIsError(tiargs) ||
-        fargs && arrayObjectIsError(cast(Objects*)fargs))
-    {
-        return null;
-    }
-
-    MatchAccumulator m;
-    functionResolve(m, s, loc, sc, tiargs, tthis, fargs, null);
-    auto orig_s = s;
-
-    if (m.last > MATCH.nomatch && m.lastf)
-    {
-        if (m.count == 1) // exactly one match
-        {
-            if (!(flags & FuncResolveFlag.quiet))
-                m.lastf.functionSemantic();
-            return m.lastf;
-        }
-        if ((flags & FuncResolveFlag.overloadOnly) && !tthis && m.lastf.needThis())
-        {
-            return m.lastf;
-        }
-    }
-
-    /* Failed to find a best match.
-     * Do nothing or print error.
-     */
-    if (m.last == MATCH.nomatch)
-    {
-        // error was caused on matched function, not on the matching itself,
-        // so return the function to produce a better diagnostic
-        if (m.count == 1)
-            return m.lastf;
-    }
-
-    // We are done at this point, as the rest of this function generate
-    // a diagnostic on invalid match
-    if (flags & FuncResolveFlag.quiet)
-        return null;
-
-    auto fd = s.isFuncDeclaration();
-    auto od = s.isOverDeclaration();
-    auto td = s.isTemplateDeclaration();
-    if (td && td.funcroot)
-        s = fd = td.funcroot;
-
-    OutBuffer tiargsBuf;
-    arrayObjectsToBuffer(&tiargsBuf, tiargs);
-
-    OutBuffer fargsBuf;
-    fargsBuf.writeByte('(');
-    argExpTypesToCBuffer(&fargsBuf, fargs);
-    fargsBuf.writeByte(')');
-    if (tthis)
-        tthis.modToBuffer(&fargsBuf);
-
-    // The call is ambiguous
-    if (m.lastf && m.nextf)
-    {
-        TypeFunction tf1 = m.lastf.type.toTypeFunction();
-        TypeFunction tf2 = m.nextf.type.toTypeFunction();
-        const(char)* lastprms = parametersTypeToChars(tf1.parameterList);
-        const(char)* nextprms = parametersTypeToChars(tf2.parameterList);
-
-        const(char)* mod1 = prependSpace(MODtoChars(tf1.mod));
-        const(char)* mod2 = prependSpace(MODtoChars(tf2.mod));
-
-        .error(loc, "`%s.%s` called with argument types `%s` matches both:\n%s:     `%s%s%s`\nand:\n%s:     `%s%s%s`",
-            s.parent.toPrettyChars(), s.ident.toChars(),
-            fargsBuf.peekChars(),
-            m.lastf.loc.toChars(), m.lastf.toPrettyChars(), lastprms, mod1,
-            m.nextf.loc.toChars(), m.nextf.toPrettyChars(), nextprms, mod2);
-        return null;
-    }
-
-    // no match, generate an error messages
-    if (!fd)
-    {
-        // all of overloads are templates
-        if (td)
-        {
-            .error(loc, "%s `%s.%s` cannot deduce function from argument types `!(%s)%s`",
-                   td.kind(), td.parent.toPrettyChars(), td.ident.toChars(),
-                   tiargsBuf.peekChars(), fargsBuf.peekChars());
-
-            printCandidates(loc, td, sc.isDeprecated());
-            return null;
-        }
-        /* This case used to happen when several ctors are mixed in an agregate.
-           A (bad) error message is already generated in overloadApply().
-           see https://issues.dlang.org/show_bug.cgi?id=19729
-           and https://issues.dlang.org/show_bug.cgi?id=17259
-        */
-        if (!od)
-            return null;
-    }
-
-    if (od)
-    {
-        .error(loc, "none of the overloads of `%s` are callable using argument types `!(%s)%s`",
-               od.ident.toChars(), tiargsBuf.peekChars(), fargsBuf.peekChars());
-        return null;
-    }
-
-    // remove when deprecation period of class allocators and deallocators is over
-    if (fd.isNewDeclaration() && fd.checkDisabled(loc, sc))
-        return null;
-
-    bool hasOverloads = fd.overnext !is null;
-    auto tf = fd.type.isTypeFunction();
-    // if type is an error, the original type should be there for better diagnostics
-    if (!tf)
-        tf = fd.originalType.toTypeFunction();
-
-    if (tthis && !MODimplicitConv(tthis.mod, tf.mod)) // modifier mismatch
-    {
-        OutBuffer thisBuf, funcBuf;
-        MODMatchToBuffer(&thisBuf, tthis.mod, tf.mod);
-        auto mismatches = MODMatchToBuffer(&funcBuf, tf.mod, tthis.mod);
-        if (hasOverloads)
-        {
-            .error(loc, "none of the overloads of `%s` are callable using a %sobject",
-                   fd.ident.toChars(), thisBuf.peekChars());
-            printCandidates(loc, fd, sc.isDeprecated());
-            return null;
-        }
-
-        const(char)* failMessage;
-        functionResolve(m, orig_s, loc, sc, tiargs, tthis, fargs, &failMessage);
-        if (failMessage)
-        {
-            .error(loc, "%s `%s%s%s` is not callable using argument types `%s`",
-                   fd.kind(), fd.toPrettyChars(), parametersTypeToChars(tf.parameterList),
-                   tf.modToChars(), fargsBuf.peekChars());
-            errorSupplemental(loc, failMessage);
-            return null;
-        }
-
-        .error(loc, "%smethod `%s` is not callable using a %sobject",
-               funcBuf.peekChars(), fd.toPrettyChars(), thisBuf.peekChars());
-
-        if (mismatches.isNotShared)
-            .errorSupplemental(fd.loc, "Consider adding `shared` here");
-        else if (mismatches.isMutable)
-            .errorSupplemental(fd.loc, "Consider adding `const` or `inout` here");
-        return null;
-    }
-
-    //printf("tf = %s, args = %s\n", tf.deco, (*fargs)[0].type.deco);
-    if (hasOverloads)
-    {
-        .error(loc, "none of the overloads of `%s` are callable using argument types `%s`",
-               fd.toChars(), fargsBuf.peekChars());
-        printCandidates(loc, fd, sc.isDeprecated());
-        return null;
-    }
-
-    .error(loc, "%s `%s%s%s` is not callable using argument types `%s`",
-           fd.kind(), fd.toPrettyChars(), parametersTypeToChars(tf.parameterList),
-           tf.modToChars(), fargsBuf.peekChars());
-    // re-resolve to check for supplemental message
-    const(char)* failMessage;
-    functionResolve(m, orig_s, loc, sc, tiargs, tthis, fargs, &failMessage);
-    if (failMessage)
-        errorSupplemental(loc, failMessage);
-    return null;
-}
-
-/*******************************************
- * Prints template and function overload candidates as supplemental errors.
- * Params:
- *      loc =            instantiation location
- *      declaration =    the declaration to print overload candidates for
- *      showDeprecated = If `false`, `deprecated` function won't be shown
- */
-private void printCandidates(Decl)(const ref Loc loc, Decl declaration, bool showDeprecated)
-if (is(Decl == TemplateDeclaration) || is(Decl == FuncDeclaration))
-{
-    // max num of overloads to print (-v overrides this).
-    enum int DisplayLimit = 5;
-    int displayed;
-    const(char)* constraintsTip;
-
-    // determine if the first candidate was printed
-    bool printed = false;
-
-    overloadApply(declaration, (Dsymbol s)
-    {
-        Dsymbol nextOverload;
-
-        if (auto fd = s.isFuncDeclaration())
-        {
-            // Don't print overloads which have errors.
-            // Not that if the whole overload set has errors, we'll never reach
-            // this point so there's no risk of printing no candidate
-            if (fd.errors || fd.type.ty == Terror)
-                return 0;
-            // Don't print disabled functions, or `deprecated` outside of deprecated scope
-            if (fd.storage_class & STC.disable || (fd.isDeprecated() && !showDeprecated))
-                return 0;
-
-            const single_candidate = fd.overnext is null;
-            auto tf = cast(TypeFunction) fd.type;
-            .errorSupplemental(fd.loc,
-                    printed ? "                `%s%s`" :
-                    single_candidate ? "Candidate is: `%s%s`" : "Candidates are: `%s%s`",
-                    fd.toPrettyChars(),
-                parametersTypeToChars(tf.parameterList));
-            printed = true;
-            nextOverload = fd.overnext;
-        }
-        else if (auto td = s.isTemplateDeclaration())
-        {
-            import dmd.staticcond;
-
-            const tmsg = td.toCharsNoConstraints();
-            const cmsg = td.getConstraintEvalError(constraintsTip);
-
-            const single_candidate = td.overnext is null;
-
-            // add blank space if there are multiple candidates
-            // the length of the blank space is `strlen("Candidates are: ")`
-
-            if (cmsg)
-            {
-                .errorSupplemental(td.loc,
-                        printed ? "                `%s`\n%s" :
-                        single_candidate ? "Candidate is: `%s`\n%s" : "Candidates are: `%s`\n%s",
-                        tmsg, cmsg);
-                printed = true;
-            }
-            else
-            {
-                .errorSupplemental(td.loc,
-                        printed ? "                `%s`" :
-                        single_candidate ? "Candidate is: `%s`" : "Candidates are: `%s`",
-                        tmsg);
-                printed = true;
-            }
-            nextOverload = td.overnext;
-        }
-
-        if (global.params.verbose || ++displayed < DisplayLimit)
-            return 0;
-
-        // Too many overloads to sensibly display.
-        // Just show count of remaining overloads.
-        int num = 0;
-        overloadApply(nextOverload, (s) { ++num; return 0; });
-
-        if (num > 0)
-            .errorSupplemental(loc, "... (%d more, -v to show) ...", num);
-        return 1;   // stop iterating
-    });
-
-    // Nothing was displayed, all overloads are either disabled or deprecated
-    if (!displayed)
-        .errorSupplemental(loc, "All possible candidates are marked as `deprecated` or `@disable`");
-    // should be only in verbose mode
-    if (constraintsTip)
-        .tip(constraintsTip);
 }
 
 /**************************************
@@ -3369,7 +2883,7 @@ private void markAsNeedingClosure(Dsymbol f, FuncDeclaration outerFunc)
     for (Dsymbol sx = f; sx && sx != outerFunc; sx = sx.toParentP(outerFunc))
     {
         FuncDeclaration fy = sx.isFuncDeclaration();
-        if (fy && fy.closureVars.dim)
+        if (fy && fy.closureVars.length)
         {
             /* fy needs a closure if it has closureVars[],
              * because the frame pointer in the closure will be accessed.
@@ -3401,13 +2915,16 @@ private bool checkEscapingSiblings(FuncDeclaration f, FuncDeclaration outerFunc,
         FuncDeclaration f;
     }
 
+    if (f.computedEscapingSiblings)
+        return f.hasEscapingSiblings;
+
     PrevSibling ps;
     ps.p = cast(PrevSibling*)p;
     ps.f = f;
 
     //printf("checkEscapingSiblings(f = %s, outerfunc = %s)\n", f.toChars(), outerFunc.toChars());
     bool bAnyClosures = false;
-    for (size_t i = 0; i < f.siblingCallers.dim; ++i)
+    for (size_t i = 0; i < f.siblingCallers.length; ++i)
     {
         FuncDeclaration g = f.siblingCallers[i];
         if (g.isThis() || g.tookAddressOf)
@@ -3442,6 +2959,8 @@ private bool checkEscapingSiblings(FuncDeclaration f, FuncDeclaration outerFunc,
             prev = prev.p;
         }
     }
+    f.hasEscapingSiblings = bAnyClosures;
+    f.computedEscapingSiblings = true;
     //printf("\t%d\n", bAnyClosures);
     return bAnyClosures;
 }
@@ -3506,15 +3025,15 @@ extern (C++) final class FuncLiteralDeclaration : FuncDeclaration
     // backend
     bool deferToObj;
 
-    extern (D) this(const ref Loc loc, const ref Loc endloc, Type type, TOK tok, ForeachStatement fes, Identifier id = null)
+    extern (D) this(const ref Loc loc, const ref Loc endloc, Type type, TOK tok, ForeachStatement fes, Identifier id = null, StorageClass storage_class = STC.undefined_)
     {
-        super(loc, endloc, null, STC.undefined_, type);
+        super(loc, endloc, null, storage_class, type);
         this.ident = id ? id : Id.empty;
         this.tok = tok;
         this.fes = fes;
         // Always infer scope for function literals
         // See https://issues.dlang.org/show_bug.cgi?id=20362
-        this.flags |= FUNCFLAG.inferScope;
+        this.inferScope = true;
         //printf("FuncLiteralDeclaration() id = '%s', type = '%s'\n", this.ident.toChars(), type.toChars());
     }
 
@@ -3522,7 +3041,7 @@ extern (C++) final class FuncLiteralDeclaration : FuncDeclaration
     {
         //printf("FuncLiteralDeclaration::syntaxCopy('%s')\n", toChars());
         assert(!s);
-        auto f = new FuncLiteralDeclaration(loc, endloc, type.syntaxCopy(), tok, fes, ident);
+        auto f = new FuncLiteralDeclaration(loc, endloc, type.syntaxCopy(), tok, fes, ident, storage_class & STC.auto_);
         f.treq = treq; // don't need to copy
         FuncDeclaration.syntaxCopy(f);
         return f;
@@ -3565,7 +3084,7 @@ extern (C++) final class FuncLiteralDeclaration : FuncDeclaration
      * If B to A conversion is convariant that requires offseet adjusting,
      * all return statements should be adjusted to return expressions typed A.
      */
-    void modifyReturns(Scope* sc, Type tret)
+    extern (D) void modifyReturns(Scope* sc, Type tret)
     {
         import dmd.statement_rewrite_walker;
 
@@ -3581,9 +3100,7 @@ extern (C++) final class FuncLiteralDeclaration : FuncDeclaration
             {
                 Expression exp = s.exp;
                 if (exp && !exp.type.equals(tret))
-                {
-                    s.exp = exp.castTo(sc, tret);
-                }
+                    s.exp = exp.implicitCastTo(sc, tret);
             }
         }
 
@@ -3643,7 +3160,7 @@ extern (C++) final class CtorDeclaration : FuncDeclaration
     {
         super(loc, endloc, Id.ctor, stc, type);
         this.isCpCtor = isCpCtor;
-        //printf("CtorDeclaration(loc = %s) %s\n", loc.toChars(), toChars());
+        //printf("CtorDeclaration(loc = %s) %s %p\n", loc.toChars(), toChars(), this);
     }
 
     override CtorDeclaration syntaxCopy(Dsymbol s)
@@ -3865,6 +3382,9 @@ extern (C++) class StaticCtorDeclaration : FuncDeclaration
  */
 extern (C++) final class SharedStaticCtorDeclaration : StaticCtorDeclaration
 {
+    /// Exclude this constructor from cyclic dependency check
+    bool standalone;
+
     extern (D) this(const ref Loc loc, const ref Loc endloc, StorageClass stc)
     {
         super(loc, endloc, "_sharedStaticCtor", stc);
@@ -3983,6 +3503,7 @@ extern (C++) final class InvariantDeclaration : FuncDeclaration
 {
     extern (D) this(const ref Loc loc, const ref Loc endloc, StorageClass stc, Identifier id, Statement fbody)
     {
+        // Make a unique invariant for now; we'll fix it up as we add it to the aggregate invariant list.
         super(loc, endloc, id ? id : Identifier.generateId("__invariant"), stc, null);
         this.fbody = fbody;
     }
@@ -4018,6 +3539,15 @@ extern (C++) final class InvariantDeclaration : FuncDeclaration
     override void accept(Visitor v)
     {
         v.visit(this);
+    }
+
+    extern (D) void fixupInvariantIdent(size_t offset)
+    {
+        OutBuffer idBuf;
+        idBuf.writestring("__invariant");
+        idBuf.print(offset);
+
+        ident = Identifier.idPool(idBuf[]);
     }
 }
 
@@ -4121,5 +3651,222 @@ extern (C++) final class NewDeclaration : FuncDeclaration
     override void accept(Visitor v)
     {
         v.visit(this);
+    }
+}
+
+/**************************************
+ * When a traits(compiles) is used on a function literal call
+ * we need to take into account if the body of the function
+ * violates any attributes, however, we must not affect the
+ * attribute inference on the outer function. The attributes
+ * of the function literal still need to be inferred, therefore
+ * we need a way to check for the scope that the traits compiles
+ * introduces.
+ *
+ * Params:
+ *   sc = scope to be checked for
+ *
+ * Returns: `true` if the provided scope is the root
+ * of the traits compiles list of scopes.
+ */
+bool isRootTraitsCompilesScope(Scope* sc)
+{
+    return (sc.flags & SCOPE.compile) && !(sc.func.flags & SCOPE.compile);
+}
+
+/**************************************
+ * A statement / expression in this scope is not `@safe`,
+ * so mark the enclosing function as `@system`
+ *
+ * Params:
+ *   sc = scope that the unsafe statement / expression is in
+ *   gag = surpress error message (used in escape.d)
+ *   loc = location of error
+ *   fmt = printf-style format string
+ *   arg0  = (optional) argument for first %s format specifier
+ *   arg1  = (optional) argument for second %s format specifier
+ *   arg2  = (optional) argument for third %s format specifier
+ * Returns: whether there's a safe error
+ */
+bool setUnsafe(Scope* sc,
+    bool gag = false, Loc loc = Loc.init, const(char)* fmt = null,
+    RootObject arg0 = null, RootObject arg1 = null, RootObject arg2 = null)
+{
+    if (sc.intypeof)
+        return false; // typeof(cast(int*)0) is safe
+
+    if (sc.flags & SCOPE.debug_) // debug {} scopes are permissive
+        return false;
+
+    if (!sc.func)
+    {
+        if (sc.varDecl)
+        {
+            if (sc.varDecl.storage_class & STC.safe)
+            {
+                .error(loc, fmt, arg0 ? arg0.toChars() : "", arg1 ? arg1.toChars() : "", arg2 ? arg2.toChars() : "");
+                return true;
+            }
+            else if (!(sc.varDecl.storage_class & STC.trusted))
+            {
+                sc.varDecl.storage_class |= STC.system;
+                sc.varDecl.systemInferred = true;
+            }
+        }
+        return false;
+    }
+
+
+    if (isRootTraitsCompilesScope(sc)) // __traits(compiles, x)
+    {
+        if (sc.func.isSafeBypassingInference())
+        {
+            // Message wil be gagged, but still call error() to update global.errors and for
+            // -verrors=spec
+            .error(loc, fmt, arg0 ? arg0.toChars() : "", arg1 ? arg1.toChars() : "", arg2 ? arg2.toChars() : "");
+            return true;
+        }
+        return false;
+    }
+
+    return sc.func.setUnsafe(gag, loc, fmt, arg0, arg1, arg2);
+}
+
+/***************************************
+ * Like `setUnsafe`, but for safety errors still behind preview switches
+ *
+ * Given a `FeatureState fs`, for example dip1000 / dip25 / systemVariables,
+ * the behavior changes based on the setting:
+ *
+ * - In case of `-revert=fs`, it does nothing.
+ * - In case of `-preview=fs`, it's the same as `setUnsafe`
+ * - By default, print a deprecation in `@safe` functions, or store an attribute violation in inferred functions.
+ *
+ * Params:
+ *   sc = used to find affected function/variable, and for checking whether we are in a deprecated / speculative scope
+ *   fs = feature state from the preview flag
+ *   gag = surpress error message
+ *   loc = location of error
+ *   msg = printf-style format string
+ *   arg0  = (optional) argument for first %s format specifier
+ *   arg1  = (optional) argument for second %s format specifier
+ *   arg2  = (optional) argument for third %s format specifier
+ * Returns: whether an actual safe error (not deprecation) occured
+ */
+bool setUnsafePreview(Scope* sc, FeatureState fs, bool gag, Loc loc, const(char)* msg,
+    RootObject arg0 = null, RootObject arg1 = null, RootObject arg2 = null)
+{
+    //printf("setUnsafePreview() fs:%d %s\n", fs, msg);
+    with (FeatureState) final switch (fs)
+    {
+      case disabled:
+        return false;
+
+      case enabled:
+        return sc.setUnsafe(gag, loc, msg, arg0, arg1, arg2);
+
+      case default_:
+        if (!sc.func)
+            return false;
+        if (sc.func.isSafeBypassingInference())
+        {
+            if (!gag && !sc.isDeprecated())
+            {
+                deprecation(loc, msg, arg0 ? arg0.toChars() : "", arg1 ? arg1.toChars() : "", arg2 ? arg2.toChars() : "");
+            }
+        }
+        else if (!sc.func.safetyViolation)
+        {
+            import dmd.func : AttributeViolation;
+            sc.func.safetyViolation = new AttributeViolation(loc, msg, arg0, arg1, arg2);
+        }
+        return false;
+    }
+}
+
+/// Stores a reason why a function failed to infer a function attribute like `@safe` or `pure`
+///
+/// Has two modes:
+/// - a regular safety error, stored in (fmtStr, arg0, arg1)
+/// - a call to a function without the attribute, which is a special case, because in that case,
+///   that function might recursively also have a `AttributeViolation`. This way, in case
+///   of a big call stack, the error can go down all the way to the root cause.
+///   The `FunctionDeclaration` is then stored in `arg0` and `fmtStr` must be `null`.
+struct AttributeViolation
+{
+    /// location of error
+    Loc loc = Loc.init;
+    /// printf-style format string
+    const(char)* fmtStr = null;
+    /// Arguments for up to two `%s` format specifiers in format string
+    RootObject arg0 = null;
+    /// ditto
+    RootObject arg1 = null;
+    /// ditto
+    RootObject arg2 = null;
+}
+
+/// Print the reason why `fd` was inferred `@system` as a supplemental error
+/// Params:
+///   fd = function to check
+///   maxDepth = up to how many functions deep to report errors
+///   deprecation = print deprecations instead of errors
+///   stc = storage class of attribute to check
+void errorSupplementalInferredAttr(FuncDeclaration fd, int maxDepth, bool deprecation, STC stc)
+{
+    auto errorFunc = deprecation ? &deprecationSupplemental : &errorSupplemental;
+
+    AttributeViolation* s;
+    const(char)* attr;
+    if (stc & STC.safe)
+    {
+        s = fd.safetyViolation;
+        attr = "@safe";
+    }
+    else if (stc & STC.pure_)
+    {
+        s = fd.pureViolation;
+        attr = "pure";
+    }
+    else if (stc & STC.nothrow_)
+    {
+        s = fd.nothrowViolation;
+        attr = "nothrow";
+    }
+    else if (stc & STC.nogc)
+    {
+        s = fd.nogcViolation;
+        attr = "@nogc";
+    }
+
+    if (s)
+    {
+        if (s.fmtStr)
+        {
+            errorFunc(s.loc, deprecation ?
+                "which wouldn't be `%s` because of:" :
+                "which wasn't inferred `%s` because of:", attr);
+            if (stc == STC.nogc || stc == STC.pure_)
+            {
+                auto f = (cast(Dsymbol) s.arg0).isFuncDeclaration();
+                errorFunc(s.loc, s.fmtStr, f.kind(), f.toPrettyChars(), s.arg1 ? s.arg1.toChars() : "");
+            }
+            else
+            {
+                errorFunc(s.loc, s.fmtStr,
+                    s.arg0 ? s.arg0.toChars() : "", s.arg1 ? s.arg1.toChars() : "", s.arg2 ? s.arg2.toChars() : "");
+            }
+        }
+        else if (auto sa = s.arg0.isDsymbol())
+        {
+            if (FuncDeclaration fd2 = sa.isFuncDeclaration())
+            {
+                if (maxDepth > 0)
+                {
+                    errorFunc(s.loc, "which calls `%s`", fd2.toPrettyChars());
+                    errorSupplementalInferredAttr(fd2, maxDepth - 1, deprecation, stc);
+                }
+            }
+        }
     }
 }

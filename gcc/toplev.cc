@@ -1,5 +1,5 @@
 /* Top level of GCC compilers (cc1, cc1plus, etc.)
-   Copyright (C) 1987-2022 Free Software Foundation, Inc.
+   Copyright (C) 1987-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -49,6 +49,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "insn-attr.h"
 #include "output.h"
 #include "toplev.h"
+#include "compile-cache.h"
 #include "expr.h"
 #include "intl.h"
 #include "tree-diagnostic.h"
@@ -74,7 +75,10 @@ along with GCC; see the file COPYING3.  If not see
 #include "ipa-reference.h"
 #include "symbol-summary.h"
 #include "tree-vrp.h"
+#include "sreal.h"
+#include "ipa-cp.h"
 #include "ipa-prop.h"
+#include "ipa-utils.h"
 #include "gcse.h"
 #include "omp-offload.h"
 #include "edit-context.h"
@@ -88,16 +92,13 @@ along with GCC; see the file COPYING3.  If not see
 #include "ipa-modref.h"
 #include "ipa-param-manipulation.h"
 #include "dbgcnt.h"
-
-#if defined(DBX_DEBUGGING_INFO) || defined(XCOFF_DEBUGGING_INFO)
-#include "dbxout.h"
-#endif
-
-#ifdef XCOFF_DEBUGGING_INFO
-#include "xcoffout.h"		/* Needed for external data declarations. */
-#endif
+#include "gcc-urlifier.h"
 
 #include "selftest.h"
+
+#ifdef HAVE_LIBGAS
+#include "gas-embed.h"		/* for -fintegrated-as (gas_assemble_buffer) */
+#endif
 
 #ifdef HAVE_isl
 #include <isl/version.h>
@@ -107,7 +108,7 @@ static void general_init (const char *, bool);
 static void backend_init (void);
 static int lang_dependent_init (const char *);
 static void init_asm_output (const char *);
-static void finalize (bool);
+static void finalize ();
 
 static void crash_signal (int) ATTRIBUTE_NORETURN;
 static void compile_file (void);
@@ -167,10 +168,28 @@ const char *user_label_prefix;
    and debugging dumps.  */
 
 FILE *asm_out_file;
+
+/* The integrated assembler (on by default, -fintegrated-as): cc1plus folds
+   the GNU assembler (libgas, gcc/gas-embed.h) into the compiler so a
+   compile-to-object is a single process.  When the output is a real object
+   file, asm_out_file is an open_memstream() handle and these capture the
+   buffer it writes into.  After fclose(asm_out_file) they hold the complete
+   assembly text, which is then handed to gas_assemble_buffer() to produce
+   the object file (or, for -S / -fno-integrated-as, written verbatim to the
+   text output and not assembled -- see the flag_asm_output_only fold in
+   process_options).  */
+static char *asm_mem_buf;
+static size_t asm_mem_size;
+/* True when asm_out_file is an open_memstream() handle (set in
+   init_asm_output).  Checked at finalize independently of asm_mem_buf, which
+   open_memstream only populates once the stream is flushed/closed.  */
+static bool asm_using_memstream;
+
 FILE *aux_info_file;
 FILE *callgraph_info_file = NULL;
 static bitmap callgraph_info_external_printed;
 FILE *stack_usage_file = NULL;
+static bool no_backend = false;
 
 /* The current working directory of a translation.  It's generally the
    directory from which compilation was initiated, but a preprocessed
@@ -331,7 +350,7 @@ wrapup_global_declaration_1 (tree decl)
 {
   /* We're not deferring this any longer.  Assignment is conditional to
      avoid needlessly dirtying PCH pages.  */
-  if (CODE_CONTAINS_STRUCT (TREE_CODE (decl), TS_DECL_WITH_VIS)
+  if (HAS_DECL_ASSEMBLER_NAME_P (decl)
       && DECL_DEFER_OUTPUT (decl) != 0)
     DECL_DEFER_OUTPUT (decl) = 0;
 
@@ -462,7 +481,10 @@ compile_file (void)
   /* Compilation is now finished except for writing
      what's left of the symbol table output.  */
 
-  if (flag_syntax_only || flag_wpa)
+  /* On a compilation-cache hit, the .s has already been written into
+     asm_out_file by compile_cache_try_serve() during parsing; skip the
+     back-end entirely.  */
+  if (flag_syntax_only || flag_wpa || compile_cache_hit_p ())
     return;
  
   /* Reset maximum_field_alignment, it can be adjusted by #pragma pack
@@ -707,9 +729,20 @@ init_asm_output (const char *name)
 	}
       if (!strcmp (asm_file_name, "-"))
 	asm_out_file = stdout;
-      else if (!canonical_filename_eq (asm_file_name, name)
-	       || !strcmp (asm_file_name, HOST_BIT_BUCKET))
+      else if (!strcmp (asm_file_name, HOST_BIT_BUCKET))
+	/* -fsyntax-only and friends: keep writing to the bit bucket; no
+	   object is produced and the integrated assembler is not invoked.  */
 	asm_out_file = fopen (asm_file_name, "w");
+      else if (!canonical_filename_eq (asm_file_name, name))
+	/* Real output.  Build the assembly into an in-memory buffer instead of
+	   writing it straight to a file.  At finalize() the buffer is either
+	   handed to the integrated assembler to produce the object file, or
+	   (when emitting assembly only, -S) written verbatim to asm_file_name.
+	   This is the seam that lets a compile-to-object run in one process.  */
+	{
+	  asm_out_file = open_memstream (&asm_mem_buf, &asm_mem_size);
+	  asm_using_memstream = true;
+	}
       else
 	/* Use UNKOWN_LOCATION to prevent gcc from printing the first
 	   line in the current file. */
@@ -721,7 +754,7 @@ init_asm_output (const char *name)
 		     "cannot open %qs for writing: %m", asm_file_name);
     }
 
-  if (!flag_syntax_only)
+  if (!flag_syntax_only && !(global_dc->get_lang_mask () & CL_LTODump))
     {
       targetm.asm_out.file_start ();
 
@@ -837,7 +870,8 @@ output_stack_usage_1 (FILE *cf)
   if (stack_usage_file)
     {
       print_decl_identifier (stack_usage_file, current_function_decl,
-			     PRINT_DECL_ORIGIN | PRINT_DECL_NAME);
+			     PRINT_DECL_ORIGIN | PRINT_DECL_NAME
+			     | PRINT_DECL_REMAP_DEBUG);
       fprintf (stack_usage_file, "\t" HOST_WIDE_INT_PRINT_DEC"\t%s\n",
 	       stack_usage, stack_usage_kind_str[stack_usage_kind]);
     }
@@ -992,7 +1026,7 @@ internal_error_reentered (diagnostic_context *, const char *, va_list *)
 static void
 internal_error_function (diagnostic_context *, const char *, va_list *)
 {
-  global_dc->internal_error = internal_error_reentered;
+  global_dc->m_internal_error = internal_error_reentered;
   warn_if_plugins ();
   emergency_dump_function ();
 }
@@ -1025,34 +1059,37 @@ general_init (const char *argv0, bool init_signals)
   /* Initialize the diagnostics reporting machinery, so option parsing
      can give warnings and errors.  */
   diagnostic_initialize (global_dc, N_OPTS);
-  global_dc->lang_mask = lang_hooks.option_lang_mask ();
   /* Set a default printer.  Language specific initializations will
      override it later.  */
   tree_diagnostics_defaults (global_dc);
 
-  global_dc->show_caret
+  global_dc->m_source_printing.enabled
     = global_options_init.x_flag_diagnostics_show_caret;
-  global_dc->show_labels_p
+  global_dc->m_source_printing.show_labels_p
     = global_options_init.x_flag_diagnostics_show_labels;
-  global_dc->show_line_numbers_p
+  global_dc->m_source_printing.show_line_numbers_p
     = global_options_init.x_flag_diagnostics_show_line_numbers;
-  global_dc->show_cwe
-    = global_options_init.x_flag_diagnostics_show_cwe;
-  global_dc->path_format
-    = (enum diagnostic_path_format)global_options_init.x_flag_diagnostics_path_format;
-  global_dc->show_path_depths
-    = global_options_init.x_flag_diagnostics_show_path_depths;
-  global_dc->show_option_requested
-    = global_options_init.x_flag_diagnostics_show_option;
-  global_dc->min_margin_width
+  global_dc->set_show_cwe (global_options_init.x_flag_diagnostics_show_cwe);
+  global_dc->set_show_rules (global_options_init.x_flag_diagnostics_show_rules);
+  global_dc->set_path_format
+    ((enum diagnostic_path_format)
+     global_options_init.x_flag_diagnostics_path_format);
+  global_dc->set_show_path_depths
+    (global_options_init.x_flag_diagnostics_show_path_depths);
+  global_dc->set_show_option_requested
+    (global_options_init.x_flag_diagnostics_show_option);
+  global_dc->m_source_printing.min_margin_width
     = global_options_init.x_diagnostics_minimum_margin_width;
-  global_dc->show_column
+  global_dc->m_show_column
     = global_options_init.x_flag_show_column;
-  global_dc->internal_error = internal_error_function;
-  global_dc->option_enabled = option_enabled;
-  global_dc->option_state = &global_options;
-  global_dc->option_name = option_name;
-  global_dc->get_option_url = get_option_url;
+  global_dc->m_internal_error = internal_error_function;
+  const unsigned lang_mask = lang_hooks.option_lang_mask ();
+  global_dc->set_option_hooks (option_enabled,
+			       &global_options,
+			       option_name,
+			       get_option_url,
+			       lang_mask);
+  global_dc->set_urlifier (make_gcc_urlifier (lang_mask));
 
   if (init_signals)
     {
@@ -1087,8 +1124,8 @@ general_init (const char *argv0, bool init_signals)
   input_location = UNKNOWN_LOCATION;
   line_table = ggc_alloc<line_maps> ();
   linemap_init (line_table, BUILTINS_LOCATION);
-  line_table->reallocator = realloc_for_line_map;
-  line_table->round_alloc_size = ggc_round_alloc_size;
+  line_table->m_reallocator = realloc_for_line_map;
+  line_table->m_round_alloc_size = ggc_round_alloc_size;
   line_table->default_range_bits = 5;
   init_ttree ();
 
@@ -1226,7 +1263,7 @@ parse_alignment_opts (void)
 
 /* Process the options that have been parsed.  */
 static void
-process_options (bool no_backend)
+process_options ()
 {
   const char *language_string = lang_hooks.name;
 
@@ -1239,7 +1276,7 @@ process_options (bool no_backend)
   input_location = saved_location;
 
   if (flag_diagnostics_generate_patch)
-      global_dc->edit_context_ptr = new edit_context ();
+    global_dc->create_edit_context ();
 
   /* Avoid any informative notes in the second run of -fcompare-debug.  */
   if (flag_compare_debug) 
@@ -1255,6 +1292,33 @@ process_options (bool no_backend)
 
   if (flag_short_enums == 2)
     flag_short_enums = targetm.default_short_enums ();
+
+#ifndef HAVE_LIBGAS
+  /* Built without the embedded assembler (not a combined tree, or a target
+     libgas does not support): the integrated assembler cannot run at all.
+     An explicit -fintegrated-as is a loud error; the silent default flips
+     to the classic external-as pipeline (the driver's invoke_as made the
+     same compile-time choice, so it already routed this compile through
+     `as`).  */
+  if (flag_integrated_as)
+    {
+      if (global_options_set.x_flag_integrated_as)
+	sorry ("%<-fintegrated-as%> is not supported by this configuration "
+	       "of the compiler (built without libgas)");
+      flag_integrated_as = 0;
+    }
+#endif
+
+  /* -fno-integrated-as: skip the in-process assembler and emit textual
+     assembly to the output file instead, exactly like -S / the PCH specs do
+     via -fasm-output-only -- reuse that internal flag so init_asm_output /
+     finalize need no third mode.  The driver's invoke_as pairs this with an
+     external `as` stage that turns the temporary .s into the real object
+     (and passes -fasm-output-only itself; this fold additionally covers a
+     bare cc1/cc1plus invocation, which then writes text to its -o just like
+     stock GCC did).  */
+  if (!flag_integrated_as)
+    flag_asm_output_only = 1;
 
   /* Set aux_base_name if not already set.  */
   if (aux_base_name)
@@ -1364,7 +1428,7 @@ process_options (bool no_backend)
      option flags in use.  */
   if (version_flag)
     {
-      print_version (stderr, "", true);
+      /* We already printed the version header in main ().  */
       if (!quiet_flag)
 	{
 	  fputs ("options passed: ", stderr);
@@ -1415,21 +1479,8 @@ process_options (bool no_backend)
       && ctf_debug_info_level == CTFINFO_LEVEL_NONE)
     write_symbols = NO_DEBUG;
 
-  /* Warn if STABS debug gets enabled and is not the default.  */
-  if (PREFERRED_DEBUGGING_TYPE != DBX_DEBUG && (write_symbols & DBX_DEBUG))
-    warning (0, "STABS debugging information is obsolete and not "
-	     "supported anymore");
-
   if (write_symbols == NO_DEBUG)
     ;
-#if defined(DBX_DEBUGGING_INFO)
-  else if (write_symbols == DBX_DEBUG)
-    debug_hooks = &dbx_debug_hooks;
-#endif
-#if defined(XCOFF_DEBUGGING_INFO)
-  else if (write_symbols == XCOFF_DEBUG)
-    debug_hooks = &xcoff_debug_hooks;
-#endif
 #ifdef DWARF2_DEBUGGING_INFO
   else if (dwarf_debuginfo_p ())
     debug_hooks = &dwarf2_debug_hooks;
@@ -1456,30 +1507,6 @@ process_options (bool no_backend)
       error_at (UNKNOWN_LOCATION,
 		"target system does not support the %qs debug format",
 		debug_type_names[debug_set_to_format (write_symbols)]);
-    }
-
-  /* We know which debug output will be used so we can set flag_var_tracking
-     and flag_var_tracking_uninit if the user has not specified them.  */
-  if (debug_info_level < DINFO_LEVEL_NORMAL
-      || !dwarf_debuginfo_p ()
-      || debug_hooks->var_location == do_nothing_debug_hooks.var_location)
-    {
-      if ((OPTION_SET_P (flag_var_tracking) && flag_var_tracking == 1)
-	  || (OPTION_SET_P (flag_var_tracking_uninit)
-	      && flag_var_tracking_uninit == 1))
-        {
-	  if (debug_info_level < DINFO_LEVEL_NORMAL)
-	    warning_at (UNKNOWN_LOCATION, 0,
-			"variable tracking requested, but useless unless "
-			"producing debug info");
-	  else
-	    warning_at (UNKNOWN_LOCATION, 0,
-			"variable tracking requested, but not supported "
-			"by this debug format");
-	}
-      flag_var_tracking = 0;
-      flag_var_tracking_uninit = 0;
-      flag_var_tracking_assignments = 0;
     }
 
   /* The debug hooks are used to implement -fdump-go-spec because it
@@ -1608,6 +1635,13 @@ process_options (bool no_backend)
       flag_associative_math = 0;
     }
 
+  if (flag_hardened && !HAVE_FHARDENED_SUPPORT)
+    {
+      warning_at (UNKNOWN_LOCATION, 0,
+		  "%<-fhardened%> not supported for this target");
+      flag_hardened = 0;
+    }
+
   /* -fstack-clash-protection is not currently supported on targets
      where the stack grows up.  */
   if (flag_stack_clash_protection && !STACK_GROWS_DOWNWARD)
@@ -1617,13 +1651,26 @@ process_options (bool no_backend)
 		  "where the stack grows from lower to higher addresses");
       flag_stack_clash_protection = 0;
     }
+  else if (flag_hardened)
+    {
+      if (!flag_stack_clash_protection
+	   /* Don't enable -fstack-clash-protection when -fstack-check=
+	      is used: it would result in confusing errors.  */
+	   && flag_stack_check == NO_STACK_CHECK)
+	flag_stack_clash_protection = 1;
+      else if (flag_stack_check != NO_STACK_CHECK)
+	warning_at (UNKNOWN_LOCATION, OPT_Whardened,
+		    "%<-fstack-clash-protection%> is not enabled by "
+		    "%<-fhardened%> because %<-fstack-check%> was "
+		    "specified on the command line");
+    }
 
   /* We cannot support -fstack-check= and -fstack-clash-protection at
      the same time.  */
   if (flag_stack_check != NO_STACK_CHECK && flag_stack_clash_protection)
     {
       warning_at (UNKNOWN_LOCATION, 0,
-		  "%<-fstack-check=%> and %<-fstack-clash_protection%> are "
+		  "%<-fstack-check=%> and %<-fstack-clash-protection%> are "
 		  "mutually exclusive; disabling %<-fstack-check=%>");
       flag_stack_check = NO_STACK_CHECK;
     }
@@ -1632,8 +1679,9 @@ process_options (bool no_backend)
      target already uses a soft frame pointer, the transition is trivial.  */
   if (!FRAME_GROWS_DOWNWARD && flag_stack_protect)
     {
-      warning_at (UNKNOWN_LOCATION, 0,
-		  "%<-fstack-protector%> not supported for this target");
+      if (!flag_stack_protector_set_by_fhardened_p)
+	warning_at (UNKNOWN_LOCATION, 0,
+		    "%<-fstack-protector%> not supported for this target");
       flag_stack_protect = 0;
     }
   if (!flag_stack_protect)
@@ -1679,6 +1727,16 @@ process_options (bool no_backend)
       flag_sanitize &= ~SANITIZE_HWADDRESS;
     }
 
+  if (flag_sanitize & SANITIZE_SHADOW_CALL_STACK)
+    {
+      if (!targetm.have_shadow_call_stack)
+	sorry ("%<-fsanitize=shadow-call-stack%> not supported "
+	       "in current platform");
+      else if (flag_exceptions)
+	error_at (UNKNOWN_LOCATION, "%<-fsanitize=shadow-call-stack%> "
+		  "requires %<-fno-exceptions%>");
+    }
+
   HOST_WIDE_INT patch_area_size, patch_area_start;
   parse_and_check_patch_area (flag_patchable_function_entry, false,
 			      &patch_area_size, &patch_area_start);
@@ -1695,13 +1753,11 @@ process_options (bool no_backend)
   if (!OPTION_SET_P (warnings_are_errors))
     {
       if (warn_coverage_mismatch
-	  && (global_dc->classify_diagnostic[OPT_Wcoverage_mismatch] ==
-	      DK_UNSPECIFIED))
+	  && option_unspecified_p (OPT_Wcoverage_mismatch))
 	diagnostic_classify_diagnostic (global_dc, OPT_Wcoverage_mismatch,
 					DK_ERROR, UNKNOWN_LOCATION);
       if (warn_coverage_invalid_linenum
-	  && (global_dc->classify_diagnostic[OPT_Wcoverage_invalid_line_number] ==
-	      DK_UNSPECIFIED))
+	  && option_unspecified_p (OPT_Wcoverage_invalid_line_number))
 	diagnostic_classify_diagnostic (global_dc, OPT_Wcoverage_invalid_line_number,
 					DK_ERROR, UNKNOWN_LOCATION);
     }
@@ -1903,6 +1959,9 @@ lang_dependent_init (const char *name)
 void
 target_reinit (void)
 {
+  if (no_backend)
+    return;
+
   struct rtl_data saved_x_rtl;
   rtx *saved_regno_reg_rtx;
   tree saved_optimization_current_node;
@@ -1995,7 +2054,7 @@ dump_memory_report (const char *header)
 /* Clean up: close opened files, etc.  */
 
 static void
-finalize (bool no_backend)
+finalize ()
 {
   /* Close the dump files.  */
   if (flag_gen_aux_info)
@@ -2012,11 +2071,75 @@ finalize (bool no_backend)
 
   if (asm_out_file)
     {
+      bool used_memstream = asm_using_memstream;
       if (ferror (asm_out_file) != 0)
 	fatal_error (input_location, "error writing to %s: %m", asm_file_name);
+      /* For the integrated-assembler path asm_out_file is an open_memstream;
+	 closing it flushes the captured assembly text into asm_mem_buf and
+	 sets asm_mem_size to its length.  For the plain text-file path (stdout
+	 / bit bucket) this is just the normal close.  */
       if (fclose (asm_out_file) != 0)
 	fatal_error (input_location, "error closing %s: %m", asm_file_name);
       asm_out_file = NULL;
+
+      /* When the output was a real object file, init_asm_output captured the
+	 back-end's assembly into an in-memory stream instead of a text file.
+	 Now either write that text verbatim to the text output (-S, or the
+	 -fno-integrated-as pipeline, both folded into flag_asm_output_only)
+	 or assemble it in-process to the object, with no forked `as` and no
+	 temporary .s file.
+
+	 On a compilation-cache HIT none of this runs: the serve path already
+	 placed the cached .o at asm_file_name and closed the (empty) memstream,
+	 setting asm_out_file = NULL, so this whole block is skipped and
+	 compile_cache_store() below no-ops.  */
+      if (used_memstream)
+	{
+	  if (flag_asm_output_only)
+	    {
+	      /* The user asked for -S, or the external-assembler pipeline is
+		 in effect (-fno-integrated-as): emit the assembly text
+		 verbatim to the text output file and do not assemble it.  */
+	      FILE *sf = fopen (asm_file_name, "w");
+	      if (sf == NULL)
+		fatal_error (input_location,
+			     "cannot open %qs for writing: %m", asm_file_name);
+	      if (asm_mem_size != 0
+		  && fwrite (asm_mem_buf, 1, asm_mem_size, sf) != asm_mem_size)
+		fatal_error (input_location,
+			     "error writing to %s: %m", asm_file_name);
+	      if (fclose (sf) != 0)
+		fatal_error (input_location,
+			     "error closing %s: %m", asm_file_name);
+	    }
+	  else if (!seen_error ())
+	    {
+#ifdef HAVE_LIBGAS
+	      /* Compile-to-object: assemble the buffered text in-process,
+		 writing the object straight to asm_file_name (the .o path the
+		 driver handed us).  gas_assemble_buffer is the libgas entry
+		 point declared in gas-embed.h.  No forked `as`, no temporary
+		 .s file.  A broken TU (seen_error) is not fed to the
+		 assembler.  */
+	      int rc = gas_assemble_buffer (asm_mem_buf ? asm_mem_buf : "",
+					    asm_mem_size, asm_file_name);
+	      if (rc != 0)
+		fatal_error (input_location,
+			     "integrated assembler failed on %qs (code %d)",
+			     asm_file_name, rc);
+#else
+	      /* Unreachable: without libgas, process_options forced
+		 !flag_integrated_as and therefore flag_asm_output_only, so
+		 a real object request never lands in this branch.  */
+	      gcc_unreachable ();
+#endif
+	    }
+
+	  free (asm_mem_buf);
+	  asm_mem_buf = NULL;
+	  asm_mem_size = 0;
+	  asm_using_memstream = false;
+	}
     }
 
   if (stack_usage_file)
@@ -2077,7 +2200,7 @@ standard_type_bitsize (int bitsize)
 
 /* Initialize the compiler, and compile the input file.  */
 static void
-do_compile (bool no_backend)
+do_compile ()
 {
   /* Don't do any more if an error has already occurred.  */
   if (!seen_error ())
@@ -2164,7 +2287,12 @@ do_compile (bool no_backend)
 
       timevar_start (TV_PHASE_FINALIZE);
 
-      finalize (no_backend);
+      finalize ();
+
+      /* If this was a cache miss, the back-end has now produced and
+	 finalize() has closed the .s file; publish it to the cache.  No-op
+	 on a hit, on error, or when caching is disabled.  */
+      compile_cache_store ();
 
       timevar_stop (TV_PHASE_FINALIZE);
     }
@@ -2285,6 +2413,10 @@ toplev::main (int argc, char **argv)
 
   initialize_plugins ();
 
+  /* Handle the dump options now that plugins have had a chance to install new
+     passes.  */
+  handle_deferred_dump_options ();
+
   if (version_flag)
     print_version (stderr, "", true);
 
@@ -2301,15 +2433,15 @@ toplev::main (int argc, char **argv)
 	 initialization based on the command line options.  This hook also
 	 sets the original filename if appropriate (e.g. foo.i -> foo.c)
 	 so we can correctly initialize debug output.  */
-      bool no_backend = lang_hooks.post_options (&main_input_filename);
+      no_backend = lang_hooks.post_options (&main_input_filename);
 
-      process_options (no_backend);
+      process_options ();
 
       if (m_use_TV_TOTAL)
 	start_timevars ();
-      do_compile (no_backend);
+      do_compile ();
 
-      if (flag_self_test)
+      if (flag_self_test && !seen_error ())
 	{
 	  if (no_backend)
 	    error_at (UNKNOWN_LOCATION, "self-tests incompatible with %<-E%>");
@@ -2325,13 +2457,11 @@ toplev::main (int argc, char **argv)
      emit some diagnostics here.  */
   invoke_plugin_callbacks (PLUGIN_FINISH, NULL);
 
-  if (flag_diagnostics_generate_patch)
+  if (auto edit_context_ptr = global_dc->get_edit_context ())
     {
-      gcc_assert (global_dc->edit_context_ptr);
-
       pretty_printer pp;
       pp_show_color (&pp) = pp_show_color (global_dc->printer);
-      global_dc->edit_context_ptr->print_diff (&pp, true);
+      edit_context_ptr->print_diff (&pp, true);
       pp_flush (&pp);
     }
 
@@ -2352,6 +2482,7 @@ toplev::main (int argc, char **argv)
 void
 toplev::finalize (void)
 {
+  no_backend = false;
   rtl_initialized = false;
   this_target_rtl->target_specific_initialized = false;
 
@@ -2360,14 +2491,22 @@ toplev::finalize (void)
   ipa_fnsummary_cc_finalize ();
   ipa_modref_cc_finalize ();
   ipa_edge_modifications_finalize ();
+  ipa_icf_cc_finalize ();
 
+  ipa_prop_cc_finalize ();
+  ipa_profile_cc_finalize ();
+  ipa_sra_cc_finalize ();
   cgraph_cc_finalize ();
   cgraphunit_cc_finalize ();
   symtab_thunks_cc_finalize ();
+  dwarf2cfi_cc_finalize ();
   dwarf2out_cc_finalize ();
   gcse_cc_finalize ();
   ipa_cp_cc_finalize ();
   ira_costs_cc_finalize ();
+  tree_cc_finalize ();
+  reginfo_cc_finalize ();
+  varasm_cc_finalize ();
 
   /* save_decoded_options uses opts_obstack, so these must
      be cleaned up together.  */
@@ -2375,6 +2514,8 @@ toplev::finalize (void)
   XDELETEVEC (save_decoded_options);
   save_decoded_options = NULL;
   save_decoded_options_count = 0;
+
+  ggc_common_finalize ();
 
   /* Clean up the context (and pass_manager etc). */
   delete g;

@@ -15,7 +15,7 @@
  * - $(LINK2 https://github.com/ldc-developers/ldc, LDC repository)
  * - $(LINK2 https://github.com/D-Programming-GDC/gcc, GDC repository)
  *
- * Copyright:   Copyright (C) 1999-2022 by The D Language Foundation, All Rights Reserved
+ * Copyright:   Copyright (C) 1999-2024 by The D Language Foundation, All Rights Reserved
  * Authors:     $(LINK2 https://www.digitalmars.com, Walter Bright)
  * License:     $(LINK2 https://www.boost.org/LICENSE_1_0.txt, Boost License 1.0)
  * Source:      $(LINK2 https://github.com/dlang/dmd/blob/master/src/dmd/target.d, _target.d)
@@ -25,7 +25,7 @@
 
 module dmd.target;
 
-import dmd.globals : Param;
+import dmd.globals : Param, CHECKENABLE;
 
 enum CPU : ubyte
 {
@@ -61,8 +61,8 @@ extern (C++) struct Target
     import dmd.dscope : Scope;
     import dmd.expression : Expression;
     import dmd.func : FuncDeclaration;
-    import dmd.globals : LINK, Loc, d_int64;
-    import dmd.astenums : TY;
+    import dmd.location;
+    import dmd.astenums : LINK, TY;
     import dmd.mtype : Type, TypeFunction, TypeTuple;
     import dmd.root.ctfloat : real_t;
     import dmd.statement : Statement;
@@ -110,8 +110,8 @@ extern (C++) struct Target
 
     /// Architecture name
     const(char)[] architectureName;
-    CPU cpu = CPU.baseline; // CPU instruction set to target
-    bool is64bit;           // generate 64 bit code for x86_64; true by default for 64 bit dmd
+    CPU cpu;                // CPU instruction set to target
+    bool isX86_64;          // generate 64 bit code for x86_64; true by default for 64 bit dmd
     bool isLP64;            // pointers are 64 bits
 
     // Environmental
@@ -119,24 +119,24 @@ extern (C++) struct Target
     const(char)[] lib_ext;    /// extension for static library files
     const(char)[] dll_ext;    /// extension for dynamic library files
     bool run_noext;           /// allow -run sources without extensions
-    bool mscoff = false;      // for Win32: write MsCoff object files instead of OMF
+    bool omfobj;              // for Win32: write OMF object files instead of MsCoff
     /**
      * Values representing all properties for floating point types
      */
     extern (C++) struct FPTypeProperties(T)
     {
-        real_t max;                         /// largest representable value that's not infinity
-        real_t min_normal;                  /// smallest representable normalized value that's not 0
-        real_t nan;                         /// NaN value
-        real_t infinity;                    /// infinity value
-        real_t epsilon;                     /// smallest increment to the value 1
+        real_t max;         /// largest representable value that's not infinity
+        real_t min_normal;  /// smallest representable normalized value that's not 0
+        real_t nan;         /// NaN value
+        real_t infinity;    /// infinity value
+        real_t epsilon;     /// smallest increment to the value 1
 
-        d_int64 dig;                        /// number of decimal digits of precision
-        d_int64 mant_dig;                   /// number of bits in mantissa
-        d_int64 max_exp;                    /// maximum int value such that 2$(SUPERSCRIPT `max_exp-1`) is representable
-        d_int64 min_exp;                    /// minimum int value such that 2$(SUPERSCRIPT `min_exp-1`) is representable as a normalized value
-        d_int64 max_10_exp;                 /// maximum int value such that 10$(SUPERSCRIPT `max_10_exp` is representable)
-        d_int64 min_10_exp;                 /// minimum int value such that 10$(SUPERSCRIPT `min_10_exp`) is representable as a normalized value
+        long dig;           /// number of decimal digits of precision
+        long mant_dig;      /// number of bits in mantissa
+        long max_exp;       /// maximum int value such that 2$(SUPERSCRIPT `max_exp-1`) is representable
+        long min_exp;       /// minimum int value such that 2$(SUPERSCRIPT `min_exp-1`) is representable as a normalized value
+        long max_10_exp;    /// maximum int value such that 10$(SUPERSCRIPT `max_10_exp` is representable)
+        long min_10_exp;    /// minimum int value such that 10$(SUPERSCRIPT `min_10_exp`) is representable as a normalized value
     }
 
     FPTypeProperties!float FloatProperties;     ///
@@ -159,7 +159,7 @@ extern (C++) struct Target
      * This can be used to restore the state set by `_init` to its original
      * state.
      */
-    void deinitialize()
+    void deinitialize() @safe
     {
         this = this.init;
     }
@@ -203,7 +203,7 @@ extern (C++) struct Target
      *      2   vector element type is not supported
      *      3   vector size is not supported
      */
-    extern (C++) int isVectorTypeSupported(int sz, Type type);
+    extern (C++) int isVectorTypeSupported(int sz, Type type) @safe;
 
     /**
      * Checks whether the target supports the given operation for vectors.
@@ -221,7 +221,7 @@ extern (C++) struct Target
      * Returns:
      *      `LINK` to use for `extern(System)`
      */
-    extern (C++) LINK systemLinkage();
+    extern (C++) LINK systemLinkage() @safe;
 
     /**
      * Describes how an argument type is passed to a function on target.
@@ -244,17 +244,6 @@ extern (C++) struct Target
      *   true if return value from function is on the stack
      */
     extern (C++) bool isReturnOnStack(TypeFunction tf, bool needsThis);
-
-    /***
-     * Determine the size a value of type `t` will be when it
-     * is passed on the function parameter stack.
-     * Params:
-     *  loc = location to use for error messages
-     *  t = type of parameter
-     * Returns:
-     *  size used on parameter stack
-     */
-    extern (C++) ulong parameterSize(const ref Loc loc, Type t);
 
     /**
      * Decides whether an `in` parameter of the specified POD type is to be
@@ -281,7 +270,7 @@ extern (C++) struct Target
      *  tf = type of function being called
      * Returns: `true` if the callee invokes destructors for arguments.
      */
-    extern (C++) bool isCalleeDestroyingArgs(TypeFunction tf);
+    extern (C++) bool isCalleeDestroyingArgs(TypeFunction tf) @safe;
 
     /**
      * Returns true if the implementation for object monitors is always defined
@@ -293,6 +282,13 @@ extern (C++) struct Target
      *      `false` if the target backend handles synchronizing monitors.
      */
     extern (C++) bool libraryObjectMonitors(FuncDeclaration fd, Statement fbody);
+
+    /**
+     * Returns true if the target supports `pragma(linkerDirective)`.
+     * Returns:
+     *      `false` if the target does not support `pragma(linkerDirective)`.
+     */
+    extern (C++) bool supportsLinkerDirective() const @safe;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -324,7 +320,11 @@ struct TargetC
         Gcc_Clang,            /// gcc and clang
     }
     bool  crtDestructorsSupported = true; /// Not all platforms support crt_destructor
+    ubyte boolsize;           /// size of a C `_Bool` type
+    ubyte shortsize;          /// size of a C `short` or `unsigned short` type
+    ubyte intsize;            /// size of a C `int` or `unsigned int` type
     ubyte longsize;           /// size of a C `long` or `unsigned long` type
+    ubyte long_longsize;      /// size of a C `long long` or `unsigned long long` type
     ubyte long_doublesize;    /// size of a C `long double`
     ubyte wchar_tsize;        /// size of a C `wchar_t` type
     Runtime runtime;          /// vendor of the C runtime to link against
@@ -340,7 +340,7 @@ struct TargetCPP
     import dmd.dsymbol : Dsymbol;
     import dmd.dclass : ClassDeclaration;
     import dmd.func : FuncDeclaration;
-    import dmd.mtype : Parameter, Type;
+    import dmd.mtype : Type;
 
     enum Runtime : ubyte
     {
@@ -354,6 +354,7 @@ struct TargetCPP
     bool reverseOverloads;    /// set if overloaded functions are grouped and in reverse order (such as in dmc and cl)
     bool exceptions;          /// set if catching C++ exceptions is supported
     bool twoDtorInVtable;     /// target C++ ABI puts deleting and non-deleting destructor into vtable
+    bool splitVBasetable;     /// set if C++ ABI uses separate tables for virtual functions and virtual bases
     bool wrapDtorInExternD;   /// set if C++ dtors require a D wrapper to be callable from runtime
     Runtime runtime;          /// vendor of the C++ runtime to link against
 
@@ -398,13 +399,13 @@ struct TargetCPP
 
     /**
      * Get the type that will really be used for passing the given argument
-     * to an `extern(C++)` function.
+     * to an `extern(C++)` function, or `null` if unhandled.
      * Params:
-     *      p = parameter to be passed.
+     *      t = type to be passed.
      * Returns:
-     *      `Type` to use for parameter `p`.
+     *      `Type` to use for type `t`.
      */
-    extern (C++) Type parameterType(Parameter p);
+    extern (C++) Type parameterType(Type t);
 
     /**
      * Checks whether type is a vendor-specific fundamental type.

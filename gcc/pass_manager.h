@@ -1,5 +1,5 @@
 /* pass_manager.h - The pipeline of optimization passes
-   Copyright (C) 2013-2022 Free Software Foundation, Inc.
+   Copyright (C) 2013-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -106,7 +106,7 @@ private:
 
 private:
   context *m_ctxt;
-  hash_map<nofree_string_hash, opt_pass *> *m_name_to_pass_map;
+  hash_map<free_string_hash, opt_pass *> *m_name_to_pass_map;
 
   /* References to all of the individual passes.
      These fields are generated via macro expansion.
@@ -146,4 +146,3 @@ private:
 } // namespace gcc
 
 #endif /* ! GCC_PASS_MANAGER_H */
-

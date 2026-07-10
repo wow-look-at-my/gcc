@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 B o d y                                  --
 --                                                                          --
---          Copyright (C) 1992-2022, Free Software Foundation, Inc.         --
+--          Copyright (C) 1992-2024, Free Software Foundation, Inc.         --
 --                                                                          --
 -- GNAT is free software;  you can  redistribute it  and/or modify it under --
 -- terms of the  GNU General Public License as published  by the Free Soft- --
@@ -34,7 +34,9 @@ with System.Storage_Elements; use System.Storage_Elements;
 
 with Ada.Unchecked_Conversion;
 
-package body Interfaces.C.Strings is
+package body Interfaces.C.Strings with
+  SPARK_Mode => Off
+is
 
    --  Note that the type chars_ptr has a pragma No_Strict_Aliasing in the
    --  spec, to prevent any assumptions about aliasing for values of this type,
@@ -90,12 +92,10 @@ package body Interfaces.C.Strings is
 
    procedure Free (Item : in out chars_ptr) is
    begin
-      if Item = Null_Ptr then
-         return;
+      if Item /= Null_Ptr then
+         Memory_Free (Item);
+         Item := Null_Ptr;
       end if;
-
-      Memory_Free (Item);
-      Item := Null_Ptr;
    end Free;
 
    --------------------
@@ -185,6 +185,8 @@ package body Interfaces.C.Strings is
 
    function Position_Of_Nul (Into : char_array) return size_t is
    begin
+      pragma Annotate (Gnatcheck, Exempt_On, "Improper_Returns",
+                       "early returns for performance");
       for J in Into'Range loop
          if Into (J) = nul then
             return J;
@@ -192,6 +194,8 @@ package body Interfaces.C.Strings is
       end loop;
 
       return Into'Last + 1;
+
+      pragma Annotate (Gnatcheck, Exempt_Off, "Improper_Returns");
    end Position_Of_Nul;
 
    ------------
@@ -224,6 +228,8 @@ package body Interfaces.C.Strings is
       Nul_Check : Boolean := False) return chars_ptr
    is
    begin
+      pragma Annotate (Gnatcheck, Exempt_On, "Improper_Returns",
+                       "early returns for performance");
       if Item = null then
          return Null_Ptr;
       elsif Nul_Check
@@ -233,6 +239,8 @@ package body Interfaces.C.Strings is
       else
          return To_chars_ptr (Item (Item'First)'Address);
       end if;
+
+      pragma Annotate (Gnatcheck, Exempt_Off, "Improper_Returns");
    end To_Chars_Ptr;
 
    ------------
@@ -300,6 +308,8 @@ package body Interfaces.C.Strings is
       Length : size_t) return char_array
    is
    begin
+      pragma Annotate (Gnatcheck, Exempt_On, "Improper_Returns",
+                       "early returns for performance");
       if Item = Null_Ptr then
          raise Dereference_Error;
       end if;
@@ -326,6 +336,8 @@ package body Interfaces.C.Strings is
 
          return Result;
       end;
+
+      pragma Annotate (Gnatcheck, Exempt_Off, "Improper_Returns");
    end Value;
 
    function Value (Item : chars_ptr) return String is
@@ -334,9 +346,13 @@ package body Interfaces.C.Strings is
    end Value;
 
    function Value (Item : chars_ptr; Length : size_t) return String is
-      Result : char_array (0 .. Length);
+      Result : String (1 .. Natural (Length));
+      C : char;
 
    begin
+      pragma Annotate (Gnatcheck, Exempt_On, "Improper_Returns",
+                       "early returns for performance");
+
       --  As per AI-00177, this is equivalent to:
 
       --    To_Ada (Value (Item, Length) & nul);
@@ -345,16 +361,19 @@ package body Interfaces.C.Strings is
          raise Dereference_Error;
       end if;
 
-      for J in 0 .. Length - 1 loop
-         Result (J) := Peek (Item + J);
+      for J in Result'Range loop
+         C := Peek (Item + size_t (J - 1));
 
-         if Result (J) = nul then
-            return To_Ada (Result (0 .. J));
+         if C = nul then
+            return Result (1 .. J - 1);
+         else
+            Result (J) := To_Ada (C);
          end if;
       end loop;
 
-      Result (Length) := nul;
-      return To_Ada (Result);
+      return Result;
+
+      pragma Annotate (Gnatcheck, Exempt_Off, "Improper_Returns");
    end Value;
 
 end Interfaces.C.Strings;

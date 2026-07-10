@@ -1,5 +1,5 @@
 /* LTO partitioning logic routines.
-   Copyright (C) 2009-2022 Free Software Foundation, Inc.
+   Copyright (C) 2009-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -31,10 +31,11 @@ along with GCC; see the file COPYING3.  If not see
 #include "lto-streamer.h"
 #include "symbol-summary.h"
 #include "tree-vrp.h"
+#include "sreal.h"
+#include "ipa-cp.h"
 #include "ipa-prop.h"
 #include "ipa-fnsummary.h"
 #include "lto-partition.h"
-#include "sreal.h"
 
 vec<ltrans_partition> ltrans_partitions;
 
@@ -333,7 +334,6 @@ lto_1_to_1_map (void)
       else
 	{
 	  partition = new_partition ("");
-	  pmap.put (NULL, partition);
 	  npartitions++;
 	}
 
@@ -898,6 +898,11 @@ maybe_rewrite_identifier (const char *ptr)
 	}
       copy[off] = valid;
     }
+  if (copy)
+    {
+      match = IDENTIFIER_POINTER (get_identifier (copy));
+      free (copy);
+    }
   return match;
 #else
   return ptr;
@@ -921,9 +926,7 @@ validize_symbol_for_target (symtab_node *node)
     {
       symtab->change_decl_assembler_name (decl, get_identifier (name2));
       if (node->lto_file_data)
-	lto_record_renamed_decl (node->lto_file_data, name,
-				 IDENTIFIER_POINTER
-				 (DECL_ASSEMBLER_NAME (decl)));
+	lto_record_renamed_decl (node->lto_file_data, name, name2);
     }
 }
 
@@ -936,12 +939,12 @@ static hash_map<const char *, unsigned> *lto_clone_numbers;
 static bool
 privatize_symbol_name_1 (symtab_node *node, tree decl)
 {
-  const char *name = IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME (decl));
+  const char *name0 = IDENTIFIER_POINTER (DECL_ASSEMBLER_NAME (decl));
 
-  if (must_not_rename (node, name))
+  if (must_not_rename (node, name0))
     return false;
 
-  name = maybe_rewrite_identifier (name);
+  const char *name = maybe_rewrite_identifier (name0);
   unsigned &clone_number = lto_clone_numbers->get_or_insert (name);
   symtab->change_decl_assembler_name (decl,
 				      clone_function_name (
@@ -949,7 +952,7 @@ privatize_symbol_name_1 (symtab_node *node, tree decl)
   clone_number++;
 
   if (node->lto_file_data)
-    lto_record_renamed_decl (node->lto_file_data, name,
+    lto_record_renamed_decl (node->lto_file_data, name0,
 			     IDENTIFIER_POINTER
 			     (DECL_ASSEMBLER_NAME (decl)));
 
@@ -1033,14 +1036,17 @@ promote_symbol (symtab_node *node)
 /* Return true if NODE needs named section even if it won't land in
    the partition symbol table.
 
-   FIXME: we should really not use named sections for inline clones
-   and master clones.  */
+   FIXME: we should really not use named sections for master clones.  */
 
 static bool
 may_need_named_section_p (lto_symtab_encoder_t encoder, symtab_node *node)
 {
   struct cgraph_node *cnode = dyn_cast <cgraph_node *> (node);
+  /* We do not need to handle variables since we never clone them.  */
   if (!cnode)
+    return false;
+  /* Only master clones will have bodies streamed.  */
+  if (cnode->clone_of)
     return false;
   if (node->real_symbol_p ())
     return false;

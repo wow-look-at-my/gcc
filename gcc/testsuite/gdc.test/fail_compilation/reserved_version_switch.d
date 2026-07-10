@@ -70,6 +70,10 @@
 // REQUIRED_ARGS: -version=Alpha
 // REQUIRED_ARGS: -version=Alpha_SoftFloat
 // REQUIRED_ARGS: -version=Alpha_HardFloat
+// REQUIRED_ARGS: -version=LoongArch32
+// REQUIRED_ARGS: -version=LoongArch64
+// REQUIRED_ARGS: -version=LoongArch_HardFloat
+// REQUIRED_ARGS: -version=LoongArch_SoftFloat
 // REQUIRED_ARGS: -version=LittleEndian
 // REQUIRED_ARGS: -version=BigEndian
 // REQUIRED_ARGS: -version=ELFv1
@@ -105,6 +109,9 @@
 // REQUIRED_ARGS: -version=none
 // REQUIRED_ARGS: -version=D_PreConditions
 // REQUIRED_ARGS: -version=D_PostConditions
+// REQUIRED_ARGS: -version=D_ProfileGC
+// REQUIRED_ARGS: -version=D_Invariants
+// REQUIRED_ARGS: -version=D_Optimized
 // REQUIRED_ARGS: -debug=DigitalMars
 // REQUIRED_ARGS: -debug=GNU
 // REQUIRED_ARGS: -debug=LDC
@@ -172,6 +179,10 @@
 // REQUIRED_ARGS: -debug=Alpha
 // REQUIRED_ARGS: -debug=Alpha_SoftFloat
 // REQUIRED_ARGS: -debug=Alpha_HardFloat
+// REQUIRED_ARGS: -debug=LoongArch32
+// REQUIRED_ARGS: -debug=LoongArch64
+// REQUIRED_ARGS: -debug=LoongArch_HardFloat
+// REQUIRED_ARGS: -debug=LoongArch_SoftFloat
 // REQUIRED_ARGS: -debug=LittleEndian
 // REQUIRED_ARGS: -debug=BigEndian
 // REQUIRED_ARGS: -debug=ELFv1
@@ -207,6 +218,9 @@
 // REQUIRED_ARGS: -debug=none
 // REQUIRED_ARGS: -debug=D_PreConditions
 // REQUIRED_ARGS: -debug=D_PostConditions
+// REQUIRED_ARGS: -debug=D_ProfileGC
+// REQUIRED_ARGS: -debug=D_Invariants
+// REQUIRED_ARGS: -debug=D_Optimized
 /*
 TEST_OUTPUT:
 ---
@@ -280,6 +294,10 @@ Error: version identifier `WASI` is reserved and cannot be set
 Error: version identifier `Alpha` is reserved and cannot be set
 Error: version identifier `Alpha_SoftFloat` is reserved and cannot be set
 Error: version identifier `Alpha_HardFloat` is reserved and cannot be set
+Error: version identifier `LoongArch32` is reserved and cannot be set
+Error: version identifier `LoongArch64` is reserved and cannot be set
+Error: version identifier `LoongArch_HardFloat` is reserved and cannot be set
+Error: version identifier `LoongArch_SoftFloat` is reserved and cannot be set
 Error: version identifier `LittleEndian` is reserved and cannot be set
 Error: version identifier `BigEndian` is reserved and cannot be set
 Error: version identifier `ELFv1` is reserved and cannot be set
@@ -315,5 +333,8 @@ Error: version identifier `all` is reserved and cannot be set
 Error: version identifier `none` is reserved and cannot be set
 Error: version identifier `D_PreConditions` is reserved and cannot be set
 Error: version identifier `D_PostConditions` is reserved and cannot be set
+Error: version identifier `D_ProfileGC` is reserved and cannot be set
+Error: version identifier `D_Invariants` is reserved and cannot be set
+Error: version identifier `D_Optimized` is reserved and cannot be set
 ---
 */

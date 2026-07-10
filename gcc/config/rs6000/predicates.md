@@ -1,5 +1,5 @@
 ;; Predicate definitions for POWER and PowerPC.
-;; Copyright (C) 2005-2022 Free Software Foundation, Inc.
+;; Copyright (C) 2005-2024 Free Software Foundation, Inc.
 ;;
 ;; This file is part of GCC.
 ;;
@@ -496,7 +496,7 @@
 })
 
 ;; Return 1 if op is a constant integer valid for D field
-;; or non-special register register.
+;; or non-special register.
 (define_predicate "reg_or_short_operand"
   (if_then_else (match_code "const_int")
     (match_operand 0 "short_cint_operand")
@@ -694,6 +694,12 @@
   return num_insns > 1;
 })
 
+;; Return true if the operand is a constant that can be loaded with a vspltisw
+;; instruction and then a vupkhsw instruction.
+
+(define_predicate "vspltisw_vupkhsw_constant_split"
+  (and (match_code "const_vector")
+       (match_test "vspltisw_vupkhsw_constant_p (op, mode)")))
 
 ;; Return 1 if the operand is constant that can loaded directly with a XXSPLTIB
 ;; instruction.
@@ -742,6 +748,11 @@
           && xxspltib_constant_p (op, mode, &num_insns, &value))
 	return true;
 
+      /* V2DI constant within RANGE (-16, 15) can be synthesized with a
+	 vspltisw and a vupkhsw.  */
+      if (vspltisw_vupkhsw_constant_p (op, mode, &value))
+	return true;
+
       return easy_altivec_constant (op, mode);
     }
 
@@ -760,7 +771,7 @@
     return 0;
   elt = BYTES_BIG_ENDIAN ? GET_MODE_NUNITS (mode) - 1 : 0;
   val = const_vector_elt_as_int (op, elt);
-  val = ((val & 0xff) ^ 0x80) - 0x80;
+  val = sext_hwi (val, 8);
   return EASY_VECTOR_15_ADD_SELF (val);
 })
 
@@ -797,6 +808,43 @@
        (and (match_test "TARGET_ALTIVEC")
 	    (and (match_test "easy_altivec_constant (op, mode)")
 		 (match_test "vspltis_shifted (op) != 0")))))
+
+;; Return true if this is a vector constant and each byte in
+;; it is the same.
+(define_predicate "const_vector_each_byte_same"
+  (match_code "const_vector")
+{
+  rtx elt;
+  if (!const_vec_duplicate_p (op, &elt))
+    return false;
+
+  machine_mode emode = GET_MODE_INNER (mode);
+  unsigned HOST_WIDE_INT eval;
+  if (CONST_INT_P (elt))
+    eval = INTVAL (elt);
+  else if (CONST_DOUBLE_AS_FLOAT_P (elt))
+    {
+      gcc_assert (emode == SFmode || emode == DFmode);
+      long l[2];
+      real_to_target (l, CONST_DOUBLE_REAL_VALUE (elt), emode);
+      /* real_to_target puts 32-bit pieces in each long.  */
+      eval = zext_hwi (l[0], 32);
+      eval |= zext_hwi (l[1], 32) << 32;
+    }
+  else
+    return false;
+
+  unsigned int esize = GET_MODE_SIZE (emode);
+  unsigned char byte0 = eval & 0xff;
+  for (unsigned int i = 1; i < esize; i++)
+    {
+      eval >>= BITS_PER_UNIT;
+      if (byte0 != (eval & 0xff))
+	return false;
+    }
+
+  return true;
+})
 
 ;; Return 1 if operand is a vector int register or is either a vector constant
 ;; of all 0 bits of a vector constant of all 1 bits.
@@ -864,7 +912,7 @@
   if (!TARGET_QUAD_MEMORY && !TARGET_SYNC_TI)
     return false;
 
-  if (GET_MODE_SIZE (mode) != 16 || !MEM_P (op) || MEM_ALIGN (op) < 128)
+  if (GET_MODE_SIZE (mode) != 16 || MEM_ALIGN (op) < 128)
     return false;
 
   return quad_address_p (XEXP (op, 0), mode, false);
@@ -876,7 +924,7 @@
 (define_predicate "vsx_quad_dform_memory_operand"
   (match_code "mem")
 {
-  if (!TARGET_P9_VECTOR || !MEM_P (op) || GET_MODE_SIZE (mode) != 16)
+  if (!TARGET_P9_VECTOR)
     return false;
 
   return quad_address_p (XEXP (op, 0), mode, false);
@@ -1088,20 +1136,6 @@
   return INTVAL (offset) % 4 == 0;
 })
 
-;; Return 1 if the operand is a memory operand that has a valid address for
-;; a DS-form instruction. I.e. the address has to be either just a register,
-;; or register + const where the two low order bits of const are zero.
-(define_predicate "ds_form_mem_operand"
-  (match_code "subreg,mem")
-{
-  if (!any_memory_operand (op, mode))
-    return false;
-
-  rtx addr = XEXP (op, 0);
-
-  return address_to_insn_form (addr, mode, NON_PREFIXED_DS) == INSN_FORM_DS;
-})
-
 ;; Return 1 if the operand, used inside a MEM, is a SYMBOL_REF.
 (define_predicate "symbol_ref_operand"
   (and (match_code "symbol_ref")
@@ -1109,7 +1143,7 @@
 		    && (DEFAULT_ABI != ABI_AIX || SYMBOL_REF_FUNCTION_P (op))")))
 
 ;; Return 1 if op is an operand that can be loaded via the GOT.
-;; or non-special register register field no cr0
+;; or non-special register field no cr0
 (define_predicate "got_operand"
   (match_code "symbol_ref,const,label_ref"))
 
@@ -1277,10 +1311,15 @@
 (define_predicate "mma_disassemble_output_operand"
   (match_code "reg,subreg,mem")
 {
+  if (MEM_P (op))
+    {
+      rtx  addr = XEXP (op, 0);
+      return indexed_or_indirect_address (addr, mode)
+	     || quad_address_p (addr, mode, false);
+    }
+
   if (SUBREG_P (op))
     op = SUBREG_REG (op);
-  if (!REG_P (op))
-    return true;
 
   return vsx_register_operand (op, mode);
 })
@@ -2045,3 +2084,22 @@
  (if_then_else (match_test "TARGET_VSX")
   (match_operand 0 "reg_or_cint_operand")
   (match_operand 0 "const_int_operand")))
+
+;; Return true if the operand is a valid Mach-O pic address.
+;;
+(define_predicate "macho_pic_address"
+  (match_code "const,unspec")
+{
+  if (GET_CODE (op) == CONST)
+    op = XEXP (op, 0);
+
+  if (GET_CODE (op) == UNSPEC && XINT (op, 1) == UNSPEC_MACHOPIC_OFFSET)
+    return CONSTANT_P (XVECEXP (op, 0, 0));
+  else
+    return false;
+})
+
+(define_predicate "lowpart_subreg_operator"
+  (and (match_code "subreg")
+       (match_test "subreg_lowpart_offset (mode, GET_MODE (SUBREG_REG (op)))
+		    == SUBREG_BYTE (op)")))

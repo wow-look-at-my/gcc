@@ -3,6 +3,7 @@ version(CRuntime_Microsoft)
 {
     extern(C)
     {
+        extern __gshared void* __ImageBase;
         extern __gshared uint _DP_beg;
         extern __gshared uint _DP_end;
         extern __gshared uint _TP_beg;
@@ -18,10 +19,10 @@ version(CRuntime_Microsoft)
     {
         import core.internal.traits : externDFunc;
         alias findImageSection = externDFunc!("rt.sections_win64.findImageSection",
-                                              void[] function(string name) nothrow @nogc);
-        dataSection = findImageSection(".data");
+                                              void[] function(void* handle, string name) nothrow @nogc);
+        dataSection = findImageSection(&__ImageBase, ".data");
     }
-    
+
     void[] tlsRange;
     static this()
     {
@@ -30,7 +31,7 @@ version(CRuntime_Microsoft)
                                               void[] function() nothrow @nogc);
         tlsRange = initTLSRanges();
     }
-    
+
     version = ptrref_supported;
 }
 else version(Win32)
@@ -126,7 +127,7 @@ bool findDataPtr(const(void)* ptr)
             void* addr = dataSection.ptr + *p;
         else
             void* addr = *p;
-        
+
         if (addr == ptr)
             return true;
     }
@@ -158,7 +159,7 @@ void testRefPtr()
 
     assert(!findTlsPtr(cast(size_t*)&tlsStr)); // length
     assert(findTlsPtr(cast(size_t*)&tlsStr + 1)); // ptr
-    
+
     // monitor is manually managed
     assert(!findDataPtr(cast(size_t*)cast(void*)Class.classinfo + 1));
     assert(!findDataPtr(cast(size_t*)cast(void*)Class.classinfo + 1));
@@ -167,7 +168,7 @@ void testRefPtr()
     assert(!findTlsPtr(&arr));
     assert(!findDataPtr(cast(size_t*)&arr + 1));
     assert(!findTlsPtr(cast(size_t*)&arr + 1));
-    
+
     assert(findDataPtr(cast(size_t*)&strArr[0] + 1)); // ptr in _DATA!
     assert(findDataPtr(cast(size_t*)&strArr[1] + 1)); // ptr in _DATA!
     strArr[1] = "c";

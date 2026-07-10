@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 S p e c                                  --
 --                                                                          --
---          Copyright (C) 1992-2022, Free Software Foundation, Inc.         --
+--          Copyright (C) 1992-2024, Free Software Foundation, Inc.         --
 --                                                                          --
 -- GNAT is free software;  you can  redistribute it  and/or modify it under --
 -- terms of the  GNU General Public License as published  by the Free Soft- --
@@ -34,6 +34,10 @@ package Exp_Aggr is
    function Is_Delayed_Aggregate (N : Node_Id) return Boolean;
    --  Returns True if N is an aggregate of some kind whose Expansion_Delayed
    --  flag is set (see sinfo for meaning of flag).
+
+   function Is_Two_Pass_Aggregate (N : Node_Id) return Boolean;
+   --  Return True if N is an aggregate that is to be expanded in two passes.
+   --  This is the case if it consists only of iterated associations.
 
    procedure Convert_Aggr_In_Object_Decl (N : Node_Id);
    --  N is a N_Object_Declaration with an expression which must be an

@@ -6,7 +6,7 @@
 --                                                                          --
 --                                 B o d y                                  --
 --                                                                          --
---                    Copyright (C) 2007-2022, AdaCore                      --
+--                    Copyright (C) 2007-2024, AdaCore                      --
 --                                                                          --
 -- GNAT is free software;  you can  redistribute it  and/or modify it under --
 -- terms of the  GNU General Public License as published  by the Free Soft- --
@@ -304,7 +304,7 @@ package body GNAT.Serial_Communications is
          Current.c_cc (VMIN)  := char'Val (0);
          Current.c_cc (VTIME) := char'Val (Natural (Timeout * 10));
 
-         Current.c_lflag := Current.c_lflag or (not ICANON);
+         Current.c_lflag := Current.c_lflag or not ICANON;
       end if;
 
       Res := cfsetispeed (Current'Address, C_Data_Rate (Rate));
@@ -382,6 +382,7 @@ package body GNAT.Serial_Communications is
    begin
       if Port.H /= -1 then
          Res := close (int (Port.H));
+         Port.H := -1;
       end if;
    end Close;
 

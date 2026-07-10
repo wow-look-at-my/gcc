@@ -1,5 +1,5 @@
 /* Search for references that a functions loads or stores.
-   Copyright (C) 2019-2022 Free Software Foundation, Inc.
+   Copyright (C) 2019-2024 Free Software Foundation, Inc.
 
 This file is part of GCC.
 
@@ -51,7 +51,7 @@ struct GTY(()) modref_summary
      it is still useful for CSE.  */
   unsigned calls_interposable : 1;
 
-  /* Flags coputed by finalize method.  */
+  /* Flags computed by finalize method.  */
 
   /* Total number of accesses in loads tree.  */
   unsigned int load_accesses;
@@ -66,7 +66,7 @@ struct GTY(()) modref_summary
 
   modref_summary ();
   ~modref_summary ();
-  void dump (FILE *);
+  void dump (FILE *) const;
   bool useful_p (int ecf_flags, bool check_flags = true);
   void finalize (tree);
 };
@@ -101,14 +101,14 @@ static const int implicit_retslot_eaf_flags
      | EAF_NOT_RETURNED_INDIRECTLY;
 
 /* If function does not bind to current def (i.e. it is inline in comdat
-   section), the modref analysis may not match the behaviour of function
+   section), the modref analysis may not match the behavior of function
    which will be later symbol interposed to.  All side effects must match
    however it is possible that the other function body contains more loads
    which may trap.
    MODREF_FLAGS are flags determined by analysis of function body while
    FLAGS are flags known otherwise (i.e. by fnspec, pure/const attributes
    etc.)  */
-static inline int
+inline int
 interposable_eaf_flags (int modref_flags, int flags)
 {
   /* If parameter was previously unused, we know it is only read
@@ -120,7 +120,7 @@ interposable_eaf_flags (int modref_flags, int flags)
 		      | EAF_NOT_RETURNED_DIRECTLY | EAF_NOT_RETURNED_INDIRECTLY
 		      | EAF_NO_DIRECT_CLOBBER | EAF_NO_INDIRECT_CLOBBER;
     }
-  /* We can not deterine that value is not read at all.  */
+  /* We can not determine that value is not read at all.  */
   if ((modref_flags & EAF_NO_DIRECT_READ) && !(flags & EAF_NO_DIRECT_READ))
     modref_flags &= ~EAF_NO_DIRECT_READ;
   if ((modref_flags & EAF_NO_INDIRECT_READ) && !(flags & EAF_NO_INDIRECT_READ))

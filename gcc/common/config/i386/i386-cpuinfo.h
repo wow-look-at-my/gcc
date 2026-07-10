@@ -1,5 +1,5 @@
 /* Get CPU type and Features for x86 processors.
-   Copyright (C) 2012-2022 Free Software Foundation, Inc.
+   Copyright (C) 2012-2024 Free Software Foundation, Inc.
    Contributed by Sriraman Tallam (tmsriram@google.com)
 
 This file is part of GCC.
@@ -29,12 +29,15 @@ enum processor_vendor
 {
   VENDOR_INTEL = 1,
   VENDOR_AMD,
+  VENDOR_ZHAOXIN,
   VENDOR_OTHER,
   VENDOR_CENTAUR,
   VENDOR_CYRIX,
   VENDOR_NSC,
-  BUILTIN_VENDOR_MAX = VENDOR_OTHER,
-  VENDOR_MAX
+
+  /* Maximum values must be at the end of this enum.  */
+  VENDOR_MAX,
+  BUILTIN_VENDOR_MAX = VENDOR_OTHER
 };
 
 /* Any new types or subtypes have to be inserted at the end. */
@@ -56,6 +59,11 @@ enum processor_types
   INTEL_GOLDMONT_PLUS,
   INTEL_TREMONT,
   AMDFAM19H,
+  ZHAOXIN_FAM7H,
+  INTEL_SIERRAFOREST,
+  INTEL_GRANDRIDGE,
+  INTEL_CLEARWATERFOREST,
+  AMDFAM1AH,
   CPU_TYPE_MAX,
   BUILTIN_CPU_TYPE_MAX = CPU_TYPE_MAX
 };
@@ -89,13 +97,22 @@ enum processor_subtypes
   INTEL_COREI7_ALDERLAKE,
   AMDFAM19H_ZNVER3,
   INTEL_COREI7_ROCKETLAKE,
+  ZHAOXIN_FAM7H_LUJIAZUI,
+  AMDFAM19H_ZNVER4,
+  INTEL_COREI7_GRANITERAPIDS,
+  INTEL_COREI7_GRANITERAPIDS_D,
+  INTEL_COREI7_ARROWLAKE,
+  INTEL_COREI7_ARROWLAKE_S,
+  INTEL_COREI7_PANTHERLAKE,
+  ZHAOXIN_FAM7H_YONGFENG,
+  AMDFAM1AH_ZNVER5,
   CPU_SUBTYPE_MAX
 };
 
 /* Priority of i386 features, greater value is higher priority.   This is
    used to decide the order in which function dispatch must happen.  For
    instance, a version specialized for SSE4.2 should be checked for dispatch
-   before a version for SSE3, as SSE4.2 implies SSE3.  */
+   before a version for SSE3.  */
 enum feature_priority
 {
   P_NONE = 0,
@@ -131,6 +148,9 @@ enum feature_priority
   P_AVX512F,
   P_PROC_AVX512F,
   P_X86_64_V4,
+  P_AVX10_1_256,
+  P_AVX10_1_512,
+  P_PROC_AVX10_1_512,
   P_PROC_DYNAMIC
 };
 
@@ -237,6 +257,22 @@ enum processor_features
   FEATURE_X86_64_V2,
   FEATURE_X86_64_V3,
   FEATURE_X86_64_V4,
+  FEATURE_AVXIFMA,
+  FEATURE_AVXVNNIINT8,
+  FEATURE_AVXNECONVERT,
+  FEATURE_CMPCCXADD,
+  FEATURE_AMX_FP16,
+  FEATURE_PREFETCHI,
+  FEATURE_RAOINT,
+  FEATURE_AMX_COMPLEX,
+  FEATURE_AVXVNNIINT16,
+  FEATURE_SM3,
+  FEATURE_SHA512,
+  FEATURE_SM4,
+  FEATURE_APX_F,
+  FEATURE_USER_MSR,
+  FEATURE_AVX10_1_256,
+  FEATURE_AVX10_1_512,
   CPU_FEATURE_MAX
 };
 

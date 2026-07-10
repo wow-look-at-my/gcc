@@ -1,5 +1,5 @@
 /* Darwin host-specific hook definitions.
-   Copyright (C) 2003-2022 Free Software Foundation, Inc.
+   Copyright (C) 2003-2024 Free Software Foundation, Inc.
 
    This file is part of GCC.
 
@@ -104,7 +104,7 @@ darwin_gt_pch_get_address (size_t sz, int fd)
      space.  */
   if (addr == (void *) MAP_FAILED)
     {
-      error ("PCH memory not available %m");
+      error ("PCH memory is not available: %m");
       return NULL;
     }
 

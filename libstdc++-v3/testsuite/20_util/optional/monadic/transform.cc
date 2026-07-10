@@ -1,4 +1,3 @@
-// { dg-options "-std=gnu++23" }
 // { dg-do run { target c++23 } }
 
 #include <optional>
@@ -137,7 +136,7 @@ void f(int&) { }
 void
 test_unconstrained()
 {
-  // PR libstc++/102863 - Optional monadic ops should not be constrained
+  // PR libstdc++/102863 - Optional monadic ops should not be constrained
   std::optional<int> x;
   auto answer = x.transform([](auto& y) { f(y); return 42; });
   VERIFY( !answer );

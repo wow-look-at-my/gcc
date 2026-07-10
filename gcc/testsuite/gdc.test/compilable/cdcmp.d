@@ -60,20 +60,6 @@ bool test_nez(long x) { return x != 0; }
 bool test_gez(long x) { return x >= 0; }
 bool test_gtz(long x) { return x >  0; }
 
-bool test_ltz(float x) { return x <  0; }
-bool test_lez(float x) { return x <= 0; }
-bool test_eqz(float x) { return x == 0; }
-bool test_nez(float x) { return x != 0; }
-bool test_gez(float x) { return x >= 0; }
-bool test_gtz(float x) { return x >  0; }
-
-bool test_ltz(double x) { return x <  0; }
-bool test_lez(double x) { return x <= 0; }
-bool test_eqz(double x) { return x == 0; }
-bool test_nez(double x) { return x != 0; }
-bool test_gez(double x) { return x >= 0; }
-bool test_gtz(double x) { return x >  0; }
-
 /* ----------------------------------- */
 
 bool test_lt(ubyte x, ubyte y) { return x <  y; }
@@ -145,4 +131,3 @@ bool test_eq(double x, double y) { return x == y; }
 bool test_ne(double x, double y) { return x != y; }
 bool test_ge(double x, double y) { return x >= y; }
 bool test_gt(double x, double y) { return x >  y; }
-

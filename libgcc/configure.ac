@@ -68,11 +68,6 @@ AC_ARG_ENABLE(shared,
 ], [enable_shared=yes])
 AC_SUBST(enable_shared)
 
-AC_ARG_ENABLE(gcov,
-[  --disable-gcov          don't provide libgcov and related host tools],
-[], [enable_gcov=yes])
-AC_SUBST(enable_gcov)
-
 AC_ARG_ENABLE(vtable-verify,
 [  --enable-vtable-verify    Enable vtable verification feature ],
 [case "$enableval" in
@@ -162,6 +157,18 @@ AC_CANONICAL_HOST
 ACX_NONCANONICAL_HOST
 ACX_NONCANONICAL_TARGET
 GCC_TOPLEV_SUBDIRS
+
+AC_ARG_ENABLE(gcov,
+[  --disable-gcov          don't provide libgcov and related host tools],
+[], [case $target in
+       bpf-*-*)
+         enable_gcov=no
+       ;;
+       *)
+         enable_gcov=yes
+       ;;
+     esac])
+AC_SUBST(enable_gcov)
 
 # Calculate toolexeclibdir
 # Also toolexecdir, though it's only used in toolexeclibdir
@@ -317,7 +324,7 @@ AC_CACHE_CHECK([whether assembler supports CFI directives], [libgcc_cv_cfi],
 # word size rather than the address size.
 cat > conftest.c <<EOF
 #if defined(__x86_64__) || (!defined(__i386__) && defined(__LP64__)) \
-    || defined(__mips64)
+    || defined(__mips64) || defined(__loongarch64)
 host_address=64
 #else
 host_address=32
@@ -435,7 +442,7 @@ powerpc*-*-linux*)
     [libgcc_cv_powerpc_float128=yes],
     [libgcc_cv_powerpc_float128=no])])
 
-  CFLAGS="$CFLAGS -mpower9-vector -mfloat128-hardware"
+  CFLAGS="$CFLAGS -mcpu=power9 -mfloat128-hardware"
   AC_CACHE_CHECK([for PowerPC ISA 3.0 to build hardware __float128 libraries],
 		 [libgcc_cv_powerpc_float128_hw],
 		 [AC_COMPILE_IFELSE(
@@ -499,7 +506,8 @@ AC_SUBST(accel_dir_suffix)
 AC_SUBST(real_host_noncanonical)
 
 if test x"$enable_offload_targets" != x; then
-  extra_parts="${extra_parts} crtoffloadbegin.o crtoffloadend.o crtoffloadtable.o"
+  extra_parts="${extra_parts} crtoffloadbegin.o crtoffloadend.o"
+  extra_parts="${extra_parts} crtoffloadtable.o crtoffloadtableS.o"
 fi
 
 # Check if Solaris/x86 linker supports ZERO terminator unwind entries.
@@ -641,6 +649,42 @@ changequote([,])dnl
 esac])
 LIBGCC_CHECK_AS_LSE
 
+dnl Check if as supports .variant_pcs.
+AC_DEFUN([LIBGCC_CHECK_AS_VARIANT_PCS], [
+case "${target}" in
+aarch64*-*-*)
+  AC_CACHE_CHECK([if as supports .variant_pcs], libgcc_cv_as_variant_pcs, [
+    AC_COMPILE_IFELSE([AC_LANG_PROGRAM(,
+      [[asm (".variant_pcs foobar");]])],
+      [libgcc_cv_as_variant_pcs=yes], [libgcc_cv_as_variant_pcs=no])
+  ])
+  if test x$libgcc_cv_as_variant_pcs = xyes; then
+    AC_DEFINE(HAVE_AS_VARIANT_PCS, 1,
+	      [Define to 1 if the assembler supports .variant_pcs.])
+  fi
+  ;;
+esac])
+LIBGCC_CHECK_AS_VARIANT_PCS
+
+# Check __getauxval ABI symbol for CPU feature detection.
+case ${target} in
+aarch64*-linux-*)
+  # No link check because the libc may not be present.
+  AC_CACHE_CHECK([for __getauxval],
+		 [libgcc_cv_have___getauxval],
+		 [case ${target} in
+		  *-linux-gnu*)
+		    libgcc_cv_have___getauxval=yes
+		    ;;
+		  *)
+		    libgcc_cv_have___getauxval=no
+		  esac])
+  if test x$libgcc_cv_have___getauxval = xyes; then
+    AC_DEFINE(HAVE___GETAUXVAL, 1,
+	      [Define to 1 if __getauxval is available.])
+  fi
+esac
+
 dnl Check if as supports RTM instructions.
 AC_CACHE_CHECK(for init priority support, libgcc_cv_init_priority, [
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM(,
@@ -686,6 +730,19 @@ AC_SUBST(tm_defines)
 
 # Map from thread model to thread header.
 GCC_AC_THREAD_HEADER([$target_thread_file])
+
+AC_CACHE_CHECK([for strub support],
+  [libgcc_cv_strub_support],
+  [AC_COMPILE_IFELSE(
+    [AC_LANG_SOURCE([void __attribute__ ((__strub__)) fn (void) {}])],
+    [libgcc_cv_strub_support=yes],
+    [libgcc_cv_strub_support=no])])
+if test "x$libgcc_cv_strub_support" != xno; then
+  HAVE_STRUB_SUPPORT=
+else
+  HAVE_STRUB_SUPPORT='# '
+fi
+AC_SUBST(HAVE_STRUB_SUPPORT)
 
 # Determine what GCC version number to use in filesystem paths.
 GCC_BASE_VER
