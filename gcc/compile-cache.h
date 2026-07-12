@@ -96,6 +96,15 @@ struct cpp_reader;
    Cheap; the result is cached internally.  */
 extern bool compile_cache_enabled_p (void);
 
+/* True if a cache directory is configured at all (-fcompile-cache= or
+   GCC_COMPILE_CACHE_DIR), without any eligibility checks and without
+   latching compile_cache_enabled_p ()'s internal tri-state.  Safe to call
+   early (right after option decoding), when the full gating state
+   (lang hooks, asm_file_name, PCH mode, ...) does not exist yet.  Used to
+   decide whether libcpp should record per-file content digests at read
+   time (cpp_opts->hash_file_contents).  */
+extern bool compile_cache_configured_p (void);
+
 /* Record PCH state (PCH_ACTIVE true when creating or consuming a PCH) and,
    if the user did not set -frandom-seed, pin it to a single fixed value so
    codegen is reproducible and the cache can ever hit.  No-op when caching is
@@ -140,5 +149,16 @@ extern void compile_cache_store (void);
    was (or should be) skipped for this TU.  Used by the compile_file seam and
    to decide whether compile_cache_store () has anything to do.  */
 extern bool compile_cache_hit_p (void);
+
+/* Auto-PCH: called from c_common_read_pch after a PCH was consumed.  A
+   foreign PCH disables serve/store for this TU (its closure is invisible to
+   the walk); the auto-PCH stub (-fauto-pch-ref) instead gets its recorded
+   closure merged into the key/manifest.  */
+extern void compile_cache_note_pch_read (const char *orig_name);
+
+/* Auto-PCH: called from c_common_write_pch after the .gch is fully written.
+   When -fauto-pch-store=PATH is set (driver-internal), records the include
+   closure the .gch baked in as a single-entry manifest at PATH.  */
+extern void compile_cache_auto_pch_store (cpp_reader *pfile);
 
 #endif /* GCC_COMPILE_CACHE_H */

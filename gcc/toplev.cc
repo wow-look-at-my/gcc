@@ -96,7 +96,9 @@ along with GCC; see the file COPYING3.  If not see
 
 #include "selftest.h"
 
+#ifdef HAVE_LIBGAS
 #include "gas-embed.h"		/* for -fintegrated-as (gas_assemble_buffer) */
+#endif
 
 #ifdef HAVE_isl
 #include <isl/version.h>
@@ -166,20 +168,28 @@ const char *user_label_prefix;
    and debugging dumps.  */
 
 FILE *asm_out_file;
+
+/* The integrated assembler (on by default, -fintegrated-as): cc1plus folds
+   the GNU assembler (libgas, gcc/gas-embed.h) into the compiler so a
+   compile-to-object is a single process.  When the output is a real object
+   file, asm_out_file is an open_memstream() handle and these capture the
+   buffer it writes into.  After fclose(asm_out_file) they hold the complete
+   assembly text, which is then handed to gas_assemble_buffer() to produce
+   the object file (or, for -S / -fno-integrated-as, written verbatim to the
+   text output and not assembled -- see the flag_asm_output_only fold in
+   process_options).  */
+static char *asm_mem_buf;
+static size_t asm_mem_size;
+/* True when asm_out_file is an open_memstream() handle (set in
+   init_asm_output).  Checked at finalize independently of asm_mem_buf, which
+   open_memstream only populates once the stream is flushed/closed.  */
+static bool asm_using_memstream;
+
 FILE *aux_info_file;
 FILE *callgraph_info_file = NULL;
 static bitmap callgraph_info_external_printed;
 FILE *stack_usage_file = NULL;
 static bool no_backend = false;
-
-/* When -fintegrated-as is in effect, asm_out_file is an in-memory stream
-   (open_memstream) rather than a text file.  INTEG_ASM_BUF / INTEG_ASM_SIZE
-   are the backing buffer/length that the memstream populates on flush, and
-   INTEG_OBJ_PATH is the .o we hand to the built-in assembler.  All three are
-   only used on the -fintegrated-as path; the default path leaves them unset.  */
-static char *integ_asm_buf;
-static size_t integ_asm_size;
-static const char *integ_obj_path;
 
 /* The current working directory of a translation.  It's generally the
    directory from which compilation was initiated, but a preprocessed
@@ -703,24 +713,7 @@ print_version (FILE *file, const char *indent, bool show_global_state)
 static void
 init_asm_output (const char *name)
 {
-  if (flag_integrated_as)
-    {
-      /* With the built-in assembler, the compiler's assembly is captured into
-	 an in-memory stream and handed to gas_assemble_buffer at the end of
-	 compilation; the -o value names the final .o, not a text .s.  The
-	 prototype requires an explicit -o (asm_file_name) because integrated
-	 mode writes an object, which makes no sense on stdout.  */
-      if (asm_file_name == 0 || !strcmp (asm_file_name, "-"))
-	fatal_error (UNKNOWN_LOCATION,
-		     "%<-fintegrated-as%> requires an output file "
-		     "(%<-o%> <object>)");
-      integ_obj_path = asm_file_name;
-      asm_out_file = open_memstream (&integ_asm_buf, &integ_asm_size);
-      if (asm_out_file == 0)
-	fatal_error (UNKNOWN_LOCATION,
-		     "cannot open in-memory assembly stream: %m");
-    }
-  else if (name == NULL && asm_file_name == 0)
+  if (name == NULL && asm_file_name == 0)
     asm_out_file = stdout;
   else
     {
@@ -736,9 +729,20 @@ init_asm_output (const char *name)
 	}
       if (!strcmp (asm_file_name, "-"))
 	asm_out_file = stdout;
-      else if (!canonical_filename_eq (asm_file_name, name)
-	       || !strcmp (asm_file_name, HOST_BIT_BUCKET))
+      else if (!strcmp (asm_file_name, HOST_BIT_BUCKET))
+	/* -fsyntax-only and friends: keep writing to the bit bucket; no
+	   object is produced and the integrated assembler is not invoked.  */
 	asm_out_file = fopen (asm_file_name, "w");
+      else if (!canonical_filename_eq (asm_file_name, name))
+	/* Real output.  Build the assembly into an in-memory buffer instead of
+	   writing it straight to a file.  At finalize() the buffer is either
+	   handed to the integrated assembler to produce the object file, or
+	   (when emitting assembly only, -S) written verbatim to asm_file_name.
+	   This is the seam that lets a compile-to-object run in one process.  */
+	{
+	  asm_out_file = open_memstream (&asm_mem_buf, &asm_mem_size);
+	  asm_using_memstream = true;
+	}
       else
 	/* Use UNKOWN_LOCATION to prevent gcc from printing the first
 	   line in the current file. */
@@ -1288,6 +1292,33 @@ process_options ()
 
   if (flag_short_enums == 2)
     flag_short_enums = targetm.default_short_enums ();
+
+#ifndef HAVE_LIBGAS
+  /* Built without the embedded assembler (not a combined tree, or a target
+     libgas does not support): the integrated assembler cannot run at all.
+     An explicit -fintegrated-as is a loud error; the silent default flips
+     to the classic external-as pipeline (the driver's invoke_as made the
+     same compile-time choice, so it already routed this compile through
+     `as`).  */
+  if (flag_integrated_as)
+    {
+      if (global_options_set.x_flag_integrated_as)
+	sorry ("%<-fintegrated-as%> is not supported by this configuration "
+	       "of the compiler (built without libgas)");
+      flag_integrated_as = 0;
+    }
+#endif
+
+  /* -fno-integrated-as: skip the in-process assembler and emit textual
+     assembly to the output file instead, exactly like -S / the PCH specs do
+     via -fasm-output-only -- reuse that internal flag so init_asm_output /
+     finalize need no third mode.  The driver's invoke_as pairs this with an
+     external `as` stage that turns the temporary .s into the real object
+     (and passes -fasm-output-only itself; this fold additionally covers a
+     bare cc1/cc1plus invocation, which then writes text to its -o just like
+     stock GCC did).  */
+  if (!flag_integrated_as)
+    flag_asm_output_only = 1;
 
   /* Set aux_base_name if not already set.  */
   if (aux_base_name)
@@ -2038,47 +2069,77 @@ finalize ()
      whether fclose returns an error, since the pages might still be on the
      buffer chain while the file is open.  */
 
-  if (asm_out_file && flag_integrated_as && !compile_cache_hit_p ())
+  if (asm_out_file)
     {
-      /* asm_out_file is an open_memstream: closing it flushes the captured
-	 assembly into integ_asm_buf/integ_asm_size, which we then hand to the
-	 built-in assembler to write the object directly.  Do NOT take the
-	 normal text-file close path below for this stream.
-
-	 On a compilation-cache HIT this branch is skipped entirely: the serve
-	 path already placed the cached .o at integ_obj_path and closed the
-	 (empty) memstream, setting asm_out_file = NULL -- so there is nothing
-	 to assemble.  The explicit compile_cache_hit_p () guard makes that
-	 intent clear and is defensive should the memstream ever survive.  */
-      if (ferror (asm_out_file) != 0)
-	fatal_error (input_location,
-		     "error writing in-memory assembly stream: %m");
-      if (fclose (asm_out_file) != 0)
-	fatal_error (input_location,
-		     "error closing in-memory assembly stream: %m");
-      asm_out_file = NULL;
-
-      /* Only assemble if compilation itself produced no errors; a broken TU
-	 would otherwise feed garbage to the assembler.  */
-      if (!seen_error ())
-	{
-	  int rc = gas_assemble_buffer (integ_asm_buf ? integ_asm_buf : "",
-					integ_asm_size, integ_obj_path);
-	  if (rc != 0)
-	    error ("integrated assembler failed");
-	}
-
-      free (integ_asm_buf);
-      integ_asm_buf = NULL;
-      integ_asm_size = 0;
-    }
-  else if (asm_out_file)
-    {
+      bool used_memstream = asm_using_memstream;
       if (ferror (asm_out_file) != 0)
 	fatal_error (input_location, "error writing to %s: %m", asm_file_name);
+      /* For the integrated-assembler path asm_out_file is an open_memstream;
+	 closing it flushes the captured assembly text into asm_mem_buf and
+	 sets asm_mem_size to its length.  For the plain text-file path (stdout
+	 / bit bucket) this is just the normal close.  */
       if (fclose (asm_out_file) != 0)
 	fatal_error (input_location, "error closing %s: %m", asm_file_name);
       asm_out_file = NULL;
+
+      /* When the output was a real object file, init_asm_output captured the
+	 back-end's assembly into an in-memory stream instead of a text file.
+	 Now either write that text verbatim to the text output (-S, or the
+	 -fno-integrated-as pipeline, both folded into flag_asm_output_only)
+	 or assemble it in-process to the object, with no forked `as` and no
+	 temporary .s file.
+
+	 On a compilation-cache HIT none of this runs: the serve path already
+	 placed the cached .o at asm_file_name and closed the (empty) memstream,
+	 setting asm_out_file = NULL, so this whole block is skipped and
+	 compile_cache_store() below no-ops.  */
+      if (used_memstream)
+	{
+	  if (flag_asm_output_only)
+	    {
+	      /* The user asked for -S, or the external-assembler pipeline is
+		 in effect (-fno-integrated-as): emit the assembly text
+		 verbatim to the text output file and do not assemble it.  */
+	      FILE *sf = fopen (asm_file_name, "w");
+	      if (sf == NULL)
+		fatal_error (input_location,
+			     "cannot open %qs for writing: %m", asm_file_name);
+	      if (asm_mem_size != 0
+		  && fwrite (asm_mem_buf, 1, asm_mem_size, sf) != asm_mem_size)
+		fatal_error (input_location,
+			     "error writing to %s: %m", asm_file_name);
+	      if (fclose (sf) != 0)
+		fatal_error (input_location,
+			     "error closing %s: %m", asm_file_name);
+	    }
+	  else if (!seen_error ())
+	    {
+#ifdef HAVE_LIBGAS
+	      /* Compile-to-object: assemble the buffered text in-process,
+		 writing the object straight to asm_file_name (the .o path the
+		 driver handed us).  gas_assemble_buffer is the libgas entry
+		 point declared in gas-embed.h.  No forked `as`, no temporary
+		 .s file.  A broken TU (seen_error) is not fed to the
+		 assembler.  */
+	      int rc = gas_assemble_buffer (asm_mem_buf ? asm_mem_buf : "",
+					    asm_mem_size, asm_file_name);
+	      if (rc != 0)
+		fatal_error (input_location,
+			     "integrated assembler failed on %qs (code %d)",
+			     asm_file_name, rc);
+#else
+	      /* Unreachable: without libgas, process_options forced
+		 !flag_integrated_as and therefore flag_asm_output_only, so
+		 a real object request never lands in this branch.  */
+	      gcc_unreachable ();
+#endif
+	    }
+
+	  free (asm_mem_buf);
+	  asm_mem_buf = NULL;
+	  asm_mem_size = 0;
+	  asm_using_memstream = false;
+	}
     }
 
   if (stack_usage_file)

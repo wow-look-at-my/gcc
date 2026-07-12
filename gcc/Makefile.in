@@ -2437,8 +2437,28 @@ DRIVER_DEFINES = \
   -DTOOL_INCLUDE_DIR=\"$(gcc_tooldir)/include\" \
   -DNATIVE_SYSTEM_HEADER_DIR=\"$(NATIVE_SYSTEM_HEADER_DIR)\"
 
-CFLAGS-gcc.o += $(DRIVER_DEFINES) -DBASEVER=$(BASEVER_s)
-gcc.o: $(BASEVER)
+# In-process integrated assembler (-fintegrated-as) availability gate.
+# libgas.a exists only when this is a combined tree whose binutils gas/ was
+# patched for embedding and contrib/gas-embed/build-libgas.sh ran (top of
+# the build tree; x86-64 ELF only today -- see contrib/gas-embed/README.md).
+# HAVE_LIBGAS gates the gas_assemble_buffer() call in toplev.cc (which also
+# flips the -fintegrated-as default off at runtime when absent) and the
+# driver's default pipeline selection in gcc.cc; cp/Make-lang.in
+# conditionalizes the cc1/cc1plus/lto1 link on the same file, so a tree
+# WITHOUT binutils still builds and produces working two-process compilers.
+# ':=' so the whole gcc/ sub-make sees ONE consistent snapshot (compile
+# defines and link inputs cannot disagree within a make run); build libgas
+# BEFORE `make all-gcc` (as the CI does) or the compiler is built plain.
+# The order-only-ish deps below make an appearing/refreshed libgas.a
+# recompile the two gated objects on the NEXT make run instead of leaving
+# them stale.
+LIBGAS_ARCHIVE := $(wildcard ../libgas.a)
+LIBGAS_DEFINE := $(if $(LIBGAS_ARCHIVE),-DHAVE_LIBGAS=1)
+CFLAGS-toplev.o += $(LIBGAS_DEFINE)
+toplev.o: $(LIBGAS_ARCHIVE)
+
+CFLAGS-gcc.o += $(DRIVER_DEFINES) -DBASEVER=$(BASEVER_s) $(LIBGAS_DEFINE)
+gcc.o: $(BASEVER) $(LIBGAS_ARCHIVE)
 
 specs.h : s-specs ; @true
 s-specs : Makefile

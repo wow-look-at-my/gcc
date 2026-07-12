@@ -149,6 +149,14 @@ cc1plus-checksum.cc : build/genchecksum$(build_exeext) checksum-options \
 # sibling combined-tree build dirs; libgas.a is built by
 # contrib/gas-embed/build-libgas.sh into the top of the build tree (../libgas.a).
 GAS_BUILD = ..
+# HAVE_LIBGAS gate (see gcc/Makefile.in): only link the embedded-assembler
+# archives when the combined-tree build actually produced libgas.a.  On a
+# tree without binutils GAS_LIBS/GAS_DEPS collapse to empty and cc1plus
+# links as a plain two-process compiler (toplev.o was compiled without
+# HAVE_LIBGAS by the same read-time snapshot, so it references no gas
+# symbol).  ifeq/wildcard is evaluated when this makefile is read -- the
+# same snapshot as gcc/Makefile.in's LIBGAS_DEFINE.
+ifneq ($(wildcard $(GAS_BUILD)/libgas.a),)
 GAS_LIBS = -Wl,--start-group \
 	   $(GAS_BUILD)/libgas.a \
 	   $(GAS_BUILD)/bfd/.libs/libbfd.a \
@@ -157,12 +165,32 @@ GAS_LIBS = -Wl,--start-group \
 	   ../libiberty/libiberty.a \
 	   -Wl,--end-group $(ZLIB) $(ZSTD_LIB)
 GAS_DEPS = $(GAS_BUILD)/libgas.a
+else
+GAS_LIBS =
+GAS_DEPS =
+endif
+
+# Optional fast thread-caching malloc for the compiler proper (measured -5%
+# wall vs glibc malloc on a large template-heavy C++ TU, -3% on a mid-size
+# STL TU; jemalloc/mimalloc gave about half that).  Static archive, so the
+# installed binaries gain no runtime .so dependency.  Gracefully optional,
+# mirroring GAS_LIBS' make-level wiring: $(CC) -print-file-name prints an
+# absolute path when the library exists in the toolchain's search dirs and
+# echoes the bare name back when it does not, so a build host without
+# gperftools (libgoogle-perftools-dev on Debian/Ubuntu) still builds plain.
+# Placed after every other archive so tcmalloc's malloc/free win symbol
+# resolution over libc's.
+# -lpthread: tcmalloc_minimal references pthread symbols; on glibc >= 2.34
+# they live in libc (libpthread is a stub, so the extra -l is harmless), on
+# older hosts the explicit library is required.
+TCMALLOC_A := $(shell $(CC) -print-file-name=libtcmalloc_minimal.a)
+TCMALLOC_LIBS := $(if $(findstring /,$(TCMALLOC_A)),$(TCMALLOC_A) -lpthread)
 
 cc1plus$(exeext): $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(LIBDEPS) $(GAS_DEPS) $(c++.prev)
 	@$(call LINK_PROGRESS,$(INDEX.c++),start)
 	+$(LLINKER) $(ALL_LINKERFLAGS) $(LDFLAGS) -o $@ \
 	      $(CXX_OBJS) cc1plus-checksum.o $(BACKEND) $(CODYLIB) $(NETLIBS) \
-		$(LIBS) $(BACKENDLIBS) $(GAS_LIBS)
+		$(LIBS) $(BACKENDLIBS) $(GAS_LIBS) $(TCMALLOC_LIBS)
 	@$(call LINK_PROGRESS,$(INDEX.c++),end)
 
 ifeq ($(ENABLE_MAINTAINER_RULES), true)
