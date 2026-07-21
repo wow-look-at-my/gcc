@@ -85,11 +85,20 @@ enum cc_meta_off
    size + mtime-seconds only, so the serve-time stat shortcut matches ccache's
    safety bar: a same-second same-size rewrite that restores mtime (touch -d)
    still advances ctime and is caught without hashing the bytes.  The record
-   grew 40 -> 80 bytes and gained a flags word (CC_MHR_FLAG_*).  Each version
-   bump makes older manifests unreadable (and vice versa) -- the intended
-   clean invalidation.  */
+   grew 40 -> 80 bytes and gained a flags word (CC_MHR_FLAG_*).
+   Version 4: same layout; two new header-record flag bits.  SYSHDR marks
+   records excluded from a user-only (-MM/-MMD) dependency list, letting the
+   serve tiers synthesize such lists and so serve openssl-style -MMD builds
+   instead of declining them.  MAIN_SOURCE marks the TU's own source file:
+   the manifest key already commits the CURRENT main source's bytes, so the
+   serve side validates that record implicitly by key equality instead of by
+   its stored absolute path -- which for cmake try_compile probes points at
+   an ephemeral CMakeScratch dir that is deleted after the probe and made
+   every probe manifest permanently self-invalidating.  Each version bump
+   makes older manifests unreadable (and vice versa) -- the intended clean
+   invalidation.  */
 #define CC_MANIFEST_MAGIC      "CCMANIFS"	/* 8 bytes, no NUL stored */
-#define CC_MANIFEST_VERSION    3u
+#define CC_MANIFEST_VERSION    4u
 #define CC_MANIFEST_HEADER_SIZE  32u
 
 /* Compiler-id sidecar: a tiny file the compiler proper writes on a
@@ -214,9 +223,18 @@ enum cc_man_hdr_rec_off
 
 /* Header-record flag bits (CC_MHR_OFF_FLAGS).  A record with unknown flag
    bits must be treated as never matching (same policy as entry/probe
-   flags).  */
+   flags).  SYSHDR is the deps-relevant disposition libcpp saw at the file's
+   first stacking (CPP_INCLUDED_FILE_SYSP): set means a user-only (-MM/-MMD)
+   dependency list excludes the file.  MAIN_SOURCE marks the TU's main
+   source record (CPP_INCLUDED_FILE_MAIN): the serve side skips its
+   path-based stat/hash re-validation -- the manifest key already commits
+   the current main source's bytes, so key equality IS its validation -- and
+   dependency synthesis substitutes the serve-time source path for the
+   stored one.  */
 #define CC_MHR_FLAG_HAS_STATID  0x1u	/* stat-identity fields are trusted */
-#define CC_MHR_FLAG_KNOWN_MASK  0x1u
+#define CC_MHR_FLAG_SYSHDR      0x2u	/* excluded from -MM/-MMD deps */
+#define CC_MHR_FLAG_MAIN_SOURCE 0x4u	/* the TU's own source file */
+#define CC_MHR_FLAG_KNOWN_MASK  0x7u
 
 /* Per-probe record inside a manifest entry: one recorded __has_include
    evaluation.  16-byte fixed part, then N_CANDIDATES u32 string offsets --

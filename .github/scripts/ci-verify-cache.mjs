@@ -1378,17 +1378,19 @@ function sleepSecs(s) {
     'check 21 OK: PARANOID=1 (forced content re-hash) still serves byte-identical objects\n');
 }
 
-// ---- 22. dependency files on manifest hits (-MD contract) -----------------
+// ---- 22. dependency files on manifest hits (-MD/-MMD contract) ------------
 // A served hit must leave the SAME dependency information a real compile
 // leaves: (a) driver-tier hit (-MD -MT -MF present) synthesizes the .d from
 // the manifest records; (b) -MD without an explicit -MT (the driver spec
 // then adds -MQ <output> to the cc1 line; whichever tier serves must leave
-// the complete file); (c) -MMD (user-only deps) must not be served from the
-// manifest at all -- the records cannot distinguish system headers -- and
-// falls to the deep path, which writes exact deps.  Before this fix a
-// driver-tier hit wrote NOTHING, silently erasing ninja's recorded header
-// dependencies for that object (deps = gcc treats a missing depfile as
-// empty).
+// the complete file); (c) -MMD (user-only deps: the openssl make shape,
+// every TU compiled -MMD -MF -MT) is stored AND served too -- each record's
+// CC_MHR_FLAG_SYSHDR bit carries libcpp's own first-stacking exclusion
+// verdict, so the synthesized .d equals cpp's user-only output.  Before
+// these fixes a driver-tier hit wrote NOTHING (silently erasing ninja's
+// recorded header dependencies: deps = gcc treats a missing depfile as
+// empty), and -MMD TUs never even stored a manifest, keeping every openssl
+// warm build on the deep per-TU compiler-exec path.
 {
   const dir = path.join(work, 'depsynth');
   fs.mkdirSync(dir, { recursive: true });
@@ -1474,36 +1476,39 @@ function sleepSecs(s) {
          realSetB + '\n--- after ---\n' + depSet(d(2)));
   }
 
-  // (c) -MMD: never served from the manifest (the records carry no
-  // system-header bit, and such TUs do not even store one -- the guard
-  // precedes the key computation).  The deep object path still works:
-  // cold stores, warm deep-hits, and cpp itself writes exact user-only
-  // deps both times.
-  const argsC = ['-I' + dir, '-MMD', '-MF', d(3)];
-  const r5 = compile(XGCC, src, o(3), cache, argsC);
-  if (!/compile-cache: manifest-skip-deps-form /.test(r5.stderr)) {
-    fail('check 22: expected manifest-skip-deps-form for -MMD\n' + r5.stderr);
+  // (c) -MMD (user-only deps): a dedicated cache dir makes the cold pass
+  // explicit -- cold = real compile + manifest-store + cpp's OWN user-only
+  // .d (the reference); warm = manifest-hit that re-synthesizes the deleted
+  // .d with the IDENTICAL user-only set (system headers excluded, the TU's
+  // own files present).
+  const cacheC = path.join(dir, 'cache-mmd');
+  const argsC = ['-I' + dir, '-MMD', '-MT', 'mmd-target.o', '-MF', d(3)];
+  const r5 = compile(XGCC, src, o(3), cacheC, argsC);
+  if (!/compile-cache: manifest-store /.test(r5.stderr)) {
+    fail('check 22: expected manifest-store on the cold -MMD compile\n' + r5.stderr);
   }
-  if (/compile-cache: manifest-(hit|store) /.test(r5.stderr)) {
-    fail('check 22: -MMD must neither serve nor store a manifest\n' + r5.stderr);
+  const realSetC = depSet(d(3));
+  if (/stdint\.h/.test(realSetC)) {
+    fail("check 22: sanity: cpp's own -MMD deps include a system header\n" + realSetC);
+  }
+  if (!/dh\.h/.test(realSetC) || !/d\.c/.test(realSetC)) {
+    fail('check 22: sanity: -MMD reference deps lost the user header or main source\n' + realSetC);
   }
   fs.rmSync(d(3));
-  const r6 = compile(XGCC, src, o(3), cache, argsC);
-  if (/compile-cache: manifest-hit /.test(r6.stderr)) {
-    fail('check 22: -MMD must not be served from the manifest\n' + r6.stderr);
-  }
-  if (!keyFor(r6.keys, 'hit')) {
-    fail('check 22: -MMD warm compile should deep-hit\n' + r6.stderr);
+  const r6 = compile(XGCC, src, o(3), cacheC, argsC);
+  if (!/compile-cache: manifest-hit /.test(r6.stderr)) {
+    fail('check 22: expected manifest-hit on the warm -MMD compile\n' + r6.stderr);
   }
   if (!fs.existsSync(d(3))) {
-    fail('check 22: -MMD deep path left no dependency file');
+    fail('check 22: -MMD manifest hit left no dependency file');
   }
-  if (/stdint\.h/.test(fs.readFileSync(d(3), 'utf8'))) {
-    fail('check 22: -MMD deps must exclude system headers\n' + fs.readFileSync(d(3), 'utf8'));
+  if (realSetC !== depSet(d(3))) {
+    fail("check 22: -MMD hit-synthesized deps differ from cpp's own user-only set\n--- real ---\n" +
+         realSetC + '\n--- synthesized ---\n' + depSet(d(3)));
   }
 
   process.stdout.write(
-    'check 22 OK: hits honor -MD (explicit-MT and spec-MQ forms, equal dep sets); -MMD declines to the deep path\n');
+    'check 22 OK: hits honor -MD (explicit-MT and spec-MQ forms) and -MMD (user-only set == cpp\'s own)\n');
 }
 
 // ---- check 23: -Wa options are never silently dropped (A2) ---------------
@@ -2231,6 +2236,78 @@ function sleepSecs(s) {
   process.stdout.write(
     'check 31 OK: per-language compiler-id sidecars; warm C and C++ TUs ' +
     'serve at the driver tier with zero compiler-proper execs\n');
+}
+
+// ---- check 32: ephemeral main source (cmake try_compile shape) ------------
+// cmake configure probes compile the same tiny source from a freshly
+// created scratch dir and DELETE the whole dir right after; the next
+// configure repeats that from a NEW random scratch path.  The manifest's
+// main-source record is validated by key equality -- the manifest key
+// already commits the CURRENT source's bytes -- not by its stored (now
+// dead) absolute path, so probe manifests keep serving at the driver tier.
+// Regression shape for the zlib-ng warm-configure gap: path-validating the
+// main-source record made every probe manifest permanently
+// self-invalidating, so every configure re-paid a full compiler exec per
+// probe (measured: 4.6 s of a 4.8 s warm leg was configure).
+{
+  const dir = path.join(work, 'c32');
+  fs.mkdirSync(dir);
+  const cache = path.join(dir, 'cache');
+  const body = 'int probe_main(void) { return 42; }\n';
+  const spawnedCc1 = (t) => /\/cc1\s/.test(t);
+
+  // Cold probe from scratch dir #1, then delete the dir like cmake does.
+  // -v is on BOTH probe compiles: it reaches the cc1 line and folds into
+  // the key material like any other option (see check 31), so the pair must
+  // agree on it -- and it is what proves the warm serve spawn-free.
+  const s1 = path.join(dir, 'TryCompile-aaa');
+  fs.mkdirSync(s1);
+  fs.writeFileSync(path.join(s1, 'src.c'), body);
+  const r1 = compile(XGCC, path.join(s1, 'src.c'), path.join(s1, 'src.o'),
+                     cache, ['-v']);
+  if (!/compile-cache: manifest-store /.test(r1.stderr)) {
+    fail('check 32: expected manifest-store on the probe cold compile\n' + r1.stderr);
+  }
+  if (!spawnedCc1(r1.stderr)) {
+    fail('check 32: sanity: the cold probe compile must show the cc1 spawn '
+         + 'under -v (spawn detector broken?)\n' + r1.stderr);
+  }
+  fs.copyFileSync(path.join(s1, 'src.o'), path.join(dir, 'probe1.o'));
+  fs.rmSync(s1, { recursive: true, force: true });
+
+  // Same content from scratch dir #2: must serve spawn-free.
+  const s2 = path.join(dir, 'TryCompile-bbb');
+  fs.mkdirSync(s2);
+  fs.writeFileSync(path.join(s2, 'src.c'), body);
+  const r2 = compile(XGCC, path.join(s2, 'src.c'), path.join(s2, 'src.o'),
+                     cache, ['-v']);
+  if (!/compile-cache: manifest-hit /.test(r2.stderr)) {
+    fail('check 32: probe recompile from a new scratch dir must manifest-hit '
+         + '(dead main-source path re-validated?)\n' + r2.stderr);
+  }
+  if (spawnedCc1(r2.stderr)) {
+    fail('check 32: probe recompile spawned cc1 (driver tier declined)\n' + r2.stderr);
+  }
+  if (!fs.readFileSync(path.join(s2, 'src.o'))
+        .equals(fs.readFileSync(path.join(dir, 'probe1.o')))) {
+    fail('check 32: probe objects are not byte-identical across scratch dirs');
+  }
+
+  // Negative control: changed probe content must MISS -- the key really
+  // does commit the current source bytes, so skipping the record's
+  // path-validation gives up nothing.
+  const s3 = path.join(dir, 'TryCompile-ccc');
+  fs.mkdirSync(s3);
+  fs.writeFileSync(path.join(s3, 'src.c'),
+                   'int probe_main(void) { return 43; }\n');
+  const r3 = compile(XGCC, path.join(s3, 'src.c'), path.join(s3, 'src.o'), cache);
+  if (/compile-cache: (manifest-hit|hit) /.test(r3.stderr)) {
+    fail('check 32: changed probe content must not hit\n' + r3.stderr);
+  }
+
+  process.stdout.write(
+    'check 32 OK: probe-style TUs (deleted scratch source dirs) keep serving '
+    + 'spawn-free; changed content still misses\n');
 }
 
 // ---- cleanup + success ---------------------------------------------------

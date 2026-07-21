@@ -1502,11 +1502,20 @@ extern bool cpp_included_before (cpp_reader *, const char *, location_t);
    SIZE bytes of the file's contents (re-read from disk if libcpp no longer
    holds the buffer) for the consumer to hash itself.
 
+   FLAGS carries the CPP_INCLUDED_FILE_* facts about the file: whether its
+   FIRST stacking was "system" for dependency purposes (the MAX of the
+   includer buffer's sysp and the found directory's sysp -- the exact
+   predicate that keeps a file out of a user-only -MM/-MMD dependency list),
+   and whether it is the TU's main file.
+
    Return false to stop the walk.  See cpp_foreach_included_file.  */
+#define CPP_INCLUDED_FILE_SYSP	0x1	/* excluded from -MM/-MMD deps */
+#define CPP_INCLUDED_FILE_MAIN	0x2	/* the TU's main source file */
 typedef bool (*cpp_included_file_cb) (const char *path,
 				      const unsigned char *buffer,
 				      size_t size,
 				      const unsigned char *content_sha1,
+				      unsigned flags,
 				      void *user);
 
 /* Walk every file that was stacked for preprocessing in this TU, invoking

@@ -121,6 +121,14 @@ struct _cpp_file
      and error should be emitted if it is included normally.  */
   bool deferred_error : 1;
 
+  /* The "system" disposition the dependency machinery saw at this file's
+     FIRST stacking: MAX (includer buffer sysp, found dir sysp) != 0 -- the
+     exact predicate deciding membership in a user-only (-MM/-MMD) dependency
+     file.  Recorded unconditionally so a consumer re-synthesizing such a
+     file from the include closure can apply the same exclusion (see
+     cpp_foreach_included_file).  */
+  bool deps_sysp : 1;
+
   /* > 0: Known C++ Module header unit, <0: known not.  ==0, unknown  */
   int header_unit : 2;
 
@@ -1247,6 +1255,13 @@ _cpp_stack_file (cpp_reader *pfile, _cpp_file *file, include_type type,
 
       if (pfile->buffer && file->dir)
 	sysp = MAX (pfile->buffer->sysp, file->dir->sysp);
+
+      /* Remember the deps-relevant disposition of the FIRST stacking (the
+	 one the dependency decision below keys on), deps style or not, so
+	 the include-closure walk can reproduce a user-only dependency list
+	 later.  */
+      if (!file->stack_count)
+	file->deps_sysp = (sysp != 0);
 
       /* Add the file to the dependencies on its first inclusion.  */
       if (CPP_OPTION (pfile, deps.style) > (sysp != 0)
@@ -2409,18 +2424,20 @@ cpp_foreach_included_file (cpp_reader *pfile, cpp_included_file_cb cb,
 	continue;
 
       const char *path = f->path ? f->path : f->name;
+      unsigned flags = (f->deps_sysp ? CPP_INCLUDED_FILE_SYSP : 0)
+		       | (f == pfile->main_file ? CPP_INCLUDED_FILE_MAIN : 0);
 
       if (f->content_sha1_valid)
 	{
 	  /* Fast path: hand over the stored raw-bytes digest; no file I/O,
 	     no buffer needed.  SIZE is informational (the on-disk byte count
 	     recorded by stat); the digest is the load-bearing value.  */
-	  if (!cb (path, NULL, f->st.st_size, f->content_sha1, user))
+	  if (!cb (path, NULL, f->st.st_size, f->content_sha1, flags, user))
 	    return true;
 	}
       else if (f->buffer_valid)
 	{
-	  if (!cb (path, f->buffer, f->st.st_size, NULL, user))
+	  if (!cb (path, f->buffer, f->st.st_size, NULL, flags, user))
 	    return true;
 	}
       else
@@ -2456,7 +2473,7 @@ cpp_foreach_included_file (cpp_reader *pfile, cpp_included_file_cb cb,
 	      return false;
 	    }
 
-	  bool keep_going = cb (path, buf, size, NULL, user);
+	  bool keep_going = cb (path, buf, size, NULL, flags, user);
 	  free (buf);
 	  if (!keep_going)
 	    return true;

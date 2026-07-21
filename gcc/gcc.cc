@@ -6098,19 +6098,22 @@ driver_try_serve_from_cache (void)
   bool disqualify = false;
   bool saw_g = false;
 
-  /* Dependency-output state.  A served hit must also honor the -MD contract
-     (write the .d file ninja/make will read), so collect the request here;
-     the manifest's header records ARE the include closure, letting the serve
-     unit synthesize the file.  Forms whose output the records cannot
-     reproduce exactly decline the driver serve below (cc1plus's tier -- or
-     the real compile -- then produces the file with cpp's own semantics):
-     -M/-MM (dependency-only modes), -MMD/-MM (system headers excluded, which
-     the records do not distinguish), -MG (missing-header rules), or a -MD
-     lacking an explicit target/file on the cc1 line (cpp's default-target
-     derivation is not reimplemented here).  */
-  bool deps_md = false;		/* -MD (cc1 form carries the default file) */
-  bool deps_unsupported = false;/* -M/-MM/-MMD/-MG seen */
-  const char *deps_md_file = NULL;	/* -MD's own argument */
+  /* Dependency-output state.  A served hit must also honor the -MD/-MMD
+     contract (write the .d file ninja/make will read), so collect the
+     request here; the manifest's header records ARE the include closure --
+     with each record's CC_MHR_FLAG_SYSHDR carrying libcpp's user-only
+     exclusion bit -- letting the serve unit synthesize the file for both
+     the full (-MD) and user-only (-MMD: the openssl-style make shape)
+     forms.  Forms whose output the records cannot reproduce exactly decline
+     the driver serve below (cc1plus's tier -- or the real compile -- then
+     produces the file with cpp's own semantics): -M/-MM (dependency-only
+     modes), -MG (missing-header rules), or a -MD/-MMD lacking an explicit
+     target/file on the cc1 line (cpp's default-target derivation is not
+     reimplemented here).  */
+  bool deps_md = false;		/* -MD/-MMD (cc1 form carries the file) */
+  bool deps_user = false;	/* -MMD: user-only dependency list */
+  bool deps_unsupported = false;/* -M/-MM/-MG seen */
+  const char *deps_md_file = NULL;	/* -MD/-MMD's own argument */
   const char *deps_mf = NULL;		/* -MF argument (overrides) */
   bool deps_phony = false;		/* -MP */
   const char **deps_tgts = XNEWVEC (const char *, decoded_count);
@@ -6156,6 +6159,11 @@ driver_try_serve_from_cache (void)
 	  deps_md = true;
 	  deps_md_file = o->arg;
 	  break;
+	case OPT_MMD:
+	  deps_md = true;
+	  deps_user = true;
+	  deps_md_file = o->arg;
+	  break;
 	case OPT_MF:
 	  deps_mf = o->arg;
 	  break;
@@ -6170,7 +6178,6 @@ driver_try_serve_from_cache (void)
 	  break;
 	case OPT_M:
 	case OPT_MM:
-	case OPT_MMD:
 	case OPT_MG:
 	  deps_unsupported = true;
 	  break;
@@ -6232,6 +6239,7 @@ driver_try_serve_from_cache (void)
 	  ctx.deps_target_quoted = deps_tgt_quoted;
 	  ctx.deps_target_count = deps_tgt_count;
 	  ctx.deps_phony = deps_phony;
+	  ctx.deps_user_only = deps_user;
 	  served = compile_cache_serve_object (&ctx, src_path, out_path);
 	  free (lang);
 	}
@@ -6547,6 +6555,7 @@ driver_auto_pch_probe_inject (struct driver_apch_plan *plan)
   ctx.deps_target_quoted = NULL;
   ctx.deps_target_count = 0;
   ctx.deps_phony = false;
+  ctx.deps_user_only = false;
 
   char *base = cc_auto_pch_entry_base (&ctx, norm, plen);
   enum cc_auto_pch_probe_result pr

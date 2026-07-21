@@ -207,6 +207,16 @@ ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
       if (rflags & ~CC_MHR_FLAG_KNOWN_MASK)
 	return false;		/* written by a future format: never match */
 
+      /* The main-source record needs no path-based re-validation: the
+	 manifest key already commits the CURRENT compile's main source
+	 bytes, so reaching this entry at all proves the source matches.
+	 Its stored path may even be gone (cmake try_compile probes compile
+	 from an ephemeral CMakeScratch dir, deleted right after the probe;
+	 path-validating it made every probe manifest permanently
+	 self-invalidating -- the warm-configure gap).  */
+      if (rflags & CC_MHR_FLAG_MAIN_SOURCE)
+	continue;
+
       if (path_off + 4 > mlen)
 	return false;
       uint32_t plen = cc_get_u32 (man + path_off);
@@ -1131,11 +1141,16 @@ ccs_deps_munge (FILE *f, const char *name)
    manifest hit on ENT: the -MT/-MQ targets, then every header-record path of
    the entry -- which IS the TU's include closure, main source included, i.e.
    exactly the set -MD would have produced (system headers and all).  Under
-   -MP (ctx->deps_phony) a phony target follows for every dependency except
-   the main source SRC_PATH, matching cpp.  Layout is one logical rule (no
-   column wrapping); consumers parse it identically.  Returns false on any
-   write failure, after which the caller must treat the serve as a miss (the
-   real compile then writes its own file).  */
+   ctx->deps_user_only (-MMD) the records flagged CC_MHR_FLAG_SYSHDR are
+   skipped, reproducing libcpp's user-only exclusion.  The MAIN_SOURCE
+   record is emitted as the LIVE compile's SRC_PATH, not its stored string
+   (a probe-style TU can be re-compiled from a different directory than the
+   one that stored the entry).  Under -MP (ctx->deps_phony) a phony target
+   follows for every dependency except the main source, matching cpp.
+   Layout is one logical rule (no column wrapping); consumers parse it
+   identically.  Returns false on any write failure, after which the caller
+   must treat the serve as a miss (the real compile then writes its own
+   file).  */
 static bool
 ccs_write_deps (const cc_serve_ctx *ctx, const unsigned char *man,
 		size_t mlen, const struct cc_man_entry *ent,
@@ -1164,13 +1179,18 @@ ccs_write_deps (const cc_serve_ctx *ctx, const unsigned char *man,
     {
       const unsigned char *rec = man + ent->hdr_recs_off
 				 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+      uint32_t rflags = cc_get_u32 (rec + CC_MHR_OFF_FLAGS);
       const char *hpath
-	= cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
+	= (rflags & CC_MHR_FLAG_MAIN_SOURCE)
+	  ? src_path
+	  : cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
       if (!hpath)
 	{
 	  ok = false;
 	  break;
 	}
+      if (ctx->deps_user_only && (rflags & CC_MHR_FLAG_SYSHDR))
+	continue;
       ok = (putc (' ', f) != EOF) && ccs_deps_munge (f, hpath);
     }
   if (ok)
@@ -1181,6 +1201,11 @@ ccs_write_deps (const cc_serve_ctx *ctx, const unsigned char *man,
       {
 	const unsigned char *rec = man + ent->hdr_recs_off
 				   + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+	uint32_t rflags = cc_get_u32 (rec + CC_MHR_OFF_FLAGS);
+	if (rflags & CC_MHR_FLAG_MAIN_SOURCE)
+	  continue;		/* cpp emits no phony rule for the source */
+	if (ctx->deps_user_only && (rflags & CC_MHR_FLAG_SYSHDR))
+	  continue;
 	const char *hpath
 	  = cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
 	if (!hpath)

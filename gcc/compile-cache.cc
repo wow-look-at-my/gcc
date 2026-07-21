@@ -838,7 +838,8 @@ static struct cc_prefix_maps cc_key_pm;
    it changes the key VALUE, which is why CC_KEY_SCHEMA_VERSION is bumped.  */
 static bool
 cc_hash_one_file (const char *path, const unsigned char *buffer,
-		  size_t size, const unsigned char *content_sha1, void *user)
+		  size_t size, const unsigned char *content_sha1,
+		  unsigned file_flags, void *user)
 {
   struct cc_closure_state *st = (struct cc_closure_state *) user;
 
@@ -882,9 +883,15 @@ cc_hash_one_file (const char *path, const unsigned char *buffer,
   /* Capture the file's full stat identity for the manifest stat-shortcut (an
      identity match accepts a header on a hit without re-reading it).
      Best-effort: an untrusted identity (stat failure, changed size, too-new
-     stamps) just forces a content re-hash on the next hit.  */
+     stamps) just forces a content re-hash on the next hit.  Carry libcpp's
+     per-file facts into the record flags: the -MM/-MMD exclusion bit and the
+     main-source mark (see compile-cache-format.h CC_MHR_FLAG_*).  */
   struct cc_statid id;
   uint32_t mflags = cc_capture_statid (path, (uint64_t) size, &id);
+  if (file_flags & CPP_INCLUDED_FILE_SYSP)
+    mflags |= CC_MHR_FLAG_SYSHDR;
+  if (file_flags & CPP_INCLUDED_FILE_MAIN)
+    mflags |= CC_MHR_FLAG_MAIN_SOURCE;
   cc_meta_add_input (path, (uint64_t) size, &id, mflags, fh);
   return true;			/* keep walking */
 }
@@ -1902,11 +1909,13 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
   /* Dependency output.  A pre-parse hit skips preprocessing, so libcpp's
      deps hold only the main file and the -MT/-MQ targets; on a hit below the
      recorded closure is fed into the deps object (deps_add_dep) so
-     c_common_finish still writes a complete .d -- the -MD contract.  Forms
-     the records cannot reproduce decline the manifest serve instead (the
-     deep path recomputes exact deps): -MM/-MMD exclude system headers, which
-     the records do not distinguish; -MG (explicit opt-in) adds missing-file
-     entries; -fdeps-* (explicit opt-in) emits structured P1689 output.
+     c_common_finish still writes a complete .d -- the -MD contract.  For the
+     user-only styles (-MM/-MMD: openssl-shaped make builds) the records'
+     CC_MHR_FLAG_SYSHDR bit reproduces libcpp's exclusion, so they are served
+     too, skipping flagged records below.  Forms the records cannot reproduce
+     decline the manifest serve instead (the deep path recomputes exact
+     deps): -MG (explicit opt-in) adds missing-file entries; -fdeps-*
+     (explicit opt-in) emits structured P1689 output.
      deps.modules is deliberately NOT a decline condition: c-family
      initialization defaults it to TRUE on every compile (c-opts.cc
      c_common_init_options) -- it only means "IF module dependencies exist,
@@ -1916,18 +1925,19 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
      supported territory regardless of dependency output (their .gcm inputs
      are invisible to the include-closure walk).  */
   class mkdeps *mdeps = NULL;
+  bool deps_user_only = false;
   {
     const cpp_options *copts = cpp_get_options (pfile);
     if (copts->deps.style != DEPS_NONE
 	|| copts->deps.fdeps_format != FDEPS_FMT_NONE)
       {
-	if (copts->deps.style == DEPS_USER
-	    || copts->deps.fdeps_format != FDEPS_FMT_NONE
+	if (copts->deps.fdeps_format != FDEPS_FMT_NONE
 	    || copts->deps.missing_files)
 	  {
 	    cc_debug_line ("manifest-skip-deps-form", NULL);
 	    return false;
 	  }
+	deps_user_only = (copts->deps.style == DEPS_USER);
 	mdeps = cpp_get_deps (pfile);
       }
   }
@@ -2002,13 +2012,20 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
 	      /* Complete the dependency info from the entry's records (the
 		 include closure).  The main file is already in the deps --
 		 libcpp added it when the main buffer was stacked -- so skip
-		 its record to avoid a duplicate.  */
+		 its record (by flag, and by path for safety) to avoid a
+		 duplicate.  Under -MM/-MMD also skip the records libcpp's
+		 exclusion would have skipped (CC_MHR_FLAG_SYSHDR).  */
 	      if (mdeps)
 		for (uint32_t hi = 0; hi < ent.hdr_count; hi++)
 		  {
 		    const unsigned char *rec
 		      = man + ent.hdr_recs_off
 			+ (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+		    uint32_t rflags = cc_get_u32 (rec + CC_MHR_OFF_FLAGS);
+		    if (rflags & CC_MHR_FLAG_MAIN_SOURCE)
+		      continue;
+		    if (deps_user_only && (rflags & CC_MHR_FLAG_SYSHDR))
+		      continue;
 		    const char *hpath
 		      = cc_man_string (man, mlen,
 				       cc_get_u32 (rec + CC_MHR_OFF_PATH));
@@ -3005,8 +3022,11 @@ struct cc_apch_collect_state
 static bool
 cc_apch_collect_one (const char *path, const unsigned char *buffer,
 		     size_t size, const unsigned char *content_sha1,
-		     void *user)
+		     unsigned /* file_flags */, void *user)
 {
+  /* The gch manifest keeps every record path-validated (its "main source"
+     is the synthesized prelude stub, not a key-committed input), so the
+     per-file facts are deliberately not folded in here.  */
   struct cc_apch_collect_state *st = (struct cc_apch_collect_state *) user;
 
   unsigned char fh[20];
