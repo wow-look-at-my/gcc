@@ -49,6 +49,10 @@
    an identical key.  Declared here (extern) for the store path's use.  */
 extern bool cc_option_affects_output_p (const cl_decoded_option *decoded);
 extern bool cc_option_is_search_path_p (const cl_decoded_option *decoded);
+/* Likewise the search-path normalization the MK twins share (ccache
+   base_dir parity; see its definition for the collision-bar discussion).  */
+extern const char *cc_mk_search_path_relative (const char *path,
+					       const char *cwd);
 
 #include <sys/stat.h>
 #include <dirent.h>		/* shard scans for B1 eviction */
@@ -834,7 +838,8 @@ static struct cc_prefix_maps cc_key_pm;
    it changes the key VALUE, which is why CC_KEY_SCHEMA_VERSION is bumped.  */
 static bool
 cc_hash_one_file (const char *path, const unsigned char *buffer,
-		  size_t size, const unsigned char *content_sha1, void *user)
+		  size_t size, const unsigned char *content_sha1,
+		  unsigned file_flags, void *user)
 {
   struct cc_closure_state *st = (struct cc_closure_state *) user;
 
@@ -878,9 +883,15 @@ cc_hash_one_file (const char *path, const unsigned char *buffer,
   /* Capture the file's full stat identity for the manifest stat-shortcut (an
      identity match accepts a header on a hit without re-reading it).
      Best-effort: an untrusted identity (stat failure, changed size, too-new
-     stamps) just forces a content re-hash on the next hit.  */
+     stamps) just forces a content re-hash on the next hit.  Carry libcpp's
+     per-file facts into the record flags: the -MM/-MMD exclusion bit and the
+     main-source mark (see compile-cache-format.h CC_MHR_FLAG_*).  */
   struct cc_statid id;
   uint32_t mflags = cc_capture_statid (path, (uint64_t) size, &id);
+  if (file_flags & CPP_INCLUDED_FILE_SYSP)
+    mflags |= CC_MHR_FLAG_SYSHDR;
+  if (file_flags & CPP_INCLUDED_FILE_MAIN)
+    mflags |= CC_MHR_FLAG_MAIN_SOURCE;
   cc_meta_add_input (path, (uint64_t) size, &id, mflags, fh);
   return true;			/* keep walking */
 }
@@ -1268,6 +1279,12 @@ cc_compute_manifest_key (const char *src_path)
   cc_hash_component (&ctx, CC_TAG_CHECKSUM, executable_checksum, 16);
   cc_hash_str (&ctx, CC_TAG_LANG, lang_hooks.name);
 
+  /* The cwd: CC_TAG_CWD material under -g below, and the base the
+     search-path values relativize against either way.  The driver twin's
+     ctx->cwd resolves to the same string (same process directory; under -g
+     the -fworking-directory the specs inject IS that directory).  */
+  const char *pwd = get_src_pwd ();
+
   /* Under -g the source path + cwd bake into DWARF -- but only after the
      user's -f{file,debug}-prefix-map rewrites, so hash the MAPPED strings
      and drop the map options the mapping consumed (B2; identity + no drops
@@ -1277,7 +1294,6 @@ cc_compute_manifest_key (const char *src_path)
   memset (&pm, 0, sizeof (pm));
   if (cc_paths_affect_output_p ())
     {
-      const char *pwd = get_src_pwd ();
       cc_pmaps_collect (&pm, save_decoded_options, save_decoded_options_count);
       cc_pmaps_mark_dropped (&pm, save_decoded_options_count, src_path,
 			     pwd ? pwd : "");
@@ -1292,7 +1308,10 @@ cc_compute_manifest_key (const char *src_path)
   /* (4) Output-affecting options + (anti-shadow) search-path VALUES.  Walked
      in command-line order so option ordering is part of the key.  Map
      options whose effect is already captured by the mapped src/cwd above
-     are excluded (cc_pmaps_opt_dropped_p; never set without -g).  */
+     are excluded (cc_pmaps_opt_dropped_p; never set without -g).
+     Search-path values inside the build dir hash cwd-relative so relocated
+     build trees share manifests (cc_mk_search_path_relative; ccache base_dir
+     parity -- MK is a lookup index, every serve is still record-verified).  */
   for (unsigned i = 1; i < save_decoded_options_count; i++)
     {
       const cl_decoded_option *o = &save_decoded_options[i];
@@ -1303,8 +1322,12 @@ cc_compute_manifest_key (const char *src_path)
       if (!affects && !search)
 	continue;
       for (size_t k = 0; k < o->canonical_option_num_elements; k++)
-	cc_hash_str (&ctx, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT,
-		     o->canonical_option[k]);
+	{
+	  const char *val = o->canonical_option[k];
+	  if (search)
+	    val = cc_mk_search_path_relative (val, pwd ? pwd : "");
+	  cc_hash_str (&ctx, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT, val);
+	}
     }
   cc_pmaps_free (&pm);
 
@@ -1698,10 +1721,14 @@ cc_get_meta_xattr (const char *obj_path, size_t *len)
 
    Returns true on a served hit, false on miss/refusal (caller decides whether
    to install the back-end capture and fall through).  DEBUG_ACTION labels the
-   debug line ("hit" / "manifest-hit").  */
+   debug line ("hit" / "manifest-hit").  On a hit the object's stored
+   diagnostic counts are copied to *STORED_WARNINGS / *STORED_WERRORS when
+   non-NULL (the post-parse path forwards them to the on-hit manifest store,
+   mirroring the counts the miss-path store records).  */
 static bool
 cc_serve_from_bin (const char *ok_hex, bool require_no_fe_diag,
-		   const char *debug_action)
+		   const char *debug_action,
+		   uint32_t *stored_warnings, uint32_t *stored_werrors)
 {
   char *bin_path = cc_entry_path (ok_hex, /*make_dirs=*/false);
   char *obj_path = cc_object_sidecar_path (bin_path);
@@ -1779,12 +1806,21 @@ cc_serve_from_bin (const char *ok_hex, bool require_no_fe_diag,
       global_dc->diagnostic_count (DK_WARNING) += (int) warnings;
       global_dc->diagnostic_count (DK_WERROR) += (int) errors;
     }
+  if (stored_warnings)
+    *stored_warnings = warnings;
+  if (stored_werrors)
+    *stored_werrors = errors;
 
   free (meta);
   cc_hit = true;
   cc_debug_line (debug_action, ok_hex);
   return true;
 }
+
+/* Defined below with the rest of the store path; the post-parse serve calls
+   it to record the manifest on a deep hit.  */
+static void cc_store_manifest (uint32_t warnings, uint32_t werrors,
+			       const char *debug_action);
 
 bool
 compile_cache_try_serve (cpp_reader *pfile)
@@ -1822,8 +1858,30 @@ compile_cache_try_serve (cpp_reader *pfile)
   /* Try to serve by the object key OK.  Front-end diagnostics are allowed here
      (they re-emit on the re-parse that already happened), so pass
      require_no_fe_diag = false.  */
-  if (cc_serve_from_bin (cc_key_hex, /*require_no_fe_diag=*/false, "hit"))
-    return true;
+  uint32_t stored_warnings = 0, stored_werrors = 0;
+  if (cc_serve_from_bin (cc_key_hex, /*require_no_fe_diag=*/false, "hit",
+			 &stored_warnings, &stored_werrors))
+    {
+      /* A deep (post-parse) hit means the pre-parse manifest lookup could
+	 NOT serve this TU: no manifest under its MK, or no entry whose
+	 records still verify.  Store/refresh the manifest NOW from the
+	 metadata cc_compute_key just gathered (include closure + probes) --
+	 the exact material the miss-path store records -- so the NEXT
+	 compile serves pre-parse.  Without this, a TU whose first-ever
+	 compile object-hit a twin's store (parallel-populate race) never
+	 acquired a manifest at all and re-paid the full parse on EVERY warm
+	 build (measured: 4 llama.cpp TUs at ~2.5 s each, "manifest-miss,
+	 hit" forever).  ccache's equivalent (direct-mode manifest update
+	 after a preprocessed-mode hit) behaves the same way.  The counts
+	 are the object's stored ones, i.e. what the miss path passed;
+	 the skip-guards are the miss path's too: seen_error () mirrored
+	 here, MK validity + unverifiable-probe forms inside
+	 cc_store_manifest itself.  */
+      if (!seen_error ())
+	cc_store_manifest (stored_warnings, stored_werrors,
+			   "manifest-store-on-hit");
+      return true;
+    }
 
   /* MISS: install the back-end diagnostic capture so the store can record
      them, and fall through to the back-end.  */
@@ -1851,11 +1909,13 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
   /* Dependency output.  A pre-parse hit skips preprocessing, so libcpp's
      deps hold only the main file and the -MT/-MQ targets; on a hit below the
      recorded closure is fed into the deps object (deps_add_dep) so
-     c_common_finish still writes a complete .d -- the -MD contract.  Forms
-     the records cannot reproduce decline the manifest serve instead (the
-     deep path recomputes exact deps): -MM/-MMD exclude system headers, which
-     the records do not distinguish; -MG (explicit opt-in) adds missing-file
-     entries; -fdeps-* (explicit opt-in) emits structured P1689 output.
+     c_common_finish still writes a complete .d -- the -MD contract.  For the
+     user-only styles (-MM/-MMD: openssl-shaped make builds) the records'
+     CC_MHR_FLAG_SYSHDR bit reproduces libcpp's exclusion, so they are served
+     too, skipping flagged records below.  Forms the records cannot reproduce
+     decline the manifest serve instead (the deep path recomputes exact
+     deps): -MG (explicit opt-in) adds missing-file entries; -fdeps-*
+     (explicit opt-in) emits structured P1689 output.
      deps.modules is deliberately NOT a decline condition: c-family
      initialization defaults it to TRUE on every compile (c-opts.cc
      c_common_init_options) -- it only means "IF module dependencies exist,
@@ -1865,18 +1925,19 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
      supported territory regardless of dependency output (their .gcm inputs
      are invisible to the include-closure walk).  */
   class mkdeps *mdeps = NULL;
+  bool deps_user_only = false;
   {
     const cpp_options *copts = cpp_get_options (pfile);
     if (copts->deps.style != DEPS_NONE
 	|| copts->deps.fdeps_format != FDEPS_FMT_NONE)
       {
-	if (copts->deps.style == DEPS_USER
-	    || copts->deps.fdeps_format != FDEPS_FMT_NONE
+	if (copts->deps.fdeps_format != FDEPS_FMT_NONE
 	    || copts->deps.missing_files)
 	  {
 	    cc_debug_line ("manifest-skip-deps-form", NULL);
 	    return false;
 	  }
+	deps_user_only = (copts->deps.style == DEPS_USER);
 	mdeps = cpp_get_deps (pfile);
       }
   }
@@ -1946,18 +2007,25 @@ compile_cache_try_serve_manifest (cpp_reader *pfile, const char *src_path)
 	  char ok_hex[41];
 	  cc_hex (ent.ok_raw, ok_hex);
 	  if (cc_serve_from_bin (ok_hex, /*require_no_fe_diag=*/true,
-				 "manifest-hit"))
+				 "manifest-hit", NULL, NULL))
 	    {
 	      /* Complete the dependency info from the entry's records (the
 		 include closure).  The main file is already in the deps --
 		 libcpp added it when the main buffer was stacked -- so skip
-		 its record to avoid a duplicate.  */
+		 its record (by flag, and by path for safety) to avoid a
+		 duplicate.  Under -MM/-MMD also skip the records libcpp's
+		 exclusion would have skipped (CC_MHR_FLAG_SYSHDR).  */
 	      if (mdeps)
 		for (uint32_t hi = 0; hi < ent.hdr_count; hi++)
 		  {
 		    const unsigned char *rec
 		      = man + ent.hdr_recs_off
 			+ (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+		    uint32_t rflags = cc_get_u32 (rec + CC_MHR_OFF_FLAGS);
+		    if (rflags & CC_MHR_FLAG_MAIN_SOURCE)
+		      continue;
+		    if (deps_user_only && (rflags & CC_MHR_FLAG_SYSHDR))
+		      continue;
 		    const char *hpath
 		      = cc_man_string (man, mlen,
 				       cc_get_u32 (rec + CC_MHR_OFF_PATH));
@@ -2377,35 +2445,12 @@ cc_write_atomic_readonly (const char *path, const unsigned char *bytes,
   return ok;
 }
 
-/* Write the cache's "compiler-id" sidecar (DIR/compiler-id) so the DRIVER can
-   form the manifest key without linking this compiler's checksum object or
-   knowing lang_hooks.name: it records executable_checksum + lang_hooks.name,
-   the two key components the driver cannot derive on its own.  Idempotent and
-   cheap; written on every miss-store (a recompiled compiler -> new checksum ->
-   the driver's MK changes in lockstep, so a stale id can never cause a wrong
-   hit -- it would simply differ from the object's stored checksum-keyed MK).
-   Atomic publish.  No-op on failure.  */
+/* Publish one compiler-id sidecar at PATH (atomic tmp+rename; no-op on
+   failure).  */
 static void
-cc_write_compiler_id (void)
+cc_write_compiler_id_file (const char *path, const unsigned char *buf,
+			   size_t total)
 {
-  if (!cc_dir || !cc_dir[0])
-    return;
-  cc_ensure_dir (cc_dir);
-
-  const char *lang = lang_hooks.name ? lang_hooks.name : "";
-  uint32_t llen = (uint32_t) strlen (lang);
-
-  size_t total = 8 + 2 + 2 + 16 + 4 + (size_t) llen;
-  unsigned char *buf = (unsigned char *) xmalloc (total);
-  memcpy (buf, CC_COMPILER_ID_MAGIC, CC_MAGIC_LEN);
-  cc_put_u16 (buf + 8, (uint16_t) CC_COMPILER_ID_VERSION);
-  cc_put_u16 (buf + 10, 0);
-  memcpy (buf + 12, executable_checksum, 16);
-  cc_put_u32 (buf + 28, llen);
-  if (llen)
-    memcpy (buf + 32, lang, llen);
-
-  char *path = concat (cc_dir, "/", CC_COMPILER_ID_NAME, NULL);
   char *tmp = concat (path, ".tmpXXXXXX", NULL);
   int fd = mkstemp (tmp);
   bool ok = (fd >= 0);
@@ -2428,9 +2473,56 @@ cc_write_compiler_id (void)
     }
   else if (fd >= 0)
     unlink (tmp);
-  free (buf);
   free (tmp);
+}
+
+/* Write the cache's compiler-id sidecars so the DRIVER can form the manifest
+   key without linking this compiler's checksum object or knowing
+   lang_hooks.name: they record executable_checksum + lang_hooks.name, the
+   two key components the driver cannot derive on its own.  Idempotent and
+   cheap; written on every miss-store (a recompiled compiler -> new checksum ->
+   the driver's MK changes in lockstep, so a stale id can never cause a wrong
+   hit -- it would simply differ from the object's stored checksum-keyed MK).
+
+   Two names are published (see compile-cache-format.h): the per-language
+   "DIR/compiler-id-<prog>" keyed by THIS compiler's program name (progname:
+   the lbasename of argv[0], "cc1"/"cc1plus"/... -- the very token the driver
+   matches when it intercepts the command), and the legacy single
+   "DIR/compiler-id" for older drivers sharing the cache dir.  Without the
+   split, C and C++ TUs in one cache fought over the single file and the
+   losing language's TUs never served at the driver tier.  */
+static void
+cc_write_compiler_id (void)
+{
+  if (!cc_dir || !cc_dir[0])
+    return;
+  cc_ensure_dir (cc_dir);
+
+  const char *lang = lang_hooks.name ? lang_hooks.name : "";
+  uint32_t llen = (uint32_t) strlen (lang);
+
+  size_t total = 8 + 2 + 2 + 16 + 4 + (size_t) llen;
+  unsigned char *buf = (unsigned char *) xmalloc (total);
+  memcpy (buf, CC_COMPILER_ID_MAGIC, CC_MAGIC_LEN);
+  cc_put_u16 (buf + 8, (uint16_t) CC_COMPILER_ID_VERSION);
+  cc_put_u16 (buf + 10, 0);
+  memcpy (buf + 12, executable_checksum, 16);
+  cc_put_u32 (buf + 28, llen);
+  if (llen)
+    memcpy (buf + 32, lang, llen);
+
+  if (progname && progname[0])
+    {
+      char *lpath = concat (cc_dir, "/", CC_COMPILER_ID_PREFIX, progname,
+			    NULL);
+      cc_write_compiler_id_file (lpath, buf, total);
+      free (lpath);
+    }
+
+  char *path = concat (cc_dir, "/", CC_COMPILER_ID_NAME, NULL);
+  cc_write_compiler_id_file (path, buf, total);
   free (path);
+  free (buf);
 }
 
 /* Append/refresh this TU's entry in the manifest object keyed by MK.  The
@@ -2445,9 +2537,12 @@ cc_write_compiler_id (void)
    manifest reader could short-circuit; the authoritative copy is in the
    object header).  Atomic publish.  No-op unless the manifest key is valid,
    and skipped entirely for TUs whose probes a pre-parse serve could not
-   re-verify (__has_include_next; unverifiable probe forms).  */
+   re-verify (__has_include_next; unverifiable probe forms).  DEBUG_ACTION
+   labels the success debug line: "manifest-store" from the miss path,
+   "manifest-store-on-hit" from the post-parse-hit path.  */
 static void
-cc_store_manifest (uint32_t warnings, uint32_t werrors)
+cc_store_manifest (uint32_t warnings, uint32_t werrors,
+		   const char *debug_action)
 {
   if (!cc_manifest_key_valid)
     return;
@@ -2741,7 +2836,7 @@ cc_store_manifest (uint32_t warnings, uint32_t werrors)
 	unlink (tmp);
       else
 	{
-	  cc_debug_line ("manifest-store", cc_manifest_key_hex);
+	  cc_debug_line (debug_action, cc_manifest_key_hex);
 	  /* B1: account the manifest write (delta vs the replaced file) in
 	     its shard and evict if over budget.  */
 	  cc_evict_note_store (cc_manifest_key_hex,
@@ -2859,7 +2954,7 @@ compile_cache_store (void)
       cc_debug_line ("store", cc_key_hex);
       /* Record/refresh the manifest entry so a future run of the SAME source
 	 can serve this object BEFORE parsing.  */
-      cc_store_manifest (warnings, errors);
+      cc_store_manifest (warnings, errors, "manifest-store");
       /* Publish the compiler-id sidecar so the DRIVER can form the same
 	 manifest key (it needs this compiler's checksum + lang name).  */
       cc_write_compiler_id ();
@@ -2927,8 +3022,11 @@ struct cc_apch_collect_state
 static bool
 cc_apch_collect_one (const char *path, const unsigned char *buffer,
 		     size_t size, const unsigned char *content_sha1,
-		     void *user)
+		     unsigned /* file_flags */, void *user)
 {
+  /* The gch manifest keeps every record path-validated (its "main source"
+     is the synthesized prelude stub, not a key-committed input), so the
+     per-file facts are deliberately not folded in here.  */
   struct cc_apch_collect_state *st = (struct cc_apch_collect_state *) user;
 
   unsigned char fh[20];

@@ -5953,19 +5953,15 @@ driver_cc_debug_p (void)
   return dbg == 1;
 }
 
-/* Read the cache's "compiler-id" sidecar (DIR/compiler-id), written by
-   cc1/cc1plus on a miss-store, into *CHECKSUM (16 bytes, caller-provided) and a
-   freshly xmalloc'd *LANG.  Returns true on success.  The sidecar lets the
-   driver form the manifest key without linking the compiler's checksum object
-   or knowing lang_hooks.name.  */
+/* Read one compiler-id sidecar file at PATH into *CHECKSUM (16 bytes,
+   caller-provided) and a freshly xmalloc'd *LANG.  Returns true on
+   success.  */
 static bool
-driver_read_compiler_id (const char *cache_dir, unsigned char checksum[16],
-			 char **lang)
+driver_read_compiler_id_file (const char *path, unsigned char checksum[16],
+			      char **lang)
 {
   *lang = NULL;
-  char *path = concat (cache_dir, "/", CC_COMPILER_ID_NAME, NULL);
   FILE *f = fopen (path, "rb");
-  free (path);
   if (!f)
     return false;
 
@@ -5994,6 +5990,36 @@ driver_read_compiler_id (const char *cache_dir, unsigned char checksum[16],
     ok = false;
   fclose (f);
   return ok && *lang;
+}
+
+/* Read the compiler-id sidecar for PROG (the program this command will
+   spawn: "cc1"/"cc1plus"), written by the compiler proper on a miss-store,
+   into *CHECKSUM (16 bytes, caller-provided) and a freshly xmalloc'd *LANG.
+   Returns true on success.  The sidecar lets the driver form the manifest
+   key without linking the compiler's checksum object or knowing
+   lang_hooks.name.
+
+   The per-language "DIR/compiler-id-<prog>" is preferred: cc1 and cc1plus
+   share one cache dir, and the legacy single "DIR/compiler-id" was
+   last-store-wins, which fed the driver the OTHER language's checksum+lang
+   for every TU of the losing language -- a wrong MK, so their no-spawn tier
+   never hit (measured: every C TU of a C++-heavy build re-spawned cc1 on
+   every warm build).  The legacy name remains a fallback for caches
+   populated before the split.  */
+static bool
+driver_read_compiler_id (const char *cache_dir, const char *prog,
+			 unsigned char checksum[16], char **lang)
+{
+  char *path = concat (cache_dir, "/", CC_COMPILER_ID_PREFIX, prog, NULL);
+  bool ok = driver_read_compiler_id_file (path, checksum, lang);
+  free (path);
+  if (ok)
+    return true;
+
+  path = concat (cache_dir, "/", CC_COMPILER_ID_NAME, NULL);
+  ok = driver_read_compiler_id_file (path, checksum, lang);
+  free (path);
+  return ok;
 }
 
 /* The cc1/cc1plus command line has just been assembled into ARGBUF (its [0] is
@@ -6072,19 +6098,22 @@ driver_try_serve_from_cache (void)
   bool disqualify = false;
   bool saw_g = false;
 
-  /* Dependency-output state.  A served hit must also honor the -MD contract
-     (write the .d file ninja/make will read), so collect the request here;
-     the manifest's header records ARE the include closure, letting the serve
-     unit synthesize the file.  Forms whose output the records cannot
-     reproduce exactly decline the driver serve below (cc1plus's tier -- or
-     the real compile -- then produces the file with cpp's own semantics):
-     -M/-MM (dependency-only modes), -MMD/-MM (system headers excluded, which
-     the records do not distinguish), -MG (missing-header rules), or a -MD
-     lacking an explicit target/file on the cc1 line (cpp's default-target
-     derivation is not reimplemented here).  */
-  bool deps_md = false;		/* -MD (cc1 form carries the default file) */
-  bool deps_unsupported = false;/* -M/-MM/-MMD/-MG seen */
-  const char *deps_md_file = NULL;	/* -MD's own argument */
+  /* Dependency-output state.  A served hit must also honor the -MD/-MMD
+     contract (write the .d file ninja/make will read), so collect the
+     request here; the manifest's header records ARE the include closure --
+     with each record's CC_MHR_FLAG_SYSHDR carrying libcpp's user-only
+     exclusion bit -- letting the serve unit synthesize the file for both
+     the full (-MD) and user-only (-MMD: the openssl-style make shape)
+     forms.  Forms whose output the records cannot reproduce exactly decline
+     the driver serve below (cc1plus's tier -- or the real compile -- then
+     produces the file with cpp's own semantics): -M/-MM (dependency-only
+     modes), -MG (missing-header rules), or a -MD/-MMD lacking an explicit
+     target/file on the cc1 line (cpp's default-target derivation is not
+     reimplemented here).  */
+  bool deps_md = false;		/* -MD/-MMD (cc1 form carries the file) */
+  bool deps_user = false;	/* -MMD: user-only dependency list */
+  bool deps_unsupported = false;/* -M/-MM/-MG seen */
+  const char *deps_md_file = NULL;	/* -MD/-MMD's own argument */
   const char *deps_mf = NULL;		/* -MF argument (overrides) */
   bool deps_phony = false;		/* -MP */
   const char **deps_tgts = XNEWVEC (const char *, decoded_count);
@@ -6130,6 +6159,11 @@ driver_try_serve_from_cache (void)
 	  deps_md = true;
 	  deps_md_file = o->arg;
 	  break;
+	case OPT_MMD:
+	  deps_md = true;
+	  deps_user = true;
+	  deps_md_file = o->arg;
+	  break;
 	case OPT_MF:
 	  deps_mf = o->arg;
 	  break;
@@ -6144,7 +6178,6 @@ driver_try_serve_from_cache (void)
 	  break;
 	case OPT_M:
 	case OPT_MM:
-	case OPT_MMD:
 	case OPT_MG:
 	  deps_unsupported = true;
 	  break;
@@ -6188,7 +6221,7 @@ driver_try_serve_from_cache (void)
     {
       unsigned char checksum[16];
       char *lang = NULL;
-      if (driver_read_compiler_id (cache_dir, checksum, &lang))
+      if (driver_read_compiler_id (cache_dir, prog, checksum, &lang))
 	{
 	  char *cwd = getpwd ();
 	  cc_serve_ctx ctx;
@@ -6206,6 +6239,7 @@ driver_try_serve_from_cache (void)
 	  ctx.deps_target_quoted = deps_tgt_quoted;
 	  ctx.deps_target_count = deps_tgt_count;
 	  ctx.deps_phony = deps_phony;
+	  ctx.deps_user_only = deps_user;
 	  served = compile_cache_serve_object (&ctx, src_path, out_path);
 	  free (lang);
 	}
@@ -6460,10 +6494,11 @@ driver_auto_pch_probe_inject (struct driver_apch_plan *plan)
 
   /* Compiler id (written by cc1plus on the first miss-store).  Without it we
      cannot key the entry; the very first compile into a cold cache proceeds
-     plain and the next one picks the feature up.  */
+     plain and the next one picks the feature up.  PROG is "cc1plus" here
+     (guarded above): auto-PCH is C++-only in v1.  */
   unsigned char checksum[16];
   char *lang = NULL;
-  if (!driver_read_compiler_id (cache_dir, checksum, &lang))
+  if (!driver_read_compiler_id (cache_dir, prog, checksum, &lang))
     {
       driver_apch_log ("off", "no compiler-id sidecar yet (cold cache)");
       free (decoded);
@@ -6520,6 +6555,7 @@ driver_auto_pch_probe_inject (struct driver_apch_plan *plan)
   ctx.deps_target_quoted = NULL;
   ctx.deps_target_count = 0;
   ctx.deps_phony = false;
+  ctx.deps_user_only = false;
 
   char *base = cc_auto_pch_entry_base (&ctx, norm, plen);
   enum cc_auto_pch_probe_result pr

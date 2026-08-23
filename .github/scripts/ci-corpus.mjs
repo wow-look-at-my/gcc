@@ -28,7 +28,26 @@
 //   CORPUS_CC / CORPUS_CXX
 //                override the compiler command, possibly multi-word (local
 //                testing with an uninstalled tree: ".../xgcc -B.../gcc")
+//   CORPUS_CC_WRAP
+//                prefix prepended to both compiler commands (e.g. "ccache"
+//                for the profiling matrix's ccache column)
 //   CORPUS_WORK  scratch dir (default $RUNNER_TEMP/corpus)
+//   CORPUS_BUILD_TYPE
+//                llama.cpp only: CMAKE_BUILD_TYPE override (default
+//                RelWithDebInfo -- the validation flow relies on that
+//                default; only the profiling matrix's Release row sets this)
+//   CORPUS_TIMING_LEG
+//                single-leg timing mode for .github/workflows/profiling.yml:
+//                skip the off/cold/warm validation sequence and instead time
+//                ONE build, printing integer wall seconds and appending
+//                wall=<secs> to $GITHUB_OUTPUT. Legs:
+//                  plain       one build, compile cache off
+//                  cache-cold  one build, -fcompile-cache into an empty dir
+//                  cache-warm  untimed -fcompile-cache populate build, then
+//                              a timed fresh-dir build served from the cache
+//                  prewarmed   like cache-warm but with the compile cache
+//                              off both times -- the warm cache is external
+//                              (CORPUS_CC_WRAP=ccache + CCACHE_* env)
 //
 // Node ESM, standard-library only (matches ci-verify-cache.mjs conventions).
 
@@ -62,8 +81,10 @@ const HIT_FLOOR = { openssl: 400, 'zlib-ng': 30, sqlite: 2, fmt: 20, 'llama.cpp'
 
 const RT = process.env.RUNNER_TEMP || os.tmpdir();
 const dist = process.env.GCC_DIST || path.join(RT, 'gcc-dist');
-const CC = process.env.CORPUS_CC || path.join(dist, 'bin', 'gcc');
-const CXX = process.env.CORPUS_CXX || path.join(dist, 'bin', 'g++');
+const wrapCmd = (cmd) =>
+  process.env.CORPUS_CC_WRAP ? `${process.env.CORPUS_CC_WRAP} ${cmd}` : cmd;
+const CC = wrapCmd(process.env.CORPUS_CC || path.join(dist, 'bin', 'gcc'));
+const CXX = wrapCmd(process.env.CORPUS_CXX || path.join(dist, 'bin', 'g++'));
 const work = path.join(process.env.CORPUS_WORK || path.join(RT, 'corpus'), project);
 const srcDir = path.join(work, 'src');
 const cacheDir = path.join(work, 'cc-cache');
@@ -184,26 +205,55 @@ function fetchSource() {
     run('fetch', ['unzip', '-q', '-o', zip, '-d', work]);
     fs.renameSync(path.join(work, pin.dir), srcDir);
   }
-  // b9891's webui defaults kit.version to Date.now(), making the generated
-  // ui.cpp nondeterministic across builds -- pin it so byte-identity is
-  // testable (same class as SOURCE_DATE_EPOCH for openssl).
-  if (project === 'llama.cpp') {
-    const cfg = path.join(srcDir, 'tools', 'ui', 'svelte.config.js');
-    const s = fs.readFileSync(cfg, 'utf8');
-    if (!/\bversion\s*:/.test(s)) {
-      const p = s.replace(/(\bkit:\s*\{)/, `$1\n\t\tversion: { name: 'corpus' },`);
-      if (p === s) fail('could not pin SvelteKit version in tools/ui/svelte.config.js');
-      fs.writeFileSync(cfg, p);
-    }
-  }
 }
 
-// Extra compile flags for a build in DIR with/without the cache. llama.cpp
-// builds with -g (RelWithDebInfo), so it also prefix-maps the build dir --
-// the flag whose cache-key handling (B2) this leg exists to exercise.
+// llama.cpp only: build the SvelteKit webui ONCE, into the source tree.
+//
+// llama-server embeds the webui as a generated ui.cpp. By default every
+// build dir runs its own `npm run build` (scripts/ui-assets.cmake priority
+// 2), but Vite/Rollup chunk content-hashes are NOT reproducible across
+// separate builds -- chunking and hashing vary with module-graph iteration
+// order, and the hash names feed back into the emitted bundle -- even with
+// SvelteKit's kit.version pinned (an earlier fix pinned it to stop
+// kit.version defaulting to Date.now(); the chunk hashes still differed).
+// Three independent webui builds therefore embed three DIFFERENT ui.cpp
+// files, and the cold/warm byte-identity assertion fails on ui.cpp.o
+// through no fault of the compiler (it correctly misses on changed input).
+//
+// So make the embed deterministic BY CONSTRUCTION: pre-build the webui once
+// into tools/ui/dist. That is ui-assets.cmake's priority 1 ("pre-built
+// assets supplied by the user", checked before the npm and HF-download
+// paths; `npm run build` without LLAMA_UI_OUT_DIR targets ./dist exactly
+// for this flow), so all three build dirs embed the SAME bytes --
+// tools/ui/embed.cpp output depends only on asset contents (sorted names,
+// data, FNV etag), and the gzip pre-compression step is deterministic for a
+// fixed input file. Bonus: the webui pipeline runs once instead of 3x.
+function prebuildWebui() {
+  const uiDir = path.join(srcDir, 'tools', 'ui');
+  if (fs.existsSync(path.join(uiDir, 'dist', 'index.html'))) return;
+  run('webui', ['npm', 'ci', '--no-audit', '--no-fund'], { cwd: uiDir, quietStdout: true });
+  run('webui', ['npm', 'run', 'build'], { cwd: uiDir, quietStdout: true });
+  if (!fs.existsSync(path.join(uiDir, 'dist', 'index.html')))
+    fail('webui pre-build produced no tools/ui/dist/index.html');
+  process.stdout.write('[webui] built once into tools/ui/dist (shared by off/cold/warm)\n');
+}
+
+// llama.cpp's CMAKE_BUILD_TYPE (only the profiling matrix's Release row
+// overrides the default; see the CORPUS_BUILD_TYPE docs up top).
+const llamaBuildType = process.env.CORPUS_BUILD_TYPE || 'RelWithDebInfo';
+
+// Extra compile flags for a build in DIR with/without the cache. The
+// RelWithDebInfo (-g) llama.cpp build also prefix-maps the build dir -- the
+// flag whose cache-key handling (B2) that leg exists to exercise. Under -g
+// ONLY: the fork's cache normalizes *-prefix-map into the key only when
+// paths affect the output (cc_paths_affect_output_p -- B2, by design), so
+// in a Release build the raw dir-dependent flag lands in every key verbatim
+// and poisons cross-directory serves (the epoch-1 llama-release warm=386s
+// cell: a full recompile passed off as a warm cache measurement).
 function extraFlags(dir, cache) {
   const flags = [];
-  if (project === 'llama.cpp') flags.push(`-ffile-prefix-map=${dir}=.`);
+  if (project === 'llama.cpp' && llamaBuildType === 'RelWithDebInfo')
+    flags.push(`-ffile-prefix-map=${dir}=.`);
   if (cache) flags.push(`-fcompile-cache=${cacheDir}`);
   return flags;
 }
@@ -259,7 +309,8 @@ function build(phase, dir, cache) {
       // off (no libcurl-dev on the runner), ccache off (GGML_CCACHE=OFF --
       // the fork's cache is the one under test).
       run(phase, ['cmake', '-S', srcDir, '-B', dir, '-G', 'Ninja',
-                  '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DLLAMA_CURL=OFF', '-DGGML_CCACHE=OFF',
+                  `-DCMAKE_BUILD_TYPE=${llamaBuildType}`,
+                  '-DLLAMA_CURL=OFF', '-DGGML_CCACHE=OFF',
                   `-DCMAKE_C_FLAGS=${flags.join(' ')}`, `-DCMAKE_CXX_FLAGS=${flags.join(' ')}`],
           { env, quietStdout: true });
       run(phase, ['cmake', '--build', dir, '-j', nproc], { env, quietStdout: true });
@@ -328,7 +379,51 @@ int main(void) {
 
 run('setup', [...splitCmd(CC), '--version'], { quietStdout: true });
 fetchSource();
+if (project === 'llama.cpp') prebuildWebui();
 fs.mkdirSync(cacheDir, { recursive: true });
+
+// ---------------------------------------------------------------------------
+// Single-leg timing mode (profiling.yml; see the env docs up top). Times ONE
+// build and exits: no byte-identity, no hit floors -- ci.yml's corpus job
+// (CORPUS_TIMING_LEG unset) remains the correctness gate, this mode only
+// measures. The timed section is exactly the build (configure+compile+link);
+// the populate pass of the warm legs and the post-build quick test are not.
+// ---------------------------------------------------------------------------
+const timingLeg = process.env.CORPUS_TIMING_LEG;
+if (timingLeg) {
+  const LEGS = ['plain', 'cache-cold', 'cache-warm', 'prewarmed'];
+  if (!LEGS.includes(timingLeg))
+    fail(`unknown CORPUS_TIMING_LEG '${timingLeg}' (expected ${LEGS.join('|')})`);
+  const useCompileCache = timingLeg.startsWith('cache-');
+  if (timingLeg === 'cache-warm' || timingLeg === 'prewarmed')
+    build('populate', path.join(work, 'build-populate'), useCompileCache);
+  const dir = path.join(work, `build-${timingLeg}`);
+  const t0 = Date.now();
+  build(timingLeg, dir, useCompileCache);
+  const wall = Math.round((Date.now() - t0) / 1000);
+  // Count the timed pass's cache-debug lines (from its phase log) so an
+  // all-miss "warm" measurement is visible in the job log instead of
+  // silently timing a full recompile. Legs without the compile cache
+  // (plain, prewarmed) report all zeros by construction.
+  const hits = countHits(timingLeg);
+  quickTest(timingLeg, dir);
+  if (process.env.GITHUB_OUTPUT)
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `wall=${wall}\n`);
+  process.stdout.write(
+    `\nTIMING ${project} leg=${timingLeg} wall=${wall}s ` +
+    `hits=${JSON.stringify(hits)} ` +
+    `(timed build only; fetch/webui/populate/quick-test excluded)\n`);
+  // Timing mode stays non-gating (ci.yml's corpus job is the correctness
+  // gate), but a *-warm leg that never hit the cache measured the wrong
+  // thing -- the epoch-1 llama-release warm=386s cell -- so warn LOUDLY;
+  // do not fail the job.
+  if (timingLeg.endsWith('-warm') && hits.manifestHit + hits.hit === 0)
+    process.stdout.write(
+      `::warning title=corpus ${project} ${timingLeg}::timed warm build had ` +
+      `ZERO compile-cache hits (${JSON.stringify(hits)}) -- it measured a ` +
+      `full recompile, not a cache-served build\n`);
+  process.exit(0);
+}
 
 const phases = [
   { name: 'off', cache: false },

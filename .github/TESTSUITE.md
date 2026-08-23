@@ -68,6 +68,34 @@ XPASS:` log lines or the report artifact, and annotate each with a comment
 saying why it is benign. The gate logs unused entries so stale waivers can
 be pruned.
 
+## Deliberate QoI trades
+
+Waiver-ledger-style entries for on-purpose behavior deltas that are not
+testsuite diffs. The spec-only policy still applies: each entry must say
+exactly which bar moved and why, and every serve must remain verified.
+
+- **Manifest-key search-path normalization (ccache `base_dir` parity,
+  2026-07).** `cc_mk_search_path_relative` (compile-cache-serve.cc, called
+  by both MK twins) hashes an include search-path *value* lying inside the
+  compile cwd in its cwd-relative form, so two build dirs differing only in
+  absolute location (cmake's absolute `-I<builddir>/sub` for generated
+  headers) produce one MK. This lowers **only the MK collision bar** (MK is
+  a lookup index, never an authority): compiles from different build dirs
+  that formerly keyed apart can now select the same manifest, and a
+  candidate re-verifies against its *recorded* absolute header paths --
+  possibly the other build dir's (still existing, still content-matching)
+  copies rather than this dir's same-named ones. Object serving stays
+  verified end to end (per-header stat/hash records + the full-closure
+  content-addressed object key), which is exactly ccache
+  `base_dir`+`CCACHE_NOHASHDIR`'s bar; if the recorded headers changed or
+  vanished, the records fail and the TU recompiles. Search-path values
+  *outside* the cwd still hash raw, preserving the anti-shadowing bar for
+  directories the build tree does not own. Why: measured on the llama.cpp
+  Release warm leg, build-dir `-I` values re-keyed 16 TUs per fresh build
+  dir at ~2.5 s each -- ~12.3 s of the 13.2 s fork-vs-ccache warm gap
+  (hitpath measurement run 2026-07-09; regression-guarded by
+  ci-verify-cache check 29).
+
 ## Corpus notes
 
 - Sources are pinned (openssl-3.3.1, zlib-ng 2.2.1, sqlite amalgamation

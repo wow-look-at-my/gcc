@@ -207,6 +207,16 @@ ccs_records_match (const unsigned char *man, size_t mlen, uint64_t recs_off,
       if (rflags & ~CC_MHR_FLAG_KNOWN_MASK)
 	return false;		/* written by a future format: never match */
 
+      /* The main-source record needs no path-based re-validation: the
+	 manifest key already commits the CURRENT compile's main source
+	 bytes, so reaching this entry at all proves the source matches.
+	 Its stored path may even be gone (cmake try_compile probes compile
+	 from an ephemeral CMakeScratch dir, deleted right after the probe;
+	 path-validating it made every probe manifest permanently
+	 self-invalidating -- the warm-configure gap).  */
+      if (rflags & CC_MHR_FLAG_MAIN_SOURCE)
+	continue;
+
       if (path_off + 4 > mlen)
 	return false;
       uint32_t plen = cc_get_u32 (man + path_off);
@@ -516,6 +526,48 @@ cc_option_is_search_path_p (const cl_decoded_option *decoded)
     }
 }
 
+/* Relativize one search-path VALUE against CWD for MANIFEST-key hashing
+   (ccache base_dir parity): a search dir INSIDE the current (build)
+   directory hashes as its cwd-relative form, so two build trees differing
+   only in their absolute location -- e.g. cmake's absolute -I<builddir>/sub
+   for generated headers -- produce the same MK and share manifest entries.
+   This lowers only the MK collision bar (MK is a lookup index): every serve
+   still re-verifies the recorded per-header identities and the object key
+   stays a full-closure content address, so a candidate whose headers do not
+   match simply falls through to a real compile.  A value outside CWD, or a
+   relative one, hashes unchanged, preserving the anti-shadowing bar for
+   every directory the build tree does not own.  See "Deliberate QoI trades"
+   in .github/TESTSUITE.md.
+
+   Returns PATH itself, a suffix of PATH, or a literal "." -- never an
+   allocation.  Non-path elements of a search option (the "-I" token itself)
+   pass through untouched (they never begin with CWD).  Both MK twins
+   (ccs_compute_manifest_key here / cc_compute_manifest_key in
+   compile-cache.cc) MUST call this with their side's cwd -- the same value
+   CC_TAG_CWD hashes under -g (driver: ctx->cwd; cc1plus: get_src_pwd ()),
+   which is what keeps the twins byte-identical.  */
+const char *
+cc_mk_search_path_relative (const char *path, const char *cwd)
+{
+  if (!path || !cwd || !cwd[0] || !IS_ABSOLUTE_PATH (path))
+    return path;
+  size_t cwd_len = strlen (cwd);
+  /* Ignore trailing separators on CWD; a bare root ("/") never relativizes
+     (cwd_len stays 1 and the separator check below cannot pass).  */
+  while (cwd_len > 1 && IS_DIR_SEPARATOR (cwd[cwd_len - 1]))
+    cwd_len--;
+  if (cwd_len <= 1 || filename_ncmp (path, cwd, cwd_len) != 0)
+    return path;
+  if (path[cwd_len] == '\0')
+    return ".";			/* the search dir IS the cwd */
+  if (!IS_DIR_SEPARATOR (path[cwd_len]))
+    return path;		/* /foo vs /foobar: not inside */
+  const char *rel = path + cwd_len;
+  while (IS_DIR_SEPARATOR (*rel))
+    rel++;
+  return rel[0] ? rel : ".";	/* "/cwd///" collapses to "." */
+}
+
 /* ------------------------------------------------------------------------ */
 /* B2: prefix-map-aware -g keys (see compile-cache-serve.h)                 */
 /* ------------------------------------------------------------------------ */
@@ -744,7 +796,10 @@ ccs_compute_manifest_key (const cc_serve_ctx *ctx, const char *src_path,
   /* (4) Output-affecting options + (anti-shadow) search-path VALUES, in
      command-line order.  decoded[0] is the program-name slot; skip it.
      Map options whose effect is already captured by the mapped src/cwd
-     above are excluded (cc_pmaps_opt_dropped_p; never set without -g).  */
+     above are excluded (cc_pmaps_opt_dropped_p; never set without -g).
+     Search-path values inside the build dir hash cwd-relative so relocated
+     build trees share manifests (cc_mk_search_path_relative; ccache base_dir
+     parity -- MK is a lookup index, every serve is still record-verified).  */
   for (unsigned i = 1; i < ctx->decoded_count; i++)
     {
       const cl_decoded_option *o = &ctx->decoded[i];
@@ -755,8 +810,14 @@ ccs_compute_manifest_key (const cc_serve_ctx *ctx, const char *src_path,
       if (!affects && !search)
 	continue;
       for (size_t k = 0; k < o->canonical_option_num_elements; k++)
-	ccs_hash_str (&ctx_sha, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT,
-		      o->canonical_option[k]);
+	{
+	  const char *val = o->canonical_option[k];
+	  if (search)
+	    val = cc_mk_search_path_relative (val,
+					      ctx->cwd ? ctx->cwd : "");
+	  ccs_hash_str (&ctx_sha, search ? CC_TAG_SEARCH_PATH : CC_TAG_OPT,
+			val);
+	}
     }
   cc_pmaps_free (&pm);
 
@@ -1080,11 +1141,16 @@ ccs_deps_munge (FILE *f, const char *name)
    manifest hit on ENT: the -MT/-MQ targets, then every header-record path of
    the entry -- which IS the TU's include closure, main source included, i.e.
    exactly the set -MD would have produced (system headers and all).  Under
-   -MP (ctx->deps_phony) a phony target follows for every dependency except
-   the main source SRC_PATH, matching cpp.  Layout is one logical rule (no
-   column wrapping); consumers parse it identically.  Returns false on any
-   write failure, after which the caller must treat the serve as a miss (the
-   real compile then writes its own file).  */
+   ctx->deps_user_only (-MMD) the records flagged CC_MHR_FLAG_SYSHDR are
+   skipped, reproducing libcpp's user-only exclusion.  The MAIN_SOURCE
+   record is emitted as the LIVE compile's SRC_PATH, not its stored string
+   (a probe-style TU can be re-compiled from a different directory than the
+   one that stored the entry).  Under -MP (ctx->deps_phony) a phony target
+   follows for every dependency except the main source, matching cpp.
+   Layout is one logical rule (no column wrapping); consumers parse it
+   identically.  Returns false on any write failure, after which the caller
+   must treat the serve as a miss (the real compile then writes its own
+   file).  */
 static bool
 ccs_write_deps (const cc_serve_ctx *ctx, const unsigned char *man,
 		size_t mlen, const struct cc_man_entry *ent,
@@ -1113,13 +1179,18 @@ ccs_write_deps (const cc_serve_ctx *ctx, const unsigned char *man,
     {
       const unsigned char *rec = man + ent->hdr_recs_off
 				 + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+      uint32_t rflags = cc_get_u32 (rec + CC_MHR_OFF_FLAGS);
       const char *hpath
-	= cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
+	= (rflags & CC_MHR_FLAG_MAIN_SOURCE)
+	  ? src_path
+	  : cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
       if (!hpath)
 	{
 	  ok = false;
 	  break;
 	}
+      if (ctx->deps_user_only && (rflags & CC_MHR_FLAG_SYSHDR))
+	continue;
       ok = (putc (' ', f) != EOF) && ccs_deps_munge (f, hpath);
     }
   if (ok)
@@ -1130,6 +1201,11 @@ ccs_write_deps (const cc_serve_ctx *ctx, const unsigned char *man,
       {
 	const unsigned char *rec = man + ent->hdr_recs_off
 				   + (uint64_t) hi * CC_MAN_HDR_REC_SIZE;
+	uint32_t rflags = cc_get_u32 (rec + CC_MHR_OFF_FLAGS);
+	if (rflags & CC_MHR_FLAG_MAIN_SOURCE)
+	  continue;		/* cpp emits no phony rule for the source */
+	if (ctx->deps_user_only && (rflags & CC_MHR_FLAG_SYSHDR))
+	  continue;
 	const char *hpath
 	  = cc_man_string (man, mlen, cc_get_u32 (rec + CC_MHR_OFF_PATH));
 	if (!hpath)

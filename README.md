@@ -95,3 +95,26 @@ cherry-picks in the order above.
   fault counts, bench-corpus walls) live in the constituent commit
   messages and the PR #13/#14 bodies; those are a **different workload**
   and are linked in Notes, never pasted into the cells.
+
+## Corpus build-performance matrix (self-updating, on the wiki)
+
+A second results table — **corpus workloads × toolchain configs** (a
+different workload from the self-build table above) — maintains itself on
+the wiki: **[Build-Performance-Matrix](https://github.com/wow-look-at-my/gcc/wiki/Build-Performance-Matrix)**.
+Rows are the pinned corpus projects from ci.yml's validation job
+(llama.cpp Release/RelWithDebInfo, fmt, sqlite, zlib-ng, openssl no-asm);
+columns are toolchain configs (stock Ubuntu gcc-13, the published fork
+PGO dist, fork `-fcompile-cache` cold/warm, ccache-warm + fork); each cell
+is
+the wall seconds of one timed `-j$(nproc)` build on a hosted 4-vCPU
+runner. To (re)fill it: push a change to the matrix config (an epoch bump
+counts) or run Actions → **Profiling matrix** → Run workflow —
+each cell is an independent job that reports its own result via
+[profiling-results-matrix](https://github.com/wow-look-at-my/profiling-results-matrix)
+(dead jobs surface as aborted/lost, never as a forever-in-flight cell).
+Config: [`profiling-matrix.config.ts`](profiling-matrix.config.ts) (bump
+`epoch` there when the published dist changes; old numbers render struck
+through until re-measured). Measurement:
+[`.github/scripts/ci-corpus.mjs`](.github/scripts/ci-corpus.mjs) in its
+`CORPUS_TIMING_LEG` single-leg mode, dispatched by
+[`.github/workflows/profiling.yml`](.github/workflows/profiling.yml).

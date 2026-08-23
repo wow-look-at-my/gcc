@@ -128,18 +128,21 @@ struct cc_serve_ctx
      served manifest hit must also write a make-style dependency file there
      honoring the -MD contract (every file of the include closure, system
      headers included) -- the recorded header set IS that closure, so the
-     driver can emit the .d without running the preprocessor.  The driver
-     only requests this for the forms it can reproduce exactly (-MD with an
+     driver can emit the .d without running the preprocessor.  Under
+     DEPS_USER_ONLY (-MMD) the records flagged CC_MHR_FLAG_SYSHDR are
+     excluded, reproducing libcpp's user-only list.  The driver only
+     requests this for the forms it can reproduce exactly (-MD/-MMD with an
      explicit dependency file and at least one -MT/-MQ target, optional
      -MP); for anything else it declines the serve instead and cc1plus's
      tier takes over.  All three pointers are borrowed.  A hit that fails to
      write the file reports a miss (the object may already be placed; the
      ensuing real compile simply overwrites it and writes its own .d).  */
-  const char *deps_path;		/* dependency file (-MF / -MD arg) */
+  const char *deps_path;		/* dependency file (-MF / -MD/-MMD arg) */
   const char *const *deps_targets;	/* target names, command-line order */
   const bool *deps_target_quoted;	/* per-target: munge like -MQ */
   unsigned deps_target_count;
   bool deps_phony;			/* -MP: phony target per header */
+  bool deps_user_only;			/* -MMD: skip SYSHDR records */
 };
 
 /* ---- B2: prefix-map-aware -g keys (shared by ALL key computations) ---- */
